@@ -1,0 +1,82 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] mmc: sunxi: tell the DMA layer how far the IDMAC can address
+
+The IDMAC descriptors carry word addresses. The A733 manual defines DES2
+(buffer address, Table 11-7), DES3 (next descriptor, Table 11-8) and SMHC_DLBA
+(register 0x0084) each as a word address (4 bytes), so a variant with
+idma_des_shift = 2 -- which is how this driver already writes those fields --
+reaches 34 bits of physical memory through 32-bit registers.
+
+Nothing tells the DMA layer that. A platform device created from OF starts at
+DMA_BIT_MASK(32), and of_dma_configure() only ever narrows a mask, never
+widens it, so the controller is treated as a 32-bit device. On a board whose
+DRAM starts at 0x1_00000000 that means every single transfer is bounced
+through swiotlb: a memcpy per byte, on top of each request, on the CPU.
+
+Measured on the Radxa Cubie A7S, the 8 GiB board, same script and same card on both
+stacks:
+
+  vendor 6.6.98   ondemand, unpinned   0.83 s / 256 MiB   323 MB/s
+  vendor 6.6.98   performance, cpu6    0.82 s / 256 MiB   327 MB/s
+  ours   6.18.36  schedutil, unpinned  2.20 s / 256 MiB   122 MB/s
+  ours   6.18.36  performance, cpu6    1.82 s / 256 MiB   148 MB/s
+
+Two fingerprints of the bounce, both from silicon rather than from reading the
+vendor source. io_tlb_used_hiwater moves from 512 to 1024 slabs across our
+reads -- 2 MiB, exactly max_req_size -- while the vendor kernel's stays at 309
+for the whole run. And our read gains 21 % from raising the CPU clock from
+247 MHz to 2002 MHz where the vendor's gains 1 %, which is what a data path
+that copies every byte on the CPU looks like next to one that does not.
+
+So set the mask from the shift the variant already declares. The A733 asks for
+34 bits, which covers this board's DRAM whole; every variant without
+idma_des_shift asks for the 32 bits it already had, so nothing changes for
+them. The vendor driver hardcodes DMA_BIT_MASK(64) here, which the hardware
+does not back up -- it only survives because 8 GiB of DRAM at 0x1_00000000
+happens to end inside 34 bits.
+
+A platform that cannot honour the wider mask keeps the narrower one and warns:
+bounce buffering is slower, not wrong.
+
+Not hardware-tested yet. The test is a cold boot with the same read: if the
+bounce is what costs us, io_tlb_used_hiwater stops moving during the read and
+the difference between the 247 MHz and 2002 MHz runs collapses.
+
+Assisted-by: Claude
+---
+--- a/drivers/mmc/host/sunxi-mmc.c
++++ b/drivers/mmc/host/sunxi-mmc.c
+@@ -1765,6 +1765,33 @@
+ 	if (ret)
+ 		return ret;
+ 
++	/*
++	 * The IDMAC descriptors hold word addresses, not byte addresses: the
++	 * A733 manual documents DES2 (buffer), DES3 (next descriptor) and
++	 * SMHC_DLBA alike as a word address (4 bytes). A variant that shifts
++	 * its addresses therefore reaches 32 + idma_des_shift bits of physical
++	 * memory through those 32-bit fields, so say so.
++	 *
++	 * It has to be said, because an OF platform device starts at
++	 * DMA_BIT_MASK(32) and of_dma_configure() only ever narrows that mask,
++	 * never widens it. Left at 32 bits on a board whose DRAM starts at
++	 * 0x1_00000000, every transfer is bounced through swiotlb, which costs
++	 * a memcpy per byte on top of each request. Measured on the Cubie A7S:
++	 * io_tlb_used_hiwater climbs by max_req_size worth of slabs across a
++	 * read where the vendor kernel's does not move, and the same read costs
++	 * us 21 % more wall clock at 247 MHz than at 2002 MHz while the vendor
++	 * is indifferent to CPU frequency.
++	 *
++	 * Variants without idma_des_shift ask for the 32 bits they already had.
++	 * If the platform cannot honour the wider mask, keep going: the 32-bit
++	 * path with bounce buffering is slower, not wrong.
++	 */
++	ret = dma_set_mask_and_coherent(&pdev->dev,
++					DMA_BIT_MASK(32 + host->cfg->idma_des_shift));
++	if (ret)
++		dev_warn(&pdev->dev, "cannot use %u-bit DMA, staying at 32\n",
++			 32 + host->cfg->idma_des_shift);
++
+ 	host->sg_cpu = dma_alloc_coherent(&pdev->dev, PAGE_SIZE,
+ 					  &host->sg_dma, GFP_KERNEL);
+ 	if (!host->sg_cpu)

@@ -1,0 +1,571 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] phy: allwinner: A733 combo-PHY -- DP link rate 2700 Mb/s PMA table
+
+COMB0's DisplayPort personality needs a different PMA configuration from
+the SuperSpeed one `phy-allwinner-a733-add-serdes-combophy` landed, and this is the first piece of it: the
+rate table for 2700 Mb/s (HBR), the lane-count write, and a
+phy_ops.configure to reach them. The USB3 path is not touched -- not one
+existing line of table or code changes, and nothing in this tree calls
+phy_configure() (dwc3 uses init/power_on/set_mode only).
+
+Where the table comes from, and where it does not
+
+The sequence is combo0_dp_set_rate() case 2700 of the vendor driver
+(bsp/drivers/phy/sunxi-cadence-combophy.c:1158-1385), taken on the
+usb_dp_state == 0 branch -- Type-C pin assignment C/E, four DP lanes, no
+concurrent SuperSpeed. 164 PMA writes plus the two wrapper writes the
+vendor performs first (LINK_CTRL2 IDDQ clear at :1159-1161, LINK_CTRL1 =
+0x01100001 at :1163). One of those 164 is the ssc_en == true arm of an
+if/else, dropped, so the table ships 163 writes over 156 unique indices.
+
+Per the tree's rule that vendor source is a hint and never evidence, that
+sequence was then checked against silicon, with a capture taken on
+the 8 GiB board on the vendor 6.6 stack with a live 4-lane DP-alt link at 2.7
+Gbps (1920x1200, orientation REVERSE, pin assignment C, HPD asserted). Pin
+assignment C is exactly usb_dp_state == 0, so the capture is a witness of
+this branch and not of a neighbouring one. Per unique index:
+
+	silicon reads back what the table writes : 71
+	silicon differs                          :  4
+	silicon cannot say                       : 81
+
+The 4 that differ are TX_TXCC_MGNFS_MULT_000 on all four lanes, and they
+are not a wrong value: link training owns that register.
+combo0_dp_set_sw_pre() rewrites it at every swing/pre-emphasis step, and
+the live quartet 0x0010/0x000E/0x000E/0x0010 is verbatim the vendor's own
+dp_lv_table_2g7[sw=2][pre=0] MGNFS row (:556-559). At that same row TXDRV
+is 0x0003 and CPOST is 0x0000, which is why the other three training-owned registers
+agree -- training landed on the config value. All 16 training-owned
+registers are marked "t" in the table; this table is not their authority,
+and 8 of the 71 agreements are therefore not independent evidence (63
+are).
+
+The 81 the silicon cannot settle, and why each
+
+	49  odd index, never sampled
+	28  written zero, reads zero
+	 4  written non-zero, reads zero
+
+The 49 are the load-bearing number and they are a limit of the capture
+method, not of the part. An odd index sits at byte offset 2 mod 4, and
+both captures were taken with 32-bit reads on a 4-byte stride, so those
+addresses were never read. Nor can the odd half be recovered from the even
+read: a 32-bit read of this PMA returns the 16-bit register mirrored into
+both halves rather than a packed pair. CMN_PLL0_INTDIV_M0 (0x0090) =
+0x0180 and CMN_PLL0_FRACDIVL_M0 (0x0091) = 0x9DBA read back as 0x01800180,
+not 0x9DBA0180; 0xC010 = 0x51D9 with 0xC011 = 0x0100 reads 0x51D951D9.
+Zero of 537 non-zero DP words and zero of the non-zero words in the 6 GiB board's
+dump have differing halves. A 16-bit read at 2-byte stride would settle all 49 on
+the next board session -- that is the one measurement this patch is
+missing and can name.
+
+That has a consequence for `phy-allwinner-a733-add-serdes-combophy`'s own header, which is worth stating
+rather than quietly repairing: the four registers it calls
+hardware-rewritten (0x01C1, 0xC011, 0xE003, 0xE005) are all odd indices,
+so its "silicon reads 0x001B" for 0xE003 is the mirrored value of the even
+neighbour 0xE002, not a reading of 0xE003. The conclusion `phy-allwinner-a733-add-serdes-combophy` drew from
+them may still be right -- 0xE003 is PHY_PMA_PLL_RAW_CTRL and 0x01C1 is
+the PLL1 clock select that a rate change rewrites -- but it does not rest
+on that reading. Here all four are carried as the vendor writes them and
+marked unproven, per the same rule.
+
+The 4 written non-zero and reading zero are RX_SDCAL0/1_INIT_TMR on RX
+lanes 0 and 3. They read zero on both boards and in both personalities,
+while lanes 1 and 2 hold 0x001A in both; lanes 0 and 3 are the pairs the
+receptacle wires to SSTX. The likely reading
+is that the RX CDB is not populated there. Unproven either way, and the
+writes stay, because that is what the linked board ran.
+
+Named registers, not invented ones
+
+151 of the 156 indices carry a register name, and it is mainline's, not
+ours: drivers/phy/cadence/phy-cadence-torrent.c places the common CDB at
+0x0000, the TX lane CDB at 0x4000 + ln*0x200, the RX lane CDB at 0x8000 +
+ln*0x200, PHY_PCS common at 0xC000 and PHY_PMA common at 0xE000, and two
+of its three upstream variants use block_offset_shift = 0 with
+reg_offset_shift = 1 -- byte offset = index << 1, the exact mapping `phy-allwinner-a733-add-serdes-combophy`
+validated here on silicon. So the decode now has an upstream witness as
+well as a silicon one. The five indices with no upstream name (0x004B,
+0xC010, 0xC011, 0xE005, 0xE006) are left unnamed; the UM does not name
+them either.
+
+Orientation, and why a REVERSE capture is admissible
+
+The table is written for no mirror although the capture is REVERSE. That
+is sound, not lucky: every lane-block entry is written to all four lanes
+with the same value, so `phy-allwinner-a733-add-serdes-combophy`'s ^0x600 mirror maps the table onto itself.
+Checked mechanically -- of 87 lane indices the mirror moves exactly one
+pair, RX_PSC_A3 lane 0 <-> lane 3, and only because of a vendor typo
+(below).
+
+Three vendor copy-paste faults, reproduced and named
+
+Repairing them would be an unwitnessed deviation from the only sequence a
+2.7 Gbps link has been observed to train on, so they are reproduced:
+  - the group commented TX_PSC_A3 writes TX_PSC_A2 a second time; TX_PSC_A3
+    (0x4103 + ln*0x200) is never written;
+  - in the RX zero block, RX_PSC_A0 lane 0 is written twice and RX_PSC_A2
+    lane 0 lands in the A3 group, so RX_PSC_A3 lane 0 (0x8003) is never
+    written -- every value there is zero, so this is inert unless the reset
+    default is not;
+  - CMN_PLL1_SS_CTRL2_M0 (0x00D9) is written twice, 0x04C4 then 0x045F,
+    the second time from inside the PLL0 group: PLL1's SSC step is
+    clobbered and
+    CMN_PLL0_SS_CTRL2_M0 (0x0099) is never written. Both odd, so silicon
+    cannot arbitrate.
+
+SSC is off (CMN_PLL1_SS_CTRL1_M0 = 0x0002), which is what the capture
+reads and what `phy-allwinner-a733-add-serdes-combophy` chose; the ssc_en arm differs in that one register and
+is not ported.
+
+The capture is DP and not USB3 leftovers
+
+12 of the 71 agreeing indices hold a different value in the 6 GiB board's
+SuperSpeed dump, 8 of
+them config rather than training: TX_PSC_A0 and TX_PSC_A2 on lanes 0/1,
+XCVR_DIAG_HSCLK_SEL on lanes 0/1, XCVR_DIAG_BIDI_CTRL on lane 1, and
+0xC010 (0x51D9 here against 0x5100 under USB3). The wrapper writes are
+confirmed from the link window of the same capture: LINK_CTRL2 =
+0x00030010 (both IDDQ bits clear) and LINK_CTRL1 = 0x01100001 with the
+link up.
+
+What this deliberately does NOT do
+
+The DP reset bracket (combo0_dp_phy_reset, which the vendor runs before
+and after the rate write) and the swing/pre-emphasis tables
+(combo0_dp_set_sw_pre) are not ported. So this cannot complete a DP link
+on its own, and phy_configure() refuses set_voltages rather than
+half-configuring. Two further patches, each against silicon.
+
+phy_ops.configure also refuses unless the consumer has claimed the PHY for
+DP. phy_set_mode_ext() records the mode even for a driver with no
+.set_mode (drivers/phy/phy-core.c), and dwc3 sets it to a USB mode, so
+that check is what stops a stray phy_configure() from writing this table
+over a live SuperSpeed link.
+
+Honest limits: a linked board's end state says what a working DP PHY looks
+like, not which write is the gate. 81 of 156 indices are unwitnessed by
+this method, 49 of them only because the capture used the wrong access
+width.
+
+Compile-tested against 6.18.36, W=1, clean, both with and without `phy-allwinner-a733-combophy-register-a-typec-mux`
+applied. HW-pending, single observable: with the reset bracket and swing
+patches in place, a sink on Type-C J4 must train 4 lanes at 2.7 Gbps and
+the PMA must read back the 71 confirmed values above.
+
+Based on drivers/phy/sunxi-cadence-combophy.c from radxa/allwinner-bsp
+(commit b36af3872d4e, "aiot-linux-v1.4.6 release"; the file is unchanged on
+the branches cubie-aiot-v1.4.6 and cubie-aiot-v1.4.8), GPL-2.0,
+Copyright(c) 2020 - 2023 Allwinner Technology Co.,Ltd. and
+Copyright (C) 2024 Allwinner Electronics Co., Ltd. The rate table is ported
+from its combo0_dp_set_rate(), the lane-count write from combo0_dp_set_lanes():
+https://github.com/radxa/allwinner-bsp/blob/b36af3872d4e6e91da6e929f4ccf4822b3ea9d66/drivers/phy/sunxi-cadence-combophy.c
+The register names are those of drivers/phy/cadence/phy-cadence-torrent.c
+(Linux 6.18, GPL-2.0-only, Copyright 2018 Cadence Design Systems, Inc.).
+
+Assisted-by: Claude
+
+diff --git a/drivers/phy/allwinner/phy-sun60i-a733-combophy.c b/drivers/phy/allwinner/phy-sun60i-a733-combophy.c
+--- a/drivers/phy/allwinner/phy-sun60i-a733-combophy.c
++++ b/drivers/phy/allwinner/phy-sun60i-a733-combophy.c
+@@ -541,6 +541,386 @@
+ 	a733_pma_write_all(cp, a733_pma_c_post, ARRAY_SIZE(a733_pma_c_post), 0);
+ }
+ 
++/*
++ * ---------------------------------------------------------------------------
++ * DisplayPort personality, link rate 2700 Mb/s (HBR)
++ * ---------------------------------------------------------------------------
++ *
++ * combo0_dp_set_rate(), case 2700, of the vendor driver
++ * (bsp/drivers/phy/sunxi-cadence-combophy.c:1158-1385) with usb_dp_state = 0 --
++ * i.e. Type-C pin assignment C/E, four DP lanes and no SuperSpeed. That is the
++ * branch the 8 GiB board's capture below was taken on, so the two describe the same
++ * thing. ssc_en = 0, matching that capture.
++ *
++ * The index space is not guesswork: it is mainline's Cadence Torrent layout.
++ * drivers/phy/cadence/phy-cadence-torrent.c uses common CDB at 0x0000, TX lane
++ * CDB at 0x4000 + ln*0x200, RX lane CDB at 0x8000 + ln*0x200, PHY_PCS common at
++ * 0xC000 and PHY_PMA common at 0xE000, with block_offset_shift = 0 and
++ * reg_offset_shift = 1 -- byte offset = index << 1, exactly the mapping `phy-allwinner-a733-add-serdes-combophy`
++ * validated on silicon here. 151 of the 156 indices below therefore carry a
++ * register name taken from that driver rather than invented; the five that do
++ * not (0x004B, 0xC010, 0xC011, 0xE005, 0xE006) are left unnamed, and the UM does
++ * not name them either.
++ *
++ * Silicon: a capture on the 8 GiB board running
++ * the vendor 6.6 stack with a live 4-lane DP-alt link at 2.7 Gbps (1920x1200,
++ * orientation REVERSE, pin assignment C). Non-zero 32-bit words of the PMA
++ * window. Per unique index, the table against that capture:
++ *
++ *	silicon reads back what we write : 71   (of which 8 are also written by
++ *					        link training, with the same value)
++ *	silicon differs                  :  4   (all four explained, see "t")
++ *	silicon cannot say               : 81
++ *
++ * "cannot say" is 81 and splits three ways, each meaning something different:
++ *
++ *   u  49 indices are ODD, and an odd index sits at byte offset 2 mod 4. Both
++ *      captures were taken with 32-bit reads on a 4-byte stride, so those
++ *      addresses were never sampled at all -- and a 32-bit read of this PMA
++ *      returns the 16-bit register mirrored into both halves rather than a
++ *      packed pair (0x0090 = 0x0180 and 0x0091 = 0x9DBA read back as
++ *      0x01800180, not 0x9DBA0180), so the odd half cannot be recovered from
++ *      the even read either. This is a limit of the capture method, not of the
++ *      silicon: a 16-bit read at 2-byte stride would settle all 49.
++ *   z  28 indices are written as zero and read as zero. A zero read-back cannot
++ *      tell a successful write from an untouched register.
++ *   x   4 indices are written non-zero and read zero: RX_SDCAL0/1_INIT_TMR on
++ *      RX lanes 0 and 3. They read zero on BOTH boards and in BOTH personalities
++ *      (the 6 GiB board's USB3 dump reads the same), while lanes 1 and 2 hold 0x001A in
++ *      both. Lanes 0 and 3 are the pairs the receptacle wires to SSTX
++ *, so the likely reading is that the RX CDB
++ *      is not populated there -- unproven either way, and the write is kept
++ *      because that is what the linked board ran.
++ *
++ * t  The four "silicon differs" are TX_TXCC_MGNFS_MULT_000 on all four lanes,
++ *    and the difference is not a wrong value -- it is link training. The vendor
++ *    rewrites that register (and TX_TXCC_CTRL, DRV_DIAG_TX_DRV,
++ *    TX_TXCC_CPOST_MULT_00) from combo0_dp_set_sw_pre() at every swing/pre-
++ *    emphasis step, and the live quartet 0x0010/0x000E/0x000E/0x0010 is verbatim
++ *    the vendor's own dp_lv_table_2g7[sw=2][pre=0] MGNFS row
++ *    (sunxi-cadence-combophy.c:556-559). At that same row TXDRV is 0x0003 and
++ *    CPOST is 0x0000, which is why the other three agree: training happened to
++ *    land on the config value. All 16 are marked "t" -- they are not config
++ *    constants and this table is not their authority. Same class as the four
++ *    `phy-allwinner-a733-add-serdes-combophy` named (0x01C1, 0xC011, 0xE003, 0xE005); note that all four of those
++ *    are odd indices, so what `phy-allwinner-a733-add-serdes-combophy`'s header reports for them ("silicon reads
++ *    0x001B" for 0xE003) is the mirrored value of the even neighbour 0xE002 and
++ *    not a reading of 0xE003 at all. They stay in the table as the vendor writes
++ *    them, and stay unproven.
++ *
++ * The capture is of the DP personality and not of USB3 leftovers: 12 of the 71
++ * agreeing indices hold a different value in the 6 GiB board's SuperSpeed dump, 8 of them
++ * config rather than training -- TX_PSC_A0/A2 and XCVR_DIAG_HSCLK_SEL on lanes
++ * 0/1, XCVR_DIAG_BIDI_CTRL lane 1, and 0xC010 (0x51D9 here against 0x5100 under
++ * USB3, the value the task of picking a rate turns on).
++ *
++ * Orientation: the capture is REVERSE and this table is written for none. That
++ * is sound rather than lucky -- every lane-block entry here is written to all
++ * four lanes with the same value, so the ^0x600 mirror `phy-allwinner-a733-add-serdes-combophy` uses maps the table
++ * onto itself. Checked mechanically: of 87 lane indices the mirror moves exactly
++ * one, RX_PSC_A3 lane 0 <-> lane 3, and only because of the vendor typo below.
++ * So no mirror is applied, and a REVERSE capture is a valid witness for it.
++ *
++ * Three vendor copy-paste faults are reproduced rather than repaired, because
++ * the only evidence we have is a board that trained a 2.7 Gbps link running
++ * exactly this sequence, typos included. Naming them is the point:
++ *   - the group commented TX_PSC_A3 writes TX_PSC_A2 a second time, so
++ *     TX_PSC_A3 (0x4103 + ln*0x200) is never written;
++ *   - in the RX zero block, RX_PSC_A0 lane 0 is written twice and RX_PSC_A2
++ *     lane 0 lands in the A3 group, so RX_PSC_A3 lane 0 (0x8003) is never
++ *     written (all values there are zero, so this is inert unless the reset
++ *     default is not);
++ *   - CMN_PLL1_SS_CTRL2_M0 (0x00D9) is written twice, 0x04C4 then 0x045F, the
++ *     second time from inside the PLL0 group -- so PLL1's SSC step is clobbered
++ *     and CMN_PLL0_SS_CTRL2_M0 (0x0099) is never written. Both are odd indices,
++ *     so silicon cannot arbitrate.
++ *
++ * Marks: (blank) read back on silicon · u odd index, never sampled · z zero
++ * write, zero read · x non-zero write, reads zero · t link-training owns it.
++ * One mark per line and "t" wins, so the column reads 63 blank, 16 t, 49 u,
++ * 24 z, 4 x over the 156 unique indices: the 16 t are the 8 that agreed, the 4
++ * that would be z and the 4 that differ. The three headline counts above are
++ * the same 156 classified without the t overlay.
++ */
++static const struct a733_pma_write a733_dp_pma_2700[] = {
++	{ 0x0022, 0x001A },	/*   CMN_SSM_BIAS_TMR */
++	{ 0x002A, 0x0034 },	/*   CMN_PLLSM0_PLLPRE_TMR */
++	{ 0x002C, 0x00DA },	/*   CMN_PLLSM0_PLLLOCK_TMR */
++	{ 0x0032, 0x0034 },	/*   CMN_PLLSM1_PLLPRE_TMR */
++	{ 0x0034, 0x00DA },	/*   CMN_PLLSM1_PLLLOCK_TMR */
++	{ 0x0064, 0x0082 },	/*   CMN_BGCAL_INIT_TMR */
++	{ 0x0065, 0x0082 },	/* u CMN_BGCAL_ITER_TMR */
++	{ 0x0074, 0x001A },	/*   CMN_IBCAL_INIT_TMR */
++	{ 0x0104, 0x0020 },	/*   CMN_TXPUCAL_INIT_TMR */
++	{ 0x0105, 0x0007 },	/* u CMN_TXPUCAL_ITER_TMR */
++	{ 0x010C, 0x0020 },	/*   CMN_TXPDCAL_INIT_TMR */
++	{ 0x010D, 0x0007 },	/* u CMN_TXPDCAL_ITER_TMR */
++	{ 0x0114, 0x030C },	/*   CMN_RXCAL_INIT_TMR */
++	{ 0x0115, 0x0007 },	/* u CMN_RXCAL_ITER_TMR */
++	{ 0x0124, 0x0007 },	/*   CMN_SD_CAL_INIT_TMR */
++	{ 0x0125, 0x0003 },	/* u CMN_SD_CAL_ITER_TMR */
++	{ 0x0126, 0x000F },	/*   CMN_SD_CAL_REFTIM_START */
++	{ 0x0128, 0x0132 },	/*   CMN_SD_CAL_PLLCNT_START */
++	{ 0x8044, 0x001A },	/* x RX_SDCAL0_INIT_TMR ln0 */
++	{ 0x8244, 0x001A },	/*   RX_SDCAL0_INIT_TMR ln1 */
++	{ 0x8444, 0x001A },	/*   RX_SDCAL0_INIT_TMR ln2 */
++	{ 0x8644, 0x001A },	/* x RX_SDCAL0_INIT_TMR ln3 */
++	{ 0x8045, 0x0082 },	/* u RX_SDCAL0_ITER_TMR ln0 */
++	{ 0x8245, 0x0082 },	/* u RX_SDCAL0_ITER_TMR ln1 */
++	{ 0x8445, 0x0082 },	/* u RX_SDCAL0_ITER_TMR ln2 */
++	{ 0x8645, 0x0082 },	/* u RX_SDCAL0_ITER_TMR ln3 */
++	{ 0x804C, 0x001A },	/* x RX_SDCAL1_INIT_TMR ln0 */
++	{ 0x824C, 0x001A },	/*   RX_SDCAL1_INIT_TMR ln1 */
++	{ 0x844C, 0x001A },	/*   RX_SDCAL1_INIT_TMR ln2 */
++	{ 0x864C, 0x001A },	/* x RX_SDCAL1_INIT_TMR ln3 */
++	{ 0x804D, 0x0082 },	/* u RX_SDCAL1_ITER_TMR ln0 */
++	{ 0x824D, 0x0082 },	/* u RX_SDCAL1_ITER_TMR ln1 */
++	{ 0x844D, 0x0082 },	/* u RX_SDCAL1_ITER_TMR ln2 */
++	{ 0x864D, 0x0082 },	/* u RX_SDCAL1_ITER_TMR ln3 */
++	{ 0x4123, 0x0A28 },	/* u TX_RCVDET_ST_TMR ln0 */
++	{ 0x4323, 0x0A28 },	/* u TX_RCVDET_ST_TMR ln1 */
++	{ 0x4523, 0x0A28 },	/* u TX_RCVDET_ST_TMR ln2 */
++	{ 0x4723, 0x0A28 },	/* u TX_RCVDET_ST_TMR ln3 */
++	{ 0x00C4, 0x0104 },	/*   CMN_PLL1_VCOCAL_INIT_TMR */
++	{ 0x00C5, 0x0005 },	/* u CMN_PLL1_VCOCAL_ITER_TMR */
++	{ 0x00C6, 0x0337 },	/*   CMN_PLL1_VCOCAL_REFTIM_START */
++	{ 0x00C8, 0x0335 },	/*   CMN_PLL1_VCOCAL_PLLCNT_START */
++	{ 0x00C2, 0x0003 },	/*   CMN_PLL1_VCOCAL_TCTRL */
++	{ 0x0084, 0x0104 },	/*   CMN_PLL0_VCOCAL_INIT_TMR */
++	{ 0x0085, 0x0005 },	/* u CMN_PLL0_VCOCAL_ITER_TMR */
++	{ 0x0086, 0x0337 },	/*   CMN_PLL0_VCOCAL_REFTIM_START */
++	{ 0x0088, 0x0335 },	/*   CMN_PLL0_VCOCAL_PLLCNT_START */
++	{ 0x0082, 0x0003 },	/*   CMN_PLL0_VCOCAL_TCTRL */
++	{ 0x00DC, 0x00CF },	/*   CMN_PLL1_LOCK_REFCNT_START */
++	{ 0x00DE, 0x00CE },	/*   CMN_PLL1_LOCK_PLLCNT_START */
++	{ 0x00DF, 0x0005 },	/* u CMN_PLL1_LOCK_PLLCNT_THR */
++	{ 0x009C, 0x00CF },	/*   CMN_PLL0_LOCK_REFCNT_START */
++	{ 0x009E, 0x00CE },	/*   CMN_PLL0_LOCK_PLLCNT_START */
++	{ 0x009F, 0x0005 },	/* u CMN_PLL0_LOCK_PLLCNT_THR */
++	{ 0xC010, 0x51D9 },	/*   - */
++	{ 0xC011, 0x0100 },	/* u - */
++	{ 0xE003, 0x0003 },	/* u PHY_PMA_PLL_RAW_CTRL */
++	{ 0xE005, 0x000B },	/* u - */
++	{ 0xE006, 0x2224 },	/*   - */
++	{ 0x4100, 0x00FB },	/*   TX_PSC_A0 ln0 */
++	{ 0x4300, 0x00FB },	/*   TX_PSC_A0 ln1 */
++	{ 0x4500, 0x00FB },	/*   TX_PSC_A0 ln2 */
++	{ 0x4700, 0x00FB },	/*   TX_PSC_A0 ln3 */
++	{ 0x4102, 0x04AA },	/*   TX_PSC_A2 ln0 */
++	{ 0x4302, 0x04AA },	/*   TX_PSC_A2 ln1 */
++	{ 0x4502, 0x04AA },	/*   TX_PSC_A2 ln2 */
++	{ 0x4702, 0x04AA },	/*   TX_PSC_A2 ln3 */
++	{ 0x4102, 0x04AA },	/*   TX_PSC_A2 ln0 */
++	{ 0x4302, 0x04AA },	/*   TX_PSC_A2 ln1 */
++	{ 0x4502, 0x04AA },	/*   TX_PSC_A2 ln2 */
++	{ 0x4702, 0x04AA },	/*   TX_PSC_A2 ln3 */
++	{ 0x8000, 0x0000 },	/* z RX_PSC_A0 ln0 */
++	{ 0x8200, 0x0000 },	/* z RX_PSC_A0 ln1 */
++	{ 0x8400, 0x0000 },	/* z RX_PSC_A0 ln2 */
++	{ 0x8600, 0x0000 },	/* z RX_PSC_A0 ln3 */
++	{ 0x8000, 0x0000 },	/* z RX_PSC_A0 ln0 */
++	{ 0x8202, 0x0000 },	/* z RX_PSC_A2 ln1 */
++	{ 0x8402, 0x0000 },	/* z RX_PSC_A2 ln2 */
++	{ 0x8602, 0x0000 },	/* z RX_PSC_A2 ln3 */
++	{ 0x8002, 0x0000 },	/* z RX_PSC_A2 ln0 */
++	{ 0x8203, 0x0000 },	/* u RX_PSC_A3 ln1 */
++	{ 0x8403, 0x0000 },	/* u RX_PSC_A3 ln2 */
++	{ 0x8603, 0x0000 },	/* u RX_PSC_A3 ln3 */
++	{ 0x8006, 0x0000 },	/* z RX_PSC_CAL ln0 */
++	{ 0x8206, 0x0000 },	/* z RX_PSC_CAL ln1 */
++	{ 0x8406, 0x0000 },	/* z RX_PSC_CAL ln2 */
++	{ 0x8606, 0x0000 },	/* z RX_PSC_CAL ln3 */
++	{ 0x8108, 0x0000 },	/* z RX_REE_GCSM1_CTRL ln0 */
++	{ 0x8308, 0x0000 },	/* z RX_REE_GCSM1_CTRL ln1 */
++	{ 0x8508, 0x0000 },	/* z RX_REE_GCSM1_CTRL ln2 */
++	{ 0x8708, 0x0000 },	/* z RX_REE_GCSM1_CTRL ln3 */
++	{ 0x8110, 0x0000 },	/* z RX_REE_GCSM2_CTRL ln0 */
++	{ 0x8310, 0x0000 },	/* z RX_REE_GCSM2_CTRL ln1 */
++	{ 0x8510, 0x0000 },	/* z RX_REE_GCSM2_CTRL ln2 */
++	{ 0x8710, 0x0000 },	/* z RX_REE_GCSM2_CTRL ln3 */
++	{ 0x8118, 0x0000 },	/* z RX_REE_PERGCSM_CTRL ln0 */
++	{ 0x8318, 0x0000 },	/* z RX_REE_PERGCSM_CTRL ln1 */
++	{ 0x8518, 0x0000 },	/* z RX_REE_PERGCSM_CTRL ln2 */
++	{ 0x8718, 0x0000 },	/* z RX_REE_PERGCSM_CTRL ln3 */
++	{ 0x40EA, 0x000F },	/*   XCVR_DIAG_BIDI_CTRL ln0 */
++	{ 0x42EA, 0x000F },	/*   XCVR_DIAG_BIDI_CTRL ln1 */
++	{ 0x44EA, 0x000F },	/*   XCVR_DIAG_BIDI_CTRL ln2 */
++	{ 0x46EA, 0x000F },	/*   XCVR_DIAG_BIDI_CTRL ln3 */
++	{ 0x4040, 0x08A4 },	/* t TX_TXCC_CTRL ln0 */
++	{ 0x4240, 0x08A4 },	/* t TX_TXCC_CTRL ln1 */
++	{ 0x4440, 0x08A4 },	/* t TX_TXCC_CTRL ln2 */
++	{ 0x4640, 0x08A4 },	/* t TX_TXCC_CTRL ln3 */
++	{ 0x40C6, 0x0003 },	/* t DRV_DIAG_TX_DRV ln0 */
++	{ 0x42C6, 0x0003 },	/* t DRV_DIAG_TX_DRV ln1 */
++	{ 0x44C6, 0x0003 },	/* t DRV_DIAG_TX_DRV ln2 */
++	{ 0x46C6, 0x0003 },	/* t DRV_DIAG_TX_DRV ln3 */
++	{ 0x4050, 0x002A },	/* t TX_TXCC_MGNFS_MULT_000 ln0 live 0x0010 */
++	{ 0x4250, 0x002A },	/* t TX_TXCC_MGNFS_MULT_000 ln1 live 0x000E */
++	{ 0x4450, 0x002A },	/* t TX_TXCC_MGNFS_MULT_000 ln2 live 0x000E */
++	{ 0x4650, 0x002A },	/* t TX_TXCC_MGNFS_MULT_000 ln3 live 0x0010 */
++	{ 0x404C, 0x0000 },	/* t TX_TXCC_CPOST_MULT_00 ln0 */
++	{ 0x424C, 0x0000 },	/* t TX_TXCC_CPOST_MULT_00 ln1 */
++	{ 0x444C, 0x0000 },	/* t TX_TXCC_CPOST_MULT_00 ln2 */
++	{ 0x464C, 0x0000 },	/* t TX_TXCC_CPOST_MULT_00 ln3 */
++	{ 0x0103, 0x007F },	/* u CMN_TXPUCAL_TUNE */
++	{ 0x010B, 0x007F },	/* u CMN_TXPDCAL_TUNE */
++	{ 0x00D8, 0x0002 },	/*   CMN_PLL1_SS_CTRL1_M0 */
++	{ 0x00D9, 0x04C4 },	/* u CMN_PLL1_SS_CTRL2_M0 */
++	{ 0x00DA, 0x006A },	/*   CMN_PLL1_SS_CTRL3_M0 */
++	{ 0x00DB, 0x0004 },	/* u CMN_PLL1_SS_CTRL4_M0 */
++	{ 0x0098, 0x0001 },	/*   CMN_PLL0_SS_CTRL1_M0 */
++	{ 0x00D9, 0x045F },	/* u CMN_PLL1_SS_CTRL2_M0 */
++	{ 0x009A, 0x006B },	/*   CMN_PLL0_SS_CTRL3_M0 */
++	{ 0x009B, 0x0004 },	/* u CMN_PLL0_SS_CTRL4_M0 */
++	{ 0x00D4, 0x0004 },	/*   CMN_PLL1_DSM_DIAG_M0 */
++	{ 0x01C4, 0x0509 },	/*   CMN_PDIAG_PLL1_CP_PADJ_M0 */
++	{ 0x01C5, 0x0F00 },	/* u CMN_PDIAG_PLL1_CP_IADJ_M0 */
++	{ 0x01C6, 0x0F08 },	/*   CMN_PDIAG_PLL1_FILT_PADJ_M0 */
++	{ 0x00D0, 0x019F },	/*   CMN_PLL1_INTDIV_M0 */
++	{ 0x00D1, 0x6276 },	/* u CMN_PLL1_FRACDIVL_M0 */
++	{ 0x00D2, 0x0002 },	/*   CMN_PLL1_FRACDIVH_M0 */
++	{ 0x00D3, 0x0116 },	/* u CMN_PLL1_HIGH_THR_M0 */
++	{ 0x01C0, 0x0002 },	/*   CMN_PDIAG_PLL1_CTRL_M0 */
++	{ 0x01C1, 0x0701 },	/* u CMN_PDIAG_PLL1_CLK_SEL_M0 */
++	{ 0x004B, 0x0000 },	/* u - */
++	{ 0x40E6, 0x0001 },	/*   XCVR_DIAG_HSCLK_SEL ln0 */
++	{ 0x42E6, 0x0001 },	/*   XCVR_DIAG_HSCLK_SEL ln1 */
++	{ 0x44E6, 0x0001 },	/*   XCVR_DIAG_HSCLK_SEL ln2 */
++	{ 0x46E6, 0x0001 },	/*   XCVR_DIAG_HSCLK_SEL ln3 */
++	{ 0x40E7, 0x0001 },	/* u XCVR_DIAG_HSCLK_DIV ln0 */
++	{ 0x42E7, 0x0001 },	/* u XCVR_DIAG_HSCLK_DIV ln1 */
++	{ 0x44E7, 0x0001 },	/* u XCVR_DIAG_HSCLK_DIV ln2 */
++	{ 0x46E7, 0x0001 },	/* u XCVR_DIAG_HSCLK_DIV ln3 */
++	{ 0x40E5, 0x0019 },	/* u XCVR_DIAG_PLLDRC_CTRL ln0 */
++	{ 0x42E5, 0x0019 },	/* u XCVR_DIAG_PLLDRC_CTRL ln1 */
++	{ 0x44E5, 0x0019 },	/* u XCVR_DIAG_PLLDRC_CTRL ln2 */
++	{ 0x46E5, 0x0019 },	/* u XCVR_DIAG_PLLDRC_CTRL ln3 */
++	{ 0xE006, 0x2224 },	/*   - */
++	{ 0x01A1, 0x8600 },	/* u CMN_PDIAG_PLL0_CLK_SEL_M0 */
++	{ 0x0094, 0x0004 },	/*   CMN_PLL0_DSM_DIAG_M0 */
++	{ 0x01A4, 0x0509 },	/*   CMN_PDIAG_PLL0_CP_PADJ_M0 */
++	{ 0x01A5, 0x0F00 },	/* u CMN_PDIAG_PLL0_CP_IADJ_M0 */
++	{ 0x01A6, 0x0F08 },	/*   CMN_PDIAG_PLL0_FILT_PADJ_M0 */
++	{ 0x0090, 0x0180 },	/*   CMN_PLL0_INTDIV_M0 */
++	{ 0x0091, 0x9DBA },	/* u CMN_PLL0_FRACDIVL_M0 */
++	{ 0x0092, 0x0002 },	/*   CMN_PLL0_FRACDIVH_M0 */
++	{ 0x0093, 0x0102 },	/* u CMN_PLL0_HIGH_THR_M0 */
++	{ 0x01A0, 0x0002 },	/*   CMN_PDIAG_PLL0_CTRL_M0 */
++};
++
++/*
++ * combo0_dp_set_lanes(), sunxi-cadence-combophy.c:1636-1648. One PMA word turns
++ * the unused lanes off: 0x0100 keeps all four, and the vendor's own comments
++ * name the other two "close lane 32" and "close lane 321", i.e. bits [3:0]
++ * disable lanes 3..0. The index is odd, so the 8 GiB board's capture cannot show it and
++ * the encoding rests on the vendor comment alone -- marked open.
++ */
++#define PMA_DP_LANE_CFG			0x4011
++#define  PMA_DP_LANE_CFG_4LANE		0x0100
++#define  PMA_DP_LANE_CFG_2LANE		0x010C
++#define  PMA_DP_LANE_CFG_1LANE		0x010E
++
++/*
++ * The two non-PMA writes the vendor performs before the PMA body, kept in that
++ * order. Both are confirmed by the same capture, from the link window rather
++ * than the PMA one: LINK_CTRL2 reads 0x00030010 (IDDQ_EN_SEL and IDDQ_EN_SOFT
++ * clear) and LINK_CTRL1 reads 0x01100001 with the DP link up.
++ */
++static void a733_combophy_dp_rate_2700(struct a733_combophy *cp)
++{
++	a733_rmw(cp->link, COMB0_LINK_CTRL2,
++		 PHY0_IDDQ_EN_SEL | PHY0_IDDQ_EN_SOFT, 0);
++
++	/* Same absolute value the USB personality writes; the macro's name
++	 * records where it was first proven, not an exclusivity.
++	 */
++	writel(COMB0_LINK_CTRL1_USB3, cp->link + COMB0_LINK_CTRL1);
++
++	a733_pma_write_all(cp, a733_dp_pma_2700,
++			   ARRAY_SIZE(a733_dp_pma_2700), 0);
++}
++
++static int a733_combophy_dp_set_lanes(struct a733_combophy *cp,
++				      unsigned int lanes)
++{
++	u16 val;
++
++	switch (lanes) {
++	case 1:
++		val = PMA_DP_LANE_CFG_1LANE;
++		break;
++	case 2:
++		val = PMA_DP_LANE_CFG_2LANE;
++		break;
++	case 4:
++		val = PMA_DP_LANE_CFG_4LANE;
++		break;
++	default:
++		dev_err(cp->dev, "DP lane count %u not supported\n", lanes);
++		return -EINVAL;
++	}
++
++	writew(val, cp->pma + (PMA_DP_LANE_CFG << 1));
++	return 0;
++}
++
++/*
++ * phy_ops.configure is how a DisplayPort controller asks for a link rate and a
++ * lane count. Nothing in this tree calls it yet -- dwc3 does not, it uses
++ * init/power_on/set_mode only -- so the USB3 path is unchanged by this patch.
++ *
++ * What is implemented is the rate table and the lane count, and nothing else:
++ * the swing/pre-emphasis tables (combo0_dp_set_sw_pre) and the DP reset bracket
++ * (combo0_dp_phy_reset, which the vendor runs before and after the rate write)
++ * are separate patches. So this cannot complete a DP link on its own, and it
++ * says so by refusing rather than by half-configuring.
++ */
++static int a733_combophy_configure(struct phy *phy,
++				   union phy_configure_opts *opts)
++{
++	struct a733_combophy *cp = phy_get_drvdata(phy);
++	struct phy_configure_opts_dp *dp = &opts->dp;
++	int ret = 0;
++
++	/* COMB0 carries SuperSpeed or DP and never both, and this driver brings
++	 * it up for USB. Refusing unless the consumer has claimed the PHY for DP
++	 * is what stops a stray phy_configure() from writing the DP rate table
++	 * over a live 10 Gbps link: phy_set_mode_ext() records the mode even for
++	 * a driver with no .set_mode (drivers/phy/phy-core.c), and dwc3 sets it
++	 * to one of the USB modes.
++	 */
++	if (phy->attrs.mode != PHY_MODE_DP) {
++		dev_warn(cp->dev, "phy_configure() while not in DP mode\n");
++		return -EINVAL;
++	}
++
++	if (dp->set_voltages) {
++		dev_warn_once(cp->dev,
++			      "DP swing/pre-emphasis not implemented, link training cannot complete\n");
++		return -EOPNOTSUPP;
++	}
++
++	mutex_lock(&cp->lock);
++
++	if (dp->set_rate) {
++		if (dp->link_rate != 2700 || dp->ssc) {
++			dev_warn(cp->dev,
++				 "only DP link rate 2700 Mb/s without SSC is implemented (asked %u Mb/s%s)\n",
++				 dp->link_rate, dp->ssc ? ", SSC" : "");
++			ret = -EOPNOTSUPP;
++			goto out;
++		}
++		a733_combophy_dp_rate_2700(cp);
++	}
++
++	if (dp->set_lanes)
++		ret = a733_combophy_dp_set_lanes(cp, dp->lanes);
++
++out:
++	mutex_unlock(&cp->lock);
++	return ret;
++}
++
+ /* combo0_usb_phy_reset(true): reset pulse, DP-lane conv, PLL enable, the
+  * POWER_STATE handshake, and the PMA_CMN_READY wait (+ one PMA nudge).
+  */
+@@ -1021,9 +1401,10 @@
+ }
+ 
+ static const struct phy_ops a733_combophy_ops = {
+-	.init	= a733_combophy_init,
+-	.exit	= a733_combophy_exit,
+-	.owner	= THIS_MODULE,
++	.init		= a733_combophy_init,
++	.exit		= a733_combophy_exit,
++	.configure	= a733_combophy_configure,
++	.owner		= THIS_MODULE,
+ };
+ 
+ static struct regulator *a733_get_opt_supply(struct device *dev, const char *id)

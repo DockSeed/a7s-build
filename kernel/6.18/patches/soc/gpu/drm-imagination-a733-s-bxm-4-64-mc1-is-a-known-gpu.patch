@@ -1,0 +1,86 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] drm/imagination: A733's BXM-4-64 MC1 is a known GPU
+
+The mainline driver's allowlist is three BVNCs and ours is not one of them, so
+on A733 it refuses to bind:
+
+  powervr 1800000.gpu: [drm] *ERROR* Unknown GPU! Set 'exp_hw_support' to bypass
+
+The board boots with a working GPU only because the command line carries
+powervr.exp_hw_support=1, and the driver then announces "Running on unknown
+hardware; expect issues" on every boot. This adds BVNC 36.56.104.183.
+
+WHAT HANGS ON AN ALLOWLIST ENTRY: NOTHING BUT THE NUMBER.
+
+That was the question worth answering before touching this, and it was answered
+by reading the driver, not by assuming. pvr_gpu_support_level()
+(pvr_device.c:529) is a switch of bodyless case labels; its only caller,
+pvr_check_gpu_supported(), prints a message and returns -ENODEV. There is no
+BVNC-indexed feature table in the kernel at all: features, BRN quirks and ERN
+enhancements arrive as bitmasks and a parameter array read out of the FIRMWARE
+FILE, in pvr_fw_get_device_info() (pvr_fw.c:167). The BVNC itself is used in
+exactly three further places -- building the firmware filename, checking it
+against the firmware header, and reporting it to userspace through
+DRM_PVR_DEV_QUERY_GPU_INFO_GET, which is the number Mesa looks up in its own
+table.
+
+WHY "SUPPORTED" AND NOT "EXPERIMENTAL"
+
+Two reasons, and the second is the operative one.
+
+(1) Our firmware was compared byte for byte against 36.52.104.182, which
+upstream promoted to supported in e55fead22ff9. Both files were parsed and laid
+side by side: identical feature mask, identical 29 parameter values, identical
+ERN set, identical FW build. The device info differs in ONE bit -- .182 carries
+BRN 71242, we do not -- and cmp finds 5 differing bytes in the whole 128 KiB.
+BRN 71242 is used once in the driver and is additionally gated on
+!gpu_multicore_support, a feature our firmware sets. There is no behavioural
+difference to a core upstream already calls supported.
+
+(2) PVR_GPU_EXPERIMENTAL would change nothing operationally: read
+pvr_check_gpu_supported() and it returns -ENODEV for EXPERIMENTAL without
+exp_hw_support, exactly as for UNKNOWN. The choice is between this and the
+status quo; "experimental" is not a middle position the code offers.
+
+⚠ WHAT THIS IS NOT: an upstream submission. Upstream's stated evidence for
+promoting .182 was a Vulkan CTS 1.4.5.3 run on real hardware. We have a GL
+acceptance that renders 65536 of 65536 pixels exactly (on the board) and no CTS
+run, and rogue_36.56.104.183_v1.fw is not in linux-firmware -- it exists only in
+Imagination's fork. The first upstream step is that firmware MR, not this patch.
+Recorded so nobody mistakes a tree-local entry for an upstream position.
+
+Three hunks, not the two an "entry" suggests: upstream's e55fead22ff9 only MOVED
+.182 between branches, so its MODULE_FIRMWARE line already existed. Ours is a
+new BVNC and needs its own.
+
+BVNC provenance: read from the silicon on the 8 GiB board (ROGUE_CR_CORE_ID__PBVNC via
+pvr_load_gpu_id), and independently from the firmware header of the file the
+driver loads.
+
+Assisted-by: Claude
+
+--- a/drivers/gpu/drm/imagination/pvr_device.c
++++ b/drivers/gpu/drm/imagination/pvr_device.c
+@@ -533,6 +533,7 @@
+ 	case PVR_PACKED_BVNC(33, 15, 11, 3):
+ 	case PVR_PACKED_BVNC(36, 52, 104, 182):
+ 	case PVR_PACKED_BVNC(36, 53, 104, 796):
++	case PVR_PACKED_BVNC(36, 56, 104, 183):
+ 		return PVR_GPU_SUPPORTED;
+ 
+ 	default:
+--- a/drivers/gpu/drm/imagination/pvr_drv.c
++++ b/drivers/gpu/drm/imagination/pvr_drv.c
+@@ -46,6 +46,7 @@
+  * * AXE-1-16M (33.15.11.3)
+  * * BXM-4-64 MC1 (36.52.104.182)
+  * * BXS-4-64 MC1 (36.53.104.796)
++ * * BXM-4-64 MC1 (36.56.104.183)
+  */
+ 
+ /**
+@@ -1537,3 +1538,4 @@
+ MODULE_FIRMWARE("powervr/rogue_33.15.11.3_v1.fw");
+ MODULE_FIRMWARE("powervr/rogue_36.52.104.182_v1.fw");
+ MODULE_FIRMWARE("powervr/rogue_36.53.104.796_v1.fw");
++MODULE_FIRMWARE("powervr/rogue_36.56.104.183_v1.fw");

@@ -1,0 +1,341 @@
+From 7f2c9a41d05e8b3762af1c0e94d5b3aa16c8f402 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Wed, 22 Jul 2026 13:30:00 +0200
+Subject: [PATCH] arm64: dts: a733: the 24 MHz node is SYS_CLK24M, not the DCXO
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Rename the `osc24M-clk` node to `sys24M-clk` and its `clock-output-names`
+to "sys24M". The rate stays 24 MHz, deliberately, and no 26 MHz node is
+added — that is the result of modelling the oscillator honestly, and the
+reason is the whole point of this patch.
+
+THE FILENAME PROMISES MORE THAN THE DIFF DELIVERS, ON PURPOSE
+
+This patch was opened as "model the 26 MHz DCXO", from the 2026-07-21
+finding that our DT was carrying `osc24M-clk { clock-frequency =
+<24000000> }` on a board whose crystal is 26 MHz. Walking the actual
+chain turned that into two separate findings:
+
+  1. The node is misnamed, not mis-rated. It does not describe the
+     crystal; it describes SYS_CLK24M, which really is 24 MHz on this
+     board, and would still be 24 MHz on a 19.2 or 26 MHz one.
+  2. The 26 MHz DCXO does belong in the tree — but as a clock provided by
+     the block that owns the strap register (RTC-CCU, patch `clk-sunxi-ng-a733-rtc-ccu-add-dcxo`), not as
+     a hand-written DT literal.
+
+So the honest fix is a rename here plus a phandle in `arm64-dts-a733-cpu-clocks-from-cpu-ccu`, and explicitly
+*not* a second oscillator node. Changing the 24 MHz to 26 MHz — the
+obvious reading of that finding, and the one upstream review of another
+A733 DT for this board asked for — would have broken four correct
+consumers to fix none.
+
+THE CHAIN, WALKED
+
+    X1 (crystal, 26.000 MHz)
+      |
+      +-- DCXO_ST0 / DCXO_ST1 strap pads tell the silicon which crystal
+      |   is fitted; result mirrored read-only into XO_CTRL0[15:14]
+      v
+    DCXO --+--> PLL_REF  (N=96, P0=104)  --+
+           |                               v
+           +-----------------------------> mux --> SYS_CLK24M (24 MHz)
+           +--> CPU_BACK_PLL, CPU_L_PLL, CPU_B_PLL, CPU_DSU_PLL
+           +--> CPU_SLOW_CLK (the clusters' backup clock)
+           +--> PLL_DIS0, PLL_DIS1, PLL_HDMI
+           +--> UFS / COMBOPHY0+1 + HDMI PHY reference gates (XO_CTRL1)
+
+    SYS_CLK24M --> AHB, APB0, APB1, APB_UART, TIMER, USB0/1/2, SMHC,
+                   SPI, GMAC0, PIO+S_GPIO debounce, ... i.e. "hosc"
+
+The DCXO branch scales with the crystal. The SYS_CLK24M branch does not:
+PLL_REF exists precisely so that this net is 24 MHz whatever is soldered
+on. Our single `osc24M` node sat on the second branch while its name
+claimed the first.
+
+WHERE EACH VALUE COMES FROM
+
+Spec (A733 UM V0.92):
+
+  * 7.1.4 Clock Sources gives both rates in one table:
+    SYS_CLK24M is a fixed 24 MHz net, muxed from either DCXO or PLL_REF;
+    DCXO is the board's external 26 MHz crystal.
+    The same two-row table recurs per module.
+  * 4.1.4.1: the real DCXO rate is read from XO_CTRL0_REG[15:14]; the
+    REFPLL rate is fixed at 24M.
+  * 9.1.5.4 DCXO Frequency: the two strap pads,
+    weak pull-up, encoding 00 = 24M, 01 = 19.2M, 10 = 26M, 11 = 24M,
+    readable in XO_CTRL0_REG[15:14]. The field table
+    lists DCXO_ST as bits[15:14], access "R".
+  * Table 4-2 carries a "Reference clock" column:
+    26 MHz for PLL_REF and the four CPU PLLs, 24 MHz for PLL_DDR,
+    PLL_PERI0/1, PLL_GPU0, PLL_VIDEO0/1/2, PLL_VE0/1, PLL_AUDIO0/1,
+    PLL_NPU, PLL_DE. (Its last three rows — PLL_DIS0/DIS1/HDMI — read
+    26 MHz too, but that part of the table did not convert cleanly to
+    text; re-check it in the manual before relying on it.)
+  * Table 4-3: REF_PLL, DCXO 26, N(INT) 96,
+    VCO 2496 MHz, OUT 24 MHz. 2496 / 104 = 24 exactly.
+  * 4.1.1: the CCU is fed by the external 26 MHz reference.
+
+Silicon (register readback; `/sys/class/sunxi_dump`, 2026-07-22):
+
+    XO_CTRL0 @0x07090160   the 6 GiB board = 0x983FB0F7   DCXO_ST[15:14] = 0b10 = 26 MHz
+                           a second 6 GiB board  = 0x183FB0F7   DCXO_ST[15:14] = 0b10 = 26 MHz
+                           the 8 GiB board = 0x983FB0F7
+
+    Decode note: the register's own documented reset value is 0x983F_10F7.
+    Our reads differ from it in exactly two read-only status fields —
+    DCXO_ST (0b10) and SYSRST_STAT (de-asserted). Every writable field
+    matches the documented default. So the 0b10 is the pads talking, not
+    a leftover. A second 6 GiB board differs from the 6 GiB board only in bit31 CLK_REQ_ENB, an
+    unrelated wake-up enable.
+
+    PLL_REF @0x02002000    the 6 GiB board = 0xF8675F00
+                           a second 6 GiB board  = 0xF8675F00
+      -> PLL_N[15:8] = 0x5F -> N = 96, P0[22:16] = 0x67 -> 104
+      -> 26 MHz x 96 / 104 = 24.000000 MHz.  With a 24 MHz input the same
+         register would produce 22.15 MHz, which matches neither Table 4-3
+         nor any peripheral rate this board runs.
+
+    PLL_PERI0 @0x020020A0  the 6 GiB board = 0xFF126310 -> N = 100 -> 24 x 100 =
+      2400 MHz = Table 4-3's PERI0_PLL row exactly (reference 24, not 26).
+
+    APB_UART @0x02002538   the 6 GiB board = 0x00000000, a second 6 GiB board = 0x00000000
+      -> src = 000 = SYS_CLK24M, M = 1.  This is UART0's parent, and the
+         serial console has been legible at 115200 8N1 on every boot of
+         this series. An 8250 divisor computed for 26 MHz on a 24 MHz
+         input gives 124.8 kBd, +8.3 %, far outside an 8N1 frame's ~3 %
+         budget. The working console is therefore a hardware measurement
+         that this net is 24 MHz, independent of any register decode.
+
+    APB1 @0x02002518       the 6 GiB board = 0x00000000 -> src = 000 = SYS_CLK24M.
+      The pinctrl "apb" clock. Also live on index 0.
+
+    CPU-PLL block, the 6 GiB board, for contrast (all four are on the DCXO branch):
+      0x08870000 = 0xF8104A00  N=75, P0=2 -> 26 x 75 / 2 = 975 MHz.
+        (The UM's CPU_BACK_PLL default note is no check on this: V0.92
+        says 975 MHz "when DCXO is 26MHz", V1.00 says 900 MHz "when DCXO
+        is 24MHz", PDF p. 305, for the same fields.)
+      0x08871000 = 0xF8802E00  N=0x2E=46 -> 26 x 46 = 1196 MHz
+      0x08872000 = 0xF8802000  N=0x20=32 -> 26 x 32 = 832, /2 = 416 MHz
+      0x08873000 = 0xF8801E00  N=0x1E=30 -> 26 x 30 = 780 MHz
+      Every one of these lands on a step of the measured OPP ladder.
+      Multiplied by 24 none of them do.
+      0x08873034 = 0x00000000  CPU_SLOW_CLK_SEL = 00 = DCXO
+        -- i.e. even the clusters' backup clock is the crystal.
+
+No vendor BSP source, no sysfs and no clk_summary was used as a source
+for any value above.
+
+EVERY CONSUMER OF THIS NODE, AND WHETHER IT IS RIGHT
+
+At this point in the series only the first two exist; the rest are listed
+because the rename has to be safe for them too, and because two of them
+need a follow-up this patch cannot reach.
+
+  pio @0x02000000, "hosc"        CORRECT at 24 MHz. The pinctrl driver
+      uses it only as the debounce clock, and PB_INT_DEB bit0
+      GPIO_INT_CLK_SELECT selects RTC_32K (0) or SYS_CLK24M (1) (UM 18.14.6.16,
+      A733 user manual) — SYS_CLK24M, not the DCXO. (Our node has no
+      `input-debounce`, so pinctrl-sunxi.c never even reads the rate;
+      sunxi_pinctrl_setup_debounce() returns early. The description is
+      still what matters.)
+
+  ccu @0x02002000, "hosc"        MOSTLY CORRECT, one wrong use, see the
+      "what this does not fix" section. The AHB/APB0/APB1/APB_UART mux
+      index 0 is SYS_CLK24M (UM 4.1.6 register descriptions: source 000 =
+      SYS_CLK24M), and APB1 and APB_UART are sitting on it right now —
+      24 MHz is required there, not merely allowed.
+
+  usbphy @0x04100400, both       CORRECT at 24 MHz. The USB2 PHY runs off
+      SYS_CLK24M; UM 9.1.5.5 lists the DCXO's two
+      dedicated PHY reference outputs as UFS and COMBOPHY0/1 + HDMI, and
+      USB2 is not among them. phy-sun4i-usb only enables the clock, so no
+      rate is consumed either way.
+
+  usb3 @0x06A00000               CORRECT and load-bearing:
+      `assigned-clock-rates = <24000000>` on CLK_USB2_SUSPEND exists to
+      force that mux off osc32k onto sys24M. Re-rating this node to
+      26 MHz would have left the assignment asking for a rate its own
+      parent can no longer produce.
+
+  r_pio @0x07025000, "hosc"      CORRECT at 24 MHz — PL_INT_DEB bit0 is
+      the same RTC_32K (0) / SYS_CLK24M (1) select (UM 18.14.7.15,
+      A733 user manual).
+
+  r_ccu @0x07010000, "hosc"      WRONG, and not fixable here. AHBS_CLK_REG
+      bits[26:24] encode the source as 000 = DCXO, 001 = RTC_32K, 010 = RC16M,
+      011 = PERIPLL_DIV (200 MHz), 100 = PERI0_300M (UM 4.2.5.1)
+      — index 0 on the R-CCU is the crystal itself, 26 MHz,
+      not SYS_CLK24M. The error is latent today: the 6 GiB board reads AHBS
+      0x03000000, APBS0 0x03000001, APBS1 0x04000000, i.e. src 011/011/100,
+      so index 0 is not selected on any of the three. The r_ccu node is
+      created by patch `arm64-dts-a733-aon-pinctrl-usb-host-vbus`, which applies after this one, so correcting
+      it belongs to a patch in that range and is recorded here rather than
+      silently left.
+
+WHY RENAME AND NOT RE-RATE, SPLIT, OR ADD A NODE
+
+  * Re-rate to 26 MHz: breaks pio, ccu (two live mux inputs), usbphy,
+    usb3 and r_pio to fix nothing — the DCXO consumers are the CPU PLLs,
+    which do not reference this node at all. It would also have put a
+    26 MHz number under a name that four subsystems read as "the 24 MHz
+    reference".
+
+  * Split into two fixed-clocks (24 MHz + 26 MHz in the DT): rejected
+    because it creates a second, weaker source for a net that patch `clk-sunxi-ng-a733-rtc-ccu-add-dcxo`
+    already derives from the silicon. Two providers of one physical clock
+    can disagree, and the DT literal is the one that would be wrong on a
+    board strapped differently. It would also register a second clock
+    named "dcxo" in the framework alongside `clk-sunxi-ng-a733-rtc-ccu-add-dcxo`'s.
+
+  * Leave alone: the name is the bug. It is what made this take a year of
+    patches to notice, and it is the point upstream review of an A733 SoC
+    dtsi for this board has already raised (below).
+
+  * Rename: the label `osc24M` is kept as an alias on the same node so
+    the rest of the series keeps resolving; new nodes use `&sys24M`.
+    Labels do not exist in the dtb, so the artefact is unambiguous, and
+    the two-label form costs nothing. This is the one place where "one
+    file only" and "no half-migration" pull against each other; keeping
+    the alias means no other patch in the series has to be touched.
+
+HOW THIS COMPOSES WITH `clk-sunxi-ng-a733-rtc-ccu-add-dcxo` AND `arm64-dts-a733-cpu-clocks-from-cpu-ccu`
+
+Patch `clk-sunxi-ng-a733-rtc-ccu-add-dcxo` adds CLK_RTC_DCXO (= 2) to the RTC-CCU, decoding the strap out
+of XO_CTRL0[15:14] on the running silicon. Patch `arm64-dts-a733-cpu-clocks-from-cpu-ccu`'s cpupll_ccu node
+takes `clocks = <&rtc_ccu CLK_RTC_DCXO>`. That is the right place for it
+and this patch deliberately does not compete with it: the DT here
+references neither CLK_RTC_DCXO nor a 26 MHz literal.
+
+The main CCU could not use CLK_RTC_DCXO even if we wanted to, and the
+reason is structural rather than a preference: rtc_ccu takes `r-ahb` from
+r_ccu, and r_ccu takes pll-periph-200m/300m from ccu. Pointing ccu's
+"hosc" at rtc_ccu closes a three-node loop in the DT clock graph. Whether
+Linux would survive it via orphan parents is beside the point — it is not
+a topology to hand to a reviewer. If the CCU ever needs a real DCXO input
+(see below), it needs a board-level fixed-clock, and that is a decision to
+make in the patch that adds the consumer, not here.
+
+UPSTREAM
+
+Upstream review of an A733 SoC dtsi for the Cubie A7S (linux-sunxi,
+June 2026, Link below) noted that the A7S and A7A schematics show a
+26 MHz crystal, that the board DT needs a way to set the crystal rate,
+and that the node and clock name are a bit misleading. This patch takes up the
+naming point. For the rate it goes another way on this SoC: this node is
+SYS_CLK24M, not the crystal, so its rate stays 24 MHz, and the crystal's
+26 MHz reaches Linux through the register that reports it (CLK_RTC_DCXO).
+If this tree is ever submitted, this patch documents that choice, and it
+keeps the upstream path open: after it the tree names two nets that the
+UM names.
+
+WHAT THIS DOES NOT FIX — a live bug this investigation surfaced
+
+`pll-ref` in ccu-sun60iw2.c (patch `clk-sunxi-ng-add-A733-sun60iw2-minimal-ccu`) is registered with parent
+`{ .fw_name = "hosc" }`, i.e. this node. Physically PLL_REF's input is the
+DCXO, not SYS_CLK24M. With the DT saying 24 MHz the driver computes
+24 x 96 / 104 = 22.15 MHz instead of 24.000 MHz, and every clock below it
+— pll-peri0 and all its taps, hence ahb/apb when they are on peri0, the
+SMHC card clocks and the rate stmmac reads for its MDC divider — is
+modelled 7.7 % low. This is arithmetic on the driver's own parent
+declaration and the register value, not a measurement, and it has never
+been observed because nothing on this board fails at a 7.7 % clock error.
+
+It is not fixed here because it cannot be: the CCU driver uses one "hosc"
+input for two different nets, so separating them is a driver change (give
+the CCU a "dcxo" input and derive an internal sys24m from pll-ref, or
+parent pll-ref to a board fixed-clock). Fixing the DT alone would move the
+error from pll-ref onto the four mux slots instead of removing it. Left
+as a follow-up for the CCU driver rather than folded in.
+
+VERIFIED / NOT VERIFIED
+
+Verified: applies clean on the full series, and also on the
+fully-patched tree (offset 5). `dtc` builds the DTS with zero
+warnings. The outcome was inspected, not the exit code: decompiling the
+resulting dtb and diffing it against the dtb built without this patch
+gives exactly two changed lines — the node name `osc24M-clk` ->
+`sys24M-clk` and `clock-output-names` "osc24M" -> "sys24M". The node keeps
+phandle 0x17 and all five `clocks` properties that referenced it
+(pinctrl@2000000, clock-controller@2002000, phy@4100400,
+clock-controller@7010000, pinctrl@7025000) still resolve to 0x17. Patch
+`arm64-dts-a733-cpu-clocks-from-cpu-ccu` applies on top unchanged.
+
+Not verified: no kernel was built and this has not been booted. The
+register reads above are silicon; everything downstream of them is spec
+plus arithmetic.
+
+PENDING — one falsifiable observation on hardware
+
+One boot of this series on the 6 GiB board or the 8 GiB board with the new dtb: the serial
+console must stay legible at 115200 8N1 from the first kernel message to
+the shell, in the same session in which `devmem 0x02002538` reads
+0x00000000 (APB_UART on src 000 = SYS_CLK24M). That pair is the whole
+claim: it says the node this patch renamed still describes a 24 MHz net,
+which is what makes the rename correct and the obvious re-rate wrong. Had
+this patch set the node to 26 MHz, the console would be garbage from
+earlycon onward — so the observation cannot pass by accident.
+
+Link: https://lore.kernel.org/all/1j33ydb77b.fsf@starbuckisacylon.baylibre.com/
+Assisted-by: Claude
+---
+ .../boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts | 40 ++++++++++++++++--
+ 1 file changed, 38 insertions(+), 2 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -389,11 +389,47 @@
+ 		interrupts = <GIC_PPI 7 IRQ_TYPE_LEVEL_HIGH>;
+ 	};
+
+-	osc24M: osc24M-clk {
++	/*
++	 * SYS_CLK24M -- the SoC-internal 24 MHz that every peripheral block
++	 * calls "hosc". It is NOT the crystal on this board and it does not
++	 * follow it:
++	 *
++	 *   XTAL -> DCXO --+-> PLL_REF (x96 /104) --+
++	 *                  |                        v
++	 *                  +---------------------> mux -> SYS_CLK24M (24 MHz)
++	 *                  +-> CPU_BACK/L/B/DSU_PLL, CPU_SLOW_CLK
++	 *                  +-> PLL_DIS0/DIS1/HDMI
++	 *                  +-> UFS / COMBOPHY0+1 + HDMI PHY reference gates
++	 *
++	 * A733 UM 7.1.4 names both nets and both rates: SYS_CLK24M is a
++	 * fixed 24 MHz net, muxed from either DCXO or PLL_REF; DCXO is the
++	 * board's external crystal, 26 MHz.
++	 * PLL_REF exists to make
++	 * this net 24 MHz on a 26 MHz board, and silicon says it does exactly
++	 * that: CCU+0x0000 reads 0xF8675F00 on the 6 GiB board and a second 6 GiB board -> N = 96,
++	 * P0 = 104, 26 MHz x 96 / 104 = 24.000000 MHz.
++	 *
++	 * So 24 MHz is the right number here and must not be "corrected" to
++	 * the crystal's 26 MHz -- only the name was wrong. Every consumer of
++	 * this node wants SYS_CLK24M: the main CCU's SYS_CLK24M mux inputs
++	 * (AHB/APB0/APB1/APB_UART src 000, UM 4.1.6), and the PIO/S_GPIO
++	 * debounce clock (PB_INT_DEB/PL_INT_DEB bit0: 0 = RTC_32K,
++	 * 1 = SYS_CLK24M).
++	 *
++	 * The 26 MHz DCXO is deliberately NOT modelled here as a second
++	 * fixed-clock: it is owned by the RTC-CCU, which decodes the
++	 * DCXO_ST0/ST1 strap out of XO_CTRL0[15:14] on the running silicon and
++	 * exports it as CLK_RTC_DCXO. A DT literal would be a second, weaker
++	 * source for the same net.
++	 *
++	 * The "osc24M" label is kept as an alias so the rest of the series
++	 * keeps resolving; new nodes should use &sys24M.
++	 */
++	sys24M: osc24M: sys24M-clk {
+ 		#clock-cells = <0>;
+ 		compatible = "fixed-clock";
+ 		clock-frequency = <24000000>;
+-		clock-output-names = "osc24M";
++		clock-output-names = "sys24M";
+ 	};
+
+ 	osc32k: osc32k-clk {
+--
+2.45.0

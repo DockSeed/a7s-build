@@ -1,0 +1,90 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] mmc: sunxi: drain the card status the HS400 sweep dirties
+
+Three cold boots of the `mmc-sunxi-drop-the-hs400-command-settle-workaround` kernel on the 8 GiB board all end the same way
+:
+
+  sunxi-mmc 4022000.mmc: HS400: data-strobe window 1..44 (44 wide), using 23
+  mmc1: unexpected status 0x400900 after switch
+  mmc1: new HS400 MMC card at address 0001
+
+The card initialises, read and write verify by md5, and no error is logged
+under load -- but the warning is there every single time, so it is not noise.
+
+0x400900 decodes as CURRENT_STATE=4 (tran), READY_FOR_DATA, and bit 22,
+R1_ILLEGAL_COMMAND. mmc_switch_status_error() prints it because
+R1_STATUS(x) = x & 0xFFF9A000 keeps exactly that bit; R1_SWITCH_ERROR is not
+set, which is why initialisation continues.
+
+The card is right and the dirt is ours. The data-strobe sweep in
+->execute_hs400_tuning fails on purpose for every delay outside the window --
+20 "send stop command failed" lines per boot, likewise identical across all
+three -- and each failed data transfer makes sunxi_mmc_handle_manual_stop()
+issue a CMD12 the card cannot honour in the state it is then in. That latches
+ILLEGAL_COMMAND, R1 error bits are cleared only by being read, and the core
+reads the status immediately after the hook returns: mmc.c calls
+->execute_hs400_tuning and then mmc_switch_status() a few lines below.
+
+So read the status once at the end of the sweep and throw it away. The
+alternative would be to teach the layer above to ignore a status bit that is
+genuinely set, which is how the command-settle workaround removed in `mmc-sunxi-drop-the-hs400-command-settle-workaround` came
+about in the first place.
+
+Placed after the sweep and before the "no delay passes" exit, so the card is
+also left clean on the failing path.
+
+CORRECTED 2026-09-19: that sentence used to say "the path where the core falls
+back to HS200". The core does not fall back; before the HS400 fallback fix the failing path cost
+the whole card. The placement is right for the reason given -- the card is left
+clean either way -- but the reason was described with a mechanism that does not
+exist, and it is deleted rather than struck through.
+
+Hardware test: the same three cold boots plus read/write/md5, with the warning
+gone and window, pick and throughput unchanged.
+
+Assisted-by: Claude
+---
+--- a/drivers/mmc/host/sunxi-mmc.c
++++ b/drivers/mmc/host/sunxi-mmc.c
+@@ -1375,6 +1375,32 @@
+  * bus that cannot frame a block. That is the intended behaviour: a slower eMMC
+  * is a nuisance, a silently corrupting one is not.
+  */
++
++/*
++ * Read the card status once and discard it.
++ *
++ * The sweep above fails on purpose for every delay outside the window, and each
++ * failed data transfer makes sunxi_mmc_handle_manual_stop() send a CMD12 that
++ * the card cannot honour in the state it is then in. The card records that as
++ * ILLEGAL_COMMAND, and R1 error bits are only cleared by being read. Since the
++ * core calls mmc_switch_status() immediately after this hook returns, leaving
++ * them latched means it reports our own leftovers as "unexpected status
++ * 0x400900 after switch" -- R1_STATUS() masks exactly bit 22 out of that value.
++ * It is only a warning, but it is a warning about dirt we made, so clean it up
++ * here rather than teach the layer above to ignore it.
++ */
++static void sunxi_mmc_drain_card_status(struct mmc_host *mmc,
++					struct mmc_card *card)
++{
++	struct mmc_command cmd = {};
++
++	cmd.opcode = MMC_SEND_STATUS;
++	cmd.arg = card->rca << 16;
++	cmd.flags = MMC_RSP_R1 | MMC_CMD_AC;
++
++	mmc_wait_for_cmd(mmc, &cmd, 0);
++}
++
+ static int sunxi_mmc_execute_hs400_tuning(struct mmc_host *mmc,
+ 					  struct mmc_card *card)
+ {
+@@ -1411,6 +1437,8 @@
+ 		}
+ 	}
+ 
++	sunxi_mmc_drain_card_status(mmc, card);
++
+ 	if (!best_len) {
+ 		dev_err(mmc_dev(mmc),
+ 			"HS400: no data-strobe delay passes, falling back\n");

@@ -1,0 +1,162 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] net: phy: maxio: give the A7S's two RJ45 LEDs distinct meanings
+
+Since `net-phy-add-maxio-mae0621a-driver` both LEDs on the Cubie A7S's RJ45 light and blink together with
+rx/tx traffic, which is a direct consequence of that patch's own LED fix and
+carries no information: two LEDs saying the same thing.
+
+Board wiring first, because the fix is only meaningful against it. The
+MAE0621A has three LED pins, of which this board uses two (SCH rev V1.10 p15):
+
+	LED1 / pin 33  -> R93 0R      -> PHY0_G_LED  -> J2  = GREEN
+	LED2 / pin 34  -> R101/R103   -> PHY0_Y_LED  -> J2  = YELLOW
+	LED0 / pin 32  -> R107 4.7k to DVCC3V3_PHY   = CFG_EXT strap, no LED
+
+LED0 is therefore not an indicator here at all; it is the strap that puts the
+RGMII I/O pad on external power (DS section 7.9 Table 7-3). Both LED drivers on
+this board are active high, because CFG_LDO0 (R112) and CFG_LDO1 (R110) are
+strapped low (DS section 7.10, Fig. 7-5).
+
+The register is LCR, page 0xD04 offset 0x10 (DS Table 8-2), and its bits are
+given twice in the datasheet: as a per-LED grid in Table 7-4 (section 7.11) and
+as a bit table with defaults in Table 8-22 (section 8.4.19). They agree:
+
+	bit 15  LED_MODE          0 = mode A, 1 = mode B
+	bit 14/13/11/10  LED2 act / link1000 / link100 / link10   defaults 1/1/0/0
+	bit  9/ 8/ 6/ 5  LED1 act / link1000 / link100 / link10   defaults 1/0/1/0
+	bit  4/ 3/ 1/ 0  LED0 act / link1000 / link100 / link10   defaults 1/0/0/1
+	bits 2, 7, 12    reserved, RO
+
+Those defaults spell 0x6251, which is exactly what an MDIO read of the register
+returned on the board before `net-phy-add-maxio-mae0621a-driver` ran, and they decode to Table 7-7's "LED0 =
+10M link+act, LED1 = 100M link+act, LED2 = 1000M link+act". Datasheet and
+silicon agree on this register to the bit, which is what makes the rest safe.
+
+`net-phy-add-maxio-mae0621a-driver` ORed LED1_LINK_1000 and LED1_LINK_10 in, giving 0x6371: green then reads
+"Link 10/100/1000 + Active 10/100/1000" and yellow keeps "Link 1000 + Active
+1000". On a gigabit link both are lit and both blink on traffic. Correct as far
+as it goes -- green is no longer dark -- but the two LEDs became redundant.
+
+Split them the conventional way: green = link, steady, at any speed; yellow =
+activity. That needs an activity-only code, and only LED mode B has one: in
+mode A the code link=0,0,0/act=1 is listed as "N/A" (Table 7-5), while in mode
+B the same code is "Active 10/100/1000Mbps" (Table 7-6). So set bit 15 and
+program
+
+	LED1 (green)  link10=1 link100=1 link1000=1 act=0
+	              -> Table 7-6 "Link 10/100/1000Mbps"
+	LED2 (yellow) link10=0 link100=0 link1000=0 act=1
+	              -> Table 7-6 "Active 10/100/1000Mbps"
+
+which turns the read-modify-write from an OR into a masked one, since bits now
+have to be cleared as well as set. LED0's four bits are read and written back
+untouched: no LED hangs on that pin, and CFG_EXT is sampled at reset only, so
+mode B reinterpreting them is unobservable on this board. On the A7S the
+sequence is therefore 0x6251 -> 0xc171.
+
+The defines are renamed and completed from Table 8-22 rather than kept as the
+two ad-hoc ones `net-phy-add-maxio-mae0621a-driver` needed, so the next person editing this does not have to
+re-derive the bit positions.
+
+This is cosmetic. It changes no timing, no link parameter and no MAC register.
+
+Anchors:
+  DS = MAE0621A Gigabit Ethernet Transceiver datasheet v1.1 (2024-08),
+       Table 7-3 (7.9), Fig. 7-5 (7.10), Tables 7-4/7-5/7-6/7-7 (7.11),
+       Table 8-2 (8.2), Table 8-22 (8.4.19).
+  SCH = board schematic RS504 rev V1.10 page 15 (U6 LED pins, R93/R101/R103,
+       R107/R110/R112).
+  SI  = LCR read 0x6251 before `net-phy-add-maxio-mae0621a-driver`'s write, quoted in `net-phy-add-maxio-mae0621a-driver`.
+
+Which colour gets which job is a choice, not a fact: the schematic fixes green
+to LED1 and yellow to LED2, and green-for-link is the usual RJ45 convention.
+Nothing in the datasheet or the schematic prescribes it.
+
+Verified: applies clean on the full series over pristine 6.18.36, and
+drivers/net/phy/maxio.o builds with W=1 KCFLAGS=-Werror. NOT verified on
+hardware -- an LED is only provable by looking at it.
+
+Assisted-by: Claude
+---
+--- a/drivers/net/phy/maxio.c
++++ b/drivers/net/phy/maxio.c
+@@ -22,8 +22,26 @@
+ #define MAXIO_MAE0621A_INSR				0x1d
+ #define MAXIO_MAE0621A_LCR_PAGE			0xd04
+ #define MAXIO_MAE0621A_LCR			0x10
+-#define MAXIO_MAE0621A_LED1_LINK_1000		BIT(8)
+-#define MAXIO_MAE0621A_LED1_LINK_10		BIT(5)
++/* LCR bit assignment: DS v1.1 Table 8-22 (section 8.4.19), cross-read with the
++ * per-LED bit table 7-4 (section 7.11). Bits 2, 7 and 12 are reserved/RO.
++ */
++#define MAXIO_MAE0621A_LCR_LED_MODE_B		BIT(15)
++#define MAXIO_MAE0621A_LCR_LED2_ACT		BIT(14)
++#define MAXIO_MAE0621A_LCR_LED2_LINK_1000	BIT(13)
++#define MAXIO_MAE0621A_LCR_LED2_LINK_100	BIT(11)
++#define MAXIO_MAE0621A_LCR_LED2_LINK_10		BIT(10)
++#define MAXIO_MAE0621A_LCR_LED1_ACT		BIT(9)
++#define MAXIO_MAE0621A_LCR_LED1_LINK_1000	BIT(8)
++#define MAXIO_MAE0621A_LCR_LED1_LINK_100	BIT(6)
++#define MAXIO_MAE0621A_LCR_LED1_LINK_10		BIT(5)
++#define MAXIO_MAE0621A_LCR_LED1_MASK		(MAXIO_MAE0621A_LCR_LED1_ACT | \
++						 MAXIO_MAE0621A_LCR_LED1_LINK_1000 | \
++						 MAXIO_MAE0621A_LCR_LED1_LINK_100 | \
++						 MAXIO_MAE0621A_LCR_LED1_LINK_10)
++#define MAXIO_MAE0621A_LCR_LED2_MASK		(MAXIO_MAE0621A_LCR_LED2_ACT | \
++						 MAXIO_MAE0621A_LCR_LED2_LINK_1000 | \
++						 MAXIO_MAE0621A_LCR_LED2_LINK_100 | \
++						 MAXIO_MAE0621A_LCR_LED2_LINK_10)
+ #define MAXIO_MAE0621A_CLK_MODE_REG      0x02
+ #define MAXIO_MAE0621A_WORK_STATUS_REG   0x1d
+ 
+@@ -139,16 +157,42 @@
+ 	phy_write(phydev, MAXIO_PAGE_SELECT, 0x0);
+ 
+ 	/*
+-	 * LED: power-on default LCR (page 0xd04 reg 0x10) maps the green LED
+-	 * (LED1 per board wiring) to 100Mbps-link only, so it is dark on a
+-	 * gigabit link. Make LED1 track link at 1000/100/10Mbps + activity
+-	 * (verified by live MDIO read: 0x6251 -> 0x6371).
++	 * LEDs. The Cubie A7S wires two of the PHY's three LED pins to the RJ45
++	 * (SCH rev V1.10 p15): LED1 (pin 33) drives the green LED through R93,
++	 * LED2 (pin 34) the yellow one through R101/R103. LED0 (pin 32) drives
++	 * no LED -- it is the CFG_EXT strap, pulled up by R107.
++	 *
++	 * The LCR power-on default is 0x6251 (DS Table 8-22 defaults, confirmed
++	 * by MDIO readback on this board) = LED0 10M, LED1 100M, LED2 1000M,
++	 * each link + activity (DS Table 7-7). On a gigabit link that leaves
++	 * green dark and only yellow alive.
++	 *
++	 * Give the two LEDs the conventional split instead: green = link,
++	 * steady, at any speed; yellow = activity. An activity-only code exists
++	 * only in LED mode B (LCR bit 15 = 1, DS Table 7-6), so select it. Per
++	 * mode B, LED1 = link{10,100,1000} + act 0 is "Link 10/100/1000Mbps" and
++	 * LED2 = link 0 + act 1 is "Active 10/100/1000Mbps".
++	 *
++	 * LED0's four bits are left exactly as read. That pin carries no LED,
++	 * and CFG_EXT is sampled only at reset (DS section 7.9), so mode B
++	 * reinterpreting those bits cannot be observed on this board.
++	 *
++	 * Expected result on this board: 0x6251 -> 0xc171.
+ 	 */
+ 	ret = maxio_read_paged(phydev, MAXIO_MAE0621A_LCR_PAGE, MAXIO_MAE0621A_LCR);
+-	if (ret >= 0)
+-		maxio_write_paged(phydev, MAXIO_MAE0621A_LCR_PAGE, MAXIO_MAE0621A_LCR,
+-				  ret | MAXIO_MAE0621A_LED1_LINK_1000 |
+-				  MAXIO_MAE0621A_LED1_LINK_10);
++	if (ret >= 0) {
++		u16 lcr = ret & ~(MAXIO_MAE0621A_LCR_LED1_MASK |
++				  MAXIO_MAE0621A_LCR_LED2_MASK);
++
++		lcr |= MAXIO_MAE0621A_LCR_LED_MODE_B;
++		lcr |= MAXIO_MAE0621A_LCR_LED1_LINK_10 |
++		       MAXIO_MAE0621A_LCR_LED1_LINK_100 |
++		       MAXIO_MAE0621A_LCR_LED1_LINK_1000;
++		lcr |= MAXIO_MAE0621A_LCR_LED2_ACT;
++
++		maxio_write_paged(phydev, MAXIO_MAE0621A_LCR_PAGE,
++				  MAXIO_MAE0621A_LCR, lcr);
++	}
+ 
+ 	return 0;
+ }

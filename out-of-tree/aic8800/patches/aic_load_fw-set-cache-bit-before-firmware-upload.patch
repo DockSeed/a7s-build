@@ -1,0 +1,57 @@
+From: bnister <30509454+bnister@users.noreply.github.com>
+Date: Wed, 4 Mar 2026 04:49:04 +0300
+Subject: [PATCH] aic_load_fw: set the cache bit before uploading firmware
+
+Based on the commit "Bluetooth fw upload fix: chip_mcu_id == 1 needs
+cache_mem_addr |= 1" by bnister (f36a0afeb43ae05725b31fc954d283f46e054b7d),
+part of the pull request "Bluetooth firmware upload fix" to
+https://github.com/shenmintao/aic8800d80, merged 2026-03-04.
+radxa-pkg/aic8800 does not carry it. Where the loader sets chip_mcu_id (bit 25
+of 0x40500000 reads 0, aic_compat_8800d80.c:343-345), bit 0 of 0x40100020 must
+be set before the upload, or DBG_MEM_WRITE_REQ reads back bogus data and the BT
+firmware load fails with "Opcode 0x0c03 failed: -110". The pull request
+describes the bit as cache-related.
+
+Carried unconditionally: on this board the loader reports chip_mcu_id=0, so the
+block does not run here; an image built for other people meets parts where it
+does.
+
+SPDX-License-Identifier: GPL-2.0-only
+
+Link: https://github.com/shenmintao/aic8800d80/pull/35
+[ adapted: rebased to the radxa-pkg src/USB/driver_fw layout; the read-failure
+message prints cache_mem_addr instead of mem_addr ]
+Assisted-by: Claude
+
+diff --git a/src/USB/driver_fw/drivers/aic8800/aic_load_fw/aic_compat_8800d80.c b/src/USB/driver_fw/drivers/aic8800/aic_load_fw/aic_compat_8800d80.c
+index 303bf57..1631534 100644
+--- a/src/USB/driver_fw/drivers/aic8800/aic_load_fw/aic_compat_8800d80.c
++++ b/src/USB/driver_fw/drivers/aic8800/aic_load_fw/aic_compat_8800d80.c
+@@ -334,6 +334,7 @@ int system_config_8800d80(struct aic_usb_dev *usb_dev){
+ 		int syscfg_num;
+ 		int ret, cnt;
+ 		const u32 mem_addr = 0x40500000;
++		const u32 cache_mem_addr = 0x40100020;
+ 		struct dbg_mem_read_cfm rd_mem_addr_cfm;
+ 		ret = rwnx_send_dbg_mem_read_req(usb_dev, mem_addr, &rd_mem_addr_cfm);
+ 		if (ret) {
+@@ -345,6 +346,19 @@ int system_config_8800d80(struct aic_usb_dev *usb_dev){
+         }
+ 		chip_id = (u8)(rd_mem_addr_cfm.memdata >> 16);
+ 		printk("chip_id=%x, chip_mcu_id = %d\n", chip_id, chip_mcu_id);
++		if (chip_mcu_id) {
++			ret = rwnx_send_dbg_mem_read_req(usb_dev, cache_mem_addr, &rd_mem_addr_cfm);
++			if (ret) {
++				printk("%x rd fail: %d\n", cache_mem_addr, ret);
++				return ret;
++			}
++			rd_mem_addr_cfm.memdata |= 0x01;
++			ret = rwnx_send_dbg_mem_write_req(usb_dev, cache_mem_addr, rd_mem_addr_cfm.memdata);
++			if (ret) {
++				printk("%x write fail: %d\n", cache_mem_addr, ret);
++				return ret;
++			}
++		}
+     #if 1
+ 		syscfg_num = sizeof(syscfg_tbl_8800d80) / sizeof(u32) / 2;
+ 		for (cnt = 0; cnt < syscfg_num; cnt++) {

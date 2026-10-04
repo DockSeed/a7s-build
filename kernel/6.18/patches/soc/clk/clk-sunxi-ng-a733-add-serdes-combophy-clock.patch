@@ -1,0 +1,185 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] clk: sunxi-ng: A733 add SERDES combo-PHY + USB3 DRD (dwc3) clocks
+
+The COMB0 combo-PHY (USB3-SS) needs the SERDES config clock at 100 MHz and
+the SERDES bus reset; the dwc3/xHCI DRD controller @0x06A00000 needs its three
+gate clocks + reset. Adds all of it to the A733 CCU:
+
+- serdes-phy-cfg @0x13C0: SUNXI_CCU_M_DATA_WITH_MUX_GATE, bit31 gate, [26:24]
+  src-mux {hosc, pll-peri0-600m}, [4:0] linear M. USB3 uses src 001 =
+  pll-peri0-600m / (M+1=6) = 100 MHz. Field layout from silicon
+  cross-check (the 8 GiB board, vendor 6.6, USB 3.2 Gen2 @10 Gbps): 0x13C0 = 0x81000005
+  (gate on, src 001, M 5).
+- RST_BUS_SERDES @0x13C4 bit16 (field SERDES_RST).
+- USB3 DRD controller clocks, all gate-only on the 24 MHz oscillator (read on
+  the 8 GiB board: SRC=SYS_CLK24M at reset, gate bit31): usb2-u2-ref @0x1348, usb2-suspend
+  @0x1350, usb2-mf @0x1354 (live reads
+  0x80000000/0x81000000/0x80000000). u2-ref/mf are gate-only (mux/M default to
+  24 MHz); usb2-suspend is a mux {osc32k, sys24M} + M because its bit24 selects
+  the source - a cold-boot POR leaves bit24=0 = osc32k (32 kHz), so the DT assigns
+  24 MHz to force sys24M (bit24=1), matching the working 8 GiB board (feeds GCTL.PWRDNSCALE).
+- RST_USB_2 @0x135C bit16 (USB2_BGR, the dwc3 controller reset).
+- res-dcap-24m @0x1A00 bit3 (parent 24M): the USB2 companion UTMI PHY
+  (u2phy @0x06b00000) power-down gate; without it dwc3 core soft-reset hangs.
+- bus-serdes @0x05C0 bit8 (SERDES_AHB_GATE_SW_CFG) and mbus-serdes @0x05E0
+  bit28 (SERDES_MBUS_GATE_SW_CFG): the two bus-matrix gates that feed the whole
+  SERDES subsystem -- the combo-PHYs' own register windows, the USB3 controller
+  behind them, and later PCIe. Register offsets from the
+  A733 user manual; field names and their reset default of 1 from
+  the CCU field tables of the A733 user manual (AHB_MAT_CLK_GATING_REG / MBUS_MAT_CLK_GATING_REG). Added
+  2026-08-01, because the per-device gates inside SUBSYS_*_BGR got a provider
+  (`clk-sunxi-ng-a733-add-serdes-subsystem-clocks`) and those gates need a real upstream to name. Both are on at reset,
+  which is why nothing missed them for as long as nobody modelled the layer
+  below. mbus-serdes is parented to ahb for the same stated reason mbus-gmac0
+  already is: this driver does not model the MBUS root and ahb is a stable
+  always-on stand-in. Neither gate divides anything and no consumer derives a
+  rate from them -- but it does put a wrong rate on the AXI side of the tree:
+  usb3-aclk will report the AHB rate in clk_summary, and the next reader will
+  take that for fact. It is a stated defect, not a free approximation, and it is
+  the same objection `clk-sunxi-ng-a733-add-serdes-subsystem-clocks` raises against folding one gate into the other's
+  parent. It stands only because this CCU models no MBUS root at all; closing it
+  means modelling that root, which is its own piece of work and is named here so
+  nobody has to rediscover it.
+
+Assisted-by: Claude
+
+diff --git a/drivers/clk/sunxi-ng/ccu-sun60iw2.c b/drivers/clk/sunxi-ng/ccu-sun60iw2.c
+--- a/drivers/clk/sunxi-ng/ccu-sun60iw2.c
++++ b/drivers/clk/sunxi-ng/ccu-sun60iw2.c
+@@ -348,6 +348,69 @@
+ static SUNXI_CCU_GATE_HWS(bus_ehci1_clk, "bus-ehci1", ahb_hws, 0x130C, BIT(4), 0);
+ static SUNXI_CCU_GATE_HWS(bus_ohci1_clk, "bus-ohci1", ahb_hws, 0x130C, BIT(0), 0);
+ 
++/*
++ * SERDES combo-PHY (COMB0/COMB1) config clock. USB3-SS needs it at 100 MHz:
++ * src 001 = pll-peri0-600m / (M+1=6) = 100 MHz (read on the 8 GiB board: 0x13C0=0x81000005).
++ * bit31 gate, [26:24] src-mux, [4:0] linear M (CCU field tables of the A733 UM).
++ */
++static const struct clk_parent_data serdes_phy_cfg_parents[] = {
++	{ .fw_name = "hosc" },			/* sys24M */
++	{ .hw = &pll_peri0_600m_clk.hw },	/* pll-peri0-600m */
++};
++static SUNXI_CCU_M_DATA_WITH_MUX_GATE(serdes_phy_cfg_clk, "serdes-phy-cfg",
++				      serdes_phy_cfg_parents, 0x13C0,
++				      0, 5,	/* M */
++				      24, 3,	/* mux */
++				      BIT(31),	/* gate */
++				      0);
++
++/*
++ * USB3 DRD (dwc3/xHCI @0x06A00000) controller clocks (read on the 8 GiB board, gate bit31):
++ *   usb2-u2-ref  0x1348 (= 0x80000000) - gate-only, mux/M default to 24 MHz
++ *   usb2-mf      0x1354 (= 0x80000000) - gate-only, mux/M default to 24 MHz
++ *   usb2-suspend 0x1350 (= 0x81000000) - bit24 SELECTS sys24M over osc32k, so
++ *     this one is NOT gate-only: mux {osc32k, sys24M} + M. Cold-boot POR leaves
++ *     bit24=0 -> osc32k (32 kHz, wrong); the DT assigns 24 MHz to force bit24=1
++ *     (as on the working 8 GiB board). Feeds dwc3 GCTL.PWRDNSCALE.
++ */
++static const struct clk_parent_data usb2_suspend_parents[] = {
++	{ .fw_name = "losc" },	/* 0 = osc32k (POR default, wrong for dwc3) */
++	{ .fw_name = "hosc" },	/* 1 = sys24M (24 MHz, what dwc3 needs) */
++};
++static SUNXI_CCU_GATE_DATA(usb2_u2_ref_clk,  "usb2-u2-ref",  osc24M, 0x1348, BIT(31), 0);
++static SUNXI_CCU_M_DATA_WITH_MUX_GATE(usb2_suspend_clk, "usb2-suspend",
++				      usb2_suspend_parents, 0x1350,
++				      0, 5,	/* M */
++				      24, 1,	/* mux: 0=osc32k 1=sys24M */
++				      BIT(31),	/* gate */
++				      0);
++static SUNXI_CCU_GATE_DATA(usb2_mf_clk,      "usb2-mf",      osc24M, 0x1354, BIT(31), 0);
++
++/* res-dcap-24m: the USB2 companion UTMI PHY (u2phy @0x06b00000) needs this to
++ * come out of power-down. Gate @0x1A00 bit3, parent dcxo/24M (vendor ccu). */
++static SUNXI_CCU_GATE_DATA(res_dcap_24m_clk, "res-dcap-24m", osc24M, 0x1A00, BIT(3), 0);
++
++/*
++ * The two bus-matrix gates that feed the whole SERDES subsystem, i.e. everything
++ * behind the combo-PHYs: the USB3 controller, the PHY's own register windows and
++ * (later) PCIe. They are the upstream of the per-device gates inside
++ * SUBSYS_*_BGR at 0x06C00004/0x0008, which a separate provider models.
++ *
++ *   bus-serdes   AHB_MAT_CLK_GATING_REG  0x05C0 bit8  SERDES_AHB_GATE_SW_CFG
++ *   mbus-serdes  MBUS_MAT_CLK_GATING_REG 0x05E0 bit28 SERDES_MBUS_GATE_SW_CFG
++ *
++ * (the field
++ * names and their reset default of 1 from the CCU field tables of the A733 user manual.) Both are on at reset,
++ * which is why nothing missed them until the subsystem gates got a driver.
++ *
++ * mbus-serdes is parented to ahb for the same reason mbus-gmac0 above is: this
++ * driver does not model the MBUS root, and ahb is a stable always-on stand-in.
++ * That approximation is visible in clk_summary and is not a rate claim - neither
++ * gate divides anything, and no consumer derives a rate from them.
++ */
++static SUNXI_CCU_GATE_HWS(bus_serdes_clk,  "bus-serdes",  ahb_hws, 0x05C0, BIT(8),  0);
++static SUNXI_CCU_GATE_HWS(mbus_serdes_clk, "mbus-serdes", ahb_hws, 0x05E0, BIT(28), 0);
++
+ /* ccu_common-based clocks (registered and reset-mapped by the core). */
+ static struct ccu_common *sun60iw2_ccu_clks[] = {
+ 	&pll_ref_clk.common,
+@@ -383,6 +446,13 @@
+ 	&bus_ohci0_clk.common,
+ 	&bus_ehci1_clk.common,
+ 	&bus_ohci1_clk.common,
++	&serdes_phy_cfg_clk.common,
++	&usb2_u2_ref_clk.common,
++	&usb2_suspend_clk.common,
++	&usb2_mf_clk.common,
++	&res_dcap_24m_clk.common,
++	&bus_serdes_clk.common,
++	&mbus_serdes_clk.common,
+ };
+ 
+ static struct clk_hw_onecell_data sun60iw2_hw_clks = {
+@@ -433,8 +503,15 @@
+ 		[CLK_BUS_EHCI0]		= &bus_ehci0_clk.common.hw,
+ 		[CLK_BUS_EHCI1]		= &bus_ehci1_clk.common.hw,
+ 		[CLK_BUS_OTG]		= &bus_otg_clk.common.hw,
++		[CLK_SERDES_PHY_CFG]	= &serdes_phy_cfg_clk.common.hw,
++		[CLK_USB2_U2_REF]	= &usb2_u2_ref_clk.common.hw,
++		[CLK_USB2_SUSPEND]	= &usb2_suspend_clk.common.hw,
++		[CLK_USB2_MF]		= &usb2_mf_clk.common.hw,
++		[CLK_RES_DCAP_24M]	= &res_dcap_24m_clk.common.hw,
++		[CLK_BUS_SERDES]	= &bus_serdes_clk.common.hw,
++		[CLK_MBUS_SERDES]	= &mbus_serdes_clk.common.hw,
+ 	},
+-	.num	= CLK_BUS_OTG + 1,
++	.num	= CLK_MBUS_SERDES + 1,
+ };
+ 
+ static struct ccu_reset_map sun60iw2_ccu_resets[] = {
+@@ -455,6 +532,8 @@
+ 	[RST_BUS_EHCI0]		= { 0x1304, BIT(20) },
+ 	[RST_BUS_EHCI1]		= { 0x130C, BIT(20) },
+ 	[RST_BUS_OTG]		= { 0x1304, BIT(24) },
++	[RST_BUS_SERDES]	= { 0x13C4, BIT(16) },
++	[RST_USB_2]		= { 0x135C, BIT(16) },
+ };
+ 
+ static const struct sunxi_ccu_desc sun60iw2_ccu_desc = {
+diff --git a/include/dt-bindings/clock/sun60i-a733-ccu.h b/include/dt-bindings/clock/sun60i-a733-ccu.h
+--- a/include/dt-bindings/clock/sun60i-a733-ccu.h
++++ b/include/dt-bindings/clock/sun60i-a733-ccu.h
+@@ -62,5 +62,12 @@
+ #define CLK_BUS_EHCI0		43
+ #define CLK_BUS_EHCI1		44
+ #define CLK_BUS_OTG		45
++#define CLK_SERDES_PHY_CFG	48
++#define CLK_USB2_U2_REF		49
++#define CLK_USB2_SUSPEND	50
++#define CLK_USB2_MF		51
++#define CLK_RES_DCAP_24M	52
++#define CLK_BUS_SERDES		53
++#define CLK_MBUS_SERDES		54
+ 
+ #endif /* _DT_BINDINGS_CLK_SUN60I_A733_CCU_H_ */
+diff --git a/include/dt-bindings/reset/sun60i-a733-ccu.h b/include/dt-bindings/reset/sun60i-a733-ccu.h
+--- a/include/dt-bindings/reset/sun60i-a733-ccu.h
++++ b/include/dt-bindings/reset/sun60i-a733-ccu.h
+@@ -26,5 +26,7 @@
+ #define RST_BUS_EHCI0		14
+ #define RST_BUS_EHCI1		15
+ #define RST_BUS_OTG		16
++#define RST_BUS_SERDES		19
++#define RST_USB_2		20
+ 
+ #endif /* _DT_BINDINGS_RST_SUN60I_A733_CCU_H_ */

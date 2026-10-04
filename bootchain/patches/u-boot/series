@@ -1,0 +1,16 @@
+# U-Boot patches, one file name per line, in apply order. They are appended to
+# the end of Radxa's quilt series (33 patches) in the consumed
+# radxa-pkg/u-boot-dlan17 tree by bootchain/overlay/apply.sh.
+#
+# This series is transitional: a port to current upstream U-Boot will replace
+# it, and the Radxa package tree with it.
+#
+# Names are flat (no directory). One file name per line; '#' lines and empty
+# lines are ignored. Format: scripts/lib/series.sh.
+sunxi-cubie-a7s-watchdog-autostart.patch
+sunxi-cubie-a7s-bootcount-rtc-gpr.patch
+sunxi-cubie-a7s-reset-through-psci.patch
+sunxi-cubie-a7s-watchdog-on-wdt-cpus.patch
+sunxi-cubie-a7s-pcie-control-pins-on-bank-pd.patch
+sunxi-cubie-a7s-drop-dead-storage-paths.patch
+sunxi-cubie-a7s-drop-spi-nor-drivers.patch

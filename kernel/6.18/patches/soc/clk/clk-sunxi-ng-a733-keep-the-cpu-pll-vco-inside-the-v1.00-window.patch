@@ -1,0 +1,180 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] clk: sunxi-ng: a733: keep the CPU PLL VCO inside the V1.00 window
+
+What. Raise A733_PLL_VCO_MIN from 480 to 650 MHz. ccu_a733_cpu_pll_find()
+already searches N only inside the VCO window and EXT_DIVP over /1, /2,
+/4, so the constant is the whole code change; the comments that quoted
+the old floor follow it. At the 26 MHz DCXO the legal N range becomes
+25..86 (was 19..86), and two operating points change encoding:
+
+  OPP      before                        after
+  494 MHz  N=19, EXT_DIVP /1, VCO 494    N=38, EXT_DIVP /2, VCO 988
+  247 MHz  N=19, EXT_DIVP /2, VCO 494    N=38, EXT_DIVP /4, VCO 988
+
+Every other rate keeps its (N, EXT_DIVP): 416 MHz = N=32 /2 (VCO 832),
+780..2002 MHz = N=30..77 /1. No OPP is added or dropped, no voltage
+changes. The lowest reachable rate moves from 123.5 to 162.5 MHz
+(N=25 /4), and the probe line reads "N 25..86".
+
+Why. UM V1.00 raised the CPU PLL VCO floor on purpose:
+
+  * Revision log, rev 0.93 (V1.00 p. ii / PDF p. 3): the Fvco entries for
+    the three CPU PLLs in Table 4-2 were updated, and the
+    descriptions of the PLL_EN, PLL_PLL_EN and PLL_N bits
+    in section 5.1.10 were revised.
+  * Table 4-2 (V1.00 p. 20 / PDF p. 41): Fvco "650M~2.26G" for all
+    three. V0.92 had "480M~2.26G" (p. 20 / PDF p. 40).
+  * 5.1.10.6 CPU_L_PLL_CTRL_REG (V1.00 p. 288-289 / PDF p. 309-310),
+    bit 31 gives the VCO input range as
+    650 MHz to 2.26 GHz; the PLL_N note bounds InputFreq*N/P/(M0*M1) to 650..2260 MHz.
+    The same for CPU_B (5.1.10.18, p. 296-297 / PDF p. 317-318) and
+    CPU_DSU (5.1.10.30, p. 304-305 / PDF p. 325-326). V0.92 5.1.10.6
+    had 480 in both places (p. 288-289 / PDF p. 308-309).
+
+The 494 and 247 MHz points of arm64-dts-a733-cpu-opp-tables-and-supply
+ran the VCO at 494 MHz, 156 MHz under that floor. Both points are ours,
+below the vendor's lowest; every vendor point in `clk-sunxi-ng-a733-add-cpu-pll-ccu`'s register dataset
+(416..2002 MHz) already has its VCO at 780 MHz or above.
+
+Why EXT_DIVP and not M0/M1. Table 4-2 lists M0 (1~4) and M1 (1~16) as
+the CPU PLLs' post-dividers, but the PLL_N note bounds
+InputFreq*N/P/(M0*M1) -- the output after M0*M1 -- by the same
+650..2260 MHz, so M0/M1 cannot reach below 650 MHz under that reading.
+EXT_DIVP (CPU_x_PLL_CLK_REG[17:16], 00 /1, 01 /2, 10 /4, 11 reserved;
+5.1.10.13 p. 294 / PDF p. 315, 5.1.10.25 p. 302 / PDF p. 323, 5.1.10.37
+p. 310 / PDF p. 331) sits after the PLL and under neither statement; with
+M0 = M1 = 1, as `clk-sunxi-ng-a733-add-cpu-pll-ccu` keeps them, the new encodings satisfy both. Its
+note (below 288 MHz output, the factor P may divide
+down to the wanted rate) names a use, not a
+limit: the vendor stack runs its 416 MHz point as N=32 /2 (`clk-sunxi-ng-a733-add-cpu-pll-ccu`'s
+dataset, both boards), and so has this driver since 2026-07-22.
+
+One caveat stays true and does not matter here. V1.00
+contradicts its own floor: the CTRL_REG reset value 0x4080_1400 has
+N=20, and a bit 31 note puts the CPU_L_PLL output at
+480 MHz with a 24 MHz DCXO -- 520 MHz at the 26 MHz DCXO, below 650 either way.
+CPU_L's CTRL_STAT note (5.1.10.17, p. 295 /
+PDF p. 316) says "650MHz to 3GHz": the same floor, a different ceiling
+that nothing here approaches. Which window the silicon really has, the
+UM does not settle, and this patch does not need it settled: every VCO
+the driver can now program lies in 650..2236 MHz, inside the V0.92 and
+the V1.00 window alike.
+
+Verified (local, 2026-09-25; not hardware-proven):
+ccu_a733_cpu_pll_find(), copied unchanged out of the patched file into a
+small host-side test program, maps all fourteen OPP rates of both clusters to the
+encodings above, each exact, and 416/780..2002 MHz to the same
+(N, EXT_DIVP) as before the change. The series applies at fuzz 0 on
+6.18.53 (229/229); drivers/clk/sunxi-ng/ccu-sun60i-a733-cpu.o builds with
+W=1 without a warning, and its object code holds 649999999 (650 MHz - 1,
+from DIV_ROUND_UP) twice and 479999999 nowhere; checkpatch --strict finds
+nothing in the code. Nothing has run on silicon.
+
+Pending on silicon. Per OPP, cluster pinned with the userspace governor,
+read at the register, not sysfs:
+  * 494 MHz: CPU_x_PLL_CTRL_REG and CTRL_STAT (+0x2c) bits[15:8] = 0x26,
+    LOCK (bit 28) set, PLL_UPDATE (bit 26) clear; CPU_x_PLL_CLK_REG
+    (+0x1c) bits[17:16] = 0b01, bits[26:24] = 0b011.
+  * 247 MHz: the same N, CLK_REG bits[17:16] = 0b10. No record in this
+    tree shows EXT_DIVP /4 on silicon -- the vendor's lowest point uses
+    /2 -- so 247 MHz also needs the core rate measured (a cycle loop
+    against CLOCK_MONOTONIC on a core of that cluster), not only read.
+  * every other OPP: the (N, EXT_DIVP) of the 2026-07-22 record.
+  * probe: "A733 CPU PLLs on a 26000000 Hz reference, N 25..86".
+Falsifier: any other encoding, LOCK clear, or a measured 247 MHz point
+that is not a quarter of 988 MHz.
+
+Not changed here: the comments in arm64-dts-a733-cpu-opp-tables-and-supply
+still give 494 MHz as N=19 /1 "inside the 480-2260 MHz window" and
+247 MHz as N=19 /2. Its rates and voltages stay right; those comments now
+describe the old encoding.
+
+Vendor comparison: not a port; the vendor's ladder never needed a VCO
+below 780 MHz, so there is nothing to take or reject.
+
+For a comparison run without it:
+A7S_SKIP_PATCHES=clk-sunxi-ng-a733-keep-the-cpu-pll-vco-inside-the-v1.00-window
+
+Assisted-by: Claude
+---
+--- a/drivers/clk/sunxi-ng/ccu-sun60i-a733-cpu.c
++++ b/drivers/clk/sunxi-ng/ccu-sun60i-a733-cpu.c
+@@ -94,8 +94,14 @@
+ /*
+  * CPU_L/B/DSU_PLL_CTRL_REG, UM 5.1.10.6.
+  *   f   = InputFreq * N / P / (M0 * M1)
+- *   VCO = InputFreq * N / P,  480 MHz <= VCO <= 2260 MHz
++ *   VCO = InputFreq * N / P,  650 MHz <= VCO <= 2260 MHz
+  * PLL_N is used raw (N = PLL_N, no +1); P, M0 and M1 are field+1.
++ *
++ * The 650 MHz floor is UM V1.00's, for all three PLLs (5.1.10.6, 5.1.10.18,
++ * 5.1.10.30 and Table 4-2; revision 0.93 changed it on purpose). V0.92 said
++ * 480 MHz. V1.00 contradicts itself once - its reset default N = 20 is a
++ * 520 MHz VCO at the 26 MHz DCXO - but no rate programmed here leaves the
++ * narrower window, so it is inside both and the stricter one costs nothing.
+  */
+ #define A733_PLL_EN			BIT(31)
+ #define A733_PLL_LDO_EN			BIT(30)
+@@ -108,9 +114,9 @@
+ #define A733_PLL_N			GENMASK(15, 8)
+ #define A733_PLL_M1			GENMASK(3, 0)
+ 
+-#define A733_PLL_VCO_MIN		480000000UL
++#define A733_PLL_VCO_MIN		650000000UL
+ #define A733_PLL_VCO_MAX		2260000000UL
+-/* "PLL N is 4/5/8/9/10/12-255" - the 480 MHz floor keeps us in the dense part. */
++/* "PLL N is 4/5/8/9/10/12-255" - the VCO floor keeps us in the dense part. */
+ #define A733_PLL_N_MIN			12
+ #define A733_PLL_N_MAX			255
+ 
+@@ -138,14 +144,16 @@
+  *            never sees the raw PLL output, it sees the divided one.
+  *
+  * The driver keeps PLL_P (and M0, M1) at 1 and varies only N and EXT_DIVP.
+- * Reason: with a 26 MHz reference, N alone covers 494..2236 MHz in 26 MHz steps
++ * Reason: with a 26 MHz reference, N alone covers 650..2236 MHz in 26 MHz steps
+  * and every additional degree of freedom only creates second encodings of rates
+  * N can already express - which would make determine_rate() non-deterministic
+  * without buying a single new frequency. Keeping M0 = M1 = 1 has a second
+- * benefit: the UM states the 480..2260 MHz window twice, once against the VCO
++ * benefit: the UM states the 650..2260 MHz window twice, once against the VCO
+  * (bit31 note) and once against the output (PLL_N note), and those two
+  * statements only coincide when M0 * M1 == 1. With M0 = M1 = 1 there is no
+- * ambiguity left to get wrong.
++ * ambiguity left to get wrong. It also decides how a rate below the floor is
++ * reached: through EXT_DIVP, which neither statement covers, never through
++ * M0/M1, whose output the PLL_N note holds to the same 650 MHz floor.
+  *
+  * The vendor driver models "p" as _SUNXI_CCU_DIV(16, 2) with a private p_reg
+  * pointing at 0x101c - that is EXT_DIVP, and PLL_P is not modelled by it at all.
+@@ -198,10 +206,15 @@
+  * Pick the (N, EXT_DIVP) pair giving the highest rate <= @rate. N is searched
+  * only inside the VCO window, so an illegal setting cannot be selected: 416 MHz
+  * for instance is unreachable with EXT_DIVP = /1 (26 * 16 = 416 MHz would put
+- * the VCO 64 MHz below the floor) and is found as N = 32 with EXT_DIVP = /2 -
++ * the VCO 234 MHz below the floor) and is found as N = 32 with EXT_DIVP = /2 -
+  * exactly what boot0 and the vendor stack program on both reference boards.
+- * EXT_DIVP is tried in ascending order and ties keep the earlier hit, so /1 wins
+- * whenever a rate is reachable both ways (780 MHz = 30x/1 and = 60x/2).
++ * 494 and 247 MHz come out the same way: N = 38 with /2 and /4, VCO 988 MHz.
++ * The UM's EXT_DIVP note (outputs below 288 MHz may use the P divider)
++ * names a use, not a limit: boot0's own 416 MHz
++ * runs on /2. EXT_DIVP is tried in ascending order and ties keep the earlier
++ * hit, so the smaller divider - the lower VCO - wins whenever a rate is
++ * reachable both ways (780 MHz = 30x/1 and = 60x/2, 494 MHz = 38x/2 and
++ * = 76x/4).
+  */
+ static unsigned long ccu_a733_cpu_pll_find(unsigned long parent,
+ 					   unsigned long rate,
+@@ -672,9 +685,9 @@
+ 
+ 	/*
+ 	 * Publish the reachable window, derived from the actual reference rather
+-	 * than hardcoded: N is bounded by the 480..2260 MHz VCO limits, the top
++	 * than hardcoded: N is bounded by the 650..2260 MHz VCO limits, the top
+ 	 * end is N_max with EXT_DIVP = /1 and the bottom end N_min with /4. At
+-	 * 26 MHz that is 123.5 MHz .. 2236 MHz.
++	 * 26 MHz that is N 25..86, 162.5 MHz .. 2236 MHz.
+ 	 */
+ 	n_min = max_t(unsigned int, A733_PLL_N_MIN,
+ 		      DIV_ROUND_UP(A733_PLL_VCO_MIN, dcxo_rate));

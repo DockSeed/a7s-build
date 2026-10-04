@@ -1,0 +1,297 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] clk: sunxi-ng: sun6i-rtc: a733 LOSC half on a split RTC block
+
+On our boot chain the A733's LOSC runs from the internal RC, not from the
+32.768 kHz crystal the board carries. Measured on both boards,
+2026-09-17 and 2026-09-22: LOSC_CTRL (0x07090000) = 0x0000401c,
+LOSC_AUTO_SWT_STA (0x07090004) = 0. LOSC_SRC_SEL = 0 selects the 16 MHz RC
+(UM V1.00 9.1.7.1), divided by 32 and by INTOSC_CLK_PRESCAL + 1 =
+16 (9.1.7.3, 0x0008 reads 0xf): 31250 Hz, 4.6 % slow before the RC's own
+tolerance. The RTC timekeeper (`arm64-dts-a733-add-the-rtc-timekeeper`) lost 3 s in 48 s on it.
+
+Mainline already has the mechanism: ccu-sun6i-rtc models LOSC_SRC_SEL as the
+"osc32k" mux with the 0x16AA key, and the crystal as an "ext-osc32k" input
+behind the EXT_LOSC_EN gate; a board selects it through assigned-clock-rates
+on CLK_OSC32K (the sun55i boards). rtc-sun6i calls it for the RTC node on its
+own mapping. This patch adds the A733 match data. `arm64-dts-a733-run-losc-from-the-32k-crystal` wires the DT.
+
+== The register, from the UM
+
+  LOSC_CTRL_REG 0x0000 (9.1.7.1)
+    [31:16] KEY_FIELD         0x16AA, required to write bits 1:0
+    [15]    AUTO_SWT_FUNCTION 0 = auto switch enabled
+    [14]    AUTO_SWT_32K_SEL  1 = a lost crystal sends LOSC back to the RC
+    [4]     EXT_LOSC_EN       crystal enable, reset value 1
+    [3:2]   EXT_LOSC_GSM      drive; left alone, changing it is not advised
+    [1]     RTC_SRC_SEL       0 = LOSC_SRC, 1 = DCXO/N 32k
+    [0]     LOSC_SRC_SEL      0 = RC16M/32/N, 1 = external 32.768 kHz
+  LOSC_AUTO_SWT_STA_REG 0x0004 (9.1.7.2)
+    [2] EXT_LOSC_STA (1 = crystal abnormal, valid with auto switch on),
+    [1] AUTO_SWT_PEND (W1C), [0] LOSC_SRC_SEL_STA; [31:3] reserved
+
+0x401c decodes as: auto switch on with RC fallback (15:14 = 01), crystal
+enabled (4), GSM high (3:2 = 11, set by the firmware; the reset value is
+0x4010), RTC counter on LOSC (1 = 0), LOSC from the RC (0 = 0). The crystal
+runs and is monitored; only the mux is on the wrong input. The vendor stack
+reads 0x401d, STA 0x1 -- the same word with bit 0 set.
+
+UM 9.1.5.1 gives two procedures. (c), with the auto switch: bit 14 = 1,
+crystal on (bit 4), bit 15 = 0, EXT_LOSC_STA read three times with 0 meaning
+the crystal started, then select. Its steps 5 and 7 as printed write RTC_SRC_SEL = 1
+and LOSC_SRC_SEL = 0, which select DCXO/N and the RC -- apparently a misprint. (d), without
+the auto switch: bit 15 = 1, bit 14 = 0, then bit 0 = 1. Common to both, and
+all we need: the crystal is enabled before bit 0 is set. The auto switch
+stays as the firmware left it, on, which is (c)'s state; its startup check is
+moot here because bit 4 has been 1 since reset and STA reads 0 (bit 2 clear,
+crystal normal) before the switch. We check the result afterwards instead.
+
+The clock framework produces that order unchanged: reparenting "osc32k" to
+"ext-osc32k-gate" first enables the gate (LOSC_CTRL |= BIT(4), no key -- the
+key guards bits 1:0 only), then ccu_mux writes 0x16aa0000 | bit 0. From
+0x401c the two writes are 0x0000401c and 0x16aa401d. With the auto switch on,
+a crystal that does not run is caught by the hardware, which returns bit 0 to
+the RC and sets AUTO_SWT_PEND.
+
+== What the A733 entry leaves out, and why
+
+Our DT splits the RTC block (`clk-sunxi-ng-a733-rtc-ccu-maps-only-the-dcxo-control-group`): the RTC node maps 0x000-0x15b, and the
+DCXO control group 0x15c-0x16f is the A733 RTC-CCU (`clk-sunxi-ng-a733-add-minimal-rtc-ccu` and `clk-sunxi-ng-a733-rtc-ccu-add-dcxo`). Mainline's
+code touches that group in two places:
+
+ - "iosc" gates CLK16M_RC_EN, XO_CTRL0 (0x160) bit 0. On the A733 that
+   register is behind the XO_CTRL_WP_REG (0x15c) 0x16AA key (9.1.7.15), which
+   the gate does not write, and the RC is the auto switch's fallback. So the
+   A733 iosc keeps rate and accuracy and gets no gate ops (dcxo_ctrl_elsewhere):
+   the RC stays as the firmware left it, on (0x160 bit 0 = 1 on both boards).
+ - "osc24M-32k" (the DCXO/N 32k) is not registered. Its A733 divider follows
+   the DCXO_ST strap in XO_CTRL0 [15:14] (upstream reads it there, see below).
+   Nothing selects it (RTC_SRC_SEL = 0), so rtc-32k gets one parent, as on
+   the H616, and the fanout mux the two inputs it can take here.
+
+No IOSC calibration: INTOSC_CLK_AUTO_CALI_REG (0x000c) reads 0x7a000000, off,
+on both boards. With it on, ccu_iosc_32k_prepare() would switch the RC path
+to the calibrated output at registration, and iosc-32k would report 32768 Hz
+like the crystal; assigned-clock-rates would then pick a parent by which rate
+was cached first. Without it the RC path is 31250 Hz and only the crystal
+matches 32768.
+
+Diagnostics: after the provider is registered -- when of_clk_add_hw_provider()
+has applied the node's assigned rate -- the A733 path reads LOSC_CTRL and
+polls LOSC_SRC_SEL_STA for up to 10 ms, and logs which oscillator the hardware
+reports. A crystal that was selected but not confirmed, or EXT_LOSC_STA set,
+is a warning. That line is the board check for this patch.
+
+== Upstream
+
+"clk: sunxi-ng: sun6i-rtc: add a733 support" (0a136efc0fc2, 2026-07-23, after
+6.18) models the whole 0x400 block in one node: the LOSC half as here, plus
+the DCXO-strap divider for osc24M-32k at 0x160 and the four DCXO gates at
+0x16c as CLK_HOSC_*. Its data sets have_iosc_calibration. We do not take it
+as it stands: its 0x160/0x16c clocks would be a second provider for
+registers our RTC-CCU owns -- and an unused hosc-serdes0 there would be gated
+by clk_disable_unused under COMB0's feet. The LOSC mux, the key and the
+ext-osc32k gate are mainline's own and unchanged; what differs is scoped to
+the split. Moving to upstream's one-node shape replaces `clk-sunxi-ng-a733-add-minimal-rtc-ccu`, `clk-sunxi-ng-a733-rtc-ccu-add-dcxo` and `clk-sunxi-ng-a733-rtc-ccu-maps-only-the-dcxo-control-group` and
+every rtc_ccu consumer; that stays open.
+
+== What the vendor does and leaves out
+
+The BSP's ccu-sun60iw2-rtc.c switches in clock_source_init() at probe:
+forces LOSC_CTRL [15:14] = 01, enables the crystal only if bit 4 is clear,
+then polls LOSC_AUTO_SWT_STA with mask 0x10 for "stable" and sets bit 0.
+0x10 is bit 4, reserved in STA; EXT_LOSC_STA is bit 2 (9.1.7.2). Bit 0 is set
+whatever the poll returns, and nothing reads LOSC_SRC_SEL_STA afterwards.
+Its RC path is a fixed factor of 500 ("iosc-div32k", 32000 Hz); the divider
+is 32 * (N + 1) = 512 at the reset prescaler, 31250 Hz. We take none of it:
+the switch is mainline's mux, and the readback checks bit 0 of STA.
+We do not force [15:14]: both boards read 01, and mainline does not own
+them. The logged LOSC_CTRL shows them.
+
+== Verification
+
+Applies at fuzz 0; compile-check. Not on silicon. What proves it (with `arm64-dts-a733-run-losc-from-the-32k-crystal`):
+  dmesg        "LOSC from the external 32768 Hz crystal (LOSC_CTRL 0x0000401d,
+               STA 0x00000001)"
+  devmem       0x07090000 = 0x401d, 0x07090004 bit 0 = 1
+  clk_summary  osc32k 32768 under ext-osc32k-gate / ext_osc32k; iosc 16000000
+  RTC vs NTP   ~0 drift over 10 min instead of -4.6 %
+Falsifier: the warning line, STA bit 0 = 0, or a drift that stays at -4.6 %.
+
+Assisted-by: Claude
+---
+--- a/drivers/clk/sunxi-ng/ccu-sun6i-rtc.c
++++ b/drivers/clk/sunxi-ng/ccu-sun6i-rtc.c
+@@ -7,6 +7,7 @@
+ #include <linux/clk-provider.h>
+ #include <linux/device.h>
+ #include <linux/io.h>
++#include <linux/iopoll.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/of_device.h>
+@@ -29,6 +30,11 @@
+ 
+ #define LOSC_CTRL_REG			0x0
+ #define LOSC_CTRL_KEY			0x16aa0000
++#define LOSC_CTRL_SRC_SEL_EXT		BIT(0)
++
++#define LOSC_AUTO_SWT_STA_REG		0x4
++#define LOSC_AUTO_SWT_STA_SRC_EXT	BIT(0)
++#define LOSC_AUTO_SWT_STA_EXT_BAD	BIT(2)
+ 
+ #define IOSC_32K_CLK_DIV_REG		0x8
+ #define IOSC_32K_CLK_DIV		GENMASK(4, 0)
+@@ -48,6 +54,8 @@
+ 	bool				have_ext_osc32k		: 1;
+ 	bool				have_iosc_calibration	: 1;
+ 	bool				rtc_32k_single_parent	: 1;
++	bool				have_losc_auto_swt_sta	: 1;
++	bool				dcxo_ctrl_elsewhere	: 1;
+ 	const struct clk_parent_data	*osc32k_fanout_parents;
+ 	u8				osc32k_fanout_nparents;
+ };
+@@ -108,10 +116,24 @@
+ 	.recalc_accuracy	= ccu_iosc_recalc_accuracy,
+ };
+ 
++/*
++ * For SoCs whose RC16M enable is not in this device's register window: the
++ * rate and accuracy only, no gate. See sun60i_a733_rtc_ccu_data.
++ */
++static const struct clk_ops ccu_iosc_rate_ops = {
++	.recalc_rate		= ccu_iosc_recalc_rate,
++	.recalc_accuracy	= ccu_iosc_recalc_accuracy,
++};
++
++static struct clk_init_data iosc_init_data = {
++	.name		= "iosc",
++	.ops		= &ccu_iosc_ops,	/* updated during probe */
++	.flags		= CLK_GET_RATE_NOCACHE,
++};
++
+ static struct ccu_common iosc_clk = {
+ 	.reg		= DCXO_CTRL_REG,
+-	.hw.init	= CLK_HW_INIT_NO_PARENT("iosc", &ccu_iosc_ops,
+-						CLK_GET_RATE_NOCACHE),
++	.hw.init	= &iosc_init_data,
+ };
+ 
+ static int ccu_iosc_32k_prepare(struct clk_hw *hw)
+@@ -312,6 +334,16 @@
+ 	{ .hw = &osc24M_32k_clk.common.hw }
+ };
+ 
++/*
++ * The A733's RTC_32K fanout mux (CLK32K_FOUT_CTRL_GATING_REG [2:1], UM V1.00
++ * 9.1.7.13): 00 RTC_32K, 01 LOSC, 10 DCXO divided 32K. The third input is not
++ * registered here (see below), so the mux offers the first two.
++ */
++static const struct clk_parent_data sun60i_a733_osc32k_fanout_parents[] = {
++	{ .hw = &osc32k_clk.common.hw },
++	{ .hw = &ext_osc32k_gate_clk.common.hw },
++};
++
+ static const struct sun6i_rtc_match_data sun50i_h616_rtc_ccu_data = {
+ 	.have_iosc_calibration	= true,
+ 	.rtc_32k_single_parent	= true,
+@@ -332,6 +364,29 @@
+ 	.osc32k_fanout_nparents	= ARRAY_SIZE(sun50i_r329_osc32k_fanout_parents),
+ };
+ 
++/*
++ * A733: the LOSC half of the RTC block only. The DCXO control group
++ * (XO_CTRL_WP_REG 0x15c to XO_CTRL1_REG 0x16c) is a separate clock provider on
++ * this SoC and outside this device's register window, so nothing here may
++ * touch DCXO_CTRL_REG (0x160):
++ *  - "iosc" keeps its rate but has no gate. CLK16M_RC_EN is XO_CTRL0 bit 0,
++ *    behind the XO_CTRL_WP_REG key (UM 9.1.7.15/16), and the RC must keep
++ *    running as the hardware fallback of the LOSC auto switch (9.1.5.1 c).
++ *  - "osc24M-32k" is not registered: its divider follows the DCXO_ST strap in
++ *    XO_CTRL0 [15:14], so rtc-32k gets the one parent it uses (RTC_SRC_SEL = 0).
++ * No IOSC calibration: 0x000c reads 0x7a000000 (off) on both boards, and the
++ * calibrated RC would report 32768 Hz as well, which would make the
++ * assigned-clock-rates choice between RC and crystal depend on cache timing.
++ */
++static const struct sun6i_rtc_match_data sun60i_a733_rtc_ccu_data = {
++	.have_ext_osc32k	= true,
++	.rtc_32k_single_parent	= true,
++	.have_losc_auto_swt_sta	= true,
++	.dcxo_ctrl_elsewhere	= true,
++	.osc32k_fanout_parents	= sun60i_a733_osc32k_fanout_parents,
++	.osc32k_fanout_nparents	= ARRAY_SIZE(sun60i_a733_osc32k_fanout_parents),
++};
++
+ static const struct of_device_id sun6i_rtc_ccu_match[] = {
+ 	{
+ 		.compatible	= "allwinner,sun50i-h616-rtc",
+@@ -345,15 +400,49 @@
+ 		.compatible	= "allwinner,sun55i-a523-rtc",
+ 		.data		= &sun55i_a523_rtc_ccu_data,
+ 	},
++	{
++		.compatible	= "allwinner,sun60i-a733-rtc",
++		.data		= &sun60i_a733_rtc_ccu_data,
++	},
+ 	{},
+ };
+ MODULE_DEVICE_TABLE(of, sun6i_rtc_ccu_match);
+ 
++/*
++ * Report which oscillator LOSC runs from once the provider is registered, and
++ * with it any assigned-clock-rates of the node applied. LOSC_SRC_SEL_STA
++ * (LOSC_AUTO_SWT_STA_REG bit 0, UM 9.1.7.2) is the hardware's answer, not the
++ * bit that was written: with the auto switch enabled, a crystal that does not
++ * run sends LOSC back to the RC and clears it.
++ */
++static void sun6i_rtc_ccu_report_losc(struct device *dev, void __iomem *reg)
++{
++	u32 ctrl, sta;
++	int ret;
++
++	ctrl = readl(reg + LOSC_CTRL_REG);
++	if (!(ctrl & LOSC_CTRL_SRC_SEL_EXT)) {
++		dev_info(dev, "LOSC from the internal RC (LOSC_CTRL %#010x, STA %#010x)\n",
++			 ctrl, readl(reg + LOSC_AUTO_SWT_STA_REG));
++		return;
++	}
++
++	ret = readl_poll_timeout(reg + LOSC_AUTO_SWT_STA_REG, sta,
++				 sta & LOSC_AUTO_SWT_STA_SRC_EXT, 10, 10000);
++	if (ret || (sta & LOSC_AUTO_SWT_STA_EXT_BAD))
++		dev_warn(dev, "LOSC: external crystal selected but not confirmed (LOSC_CTRL %#010x, STA %#010x)\n",
++			 readl(reg + LOSC_CTRL_REG), sta);
++	else
++		dev_info(dev, "LOSC from the external 32768 Hz crystal (LOSC_CTRL %#010x, STA %#010x)\n",
++			 readl(reg + LOSC_CTRL_REG), sta);
++}
++
+ int sun6i_rtc_ccu_probe(struct device *dev, void __iomem *reg)
+ {
+ 	const struct sun6i_rtc_match_data *data;
+ 	struct clk *ext_osc32k_clk = NULL;
+ 	const struct of_device_id *match;
++	int ret;
+ 
+ 	/* This driver is only used for newer variants of the hardware. */
+ 	match = of_match_device(sun6i_rtc_ccu_match, dev);
+@@ -389,7 +478,19 @@
+ 	osc32k_fanout_init_data.parent_data = data->osc32k_fanout_parents;
+ 	osc32k_fanout_init_data.num_parents = data->osc32k_fanout_nparents;
+ 
+-	return devm_sunxi_ccu_probe(dev, reg, &sun6i_rtc_ccu_desc);
++	if (data->dcxo_ctrl_elsewhere) {
++		iosc_init_data.ops = &ccu_iosc_rate_ops;
++		sun6i_rtc_ccu_hw_clks.hws[CLK_OSC24M_32K] = NULL;
++	}
++
++	ret = devm_sunxi_ccu_probe(dev, reg, &sun6i_rtc_ccu_desc);
++	if (ret)
++		return ret;
++
++	if (data->have_losc_auto_swt_sta)
++		sun6i_rtc_ccu_report_losc(dev, reg);
++
++	return 0;
+ }
+ 
+ MODULE_IMPORT_NS("SUNXI_CCU");

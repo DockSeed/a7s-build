@@ -1,0 +1,64 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] clk: sunxi-ng: a733: r-ccu: source 000 is the DCXO, not SYS_CLK24M
+
+The R-CCU's three bus clocks all take their source index 000 from the device
+tree's "hosc", which is osc24M. The A733 UM gives index 000 as DCXO for all
+three: AHBS_CLK_SRC_SEL "000: DCXO" (V0.92 4.2.5.1), APBS0_CLK_SRC_SEL and
+APBS1_CLK_SRC_SEL the same (4.2.5.2, 4.2.5.3). On this SoC the DCXO is the
+26 MHz crystal; SYS_CLK24M is what REF_PLL makes out of it, and the two are a
+different net. `clk-sunxi-ng-a733-feed-pll-ref-from-the-dcxo` fixed exactly this confusion on the main CCU and said in
+its header that the R-CCU half was out of scope; this is that half.
+
+It is a live misrate, not a cosmetic one. Under our boot chain APBS0 sits on
+index 000 (APBS0_CLK = 0x00000000, M = 0), so r-apb0 is fed 26 MHz while the
+driver reports 24 MHz -- 8 % low. Its only consumer today is r_pio's "apb"
+clock, which enables it and never reads its rate, but a rate that is wrong is
+wrong before anyone reads it.
+
+Measured on silicon rather than argued from the manual. APBS1 is the one bus
+clock in this block with a consumer whose rate is observable from outside --
+the PMIC I2C hangs off it -- so its source field was moved from 100 to 000 and
+back, with FACTOR_M left at 0 and the TWI divider untouched at 3200, and the
+same transfer timed in each state (128-byte against 8-byte read, differenced,
+so per-transfer overhead cancels):
+
+    source 100   1211 us/byte      predicted at 24 MHz: 1200 us
+    source 000   1116 us/byte      predicted at 26 MHz: 1107 us
+    source 100   1218 us/byte      (restored; the change tracks the source,
+                                    not drift)
+
+1214.5 / 1116 = 1.088 against 26 / 24 = 1.083. Index 000 is the 26 MHz DCXO
+and index 100 is the 24 MHz net, both as the manual says and neither as the
+driver modelled it.
+
+So point index 000 at a "dcxo" input in both parent tables. The device tree
+side -- giving the r_ccu node that input -- is `arm64-dts-a733-r-ccu-dcxo-input`: the node is added by `arm64-dts-a733-aon-pinctrl-usb-host-vbus`,
+which applies long after this one, so the two halves cannot ride in one patch.
+Neither half does anything without the other, and `arm64-dts-a733-r-ccu-dcxo-input` says so too.
+
+Falsifier (needs both halves): clk_summary must report r-apb0 at 26000000 with
+APBS0_CLK still 0x00000000, and r-apb1 must stay at 24000000 (it sits on index
+100, which `clk-sunxi-ng-a733-r-ccu-apbs-source-100-is-sys-clk24m` already corrected and which this patch does not touch).
+
+Assisted-by: Claude
+
+--- a/drivers/clk/sunxi-ng/ccu-sun60iw2-r.c
++++ b/drivers/clk/sunxi-ng/ccu-sun60iw2-r.c
+@@ -30,7 +30,7 @@
+ #include "ccu-sun60iw2-r.h"
+ 
+ static const struct clk_parent_data r_ahb_parents[] = {
+-	{ .fw_name = "hosc" },			/* 000: DCXO 24M */
++	{ .fw_name = "dcxo" },			/* 000: DCXO, 26 MHz */
+ 	{ .fw_name = "losc" },			/* 001: RTC 32k */
+ 	{ .fw_name = "iosc" },			/* 010: RC 16M */
+ 	{ .fw_name = "pll-periph-200m" },	/* 011: PERIPLL-200M */
+@@ -48,7 +48,7 @@
+  * 7.3 kHz on the wire against the 100 kHz the device tree asks for.
+  */
+ static const struct clk_parent_data r_apbs_parents[] = {
+-	{ .fw_name = "hosc" },			/* 000: DCXO 24M */
++	{ .fw_name = "dcxo" },			/* 000: DCXO, 26 MHz */
+ 	{ .fw_name = "losc" },			/* 001: RTC 32k */
+ 	{ .fw_name = "iosc" },			/* 010: RC 16M */
+ 	{ .fw_name = "pll-periph-200m" },	/* 011: PERIPLL-200M */

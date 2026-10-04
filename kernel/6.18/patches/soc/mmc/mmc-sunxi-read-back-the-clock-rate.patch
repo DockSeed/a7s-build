@@ -1,0 +1,78 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] mmc: sunxi: read the clock rate back instead of trusting the request
+
+clk_set_rate() returning 0 means the provider accepted the call. It does not
+mean the hardware runs at the requested rate. This driver assumed it did: the
+rounded rate was used for the internal divider bookkeeping and for
+mmc->actual_clock, so everything the driver reported was the number it had asked
+for, by construction.
+
+On the A733 that hid a factor of two. With CLK_SET_RATE_PARENT set on the SMHC
+clock (fixed by the preceding patch) the framework believed it had retuned a
+fixed PLL tap from 800 to 400 MHz, ccu_mp_set_rate() then programmed both
+dividers to 1, and the eMMC ran at a 400 MHz card clock -- twice its HS400
+rating -- while ios reported 200 MHz. Six board sessions of HS400 timing work
+were evaluated against that reported number.
+
+Read the rate back after setting it, use that for the bookkeeping, and log a
+deviation. clk_get_rate() re-derives from the divider registers and the parent's
+real rate, so it would have caught this on the first boot.
+
+This is not A733-specific and needs no cfg flag: any sunxi platform whose mmc
+clock cannot exactly hit the request is better off reporting what it got.
+Where the request is honoured, which is the normal case, the branch is never
+taken and nothing changes.
+
+Assisted-by: Claude
+---
+--- a/drivers/mmc/host/sunxi-mmc.c
++++ b/drivers/mmc/host/sunxi-mmc.c
+@@ -935,12 +935,13 @@ static void sunxi_mmc_hs400_enable(struct sunxi_mmc_host *host,
+ static int sunxi_mmc_clk_set_rate(struct sunxi_mmc_host *host,
+ 				  struct mmc_ios *ios)
+ {
+ 	struct mmc_host *mmc = host->mmc;
+ 	long rate;
+ 	u32 rval, clock = ios->clock, div = 1, clkdiv = 1;
++	unsigned long real_rate;
+ 	int ret;
+ 
+ 	ret = sunxi_mmc_oclk_onoff(host, 0);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -1007,12 +1008,34 @@ static int sunxi_mmc_clk_set_rate(struct sunxi_mmc_host *host,
+ 	if (ret) {
+ 		dev_err(mmc_dev(mmc), "error setting clk to %ld: %d\n",
+ 			rate, ret);
+ 		return ret;
+ 	}
+ 
++	/*
++	 * Read the rate back instead of assuming the request was honoured.
++	 * clk_set_rate() succeeds whenever the provider accepted the call; it
++	 * does not promise the rate. A mux+divider whose parents are fixed PLL
++	 * taps can end up programmed at a completely different rate while every
++	 * rate this driver prints stays the requested one -- that is not
++	 * hypothetical, it is how a 2026-07-25 A733 HS400 session ran the eMMC
++	 * bus at twice its rated clock while mmc->actual_clock reported 200 MHz
++	 * (silicon: SMHC2_CLK = 0x81000000 = 800 MHz module, 400 MHz card).
++	 * Whatever comes back here is what the card is actually clocked at, so
++	 * it is what the bookkeeping below has to use, and a deviation deserves
++	 * a line in the log rather than a silent divergence between driver and
++	 * hardware.
++	 */
++	real_rate = clk_get_rate(host->clk_mmc);
++	if (real_rate != rate) {
++		dev_warn(mmc_dev(mmc),
++			 "clk: asked for %ld Hz, hardware runs at %lu Hz\n",
++			 rate, real_rate);
++		rate = real_rate;
++	}
++
+ 	/* set internal divider */
+ 	rval = mmc_readl(host, REG_CLKCR);
+ 	rval &= ~0xff;
+ 	rval |= clkdiv - 1;
+ 	mmc_writel(host, REG_CLKCR, rval);
+ 

@@ -1,0 +1,829 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] clk: sunxi-ng: a733: the NPU's PLL, module clock, bus gates and resets
+
+The NPU is the last compute block on this SoC with nothing in our CCU. No NPU
+clock and no NPU reset is modelled, so PLL_NPU, NPU_CLK_REG and NPU_BGR_REG
+keep whatever the boot chain left in them and no consumer can claim them. This
+patch adds six clocks and three resets and does nothing else -- nothing in the
+tree references any of them until the device tree in `arm64-dts-a733-add-the-npu` does.
+
+WHERE THE VALUES COME FROM
+--------------------------
+Register geometry from the CCU field tables of the A733 user manual (extracted
+from A733 UM V0.92, 4.1.6), every field re-read in the UM text. CCU base 0x02002000, so absolute
+= base + offset. Absolute addresses are given beside every offset throughout,
+because an offset read against the wrong base returns a plausible number
+rather than an error -- which has already cost this tree a session.
+
+  PLL_NPU_CTRL_REG   0x02A0 / abs 0x020022A0  reset 0x4010_4500
+    31     PLL_EN            0 Disable 1 Enable, reset 0
+    30     PLL_LDO_EN        reset 0x1
+    29     LOCK_ENABLE       reset 0x0
+    28     LOCK (R)          valid only while LOCK_ENABLE (bit 29) is 1
+    27     PLL_OUTPUT_GATE   reset 0x0
+    26:23  reserved
+    22:20  PLL_OUTPUT_DIV    P0 = field + 1, field 0..7, reset 0x1
+    15:8   PLL_N             N = field + 1, field 0..254, reset 0x45,
+                             field value must be at least 11
+    1      PLL_INPUT_DIV     M1 = field + 1, field 0..1, reset 0x0
+    the register's own formula: "The NPUPLL = 24MHz*N/M1/P0"
+  NPU_CLK_REG        0x0B00 / abs 0x02002B00  reset 0x0000_0000
+    31     NPU_CLK_GATING    0 = off, 1 = on
+    26:24  CLK_SRC_SEL       000 NPUPLL     001 PERI0_800M  010 PERI0_600M
+                             011 PERI0_480M 100 VE0PLL      101 VE1PLL
+                             110 DEPLL3X
+    4:0    FACTOR_M          M = field + 1, field 0..31
+    NPU_CLK = clock source / M.
+  NPU_BGR_REG        0x0B04 / abs 0x02002B04  reset 0x0008_0000
+    19 NPU_SRAM_RST (reset 0x1)  18 NPU_AHB_RST (0x0)
+    17 NPU_AXI_RST  (reset 0x0)  16 NPU_CORE_RST (0x0)
+       all four: 0 = Assert, 1 = De-assert
+    0  NPU_GATING   0 = Mask, 1 = Pass, reset 0x0
+  AHB_MAT_CLK_GATING_REG   0x05C0 / abs 0x020025C0  reset 0x1101_03FF
+    6  NPU_AHB_GATE_SW_CFG   reset 0x1
+  MBUS_MAT_CLK_GATING_REG  0x05E0 / abs 0x020025E0  reset 0xF105_5803
+    18 NPU_MBUS_GATE_SW_CFG  reset 0x1
+  Table 4-2, PLL_NPU row: Fvco 1.26G~2.52G, pre-divider 1/2, typical VCO
+    1.8G
+    ⚠ P0 1..8 does not appear in the PLL_NPU row of the Table 4-2 text extract --
+    the extract is column-major and the "P0: 1~8" tokens for this row land
+    among PLL_DE's. The authority for P0 used here is the PLL_NPU_CTRL_REG
+    field table in the A733 user manual.
+  Table 4-3 typical configuration, the row between DDR_PLL and PLL_DE:
+    DCXO 24, N 70, VCO 1680, OUT 840
+
+SILICON -- THREE STATES, TWO DRIVER STACKS, AND THEY DECIDE THE DESIGN
+----------------------------------------------------------------------
+The 6 GiB board's readings were not taken by the author; they come from a
+separate NPU investigation on 2026-08-25. The vendor-kernel board's readings are this
+patch's own, READ-ONLY through /sys/class/sunxi_dump/dump with no register
+written.
+
+  register                the 6 GiB board idle    the 6 GiB board resumed   vendor-kernel board, idle
+                          (etnaviv)    (etnaviv)      (vendor 6.6 vipcore)
+  PLL_NPU_CTRL 0x020022A0 0x01104500   0xf9104500     0x01105300
+  NPU_CLK      0x02002B00 0x00000000   0x80000000     0x00000000
+  NPU_BGR      0x02002B04 0x000f0000   0x000f0001     0x00080000
+  AHB_MAT      0x020025C0 --           --             0x110103b8
+  MBUS_MAT     0x020025E0 --           --             0xf0010803
+  NPUPLL_GATE  0x02003920 0x00010000   --             0x00010000
+  CM_NPU_CFG   0x02003B1C 0x00020000   --             0x00010000
+
+What each column settles:
+
+  - PLL_NPU IS NOT A FIXED RATE. N = 0x45 + 1 = 70 on the 6 GiB board (VCO 1680, out
+    840 MHz) and N = 0x53 + 1 = 84 on a board on the vendor kernel (VCO 2016, out 1008 MHz),
+    P0 = 2 in both. A clk_fixed_rate would be wrong at one of those two rates
+    whichever number it hardcoded, which is the same argument `clk-sunxi-ng-a733-display-engine-clock-gate-reset` made for
+    PLL_DE. So it is a ccu_nm that reads the register.
+  - THE RESET DEFAULT IS READABLE AS A FREQUENCY, and it is 840 MHz, not the
+    1.8 GHz that Table 4-2's "typical VCO" column invites. 0x4010_4500 is
+    N = 70, M1 = 1, P0 = 2 -> 24 * 70 / 1 / 2, which is exactly Table 4-3's own
+    row. PLL_EN resets to 0, so that is what the reset FIELDS encode, not an
+    output present at reset. (⚠ Table 4-2 and Table 4-3 disagree on five rows,
+    PLL_NPU among them; the UM never says which wins. It changes nothing here:
+    both numbers are inside the Fvco window and this driver programs neither.)
+  - PLL_LDO_EN CANNOT BE TRUSTED TO ITS RESET DEFAULT. The UM gives bit 30 a
+    default of 0x1; both idle readings have it CLEAR (0x01104500 / 0x01105300).
+    A PLL whose LDO is off cannot lock however long the framework polls, so
+    probe() forces LDO_EN and LOCK_ENABLE, exactly as it already does for the
+    video PLLs and PLL_DE. The resumed reading 0xf9104500 is the proof that
+    with them set the PLL locks at the untouched N: PLL_EN, LDO_EN,
+    LOCK_ENABLE, LOCK and OUTPUT_GATE all 1.
+  - THE THREE RESETS ARE NOT DECORATION. A board on the vendor kernel reads NPU_BGR =
+    0x00080000, the bare UM reset value: SRAM de-asserted, and AHB, AXI and
+    CORE all still ASSERTED. (The 6 GiB board is found the other way, 0x000f0000.) A board
+    is genuinely found with them held, so a consumer has to release them.
+  - THE TWO BUS-MATRIX GATES MOVE. Both reset ENABLED, so the cheap conclusion
+    is that nothing ever touches them -- the conclusion `clk-sunxi-ng-a733-display-engine-clock-gate-reset` and `arm64-dts-a733-display-engine-node-and-de-to-tcon-edge` drew for the
+    display engine's matrix gates. It is false here: with the NPU
+    runtime-suspended a board on the vendor kernel reads AHB_MAT bit 6 CLEAR (0x110103b8) and
+    MBUS_MAT bit 18 CLEAR (0xf0010803), while CM_NPU_STATUS reads 01 = Power
+    OFF. They are per-use software gates that a running stack turns off with
+    the block, which is why they are modelled as clocks and handed to the
+    consumer rather than written down in a comment. The same file already does
+    this for the same two registers' SERDES bits (bus-serdes 0x05C0 BIT(8),
+    mbus-serdes 0x05E0 BIT(28), from `clk-sunxi-ng-a733-add-serdes-combophy-clock`) -- and the reason is on the record:
+    USB3 linked at 10 Gbps and still would not come up on a normal boot,
+    because dwc3 reached registers behind bus-matrix gates nothing declared.
+  - THE MUX HAS NEVER BEEN ANYTHING BUT 000 = NPUPLL, across two unrelated
+    driver stacks and three states.
+
+THE PLL IS SHARED, AND IT WAS SWEPT BEFORE ITS ENABLE WAS MODELLED
+------------------------------------------------------------------
+This is the question that has to be answered before PLL_EN may be a clock's
+own enable, because clk_disable_unused() can then clear it. UM figure 4-2
+"PLL Distribution" lists PLL_NPU as feeding **MBUS, VE, NPU and DRAM0**
+(A733 user manual) -- and two of those would take the SoC down with them. It
+is the same question `clk-sunxi-ng-a733-display-engine-clock-gate-reset` had to answer for PLL_DE, and it gets the same kind
+of answer: an exhaustive register sweep, not an argument.
+
+Exactly FIVE CCU registers name NPUPLL in a source mux at all. That is not a
+guess either: it is every register in the A733 user manual whose
+field enum contains the string, and it comes out as the figure's list with VE
+counted twice. All five read on a board on the vendor kernel while it was up and running,
+2026-08-25:
+
+  register           abs           value        mux -> source
+  MBUS_CLK_REG       0x02002588    0x81000000   001 PERI0_600M
+  VE_ENC0_CLK_REG    0x02002a80    0x01000000   001 VE1PLL     (gate off)
+  VE_DEC_CLK_REG     0x02002a88    0x01000000   001 VE0PLL     (gate off)
+  DRAM0_CLK_REG      0x02002c00    0x80000003   000 DDRPLL
+  NPU_CLK_REG        0x02002b00    0x00000000   000 NPUPLL     (gate off)
+
+Not one of the four other consumers is on NPUPLL. And the decisive reading
+needs no interpretation at all: **PLL_EN is already 0 on that running board**
+(PLL_NPU_CTRL = 0x01105300), so nothing on it can be running off this PLL.
+
+⚠ THE LIMIT OF THAT SWEEP, NAMED. All three PLL_NPU readings in this patch
+come from somebody else's operating system -- vendor 6.6 on the vendor-kernel board,
+mainline etnaviv on the 6 GiB board. There is NO cold read of PLL_NPU from OUR OWN boot
+chain, which is what `clk-sunxi-ng-a733-display-engine-clock-gate-reset` had for PLL_DE ("read at the U-Boot prompt on a cold
+power-cycle -- nothing had run"). The sweep says no other consumer is muxed
+onto NPUPLL under two foreign stacks; it does not, strictly, say our chain
+leaves the muxes the same way. Cheap to close and worth closing at the next
+U-Boot prompt: read 0x020022A0, 0x02002588, 0x02002c00 cold.
+
+WHAT THIS CHANGES ON A KERNEL WITH NO NPU DRIVER BOUND
+------------------------------------------------------
+One thing, and it is named here so it is not discovered later:
+clk_disable_unused() now clears AHB_MAT bit 6 and MBUS_MAT bit 18, 1 -> 0,
+because they are clocks and nothing claims them. That is the observable this
+patch owns. It is safe on two grounds -- both fields are NPU-only by their own
+names (NPU_AHB_GATE_SW_CFG / NPU_MBUS_GATE_SW_CFG), and it is the state a
+vendor stack already leaves this silicon in whenever the NPU is idle.
+
+Everything else this patch can reach is already 0 on an idle board, PLL_EN and
+the PLL output gate included, so clk_disable_unused() writes zeros over zeros
+there -- and the sweep above is why that is a fact about the SoC and not just
+about one register. No CLK_IGNORE_UNUSED, as everywhere else in this file.
+
+WHAT THE A523 SAYS, AND WHY NONE OF IT WAS TAKEN
+------------------------------------------------
+⚠ The first draft of this patch asserted "the A523 has no NPU at all". That is
+FALSE, it is deleted rather than struck through, and the way it was caught is
+worth one line: a grep for the clock name "npu" across drivers/clk/, run to
+check for a global-name collision, hit ccu-sun55i-a523.c. Had the assertion
+stood, the section that is supposed to guard against A523 provenance would
+itself have been the reason nobody looked.
+
+ccu-sun55i-a523.c DOES model an NPU, and it is the dangerous kind of source:
+the shape is exactly what is wanted here. Its OFFSETS, its enable bit, its tap
+topology and its parent set are all wrong for this part.
+
+⚠ It is NOT true that "every number in it is wrong", which is what an earlier
+draft of this section claimed. Four of them are identical and correct on both
+parts: .lock = BIT(28), the N field geometry (shift 8, width 8, offset 1), .m
+= _SUNXI_CCU_DIV(1, 1), and the module clock's M [4:0] / mux [26:24] widths.
+An overclaim in the section whose job is to catch A523 numbers is worse than
+no section at all, so the list below is the one that survives checking.
+
+The offsets are the expensive half: both are undocumented HOLES on the A733 --
+neither 0x080 nor 0x6E0 is among the CCU registers in
+the A733 user manual's register list, whose nearest neighbours are PLL_DDR_BIAS_REG 0x030 /
+PLL_PERI0_CTRL_REG 0x0A0 and MBUS_GATE_EN_REG 0x5E4 / DMA0_BGR_REG 0x704. A
+carried-over model would write into nothing, leave the block dark, and every
+write would look like it had succeeded. That is the same failure `clk-sunxi-ng-a733-add-edp-bus-gate-and-reset` avoided
+on the eDP gate, with the same shape.
+
+  A523 (ccu-sun55i-a523.c)            A733 (UM 4.1.6, and this patch)
+  PLL_NPU reg 0x080          :319     PLL_NPU_CTRL_REG 0x02A0
+  .enable = BIT(27)          :321     PLL_EN is BIT(31). On the A733 bit 27 is
+                                      PLL_OUTPUT_GATE, so the inherited model
+                                      would toggle the output gate, never
+                                      enable the PLL, and STILL report a rate,
+                                      because ccu_nm_recalc_rate() reads the
+                                      factor fields whether or not PLL_EN is
+                                      set. Green build, plausible clk_summary,
+                                      dead silicon.
+  _SUNXI_CCU_MULT_MIN(8,8,11) :323    Same arithmetic, different BOUNDS.
+                                      ⚠ An earlier draft called this an offset
+                                      defect -- "N is the raw field, no +1".
+                                      False: _SUNXI_CCU_MULT_MIN expands with
+                                      offset 1 (ccu_mult.h:26), so both parts
+                                      compute N = field + 1. What actually
+                                      differs: its min 11 admits field 10, one
+                                      step under the UM's minimum of 11
+                                      for the PLL_N field (a bound on
+                                      the FIELD, hence N >= 12 here); and its
+                                      max 0 becomes 1 << width = 256 in
+                                      ccu_nm.c, one above the UM's field range
+                                      0..254, hence N <= 255 here.
+  TWO fixed-factor taps, /2 and /4    ONE tap, and PROGRAMMABLE:
+    (:332, :335), hung off the        PLL_OUTPUT_DIV [22:20], P0 = field + 1,
+    ccu_nm itself, which is the "4x"  range 1..8
+  CLK_SET_RATE_GATE          :329     CLK_SET_RATE_UNGATE -- the lock poll in
+                                      ccu_nm_set_rate() has to run on a PLL
+                                      that is on
+  npu module clock at 0x6e0  :496     NPU_CLK_REG 0x0B00
+  4 parents: PERI0_480M, 600M,        7 parents: NPUPLL, PERI0_800M, 600M,
+    800M, PLL_NPU_2X   :490-495       480M, VE0PLL, VE1PLL, DEPLL3X. Different
+                                      set AND different order, so even the
+                                      three shared parents sit at different
+                                      indices -- an inherited parent array
+                                      would mis-name the source of a running
+                                      clock rather than fail.
+  no NPU reset in its reset header    three: NPU_BGR bits 16 / 17 / 18
+  no NPU bus gate, no matrix gates    NPU_BGR bit 0, AHB_MAT bit 6,
+                                      MBUS_MAT bit 18
+
+The only thing that crosses over is the module clock's divider and mux WIDTHS
+(M [4:0], mux [26:24]), and they were re-read in the A733
+user manual rather than taken: a width that happens to agree is
+still not evidence. And two of our seven parents, VE0PLL and VE1PLL, are
+clocks this tree cannot name at all -- something no A523 file would ever have
+told anyone.
+
+WHAT IS DELIBERATELY NOT MODELLED, each for a stated reason
+-----------------------------------------------------------
+  NPU_BGR bit 19, NPU_SRAM_RST -- the fourth reset. It is the only one of the
+      four that resets DE-asserted, and no consumer in this tree asks for it;
+      an id nothing references is dead code, the same call `clk-sunxi-ng-a733-video-plls-and-edp-tv-pixel-clock` made for
+      PLL_VIDEO's 3X tap. Named in the reset header so it is not mistaken for
+      a gap.
+  NPUPLL_GATE_EN_REG 0x1920 / abs 0x02003920 and its read-only twin
+      NPUPLL_GATE_STAT_REG 0x19A0 -- a second gate stage in series with the
+      PLL's own PLL_OUTPUT_GATE. bit16 NPUPLL_GATE_SW_CFG (reset 1 = Enable),
+      bit0 NPUPLL_AUTO_GATE_EN (reset 1 = No-Auto), register reset
+      0x0001_0001.
+      ⚠ AN EARLIER DRAFT OF THIS ROW WAS WRONG IN BOTH HALVES and is corrected
+      rather than softened. It said the boards' 0x0001_0000 was "exactly the UM
+      reset value" and that "no stack we have measured writes it". The reset
+      value is 0x0001_0001, so 0x0001_0000 means bit0 has been CLEARED --
+      switched from the reset "No-Auto" to "Auto" -- and something therefore
+      does write it. (0x0001_0000 is the reset value of the read-only STATUS
+      twin at 0x19A0, which is where the wrong number came from.)
+      The correct reason to leave it unmodelled is the narrower one this file
+      already gives for DEPLL_GATE_EN_REG (0x1928) in the PLL_DE block: the SW GATE
+      needs no write. The vendor makes the same move on DEPLL_GATE_EN 0x1928
+      (0x00030000 against a 0x00030003 reset) and on VIDEOPLL_GATE_EN abs
+      0x02003910 (0x00770000) -- it is auto-gating, a power feature this tree
+      does not implement. Modelling the SW gate as a clock would only hand
+      clk_disable_unused() a second way to stop the PLL output.
+      (⚠ These two offsets were first transcribed WRONG, until 2026-08-25,
+      as 0x0F14/0x0F1C, which are SPI2_BGR_REG and SPIF_BGR_REG. The
+      corrected values are used here.)
+  CM_NPU_CFG_REG 0x1B1C / abs 0x02003B1C. Its bit 0 CM_NPU_MODULE_MODE looks
+      like a module gate and is not the effective one: it reads 0 with the
+      domain OFF and 0 with the domain ON, while bits [17:16] CM_NPU_STATUS
+      move 01 <-> 10 (measured on the 8 GiB board, 2026-08-25;
+      a board on the vendor kernel reads 01 = Power OFF with its NPU suspended).
+      The same finding already holds for CM_DESYS on the DE, CM_VO1 on the
+      TCON path and CM_USB2 on USB. The power island is reached through the
+      PCK-600 genpd provider, which `arm64-dts-a733-add-the-npu` wires with power-domains.
+
+⚠ AND ALL THREE RESETS ARE IN sun60iw2_ccu_resets[], not only in the header.
+A reset defined in a binding header and referenced from a device tree but
+missing from that array makes reset_control_deassert() a SILENT no-op that
+returns success -- nothing in the build checks it, and it is exactly what happened to
+RST_BUS_GMAC0 / RST_BUS_GMAC0_AXI, which cost a board session and a false
+hardware proof. Verified by
+inspecting the compiled object, not by reading the diff -- see below.
+
+VERIFIED / NOT VERIFIED
+-----------------------
+  applies      yes -- full series to a freshly unpacked 6.18.36, fuzz 0.
+  builds       yes -- compile check.
+  arrays       yes, read out of the built object rather than the diff -- the
+               method `clk-sunxi-ng-a733-display-engine-clock-gate-reset`'s header used. In ccu-sun60iw2.o:
+                 sun60iw2_ccu_clks    0x218 = 536 B = 67 entries (was 61, +6)
+                 sun60iw2_hw_clks     0x288 = 648 B = 8 + 80 * 8, so
+                                      .num == CLK_MBUS_NPU + 1 == 80 (was 74)
+                 sun60iw2_ccu_resets  0x0f8 = 248 B = 31 entries (was 28, +3)
+               The reset array is the one that matters: RST_BUS_NPU_AHB = 30
+               is the last entry, so all three resets really are IN the map
+               and not only in the header.
+  HW-effect    NOT OBSERVED. No board was touched by this patch and none is
+               owed by it: nothing in this tree consumes an NPU clock yet.
+               The register reads quoted above are INPUT evidence, not proof
+               of this patch.
+
+PENDING OBSERVABLE, so the next person knows what would falsify it: on a
+kernel carrying this patch and `arm64-dts-a733-add-the-npu`, with an NPU driver bound and resumed,
+abs 0x020022A0 shows PLL_EN|LDO_EN|LOCK_ENABLE|LOCK|OUTPUT_GATE set,
+abs 0x02002B00 bit 31 = 1 with CLK_SRC_SEL = 000, abs 0x02002B04 = 0x000f0001,
+and abs 0x020025C0 bit 6 / abs 0x020025E0 bit 18 both back to 1.
+
+Assisted-by: Claude
+
+--- a/include/dt-bindings/clock/sun60i-a733-ccu.h
++++ b/include/dt-bindings/clock/sun60i-a733-ccu.h
+@@ -110,4 +110,19 @@
+ #define CLK_DE0			72
+ #define CLK_BUS_DE0		73
+ 
++/*
++ * The NPU. Six clocks, each naming one register field: PLL_NPU's VCO
++ * (PLL_NPU_CTRL 0x02A0, N and M1) and its single output tap "NPUPLL"
++ * ([22:20] P0 + output gate), the module clock NPU_CLK 0x0B00, the block's
++ * own bus gate NPU_BGR 0x0B04 bit 0, and the two bus-matrix master gates the
++ * NPU needs as an AHB/MBUS master -- AHB_MAT_CLK_GATING 0x05C0 bit 6 and
++ * MBUS_MAT_CLK_GATING 0x05E0 bit 18.
++ */
++#define CLK_PLL_NPU		74
++#define CLK_NPUPLL		75
++#define CLK_NPU			76
++#define CLK_BUS_NPU		77
++#define CLK_AHB_NPU		78
++#define CLK_MBUS_NPU		79
++
+ #endif /* _DT_BINDINGS_CLK_SUN60I_A733_CCU_H_ */
+--- a/include/dt-bindings/reset/sun60i-a733-ccu.h
++++ b/include/dt-bindings/reset/sun60i-a733-ccu.h
+@@ -47,4 +47,15 @@
+ /* Display engine -- DE0_BGR_REG 0x0A04 bit16. There is no DE1 on this SoC. */
+ #define RST_BUS_DE0		27
+ 
++/*
++ * NPU -- NPU_BGR_REG 0x0B04, bit16 CORE, bit17 AXI, bit18 AHB (0 = Assert,
++ * 1 = De-assert). The register's fourth reset, bit19 NPU_SRAM_RST, is NOT
++ * here: it is the only one of the four that resets DE-asserted, no consumer
++ * in this tree asks for it, and an id nothing references is dead code. It is
++ * named so it is not mistaken for a gap.
++ */
++#define RST_BUS_NPU		28
++#define RST_BUS_NPU_AXI		29
++#define RST_BUS_NPU_AHB		30
++
+ #endif /* _DT_BINDINGS_RST_SUN60I_A733_CCU_H_ */
+--- a/drivers/clk/sunxi-ng/ccu-sun60iw2.c
++++ b/drivers/clk/sunxi-ng/ccu-sun60iw2.c
+@@ -1097,6 +1097,410 @@
+  */
+ static SUNXI_CCU_GATE_HWS(bus_de0_clk, "bus-de0", ahb_hws, 0x0A04, BIT(0), 0);
+ 
++/*
++ * The NPU -- a VeriSilicon VIP ("3 Tops NPU"; model 0x9000,
++ * revision 0x9202 read off silicon).
++ *
++ * Six clocks, and every one of them names one register field. The addresses
++ * are given absolute as well as by offset throughout, because an offset read
++ * against the wrong base returns a plausible number instead of an error --
++ * the A523-base mix-up that already cost this tree a session.
++ *
++ *   pll-npu   PLL_NPU_CTRL 0x02A0 / abs 0x020022A0, [15:8] N and [1] M1,
++ *             enable bit 31, lock bit 28
++ *   npupll    the same register's single output tap, [22:20] P0 gated by
++ *             PLL_OUTPUT_GATE bit 27
++ *   npu       NPU_CLK 0x0B00 / abs 0x02002B00 -- mux [26:24], divider [4:0],
++ *             gate bit 31
++ *   bus-npu   NPU_BGR 0x0B04 / abs 0x02002B04 bit 0 NPU_GATING; its three
++ *             resets are in the reset map below
++ *   ahb-npu   AHB_MAT_CLK_GATING  0x05C0 / abs 0x020025C0 bit 6,  reset 1
++ *
++ *   mbus-npu  MBUS_MAT_CLK_GATING 0x05E0 / abs 0x020025E0 bit 18, reset 1
++ *
++ *
++ * Field tables: A733 user manual, section 4.1.6.
++ *
++ *
++ * WHY THE PLL IS TWO CLOCKS. The register's own formula is
++ * "The NPUPLL = 24MHz*N/M1/P0" and ccu_nm models only N and
++ * M1 -- it has no configurable post-divider. So the VCO is the ccu_nm and P0
++ * is a separate divider clock, exactly as pll-video0/video0-pll4x and
++ * pll-de/de-pll3x above. That split is also what makes the reset default
++ * readable as a frequency: 0x4010_4500 is N = 0x45 + 1 = 70, M1 = 0 + 1 = 1,
++ * P0 = 1 + 1 = 2, i.e. a 1680 MHz VCO and an 840 MHz output -- the row the
++ * UM's own typical-configuration table carries (24 / N 70 / VCO 1680 /
++ * OUT 840). PLL_EN is 0 at reset, so that is the frequency
++ * the reset FIELDS encode, not an output present at reset.
++ *
++ * AND THE PLL IS FOUND AT TWO DIFFERENT N VALUES, which is the whole case
++ * against a clk_fixed_rate here:
++ *
++ *   state                                 PLL_NPU_CTRL   N    VCO     OUT
++ *   the 6 GiB board, mainline etnaviv, idle          0x01104500     70   1680    840 MHz
++ *   the 6 GiB board, mainline etnaviv, resumed       0xf9104500     70   1680    840 MHz
++ *   vendor-kernel board, vendor 6.6 vipcore, idle   0x01105300     84   2016   1008 MHz
++ *
++ * ⚠ All three have BIT 24 SET, which lands inside the 26:23 field the UM calls
++ * reserved. It is decoded here rather than passed over
++ * because a reader checking these words against the field table will find it:
++ * the same bit was found set on PLL_VIDEO1 and PLL_DE at a cold U-Boot prompt
++ * on 2026-08-19 and concluded to be a power-on value. Nothing here writes it
++ * -- probe() and ccu_nm_set_rate() both read-modify-write -- so it survives.
++ *
++ * A clk_fixed_rate would be wrong at one of those two rates whichever number
++ * it hardcoded. ccu_nm reads the register. The boards and readings are in
++ * the table above.
++ * The vendor-kernel board was only read; nothing was written.
++ *
++ * ⚠ THE PLL IS SHARED, AND THAT HAD TO BE SWEPT BEFORE ITS ENABLE WAS MODELLED.
++ * UM figure 4-2 "PLL Distribution" lists PLL_NPU as feeding MBUS, VE, NPU and
++ * DRAM0 -- and two of those would take the SoC down with
++ * them. Modelling PLL_EN as this clock's own enable means clk_disable_unused()
++ * can clear it on a kernel with no NPU driver, so the question is not
++ * academic. It is the same question `clk-sunxi-ng-a733-display-engine-clock-gate-reset` had to answer for PLL_DE, and the
++ * answer has the same shape: an exhaustive register sweep, not an argument.
++ *
++ * Exactly FIVE CCU registers name NPUPLL in a source mux at all -- every
++ * register in the A733 user manual whose field enum contains the
++ * string, which is the figure's list with VE counted twice. All five read on
++ * a board on the vendor kernel while it was up and running, 2026-08-25:
++ *
++ *   register           abs          value        mux -> source
++ *   MBUS_CLK_REG       0x02002588   0x81000000   001 PERI0_600M
++ *   VE_ENC0_CLK_REG    0x02002a80   0x01000000   001 VE1PLL   (gate off)
++ *   VE_DEC_CLK_REG     0x02002a88   0x01000000   001 VE0PLL   (gate off)
++ *   DRAM0_CLK_REG      0x02002c00   0x80000003   000 DDRPLL
++ *   NPU_CLK_REG        0x02002b00   0x00000000   000 NPUPLL   (gate off)
++ *
++ * Not one of the four other consumers is on NPUPLL. And the decisive reading
++ * needs no interpretation at all: PLL_EN is ALREADY 0 on that running board
++ * (PLL_NPU_CTRL = 0x01105300), so nothing on it can be running off this PLL.
++ * What clk_disable_unused() does here is write 0 to a bit that is already 0.
++ *
++ * The name "npupll" is the UM's, not ours: NPU_CLK's mux prints its source 000
++ * as "NPUPLL". Calling the tap "npu-pll" beside a VCO called
++ * "pll-npu" would differ by word order alone in a clk_summary dump.
++ *
++ * VCO WINDOW. Table 4-2's PLL_NPU row reads 1.26G~2.52G, M1 1/2, P0 1~8
++ * (A733 user manual) -- the same window as PLL_DE and the video PLLs, so the
++ * same floor applies for the same reason, and it is 1272 rather than 1260:
++ * ccu_nm_determine_rate() clamps a too-low request to min_rate while
++ * ccu_nm_set_rate() does not clamp at all, so a min_rate of 1260 MHz would be
++ * agreed on and then programmed as 24 x 52 = 1248 MHz, under the documented
++ * window. 1272 = 24 x 53 and 2520 = 24 x 105 are both exact from the 24 MHz
++ * reference. ⚠ Table 4-2 also prints PLL_NPU's TYPICAL VCO as 1.8G while the
++ * typical-configuration table and the register default both say 1680 MHz;
++ * that split hits five rows of that table and is a defect in one of the two,
++ * which the UM never resolves. It changes nothing here -- both numbers are
++ * inside the window and this driver programs neither by hand.
++ *
++ * ⚠ A523 PROVENANCE, AND IT IS THE DANGEROUS KIND: ccu-sun55i-a523.c DOES
++ * model an NPU, in a shape that looks exactly like what is wanted here. Its
++ * OFFSETS, its enable bit, its tap topology and its parent set are all wrong
++ * for this part -- and the offsets are the expensive half: neither 0x080 nor
++ * 0x6E0 appears in the CCU register list of the A733 user manual, so a
++ * carried-over model would write into an undocumented hole and leave the
++ * block dark while every write looked like it had succeeded.
++ *
++ * ⚠ It is NOT true that every number in it is wrong, and an earlier draft of
++ * this comment said so. .lock = BIT(28) is identical and correct on both
++ * parts; the N field geometry is (shift 8, width 8, offset 1) on both; .m is
++ * byte-identical; and the module clock's M [4:0] / mux [26:24] widths agree.
++ * An overclaim in the section whose job is to catch A523 numbers is worse
++ * than no section, so here is the list that is actually true:
++ *
++ *   A523 (ccu-sun55i-a523.c)          A733 (UM 4.1.6, and this file)
++ *   PLL_NPU reg 0x080  (:319)         PLL_NPU_CTRL_REG 0x02A0
++ *   .enable = BIT(27)  (:321)         PLL_EN is BIT(31); on the A733 bit 27
++ *                                     is PLL_OUTPUT_GATE, so the inherited
++ *                                     model would toggle the output gate,
++ *                                     never enable the PLL, and still report
++ *                                     a rate from the register fields
++ *   _SUNXI_CCU_MULT_MIN(8, 8, 11)     N >= 12 and N <= 255 here.
++ *                       (:323)        ⚠ NOT an offset difference -- an earlier
++ *                                     draft claimed the A523 reads N as the
++ *                                     raw field. It does not:
++ *                                     _SUNXI_CCU_MULT_MIN expands with offset
++ *                                     1 (ccu_mult.h:26), so both parts compute
++ *                                     N = field + 1. What differs is the
++ *                                     BOUNDS: its min 11 admits field 10, one
++ *                                     step below the UM's minimum of 11 for
++ *                                     the PLL_N field value (a bound on
++ *                                     the FIELD), and its max 0 becomes
++ *                                     1 << width = 256 in ccu_nm.c, one above
++ *                                     the UM's field range 0..254
++ *   TWO fixed-factor taps, /2 and     ONE tap, and it is PROGRAMMABLE:
++ *     /4 (:332, :335), hung off the   PLL_OUTPUT_DIV [22:20], P0 = field + 1,
++ *     ccu_nm itself as "4x"           1..8
++ *   CLK_SET_RATE_GATE  (:329)         CLK_SET_RATE_UNGATE -- see the lock
++ *                                     sequence, which needs the PLL ON while
++ *                                     ccu_nm_set_rate() polls
++ *   npu module clock at 0x6e0 (:496)  NPU_CLK_REG 0x0B00
++ *   4 parents: PERI0_480M, 600M,      7 parents: NPUPLL, PERI0_800M, 600M,
++ *     800M, PLL_NPU_2X  (:490-495)    480M, VE0PLL, VE1PLL, DEPLL3X --
++ *                                     different set AND different order, so
++ *                                     even the three shared parents sit at
++ *                                     different indices
++ *   no NPU reset in its reset header  three, NPU_BGR bits 16/17/18
++ *   no NPU bus gate, no matrix gates  NPU_BGR bit 0, AHB_MAT bit 6,
++ *                                     MBUS_MAT bit 18
++ *
++ * The only thing carried across is the divider/mux WIDTHS of the module clock
++ * (M [4:0], mux [26:24]) -- and they were re-read in the A733
++ * user manual rather than taken, because a width that happens to
++ * agree is still not evidence.
++ */
++#define SUN60IW2_PLL_NPU_REG		0x02A0
++
++/* See the VCO-window paragraph above for why the floor is 1272 and not 1260. */
++#define SUN60IW2_PLL_NPU_MIN_VCO	1272000000U
++#define SUN60IW2_PLL_NPU_MAX_VCO	2520000000U
++
++/* PLL_NPU_CTRL bits that are not modelled as clock gates; forced in probe(). */
++#define SUN60IW2_PLL_NPU_LDO_EN		BIT(30)
++#define SUN60IW2_PLL_NPU_LOCK_ENABLE	BIT(29)
++
++/*
++ * n: PLL_N [15:8], N = field + 1, and the minimum is the UM's own floor --
++ * the UM floor of 11 for PLL_N is a constraint on the
++ * FIELD, so N >= 12. m: PLL_INPUT_DIV [1], one bit, M1 = field + 1 (1 or 2).
++ * Spelled out rather than macro'd, which is what this file already does for
++ * every other PLL in it.
++ */
++static struct ccu_nm pll_npu_clk = {
++	.enable		= BIT(31),
++	.lock		= BIT(28),
++	.n		= _SUNXI_CCU_MULT_OFFSET_MIN_MAX(8, 8, 1, 12, 255),
++	.m		= _SUNXI_CCU_DIV(1, 1),
++	.min_rate	= SUN60IW2_PLL_NPU_MIN_VCO,
++	.max_rate	= SUN60IW2_PLL_NPU_MAX_VCO,
++	.common		= {
++		.reg		= SUN60IW2_PLL_NPU_REG,
++		.hw.init	= CLK_HW_INIT_PARENTS_HW("pll-npu",
++				pll_ref_hws, &ccu_nm_ops,
++				CLK_SET_RATE_UNGATE),
++	},
++};
++
++static const struct clk_hw *pll_npu_hws[] = { &pll_npu_clk.common.hw };
++
++/*
++ * The single output tap: PLL_OUTPUT_DIV [22:20], linear, P0 = field + 1 over
++ * a field range of 0..7, gated by PLL_OUTPUT_GATE
++ * bit 27. Unlike PLL_DE this PLL has exactly one output, so there is one tap
++ * and not two -- bits 26:23 are reserved here, not a
++ * second divider.
++ *
++ * CLK_SET_RATE_PARENT so one clk_set_rate() on the module clock configures
++ * divider, tap and PLL, the idiom `clk-sunxi-ng-a733-video-plls-and-edp-tv-pixel-clock` and `clk-sunxi-ng-a733-display-engine-clock-gate-reset` already use on this SoC.
++ * CLK_SET_RATE_UNGATE on the PLL above is what makes the lock poll mean
++ * anything: clk_change_rate() enables the clock before calling ->set_rate, so
++ * ccu_helper_wait_for_lock() inside ccu_nm_set_rate() runs on a PLL that is
++ * actually on, and the output gate is this separate clock, opened by the
++ * consumer afterwards.
++ *
++ * ⚠ That is NOT the UM's Method 2, and an earlier draft of this comment said
++ * it was. Method 2 is: LDO_EN, then write N/M1/M0/P, then
++ * PLL_EN, then LOCK_ENABLE, then wait LOCK, then wait 20 us, then
++ * PLL_OUTPUT_GATE. The framework does steps 2 and 3 the other way round --
++ * PLL_EN goes on first and the factors are written into a running PLL -- and
++ * ccu_helper_wait_for_lock() has no post-lock delay, so step 6 is absent
++ * entirely. This matches what every other PLL in this file does and no
++ * misbehaviour has been observed, but it is a deviation, not compliance.
++ *
++ * ⚠ CONSTRAINT ON THE NPU DRIVER, because neither the device tree nor this
++ * file can express it: set the rate BEFORE enabling the clock. ccu_nm_ops
++ * waits for lock only inside ccu_nm_set_rate(), so a driver that enables
++ * first opens the output gate on a PLL that may not have locked.
++ */
++static SUNXI_CCU_M_HWS_WITH_GATE(npupll_clk, "npupll", pll_npu_hws,
++				 SUN60IW2_PLL_NPU_REG, 20, 3, BIT(27),
++				 CLK_SET_RATE_PARENT);
++
++/*
++ * NPU_CLK's seven-way source mux. All seven slots are
++ * declared so the register field and the parent index stay aligned:
++ * ccu_mux_helper_get_parent() hands the RAW field back as an index, so a
++ * short array does not fail loudly -- it silently maps a high field onto the
++ * wrong parent or onto nothing.
++ *
++ * ⚠ TWO OF THE SEVEN CANNOT BE NAMED BY THIS TREE. PLL_VE0 and PLL_VE1 are
++ * the video-engine PLLs; this CCU models neither, and the video milestone
++ * (patch range `soc-sunxi-cedar-ve-carry-the-vendor-video-engine-interface`) is where they arrive. Their slots therefore carry a
++ * .name-only clk_parent_data with .index = -1, which resolves to nothing:
++ * clk_core_get() skips the DT path because index < 0 and fw_name is NULL, and
++ * clk_core_lookup("pll-ve0") finds no such clock.
++ *
++ * ⚠ .index = -1 IS NOT OPTIONAL. With the structure's default .index = 0 the
++ * lookup takes the DT path instead and parses the CCU node's OWN "clocks"
++ * property at index 0 -- which on this board is the 24 MHz oscillator. A
++ * silently wrong parent, not a missing one.
++ *
++ * ⚠ AND IF THE MUX IS EVER FOUND AT 100 OR 101 THE FAILURE IS AN OOPS, NOT A
++ * DIAGNOSTIC. Say so plainly, because the obvious guess -- "it just shows as
++ * an orphan in clk_summary" -- is wrong and was written here first.
++ * clk_core_get_parent_by_index() returns NULL, so the clock is parentless; and
++ * CLK_SET_RATE_NO_REPARENT sends ccu_mux_helper_determine_rate() down the
++ * branch that does best_parent = clk_hw_get_parent(hw) followed by
++ * clk_hw_get_rate(best_parent) (ccu_mux.c) -- and clk_hw_get_rate() reads
++ * hw->core with no NULL check, unlike clk_core_get_rate_nolock() which has
++ * one. So the first clk_set_rate()/clk_round_rate() on such a clock
++ * dereferences NULL. The same is true of encoding 111, which the UM does not
++ * document at all: the field is 3 bits, this array is 7 long, and
++ * ccu_mux_helper_get_parent() hands the raw value back.
++ *
++ * What forecloses it is in the device tree, and that makes `arm64-dts-a733-add-the-npu`'s
++ * assigned-clock-parents load-bearing rather than decorative:
++ * of_clk_set_defaults() runs from platform_probe() BEFORE drv->probe()
++ * (drivers/base/platform.c), so the mux is forced to index 000 before the
++ * consumer's first rate request can ever be made. On silicon the field has
++ * never been anything but 000 anyway -- which is also its reset value.
++ *
++ * The readings behind that: NPU_CLK = 0x00000000 on the 6 GiB board idle, 0x80000000 on
++ * the 6 GiB board with mainline etnaviv resumed, and 0x00000000 on a board on the vendor kernel under
++ * the vendor 6.6 vipcore -- CLK_SRC_SEL = 000 in every one, across two
++ * unrelated driver stacks.
++ *
++ *
++ * CLK_SET_RATE_PARENT | CLK_SET_RATE_NO_REPARENT is the pair `clk-sunxi-ng-a733-video-plls-and-edp-tv-pixel-clock` and `clk-sunxi-ng-a733-display-engine-clock-gate-reset`
++ * give the display clocks, for the same two reasons. Propagation, so one
++ * clk_set_rate() configures the chain instead of a driver poking CCU
++ * registers behind the framework. NO_REPARENT, because which source drives
++ * the NPU is a pipeline decision that belongs in the device tree -- and
++ * without it ccu_mux_helper_determine_rate() would walk all seven parents on
++ * every rate request, including the two that resolve to nothing.
++ *
++ * ⚠ Index 110 is DEPLL3X, and `clk-sunxi-ng-a733-display-engine-clock-gate-reset`'s header carries a standing warning about
++ * it: "a future VE, NPU or DRAM driver that selects DEPLL3X from its own mux
++ * inherits a clock the display retunes". This driver does not select it. The
++ * device tree pins index 000, NO_REPARENT keeps the framework from wandering
++ * there, and the slot is modelled only so a register found at 110 is
++ * described correctly rather than silently mis-named.
++ */
++static const struct clk_parent_data npu_parents[] = {
++	{ .hw = &npupll_clk.common.hw },		/* 000 NPUPLL     */
++	{ .hw = &pll_peri0_800m_clk.common.hw },	/* 001 PERI0_800M */
++	{ .hw = &pll_peri0_600m_clk.hw },		/* 010 PERI0_600M */
++	{ .hw = &pll_peri0_480m_clk.common.hw },	/* 011 PERI0_480M */
++	{ .index = -1, .name = "pll-ve0" },		/* 100 VE0PLL     */
++	{ .index = -1, .name = "pll-ve1" },		/* 101 VE1PLL     */
++	{ .hw = &de_pll3x_clk.common.hw },		/* 110 DEPLL3X    */
++};
++
++/* NPU_CLK = clock source / M, M = FACTOR_M + 1, field 0..31. */
++static SUNXI_CCU_M_DATA_WITH_MUX_GATE(npu_clk, "npu", npu_parents, 0x0B00,
++				      0, 5,	/* M   */
++				      24, 3,	/* mux */
++				      BIT(31),	/* gate */
++				      CLK_SET_RATE_PARENT |
++				      CLK_SET_RATE_NO_REPARENT);
++
++/*
++ * Three gates, three different registers, and the NPU needs all three to be a
++ * bus master rather than just a set of registers.
++ *
++ *   bus-npu   NPU_BGR bit 0 -- the block's own AHB gate. Masked on every
++ *             board read so far and Pass only with the block resumed:
++ *             0x000f0000 / 0x000f0001 on the 6 GiB board, and 0x00080000 on the vendor-kernel
++ *             board -- which is the bare UM reset value, i.e. AHB, AXI and
++ *             CORE still ASSERTED. The three resets in the map below are
++ *             therefore not decoration; a board is genuinely found with them
++ *             held.
++ *   ahb-npu   AHB_MAT bit 6 and
++ *   mbus-npu  MBUS_MAT bit 18 -- the NPU's ports on the two bus matrices.
++ *
++ * WHY THE TWO MATRIX GATES ARE CLOCKS AND NOT A COMMENT. This same file
++ * already models the same two registers' SERDES bits as clocks -- bus-serdes
++ * 0x05C0 BIT(8) and mbus-serdes 0x05E0 BIT(28), added by `clk-sunxi-ng-a733-add-serdes-combophy-clock` -- and the
++ * reason is on the record: USB3 linked at 10 Gbps and still did not come up
++ * on a normal boot, because dwc3 reached registers behind bus-matrix gates
++ * that nothing declared, so nothing held them. A block
++ * that owns its matrix gates is the shape that survives; a block that relies
++ * on their reset value is the shape that broke.
++ *
++ * The DE went the other way in `clk-sunxi-ng-a733-display-engine-clock-gate-reset` and `arm64-dts-a733-display-engine-node-and-de-to-tcon-edge` -- its matrix gates are documented
++ * there and not modelled -- and the difference is not a style split. That
++ * decision was made for a block whose in-tree driver never touches them; here
++ * the device tree hands all three to the NPU, so the consumer exists in the
++ * same series that adds them.
++ *
++ * ⚠ AND THESE TWO BITS ARE NOT PARKED AT THEIR RESET VALUE -- MEASURED.
++ * Both reset ENABLED (AHB_MAT 0x1101_03FF, MBUS_MAT 0xF105_5803), so the
++ * cheap conclusion is that nothing ever needs to touch them. A board on the vendor kernel
++ * refutes it: with its NPU runtime-suspended under the vendor stack,
++ * AHB_MAT reads 0x110103b8 -- bit 6 CLEAR -- and MBUS_MAT reads 0xf0010803 --
++ * bit 18 CLEAR, while CM_NPU_STATUS reads 01 = Power OFF.
++ * They are
++ * per-use software gates that a running stack turns off with the block, which
++ * is exactly why they belong to the consumer as clocks rather than to a
++ * comment.
++ *
++ * ⚠ What this changes on a kernel with no NPU driver bound, stated so it is
++ * not discovered later: clk_disable_unused() clears both, AHB_MAT bit 6 and
++ * MBUS_MAT bit 18 going 1 -> 0. That is the observable this patch owns, and
++ * it is safe on two grounds -- both fields are NPU-only by their own names
++ * (NPU_AHB_GATE_SW_CFG / NPU_MBUS_GATE_SW_CFG), and it
++ * is the state a vendor stack already leaves this silicon in when the NPU is
++ * idle. No CLK_IGNORE_UNUSED, as everywhere else in this file.
++ *
++ * Parent: ahb_hws for all three, which is what bus-serdes, mbus-serdes and
++ * mbus-gmac0 already do here. Only the enable bit of a matrix gate is
++ * consumed, never its rate; MBUS itself is not modelled by this CCU.
++ *
++ * ⚠ ahb-npu and mbus-npu share their REGISTERS with clocks that already exist
++ * in this file -- 0x05C0 with bus-serdes (bit 8) and 0x05E0 with mbus-serdes
++ * (bit 28). That is safe rather than a read-modify-write race only because
++ * devm_sunxi_ccu_probe() hands every clock in one CCU the same spinlock
++ * (ccu_common.c: cclk->lock = &ccu->lock), so ccu_gate_helper_enable()
++ * serialises against its neighbours. Stated because it is the kind of thing
++ * that is true today and quietly stops being true if a clock is ever
++ * registered outside this desc.
++ */
++static SUNXI_CCU_GATE_HWS(bus_npu_clk,  "bus-npu",  ahb_hws, 0x0B04, BIT(0),  0);
++static SUNXI_CCU_GATE_HWS(ahb_npu_clk,  "ahb-npu",  ahb_hws, 0x05C0, BIT(6),  0);
++static SUNXI_CCU_GATE_HWS(mbus_npu_clk, "mbus-npu", ahb_hws, 0x05E0, BIT(18), 0);
++
++/*
++ * Three NPU registers are deliberately NOT modelled, each for a stated reason
++ * rather than by omission:
++ *
++ *   NPUPLL_GATE_EN_REG  0x1920 / abs 0x02003920, and its read-only status
++ *                       twin 0x19A0. A SECOND gate stage in series with the
++ *                       PLL's own PLL_OUTPUT_GATE: bit 16 NPUPLL_GATE_SW_CFG
++ *                       (reset 1 = Enable), bit 0 NPUPLL_AUTO_GATE_EN
++ *                       (reset 1 = No-Auto), register reset 0x0001_0001
++ *                       (A733 user manual).
++ *                       ⚠ The reason is narrower than "nothing writes it" --
++ *                       because something DOES. All three boards read
++ *                       0x0001_0000 on 2026-08-25: the SW gate still at its
++ *                       permissive reset value and AUTO_GATE_EN CLEARED, i.e.
++ *                       switched from the reset "No-Auto" to "Auto". That is
++ *                       the same move the vendor makes one register along for
++ *                       the display PLLs -- DEPLL_GATE_EN 0x1928 reads
++ *                       0x00030000 against a 0x00030003 reset, and
++ *                       VIDEOPLL_GATE_EN abs 0x02003910 reads 0x00770000 (see
++ *                       the PLL_DE block above). So the SW gate needs no
++ *                       write, which is why this driver has none; the
++ *                       auto-gating is a power feature this tree does not
++ *                       implement. Modelling the SW gate as a clock would
++ *                       only hand clk_disable_unused() a second way to stop
++ *                       the PLL output.
++ *   CM_NPU_CFG_REG      0x1B1C / abs 0x02003B1C. Its bit 0 CM_NPU_MODULE_MODE
++ *                       looks like a module gate and is not the effective one
++ *                       on this SoC: it reads 0 with the domain OFF and 0
++ *                       with the domain ON, while bits [17:16] CM_NPU_STATUS
++ *                       move 01 -> 10 (measured on the 8 GiB board, 2026-08-25).
++ *                       The same finding
++ *                       already applies to CM_DESYS on the DE, CM_VO1 on the
++ *                       TCON path and CM_USB2 on USB. The power island is
++ *                       reached through the PCK-600 genpd provider, which the
++ *                       device tree wires with power-domains, not from here.
++ *   NPU_BGR bit 19      NPU_SRAM_RST, the fourth reset -- see the reset
++ *                       header. It is the only one of the four that resets
++ *                       DE-asserted, and no consumer asks for it.
++ */
++
+ /* ccu_common-based clocks (registered and reset-mapped by the core). */
+ static struct ccu_common *sun60iw2_ccu_clks[] = {
+ 	&pll_ref_clk.common,
+@@ -1160,6 +1564,12 @@
+ 	&de0_clk.common,
+ 	&bus_de0_clk.common,
+ 	&mbus_gmac0_clk.common,
++	&pll_npu_clk.common,
++	&npupll_clk.common,
++	&npu_clk.common,
++	&bus_npu_clk.common,
++	&ahb_npu_clk.common,
++	&mbus_npu_clk.common,
+ };
+ 
+ static struct clk_hw_onecell_data sun60iw2_hw_clks = {
+@@ -1238,8 +1648,14 @@
+ 		[CLK_DE_PLL3X]		= &de_pll3x_clk.common.hw,
+ 		[CLK_DE0]		= &de0_clk.common.hw,
+ 		[CLK_BUS_DE0]		= &bus_de0_clk.common.hw,
++		[CLK_PLL_NPU]		= &pll_npu_clk.common.hw,
++		[CLK_NPUPLL]		= &npupll_clk.common.hw,
++		[CLK_NPU]		= &npu_clk.common.hw,
++		[CLK_BUS_NPU]		= &bus_npu_clk.common.hw,
++		[CLK_AHB_NPU]		= &ahb_npu_clk.common.hw,
++		[CLK_MBUS_NPU]		= &mbus_npu_clk.common.hw,
+ 	},
+-	.num	= CLK_BUS_DE0 + 1,
++	.num	= CLK_MBUS_NPU + 1,
+ };
+ 
+ static struct ccu_reset_map sun60iw2_ccu_resets[] = {
+@@ -1271,6 +1687,9 @@
+ 	[RST_BUS_TCON_TV1]	= { 0x160C, BIT(16) },
+ 	[RST_BUS_DPSS_TOP1]	= { 0x16CC, BIT(16) },
+ 	[RST_BUS_DE0]		= { 0x0A04, BIT(16) },
++	[RST_BUS_NPU]		= { 0x0B04, BIT(16) },
++	[RST_BUS_NPU_AXI]	= { 0x0B04, BIT(17) },
++	[RST_BUS_NPU_AHB]	= { 0x0B04, BIT(18) },
+ };
+ 
+ static const struct sunxi_ccu_desc sun60iw2_ccu_desc = {
+@@ -1368,6 +1787,28 @@
+ 	val |= SUN60IW2_PLL_DE_LDO_EN | SUN60IW2_PLL_DE_LOCK_ENABLE;
+ 	writel(val, reg + SUN60IW2_PLL_DE_REG);
+ 
++	/*
++	 * PLL_NPU, same two bits and the same reason: LDO_EN powers the PLL's
++	 * regulator and LOCK_ENABLE only enables lock REPORTING -- the LOCK bit
++	 * is valid only while bit 29 is set to 1 --
++	 * so neither is a clock gate and neither changes any rate. PLL_EN
++	 * stays the clock's own enable, under the framework.
++	 *
++	 * ⚠ HERE THE RESET DEFAULT IS NOT WHAT THE BOARD IS FOUND IN, which
++	 * is exactly why this write is not optional. The UM gives PLL_LDO_EN
++	 * a default of 0x1, but an idle board reads
++	 * PLL_NPU_CTRL = 0x01104500 -- bit 30 CLEAR (measured on the 6 GiB board,
++	 * 2026-08-25). Something in
++	 * the boot chain or a previous power-down leaves it off, and a PLL
++	 * whose LDO is off cannot lock however long ccu_helper_wait_for_lock()
++	 * polls. With the block resumed the same register reads 0xf9104500,
++	 * i.e. LDO_EN, LOCK_ENABLE, LOCK, PLL_EN and OUTPUT_GATE all set at
++	 * the untouched N = 70 -- the 840 MHz the reset fields encode.
++	 */
++	val = readl(reg + SUN60IW2_PLL_NPU_REG);
++	val |= SUN60IW2_PLL_NPU_LDO_EN | SUN60IW2_PLL_NPU_LOCK_ENABLE;
++	writel(val, reg + SUN60IW2_PLL_NPU_REG);
++
+ 	return devm_sunxi_ccu_probe(&pdev->dev, reg, &sun60iw2_ccu_desc);
+ }
+ 

@@ -1,0 +1,86 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] phy: allwinner: A733 combo-PHY -- lane comments follow the corrected reference
+
+[Recipe cut: regenerated against the instrumentation-free driver; comment changes
+only, as before.]
+
+Comment-only. Brings four comments in line with the corrected COMB0 lane reading of
+2026-09-17. Those facts were
+re-derived twice, independently, from the UM, the pinout
+(A733_PINOUT_V0.91), schematic v1.10 p6/p12 and silicon captures:
+
+  - COMB0_RAWS_TXD_MAP_CTRL: the UM field is one per PHY lane, selecting
+    the DP lane that PHY lane carries, not "one per
+    DP lane, physical -> logical".
+  - PMA 0xF000 + n * 0x100 bit8: the UM does not define it; "lane invert"
+    is the vendor's name. The board swaps P/N on every lane, and the vendor
+    sets the bit on all four lanes in USB3 mode too, while our USB3 path
+    leaves it clear and links at 10 Gbps.
+  - The saved-lane-values comment adds that the vendor stack writes map and
+    inverts in USB3 mode, which this driver does not need.
+  - The DP entry comment attributed the missing clock recovery to the missing
+    inverts. That run had the lane map at its 0xFFFF reset as well, so the
+    measurement cannot separate the two.
+
+Not changed, because only one of the two derivations raised it: "COMB0 carries
+SuperSpeed or DP, never both", checked against the A733 user manual.
+
+No functional change; the object code is identical apart from line
+information.
+
+Assisted-by: Claude
+
+diff --git a/drivers/phy/allwinner/phy-sun60i-a733-combophy.c b/drivers/phy/allwinner/phy-sun60i-a733-combophy.c
+--- a/drivers/phy/allwinner/phy-sun60i-a733-combophy.c
++++ b/drivers/phy/allwinner/phy-sun60i-a733-combophy.c
+@@ -54,8 +54,9 @@
+  */
+ #define  DP_RAWS_TXDW_CONV_4LANE	(DP_PHY_CFG_DATA_EN | DP_PHY_CFG_LN_EN | \
+ 					 DP_PHY_CFG_LN_RSTN)
+-/* COMB0_PHY_RAWS_TXD_MAP_CTRL (0x06C06C24) -- four 4-bit fields, one per DP
+- * lane, physical -> logical. Reset default 0xFFFF; this board's
++/* COMB0_PHY_RAWS_TXD_MAP_CTRL (0x06C06C24) -- four 4-bit fields, one per PHY
++ * lane (LN0 = [3:0]), each selecting which DP lane's raw TX data that PHY lane
++ * carries (A733 user manual). Reset default 0xFFFF; this board's
+  * lane_remap = <0 1 2 3> is the identity 0x00003210.
+  */
+ #define COMB0_RAWS_TXD_MAP_CTRL		0x0C24
+@@ -124,8 +125,12 @@
+ #define  PMA_NUDGE_CLR			(0xF << 8)
+ 
+ /*
+- * Per-lane DP config word in the PMA; bit8 inverts the lane. Vendor
+- * combo0_dp_lane_invert() walks word index 0xF000 + n * 0x100. NOTE this is
++ * Per-lane config word in the PMA, index 0xF000 + n * 0x100. The vendor names
++ * bit8 a lane invert (combo0_dp_lane_invert()); the UM does not define it, and
++ * no single-variable measurement of it exists. The board swaps P/N on all four
++ * COMB0 lanes (ball COMB0-TXnP -> net LANEn-N in the schematic); the
++ * vendor stack sets bit8 on all four in USB3 mode as well as in DP, while the
++ * USB3 path here leaves it clear and links at 10 Gbps. NOTE this is
+  * a BYTE offset, like PMA_NUDGE_OFF above and unlike PMA_DP_LANE_CFG below,
+  * which is a raw word index shifted at its call site -- the file carries both
+  * conventions, so the names say which.
+@@ -253,7 +258,9 @@ struct a733_combophy {
+ 	/* The DP lane map and lane inverts, and the USB values they displace.
+ 	 * Written when the mux hands the lanes to DisplayPort and put back when
+ 	 * it takes them away, so a port that never enters DP alt mode never
+-	 * sees either register.
++	 * sees either register from this driver. (The vendor stack writes both
++	 * in USB3 mode too: map 0x3210, bit8 on all four lanes. The USB3 path
++	 * here does not, and needs neither to link at 10 Gbps.)
+ 	 */
+ 	u32			dp_lane_map;
+ 	u32			dp_lane_invert;
+@@ -1831,8 +1838,10 @@ static void a733_combophy_dp_lanes_leave(struct a733_combophy *cp)
+  * trade this tree does not make.
+  *
+  * The DP lane map at 0x06C06C24 and the four PMA lane inverts are written from
+- * here. Measured consequence of missing inverts: the sink escalates the
+- * voltage swing 1 -> 2 -> 3 and never reaches clock recovery.
++ * here. Measured consequence of the missing map and inverts together: the
++ * sink escalates the voltage swing 1 -> 2 -> 3 and never reaches clock
++ * recovery. Both were missing in that run, so it does not say which of the
++ * two was needed.
+  *
+  * Still missing for actual video, named rather than implied: the DP AUX/HPD
+  * front end at 0x06C01E00 (0x03331131 in the capture, 0x00330000 at reset),

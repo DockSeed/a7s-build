@@ -1,0 +1,451 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Fri, 2 Oct 2026 02:00:00 +0200
+Subject: [PATCH] clk: sunxi-ng: a733: the audio PLLs, I2S/OWA/DMIC module clocks, bus gates and resets
+
+Nothing on the audio side of the A733 is in our CCU: neither audio PLL,
+none of the I2S/PCM0-4, OWA (S/PDIF) and DMIC module clocks, gates or
+resets. This adds 21 clocks and 7 resets.
+
+The register map, field by field, is in the block comment
+in front of the new clocks. The decisions:
+
+- PLL_AUDIO0 (0x0260) is integer-N plus one fractional point, the UM's
+  own: Table 4-3, N 67 + FRAC 0x179A7, VCO 1625.7024 MHz, which P0 = 18
+  turns into 90.3168 MHz = 22.5792 MHz x 4, the 44.1 kHz family exact.
+  It is programmed as UM 4.1.3.5 "fractional division" (SIG_DELT_PAT_EN
+  1, FRAC_EN 0, WAVE_STEP 0, WAVE_BOT = fraction x 2^17) through
+  ccu_sdm, which writes the pattern before it sets the master switch:
+  the order of 4.1.4.1 steps 2-4. PLL_PI_EN (PAT1 bit 31) is set at
+  probe, as step 2 recommends; the other static parameters stay at their
+  defaults. A first draft modelled no fractional point at all and left
+  44.1 kHz approximate; the UM V1.00 procedure is enough to do it right.
+  The sdm pattern carries SIG_DELT_PAT_EN (bit 31), as every mainline
+  table does, because ccu_sdm_helper_read_rate() compares the pattern with
+  the whole PAT0 register; the static half is written at probe so the
+  helper's write only adds the master switch. On a first cut without bit 31
+  (the 8 GiB board, 2026-10-02) the PLL locked at the right point (CTRL 0xF97F4200,
+  PAT0 0xE00179A7) but recalc reported 0 Hz and the 4X tap divided by 128.
+- PLL_AUDIO1 (0x0280) has two taps, DIV2 (P0) and DIV5 (P1), and one
+  output gate (bit 27). The gate is part of the PLL's enable mask so
+  neither tap can close it under the other. Its defaults are the UM's
+  48 kHz point (DIV5 = 614.4 MHz, /25 = 24.576 MHz exactly), and its taps
+  do not propagate rate requests: two blocks on two taps would retune
+  each other.
+- Both PLLs get LDO_EN and LOCK_ENABLE at probe, PLL_EN stays the
+  clock's own enable -- the treatment the video and VE PLLs get.
+- OWA_RX has only mux value 010 (PERI0_400M) documented; 000 and 001 are
+  Reserved, so it is a one-entry mux table. The vendor lists 200M, 300M
+  and 400M at 0, 1, 2; that does not match the UM and is not carried.
+- Bus gates take ahb by this driver's convention; the UM names no parent.
+
+Rejected from the A523 and the vendor: the A523's PLL_AUDIO0 sits at
+0x078 with its enable at bit 27 (here 0x0260, bit 31); its 22.5792 MHz
+point (N 75, M 20, pattern 0xc000872b) and the vendor's copy of it
+(0xA002872B) are not the UM's; its 98.304 MHz point at N 49 puts the VCO
+at 1.18 GHz, under this PLL's 1.26 GHz floor (Table 4-2).
+
+Silicon, the 8 GiB board, our 6.18.54 kernel, 2026-10-02: PLL_AUDIO0_CTRL =
+0x41145500, PLL_AUDIO1_CTRL = 0x41147F00 (off, N/P at the documented
+defaults), every I2S/OWA/DMIC clock and gate register 0, AUDIOPLL_GATE_EN
+= 0x00070007. Bit 24 reads 1 in both PLL registers although the UM marks
+[26:23] reserved; all writes are read-modify-write and keep it.
+
+Ids: clocks 115-135, resets 41-47.
+
+Verified: applies, builds. Silicon effect is owed to the consumers.
+
+Assisted-by: Claude
+---
+--- a/drivers/clk/sunxi-ng/ccu-sun60iw2.c
++++ b/drivers/clk/sunxi-ng/ccu-sun60iw2.c
+@@ -2218,6 +2218,213 @@ static SUNXI_CCU_GATE_HWS(bus_dma1_clk,  "bus-dma1",  ahb_hws, 0x070C, BIT(0), 0
+ static SUNXI_CCU_GATE_HWS(mbus_dma0_clk, "mbus-dma0", ahb_hws, 0x05E4, BIT(0), 0);
+ static SUNXI_CCU_GATE_HWS(mbus_dma1_clk, "mbus-dma1", ahb_hws, 0x05E4, BIT(3), 0);
+ 
++/*
++ * Audio: the two audio PLLs, the module clocks and bus gates of I2S/PCM0-4,
++ * OWA (S/PDIF) and DMIC. UM V1.00 section 4.1 (CCU) and its register descriptions.
++ *
++ *   PLL_AUDIO0_CTRL 0x0260, reset 0x4014_5500
++ *     31 PLL_EN  30 LDO_EN  29 LOCK_ENABLE  28 LOCK (R)  27 PLL_OUTPUT_GATE
++ *     22:16 PLL_P0, P0 = field + 1 (7 bits)  15:8 PLL_N, N = field + 1,
++ *     PLL_N >= 11, so N >= 12  1 PLL_INPUT_DIV, M1
++ *     AUDIO0PLL4X = 24MHz * N / M1 / P0
++ *   PLL_AUDIO1_CTRL 0x0280, reset 0x4014_7F00
++ *     the same control bits, N and M1; 22:20 PLL_P0 and 18:16 PLL_P1, each
++ *     field + 1; AUDIO1PLL_DIV2 = 24MHz * N / M1 / P0, AUDIO1PLL_DIV5 =
++ *     24MHz * N / M1 / P1 -- default rates 1536 MHz and 614.4 MHz (24.576Mhz*25).
++ *     DIV2 and DIV5 name the default dividers, not
++ *     fixed ratios. One PLL_OUTPUT_GATE (27) serves both taps.
++ *   Table 4-2: AUDIO0 Fvco 1.26G~2.52G, P0 1~128; AUDIO1 Fvco 1.8G~3.1G,
++ *     P0/P1 1~8; reference 24MHz
++ *   Table 4-3: AUDIO0 N 67 + FRAC 0x179A7, VCO 1625.7024, 90.3168 =
++ *     22.5792 * 4; AUDIO1 N 128, VCO 3072, 1536/614.4, 24.576
++ *   AUDIOPLL_GATE_EN 0x191C, reset 0x0007_0007: bits 16-18 gate the 4X,
++ *     DIV2 and DIV5 taps, all open at reset
++ *
++ *   I2SPCMn_CLK 0x1200 + n * 0x10 (n = 0..4): 31 gate, 26:24 mux (000
++ *     AUDIO0PLL4X, 001 AUDIO1PLL_DIV2, 010 AUDIO1PLL_DIV5, 011 PERI0_200M),
++ *     4:0 M = field + 1
++ *   I2SPCM2_ASRC_CLK 0x1224: the same, mux adds 011 PERI0_300M,
++ *     100 PERI1_300M
++ *   I2SPCMn_BGR 0x120C + n * 0x10: 0 gating, 16 reset
++ *   OWA_TX_CLK 0x1280: 31 gate, mux 000 4X, 001 DIV2, 010 DIV5, 4:0 M
++ *
++ *   OWA_RX_CLK 0x1284: mux 000 and 001 Reserved, 010 PERI0_400M
++ *   OWA_BGR 0x128C, DMIC_CLK 0x12C0 (mux as OWA_TX), DMIC_BGR 0x12CC
++ *
++ *
++ * Silicon, the 8 GiB board, our 6.18.54 kernel, 2026-10-02: PLL_AUDIO0_CTRL = 0x41145500,
++ * PLL_AUDIO1_CTRL = 0x41147F00 (both PLLs off, N/P at their documented
++ * defaults), every I2S/OWA/DMIC clock and bus-gate register 0x00000000,
++ * AUDIOPLL_GATE_EN = 0x00070007. ⚠ Bit 24 reads 1 in both PLL registers
++ * although the UM marks [26:23] reserved with no default; every write here is
++ * read-modify-write, so it is kept as found.
++ *
++ * What this models, and what it leaves out:
++ * - PLL_AUDIO0 has one fractional point, the UM's own: Table 4-3's N 67 + FRAC
++ *   0x179A7, VCO 1625.7024 MHz, which P0 = 18 turns into 90.3168 MHz =
++ *   22.5792 MHz * 4 -- the 44.1 kHz family, exact. It is programmed as UM
++ *   4.1.3.5 "fractional division": SIG_DELT_PAT_EN 1, FRAC_EN 0,
++ *   WAVE_STEP 0, so WAVE_BOT (PAT0 [16:0]) carries the fraction x * 2^17.
++ *   ccu_sdm writes the pattern with the master switch clear and sets it after,
++ *   which is the order of 4.1.4.1 steps 2-4. Static parameters
++ *   per step 2: SPR_FREQ_MODE 3 in the pattern, PLL_PI_EN 1 (PAT1 bit 31) at
++ *   probe, PLL_PI_CFG, SMOOTH_EN and DITHER left at their defaults (3, 0, 0).
++ *   Every other PLL_AUDIO0 rate is integer-N.
++ * - PLL_AUDIO1 carries no CLK_SET_RATE_PARENT on its taps: its defaults are the
++ *   UM's own 48 kHz point (DIV5 / 25 = 24.576 MHz exactly), and two blocks on
++ *   two taps would otherwise retune each other's rate. PLL_AUDIO0's tap does
++ *   propagate, so a request for the 44.1 kHz family can move it.
++ * - PLL_AUDIO1's single output gate (27) is part of the PLL's enable mask, so
++ *   neither tap can switch it off under the other.
++ * - The bus gates take ahb_hws by this file's convention; the UM names no
++ *   parent for them ("see CCU"). Only the enable bit is consumed.
++ */
++#define SUN60IW2_PLL_AUDIO0_REG		0x0260
++#define SUN60IW2_PLL_AUDIO1_REG		0x0280
++#define SUN60IW2_PLL_AUDIO_LDO_EN	BIT(30)
++#define SUN60IW2_PLL_AUDIO_LOCK_ENABLE	BIT(29)
++
++#define SUN60IW2_PLL_AUDIO0_PAT0_REG	0x0268
++#define SUN60IW2_PLL_AUDIO0_PAT1_REG	0x026C
++#define SUN60IW2_PLL_PAT0_SIG_DELT_PAT_EN	BIT(31)
++#define SUN60IW2_PLL_PAT1_PI_EN		BIT(31)
++
++/*
++ * PAT0 for the Table 4-3 point: SIG_DELT_PAT_EN (31) = 1, SPR_FREQ_MODE
++ * [30:29] = 3, WAVE_STEP [28:20] = 0, SDM_DIRECTION 0, FREQ 0, WAVE_BOT [16:0]
++ * = 0x179A7 (0.73760 * 2^17). 24 MHz * (67 + 0x179A7 / 2^17) = 1625.70245 MHz;
++ * the table names the UM's 1625.7024 MHz, which P0 = 18 divides to 90.3168 MHz
++ * exactly.
++ *
++ * The pattern carries the enable bit because ccu_sdm_helper_read_rate()
++ * compares it with the whole register (ccu_sdm.c), as every mainline table
++ * does. A first cut left bit 31 out: the PLL ran at the right point
++ * (PLL_AUDIO0 0xF97F4200, PAT0 0xE00179A7, locked; the 8 GiB board, 2026-10-02) but
++ * recalc never matched, reported 0 Hz, and the 4X tap divided by 128. The UM's
++ * order -- static parameters before the master switch (4.1.4.1 steps 2-4) --
++ * is kept by writing the static half at probe (sun60iw2_ccu_probe()), so the
++ * helper's pattern write only adds bit 31.
++ */
++#define SUN60IW2_PLL_AUDIO0_PAT0_STATIC	0x600179a7
++static struct ccu_sdm_setting pll_audio0_sdm_table[] = {
++	{ .rate = 1625702400, .pattern = 0xe00179a7, .m = 1, .n = 67 },
++};
++
++static struct ccu_nm pll_audio0_clk = {
++	.enable		= BIT(31),
++	.lock		= BIT(28),
++	.n		= _SUNXI_CCU_MULT_OFFSET_MIN_MAX(8, 8, 1, 12, 255),
++	.m		= _SUNXI_CCU_DIV(1, 1),
++	.sdm		= _SUNXI_CCU_SDM(pll_audio0_sdm_table, 0,
++					 SUN60IW2_PLL_AUDIO0_PAT0_REG,
++					 SUN60IW2_PLL_PAT0_SIG_DELT_PAT_EN),
++	.min_rate	= 1260000000U,
++	.max_rate	= 2520000000U,
++	.common		= {
++		.reg		= SUN60IW2_PLL_AUDIO0_REG,
++		.features	= CCU_FEATURE_SIGMA_DELTA_MOD,
++		.hw.init	= CLK_HW_INIT_PARENTS_HW("pll-audio0",
++				pll_ref_hws, &ccu_nm_ops,
++				CLK_SET_RATE_UNGATE),
++	},
++};
++static const struct clk_hw *pll_audio0_hws[] = { &pll_audio0_clk.common.hw };
++
++static SUNXI_CCU_M_HWS_WITH_GATE(audio0_pll4x_clk, "audio0-pll4x",
++				 pll_audio0_hws, SUN60IW2_PLL_AUDIO0_REG,
++				 16, 7, BIT(27), CLK_SET_RATE_PARENT);
++
++static struct ccu_nm pll_audio1_clk = {
++	.enable		= BIT(31) | BIT(27),
++	.lock		= BIT(28),
++	.n		= _SUNXI_CCU_MULT_OFFSET_MIN_MAX(8, 8, 1, 12, 255),
++	.m		= _SUNXI_CCU_DIV(1, 1),
++	.min_rate	= 1800000000U,
++	.max_rate	= 3100000000U,
++	.common		= {
++		.reg		= SUN60IW2_PLL_AUDIO1_REG,
++		.hw.init	= CLK_HW_INIT_PARENTS_HW("pll-audio1",
++				pll_ref_hws, &ccu_nm_ops,
++				CLK_SET_RATE_UNGATE),
++	},
++};
++static const struct clk_hw *pll_audio1_hws[] = { &pll_audio1_clk.common.hw };
++
++static SUNXI_CCU_M_HWS(audio1_pll_div2_clk, "audio1-pll-div2", pll_audio1_hws,
++		       SUN60IW2_PLL_AUDIO1_REG, 20, 3, 0);
++static SUNXI_CCU_M_HWS(audio1_pll_div5_clk, "audio1-pll-div5", pll_audio1_hws,
++		       SUN60IW2_PLL_AUDIO1_REG, 16, 3, 0);
++
++static const struct clk_parent_data i2s_parents[] = {
++	{ .hw = &audio0_pll4x_clk.common.hw },	/* 000 AUDIO0PLL4X    */
++	{ .hw = &audio1_pll_div2_clk.common.hw },/* 001 AUDIO1PLL_DIV2 */
++	{ .hw = &audio1_pll_div5_clk.common.hw },/* 010 AUDIO1PLL_DIV5 */
++	{ .hw = &pll_peri0_200m_clk.hw },	/* 011 PERI0_200M     */
++};
++
++static SUNXI_CCU_M_DATA_WITH_MUX_GATE(i2s0_clk, "i2s0", i2s_parents, 0x1200,
++				      0, 5, 24, 3, BIT(31), CLK_SET_RATE_PARENT);
++static SUNXI_CCU_M_DATA_WITH_MUX_GATE(i2s1_clk, "i2s1", i2s_parents, 0x1210,
++				      0, 5, 24, 3, BIT(31), CLK_SET_RATE_PARENT);
++static SUNXI_CCU_M_DATA_WITH_MUX_GATE(i2s2_clk, "i2s2", i2s_parents, 0x1220,
++				      0, 5, 24, 3, BIT(31), CLK_SET_RATE_PARENT);
++static SUNXI_CCU_M_DATA_WITH_MUX_GATE(i2s3_clk, "i2s3", i2s_parents, 0x1230,
++				      0, 5, 24, 3, BIT(31), CLK_SET_RATE_PARENT);
++static SUNXI_CCU_M_DATA_WITH_MUX_GATE(i2s4_clk, "i2s4", i2s_parents, 0x1240,
++				      0, 5, 24, 3, BIT(31), CLK_SET_RATE_PARENT);
++
++static const struct clk_parent_data i2s2_asrc_parents[] = {
++	{ .hw = &audio0_pll4x_clk.common.hw },	/* 000 AUDIO0PLL4X    */
++	{ .hw = &audio1_pll_div2_clk.common.hw },/* 001 AUDIO1PLL_DIV2 */
++	{ .hw = &audio1_pll_div5_clk.common.hw },/* 010 AUDIO1PLL_DIV5 */
++	{ .hw = &pll_peri0_300m_clk.hw },	/* 011 PERI0_300M     */
++	{ .hw = &pll_peri1_300m_clk.hw },	/* 100 PERI1_300M     */
++};
++
++static SUNXI_CCU_M_DATA_WITH_MUX_GATE(i2s2_asrc_clk, "i2s2-asrc",
++				      i2s2_asrc_parents, 0x1224,
++				      0, 5, 24, 3, BIT(31), 0);
++
++static SUNXI_CCU_GATE_HWS(bus_i2s0_clk, "bus-i2s0", ahb_hws, 0x120C, BIT(0), 0);
++static SUNXI_CCU_GATE_HWS(bus_i2s1_clk, "bus-i2s1", ahb_hws, 0x121C, BIT(0), 0);
++static SUNXI_CCU_GATE_HWS(bus_i2s2_clk, "bus-i2s2", ahb_hws, 0x122C, BIT(0), 0);
++static SUNXI_CCU_GATE_HWS(bus_i2s3_clk, "bus-i2s3", ahb_hws, 0x123C, BIT(0), 0);
++static SUNXI_CCU_GATE_HWS(bus_i2s4_clk, "bus-i2s4", ahb_hws, 0x124C, BIT(0), 0);
++
++static const struct clk_parent_data owa_dmic_parents[] = {
++	{ .hw = &audio0_pll4x_clk.common.hw },	/* 000 AUDIO0PLL4X    */
++	{ .hw = &audio1_pll_div2_clk.common.hw },/* 001 AUDIO1PLL_DIV2 */
++	{ .hw = &audio1_pll_div5_clk.common.hw },/* 010 AUDIO1PLL_DIV5 */
++};
++
++static SUNXI_CCU_M_DATA_WITH_MUX_GATE(owa_tx_clk, "owa-tx", owa_dmic_parents,
++				      0x1280, 0, 5, 24, 3, BIT(31),
++				      CLK_SET_RATE_PARENT);
++
++/* OWA_RX: only mux value 010 is documented; 000 and 001 are Reserved. */
++static const struct clk_parent_data owa_rx_parents[] = {
++	{ .hw = &pll_peri0_400m_clk.hw },	/* 010 PERI0_400M     */
++};
++static const u8 owa_rx_table[] = { 2 };
++static struct ccu_div owa_rx_clk = {
++	.enable	= BIT(31),
++	.div	= _SUNXI_CCU_DIV(0, 5),
++	.mux	= _SUNXI_CCU_MUX_TABLE(24, 3, owa_rx_table),
++	.common	= {
++		.reg		= 0x1284,
++		.hw.init	= CLK_HW_INIT_PARENTS_DATA("owa-rx",
++							   owa_rx_parents,
++							   &ccu_div_ops, 0),
++	},
++};
++
++static SUNXI_CCU_GATE_HWS(bus_owa_clk, "bus-owa", ahb_hws, 0x128C, BIT(0), 0);
++
++static SUNXI_CCU_M_DATA_WITH_MUX_GATE(dmic_clk, "dmic", owa_dmic_parents,
++				      0x12C0, 0, 5, 24, 3, BIT(31),
++				      CLK_SET_RATE_PARENT);
++static SUNXI_CCU_GATE_HWS(bus_dmic_clk, "bus-dmic", ahb_hws, 0x12CC, BIT(0), 0);
++
+ /* ccu_common-based clocks (registered and reset-mapped by the core). */
+ static struct ccu_common *sun60iw2_ccu_clks[] = {
+ 	&pll_ref_clk.common,
+@@ -2322,6 +2529,27 @@ static struct ccu_common *sun60iw2_ccu_clks[] = {
+ 	&bus_dma1_clk.common,
+ 	&mbus_dma0_clk.common,
+ 	&mbus_dma1_clk.common,
++	&pll_audio0_clk.common,
++	&audio0_pll4x_clk.common,
++	&pll_audio1_clk.common,
++	&audio1_pll_div2_clk.common,
++	&audio1_pll_div5_clk.common,
++	&i2s0_clk.common,
++	&i2s1_clk.common,
++	&i2s2_clk.common,
++	&i2s3_clk.common,
++	&i2s4_clk.common,
++	&i2s2_asrc_clk.common,
++	&bus_i2s0_clk.common,
++	&bus_i2s1_clk.common,
++	&bus_i2s2_clk.common,
++	&bus_i2s3_clk.common,
++	&bus_i2s4_clk.common,
++	&owa_tx_clk.common,
++	&owa_rx_clk.common,
++	&bus_owa_clk.common,
++	&dmic_clk.common,
++	&bus_dmic_clk.common,
+ };
+ 
+ static struct clk_hw_onecell_data sun60iw2_hw_clks = {
+@@ -2441,8 +2669,29 @@ static struct clk_hw_onecell_data sun60iw2_hw_clks = {
+ 		[CLK_BUS_DMA1]		= &bus_dma1_clk.common.hw,
+ 		[CLK_MBUS_DMA0]		= &mbus_dma0_clk.common.hw,
+ 		[CLK_MBUS_DMA1]		= &mbus_dma1_clk.common.hw,
++		[CLK_PLL_AUDIO0]	= &pll_audio0_clk.common.hw,
++		[CLK_AUDIO0PLL4X]	= &audio0_pll4x_clk.common.hw,
++		[CLK_PLL_AUDIO1]	= &pll_audio1_clk.common.hw,
++		[CLK_AUDIO1PLL_DIV2]	= &audio1_pll_div2_clk.common.hw,
++		[CLK_AUDIO1PLL_DIV5]	= &audio1_pll_div5_clk.common.hw,
++		[CLK_I2S0]		= &i2s0_clk.common.hw,
++		[CLK_I2S1]		= &i2s1_clk.common.hw,
++		[CLK_I2S2]		= &i2s2_clk.common.hw,
++		[CLK_I2S3]		= &i2s3_clk.common.hw,
++		[CLK_I2S4]		= &i2s4_clk.common.hw,
++		[CLK_I2S2_ASRC]		= &i2s2_asrc_clk.common.hw,
++		[CLK_BUS_I2S0]		= &bus_i2s0_clk.common.hw,
++		[CLK_BUS_I2S1]		= &bus_i2s1_clk.common.hw,
++		[CLK_BUS_I2S2]		= &bus_i2s2_clk.common.hw,
++		[CLK_BUS_I2S3]		= &bus_i2s3_clk.common.hw,
++		[CLK_BUS_I2S4]		= &bus_i2s4_clk.common.hw,
++		[CLK_OWA_TX]		= &owa_tx_clk.common.hw,
++		[CLK_OWA_RX]		= &owa_rx_clk.common.hw,
++		[CLK_BUS_OWA]		= &bus_owa_clk.common.hw,
++		[CLK_DMIC]		= &dmic_clk.common.hw,
++		[CLK_BUS_DMIC]		= &bus_dmic_clk.common.hw,
+ 	},
+-	.num	= CLK_MBUS_DMA1 + 1,
++	.num	= CLK_BUS_DMIC + 1,
+ };
+ 
+ static struct ccu_reset_map sun60iw2_ccu_resets[] = {
+@@ -2493,6 +2742,13 @@ static struct ccu_reset_map sun60iw2_ccu_resets[] = {
+ 	[RST_BUS_VE_DEC]	= { 0x0A8C, BIT(18) },
+ 	[RST_BUS_DMA0]		= { 0x0704, BIT(16) },
+ 	[RST_BUS_DMA1]		= { 0x070C, BIT(16) },
++	[RST_BUS_I2S0]		= { 0x120C, BIT(16) },
++	[RST_BUS_I2S1]		= { 0x121C, BIT(16) },
++	[RST_BUS_I2S2]		= { 0x122C, BIT(16) },
++	[RST_BUS_I2S3]		= { 0x123C, BIT(16) },
++	[RST_BUS_I2S4]		= { 0x124C, BIT(16) },
++	[RST_BUS_OWA]		= { 0x128C, BIT(16) },
++	[RST_BUS_DMIC]		= { 0x12CC, BIT(16) },
+ };
+ 
+ static const struct sunxi_ccu_desc sun60iw2_ccu_desc = {
+@@ -2527,6 +2783,12 @@ static const u32 ve_pll_regs[] = {
+ 	SUN60IW2_PLL_VE1_REG,
+ };
+ 
++/* The audio PLLs: the same -- LDO_EN and LOCK_ENABLE only. */
++static const u32 audio_pll_regs[] = {
++	SUN60IW2_PLL_AUDIO0_REG,
++	SUN60IW2_PLL_AUDIO1_REG,
++};
++
+ static int sun60iw2_ccu_probe(struct platform_device *pdev)
+ {
+ 	void __iomem *reg;
+@@ -2636,6 +2898,38 @@ static int sun60iw2_ccu_probe(struct platform_device *pdev)
+ 		writel(val, reg + ve_pll_regs[i]);
+ 	}
+ 
++	/*
++	 * The audio PLLs, for the reason the video and VE PLLs above give: both
++	 * are off at reset with LOCK_ENABLE 0 (silicon, the 8 GiB board, 2026-10-02:
++	 * 0x41145500 and 0x41147F00), and LOCK only reports once LOCK_ENABLE is
++	 * set. PLL_EN stays the clock's own enable.
++	 */
++	for (i = 0; i < ARRAY_SIZE(audio_pll_regs); i++) {
++		val = readl(reg + audio_pll_regs[i]);
++		val |= SUN60IW2_PLL_AUDIO_LDO_EN | SUN60IW2_PLL_AUDIO_LOCK_ENABLE;
++		writel(val, reg + audio_pll_regs[i]);
++	}
++
++	/*
++	 * PLL_AUDIO0's fractional point needs phase interpolation on: a static
++	 * parameter, set once before SIG_DELT_PAT_EN can ever be set (UM
++	 * 4.1.4.1 step 2: PLL_PI_EN = 1 is recommended).
++	 */
++	val = readl(reg + SUN60IW2_PLL_AUDIO0_PAT1_REG);
++	val |= SUN60IW2_PLL_PAT1_PI_EN;
++	writel(val, reg + SUN60IW2_PLL_AUDIO0_PAT1_REG);
++
++	/*
++	 * And the fractional point's static half (SPR_FREQ_MODE, WAVE_BOT) in
++	 * PAT0 with the master switch still clear, unless the switch is already
++	 * on: then a boot stage has the PLL running fractionally and the write
++	 * is left to the clock framework.
++	 */
++	val = readl(reg + SUN60IW2_PLL_AUDIO0_PAT0_REG);
++	if (!(val & SUN60IW2_PLL_PAT0_SIG_DELT_PAT_EN))
++		writel(SUN60IW2_PLL_AUDIO0_PAT0_STATIC,
++		       reg + SUN60IW2_PLL_AUDIO0_PAT0_REG);
++
+ 	return devm_sunxi_ccu_probe(&pdev->dev, reg, &sun60iw2_ccu_desc);
+ }
+ 
+--- a/include/dt-bindings/clock/sun60i-a733-ccu.h
++++ b/include/dt-bindings/clock/sun60i-a733-ccu.h
+@@ -211,4 +211,32 @@
+ #define CLK_MBUS_DMA0		113
+ #define CLK_MBUS_DMA1		114
+ 
++/*
++ * Audio -- PLL_AUDIO0 0x0260 and its 4X tap, PLL_AUDIO1 0x0280 and its DIV2
++ * and DIV5 taps, the I2S/PCM0-4 module clocks (0x1200 + n * 0x10) and bus
++ * gates (0x120C + n * 0x10), I2S2's ASRC clock (0x1224), OWA TX/RX (0x1280,
++ * 0x1284) and its bus gate (0x128C), DMIC (0x12C0) and its bus gate (0x12CC).
++ */
++#define CLK_PLL_AUDIO0		115
++#define CLK_AUDIO0PLL4X		116
++#define CLK_PLL_AUDIO1		117
++#define CLK_AUDIO1PLL_DIV2	118
++#define CLK_AUDIO1PLL_DIV5	119
++#define CLK_I2S0		120
++#define CLK_I2S1		121
++#define CLK_I2S2		122
++#define CLK_I2S3		123
++#define CLK_I2S4		124
++#define CLK_I2S2_ASRC		125
++#define CLK_BUS_I2S0		126
++#define CLK_BUS_I2S1		127
++#define CLK_BUS_I2S2		128
++#define CLK_BUS_I2S3		129
++#define CLK_BUS_I2S4		130
++#define CLK_OWA_TX		131
++#define CLK_OWA_RX		132
++#define CLK_BUS_OWA		133
++#define CLK_DMIC		134
++#define CLK_BUS_DMIC		135
++
+ #endif /* _DT_BINDINGS_CLK_SUN60I_A733_CCU_H_ */
+--- a/include/dt-bindings/reset/sun60i-a733-ccu.h
++++ b/include/dt-bindings/reset/sun60i-a733-ccu.h
+@@ -91,4 +91,13 @@
+ #define RST_BUS_DMA0		39
+ #define RST_BUS_DMA1		40
+ 
++/* Audio -- bit 16 of I2S/PCM0-4_BGR (0x120C + n * 0x10), OWA_BGR, DMIC_BGR. */
++#define RST_BUS_I2S0		41
++#define RST_BUS_I2S1		42
++#define RST_BUS_I2S2		43
++#define RST_BUS_I2S3		44
++#define RST_BUS_I2S4		45
++#define RST_BUS_OWA		46
++#define RST_BUS_DMIC		47
++
+ #endif /* _DT_BINDINGS_RST_SUN60I_A733_CCU_H_ */

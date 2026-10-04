@@ -1,0 +1,96 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: a733: the GPU's power domain is GPU_TOP alone
+
+GPU_CORE is not switched by the PCK-600 on this SoC, so the node stops asking it
+to be.
+
+WHAT THE SILICON DOES (the 8 GiB board, 2026-09-07)
+--------------------------------------------------------------------------------
+GPU_CORE switches when three conditions hold at once, with no PPU write anywhere
+in the sequence: PLL_GPU0 enabled (0x020020e0), GPU0_CLK ungated with its source
+committed through the UPD bit (0x02002b20), and GPU0_GATING with the bus gate on
+and the reset released (0x02002b24). Established in three different orders across
+three cold boots, the domain switched at the third element every time. Any two of
+the three leave PWSR at 0x0, and a policy write -- edge or not, with or without
+DEV_REQ_EN and DEV_ACTIVE_EN in PWCR -- never moves it at all, while the same
+driver switches domain 0 on demand in the same boot.
+
+Those three conditions are exactly what this driver's own consumer establishes:
+clk "core", "mem" and "sys" plus the reset, in pvr_power.c:262-284, which runs in
+the runtime-resume callback before the first register access
+(pvr_device.c:611 pm_runtime_resume_and_get, then :503 pvr_load_gpu_id ->
+ROGUE_CR_CORE_ID__PBVNC). The domain therefore comes up on its own, in time, as
+a side effect of the driver doing what it does anyway.
+
+WHY LISTING IT WAS ACTIVELY HARMFUL
+--------------------------------------------------------------------------------
+With GPU_CORE in the list, genpd owns a domain it cannot drive. Two shapes of
+that were tried on the board and both are bad:
+
+ - keep the PWSR poll (`pmdomain-sunxi-pck600-read-the-boot-state`): power_on() writes the policy and waits 10 ms for a
+   status bit that only appears once the consumer has clocked the block, which it
+   may only do after power_on() returns. -110, every boot, and the probe that
+   would have powered the domain never runs.
+ - skip the poll (tried and withdrawn): the attach succeeds, and the board then
+   stops silently at 10.7 s with no powervr line on the console. ⚠ The mechanism
+   was never isolated. Two candidates fit the same observation and were not
+   separated: the driver reaching the block before the domain is up, and
+   pm_runtime_put() with the driver's 50 ms autosuspend reaching power_off() on a
+   domain that is genuinely in use. The second is in tension with an earlier
+   measurement on the board, which found that a PWPR write moves GPU_CORE in neither
+   direction and would therefore be inert. What is measured is the outcome, not
+   the cause: the same kernel with modprobe.blacklist=powervr reaches
+   graphical.target, and a hand modprobe in that boot kills it one console
+   marker later.
+
+Dropping the entry removes both. drm/powervr takes exactly one domain without
+complaint -- pvr_power.c:625 returns early for domain_count <= 1 and the driver
+core attaches the single one itself (pmdomain/core.c:3275, power_on = true) --
+and `pmdomain-sunxi-pck600-read-the-boot-state` gives GPU_TOP GENPD_FLAG_ALWAYS_ON because it really is on at boot, so
+neither GPU domain sees a PWPR write in either direction. That is the guarantee
+upstream buys with GENPD_FLAG_ALWAYS_ON on GPU_CORE (b462a227d854), reached here
+without declaring an unpowered domain to be powered.
+
+⚠ Not a free lunch: nothing in the tree now describes GPU_CORE. That is the
+honest state -- it is a domain this controller cannot switch -- but it means a
+future consumer that expects genpd to power it will find nothing, and the comment
+below says so.
+
+VERIFICATION
+--------------------------------------------------------------------------------
+- applies: patch -p1 --fuzz=0 after `arm64-dts-a733-add-the-gpu-node-disabled`, `arm64-dts-a733-enable-the-gpu-at-the-vendor-s-operating-point` and `arm64-dts-a733-gpu-mem-clock-is-the-gpu-pll`.
+- builds: a test build of this series -- the kernel that produced the HW result below.
+- HW: proven 2026-09-07 on the 8 GiB board. The falsifier was fixed in advance
+  -- powervr must bind with no register write from userspace, reach "Initialized
+  powervr", and produce /dev/dri/renderD128 -- and it is met with nothing applied
+  by hand and no modprobe.blacklist on the command line: "[drm] Initialized
+  powervr 1.0.0 for 1800000.gpu on minor 1", /dev/dri/renderD128 present,
+  GPU_CORE PWSR = 0x8, PLL_GPU0 = 0xC9104500. The provider still names the domain
+  it cannot switch ("GPU_CORE" is not powered at boot) and the probe no longer
+  sees -110. A by-hand session on the board preceded this run.
+- A console log of that run was captured.
+
+Assisted-by: Claude
+---
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -2785,9 +2785,16 @@
+ 				 <&ccu CLK_BUS_GPU0>;
+ 			clock-names = "core", "mem", "sys";
+ 			resets = <&ccu RST_BUS_GPU0>;
+-			power-domains = <&pck600 PD_GPU_TOP>,
+-					<&pck600 PD_GPU_CORE>;
+-			power-domain-names = "a", "b";
++			/*
++			 * GPU_TOP only, and that is a statement about the
++			 * silicon: the PCK-600 does not switch GPU_CORE. That
++			 * domain follows the block -- it comes up when
++			 * PLL_GPU0 runs, GPU0_CLK is ungated with its source
++			 * committed through UPD, and the bus gate is on with
++			 * the reset released, which is what this driver's
++			 * runtime resume does before it touches a register.
++			 */
++			power-domains = <&pck600 PD_GPU_TOP>;
+ 			/*
+ 			 * ⚠ THE PARENT IS PINNED AND THAT IS A SAFETY
+ 			 * PROPERTY, NOT A PREFERENCE. Left alone, GPU0_CLK

@@ -1,0 +1,173 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: allwinner: A733 minimal — add SD (mmc0) and eMMC (mmc2)
+
+Milestone-2 storage. Adds the SD (SMHC0 @0x04020000, bank PF) and eMMC
+(SMHC2 @0x04022000, bank PC) controllers to the minimal A733 boot DT, plus
+two fixed always-on regulators for their supplies and the mmc pin groups.
+
+The controllers reuse the in-tree driver via the "allwinner,sun20i-d1-mmc"
+fallback compatible — no new driver code. They consume the SMHC module +
+bus-gate clocks and the BGR reset added by patch `clk-sunxi-ng-a733-add-smhc-pll-peri1-clocks`.
+
+Everything is from live silicon (raw sunxi_dump / regmap on the 6 GiB board SD and the 8 GiB board
+eMMC), not a vendor driver:
+ - pin groups: SD = PF0..PF5 @ mux 2 (PF_CFG0=0x0e222222); eMMC = the PC pins
+   at mux 3. Truth is the schematic (v1.10 p.7): the board wires a full 8-bit
+   eMMC, net EMMC-D7 -> PC16; the 8 GiB board silicon (PC_CFG2=0x3) confirms PC16 driven.
+   PC2/3/4/12 carry no eMMC net (correctly excluded). Card-detect: schematic
+   net SDC0-DET -> PF6/PF-EINT6 (p.7/p.13); the 8 GiB board silicon PF_CFG0=0x0e222222 ->
+   PF6 mux 0xe = EINT, as wired. cd-gpios = <&pio 5 6>: on our pinctrl (`pinctrl-sunxi-add-A733-sun60iw2-minimal-pio`)
+   banks count PA=0 so PF6 = pin 166 = bank 5 (the 6 GiB board pins: "pin 166 (PF6)",
+   "pin 134 (PE6)"). <&pio 4 6> would be PE6. The earlier "bank 4" came from
+   the 8 GiB board's vendor 6.6 pinctrl, which compacts banks (PB=0) -- a different
+   driver than this DT runs on; the driver only translates, the schematic decides.
+ - interrupts: mmc0 = GIC_SPI 161 (SMHC0, INTID 193), mmc2 = GIC_SPI 163
+   (SMHC2, INTID 195) -- from the interrupt list of the A733 user manual (UM-derived). The earlier
+   SPI 129/131 was WRONG (= INTID 161/163 = CSI_ISP0/CSI_ISP2 camera lines,
+   derived backwards from a the 8 GiB board /proc hwirq reading): the mmc completion IRQ
+   never fired, both controllers hung mid-attach with no enumeration. HW-proven
+   2026-07-18: with 161/163 the IRQ counts rise on I/O and SD + eMMC read.
+ - regulators: vmmc = 3.3 V (SWOUT2, AXP318 0x12=0x17), eMMC vqmmc = 1.8 V
+   (CLDO5, 0x33=0x0d) — both read = spec on both boards. Modelled as fixed
+   always-on: boot0/U-Boot bring the rails up before Linux, so no PMIC driver
+   is needed for M2. SD stays non-UHS (vqmmc fixed 3.3 V) until the AXP318
+   regulator lands (own later milestone); eMMC HS200 works (VCCQ static 1.8 V).
+
+eMMC is wired even though this unit may ship without it — per-board policy is
+to support the full SoC/board capability and let population decide; an eMMC
+board (the 8 GiB board) exists for the end-to-end HW proof.
+
+HW proof (boot to rootfs shell, card speed not "it booted") is pending — this
+is compile/dtc-gated only.
+
+Assisted-by: Claude
+---
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -12,12 +12,13 @@
+  * (earlyprintk=sunxi-uart,0x2500000).
+  */
+ /dts-v1/;
+ 
+ #include <dt-bindings/interrupt-controller/arm-gic.h>
+ #include <dt-bindings/clock/sun60i-a733-ccu.h>
++#include <dt-bindings/gpio/gpio.h>
+ #include <dt-bindings/reset/sun60i-a733-ccu.h>
+ 
+ / {
+ 	model = "Radxa Cubie A7S (A733 minimal M1)";
+ 	compatible = "radxa,cubie-a7s", "allwinner,sun60i-a733";
+ 	interrupt-parent = <&gic>;
+@@ -477,12 +478,28 @@
+ 		#clock-cells = <0>;
+ 		compatible = "fixed-clock";
+ 		clock-frequency = <26000000>;
+ 		clock-output-names = "dcxo26M";
+ 	};
+ 
++	reg_vcc3v3: regulator-vcc3v3 {
++		compatible = "regulator-fixed";
++		regulator-name = "vcc3v3";
++		regulator-min-microvolt = <3300000>;
++		regulator-max-microvolt = <3300000>;
++		regulator-always-on;
++	};
++
++	reg_vcc1v8: regulator-vcc1v8 {
++		compatible = "regulator-fixed";
++		regulator-name = "vcc1v8";
++		regulator-min-microvolt = <1800000>;
++		regulator-max-microvolt = <1800000>;
++		regulator-always-on;
++	};
++
+ 	memory@40000000 {
+ 		device_type = "memory";
+ 		/* Fallback 1 GiB; the bootloader fixes up the real size. */
+ 		reg = <0x0 0x40000000 0x0 0x40000000>;
+ 	};
+ 
+@@ -535,12 +552,27 @@
+ 
+ 			uart0_pb_pins: uart0-pb-pins {
+ 				pins = "PB9", "PB10";
+ 				allwinner,pinmux = <2>;
+ 				function = "uart0";
+ 			};
++
++			mmc0_pins: mmc0-pins {
++				pins = "PF0", "PF1", "PF2",
++				       "PF3", "PF4", "PF5";
++				allwinner,pinmux = <2>;
++				function = "mmc0";
++			};
++
++			mmc2_pins: mmc2-pins {
++				pins = "PC0", "PC1", "PC5", "PC6",
++				       "PC8", "PC9", "PC10", "PC11",
++				       "PC13", "PC14", "PC15", "PC16";
++				allwinner,pinmux = <3>;
++				function = "mmc2";
++			};
+ 		};
+ 
+ 		ccu: clock-controller@2002000 {
+ 			compatible = "allwinner,sun60i-a733-ccu";
+ 			reg = <0x0 0x02002000 0x0 0x2000>;
+ 			clocks = <&osc24M>, <&osc32k>, <&iosc>,
+@@ -690,8 +722,55 @@
+ 			clocks = <&ccu CLK_UART0>;
+ 			resets = <&ccu RST_BUS_UART0>;
+ 			pinctrl-names = "default";
+ 			pinctrl-0 = <&uart0_pb_pins>;
+ 			status = "okay";
+ 		};
++
++		mmc0: mmc@4020000 {
++			compatible = "allwinner,sun60i-a733-mmc",
++				     "allwinner,sun20i-d1-mmc";
++			reg = <0x0 0x04020000 0x0 0x1000>;
++			clocks = <&ccu CLK_BUS_SMHC0>, <&ccu CLK_SMHC0>;
++			clock-names = "ahb", "mmc";
++			resets = <&ccu RST_BUS_SMHC0>;
++			reset-names = "ahb";
++			interrupts = <GIC_SPI 161 IRQ_TYPE_LEVEL_HIGH>;
++			pinctrl-names = "default";
++			pinctrl-0 = <&mmc0_pins>;
++			vmmc-supply = <&reg_vcc3v3>;
++			vqmmc-supply = <&reg_vcc3v3>;
++			cd-gpios = <&pio 5 6 GPIO_ACTIVE_HIGH>;	/* PF6 = pin 166; card-in reads HIGH on this board */
++			bus-width = <4>;
++			max-frequency = <150000000>;
++			cap-sd-highspeed;
++			cap-mmc-highspeed;
++			#address-cells = <1>;
++			#size-cells = <0>;
++			status = "okay";
++		};
++
++		mmc2: mmc@4022000 {
++			compatible = "allwinner,sun60i-a733-mmc",
++				     "allwinner,sun20i-d1-mmc";
++			reg = <0x0 0x04022000 0x0 0x1000>;
++			clocks = <&ccu CLK_BUS_SMHC2>, <&ccu CLK_SMHC2>;
++			clock-names = "ahb", "mmc";
++			resets = <&ccu RST_BUS_SMHC2>;
++			reset-names = "ahb";
++			interrupts = <GIC_SPI 163 IRQ_TYPE_LEVEL_HIGH>;
++			pinctrl-names = "default";
++			pinctrl-0 = <&mmc2_pins>;
++			vmmc-supply = <&reg_vcc3v3>;
++			vqmmc-supply = <&reg_vcc1v8>;
++			bus-width = <8>;
++			max-frequency = <150000000>;
++			non-removable;
++			cap-mmc-highspeed;
++			mmc-hs200-1_8v;
++			cap-mmc-hw-reset;
++			#address-cells = <1>;
++			#size-cells = <0>;
++			status = "okay";
++		};
+ 	};
+ };

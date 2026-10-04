@@ -1,0 +1,168 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: a733: add the GPU node, disabled until a board says otherwise
+
+[Recipe cut: regenerated: context only, the NPU node it used to follow is
+not carried.]
+
+`clk-sunxi-ng-a733-gpu-pll-module-clock-bus-gates-and-reset` gave the CCU six GPU clocks and a reset that nothing references. This adds
+the node that references them. It lands with status = "disabled", which is the
+point of the patch rather than a caveat on it: the description is complete and
+reviewable, and two facts it depends on have not been read on our own silicon.
+
+WHY DISABLED, AND WHAT WOULD ENABLE IT
+--------------------------------------------------------------------------------
+1. THE FIRMWARE IS NAMED AFTER A BVNC WE HAVE NOT READ. drm/imagination loads
+   rogue_<BVNC>.fw. The BVNC 36.56.104.183 comes from this project's earlier
+   Armbian-based port of this board, not from a ROGUE_CR_CORE_ID__PBVNC read on
+   this SoC -- it is still an open question. Debian's firmware-misc-nonfree ships
+   36.53.104.796 and 33.15.11.3, neither of which is that file, so even a correct
+   guess would not be delivered by the distribution we build on. Enabling the
+   node before both are settled produces a probe failure every boot that looks
+   like a driver defect and is not one.
+2. THE POWER-DOMAIN INDICES ARE UNVERIFIED. The PCK-600 binding header says so
+   about itself: only PD_USB2 = 8 is silicon-confirmed, the other indices "follow
+   the A733 hardware domain map". A live block attached to the wrong domain index
+   power-manages a different block. PD_GPU_TOP = 5 and PD_GPU_CORE = 6 are
+   written here because they are what the map says, and the node is inert until
+   someone reads 0x07065008 and 0x07066008 against the GPU's state.
+
+⚠ POWER-DOMAINS IS EFFECTIVELY MANDATORY FOR THIS DRIVER AND THE BINDING DOES
+NOT SAY SO. pvr_probe() calls pvr_power_domains_init() before anything else;
+that function opens with of_count_phandle_with_args(np, "power-domains",
+"#power-domain-cells") and returns the value when it is negative, so a node
+without the property fails probe with -ENOENT (pvr_power.c:607-624). With
+exactly one domain it returns 0 early and the platform core attaches it; with
+two it attaches them by the names "a" and "b", which is the shape this SoC's
+TOP/CORE split needs. Dropping the property to "keep the node minimal" would
+therefore break the driver, quietly, in a way the schema does not predict.
+
+WHERE THE VALUES COME FROM
+--------------------------------------------------------------------------------
+  compatible  "img,img-bxm-4-64", "img,img-rogue" -- both are in
+              Documentation/devicetree/bindings/gpu/img,powervr-rogue.yaml, and
+              mainline's dt_match[] carries the generic "img,img-rogue"
+              (pvr_drv.c:1491-1498), so no SoC-specific string is needed and none
+              is invented. ⚠ The "ti,am62-gpu" carry that this project's earlier Armbian-based port used to
+              satisfy Mesa's hardcoded allowlist is deliberately NOT here: it is
+              obsolete from Mesa 26.1, which binds through drmGetVersion().
+  reg         0x01800000, 576K -- the memory map's whole GPU0 aperture
+              0x01800000-0x0188FFFF, group GPU_SYS (A733 user manual).
+  interrupts  INTID 95 -> GIC_SPI 63 (SPI = INTID - 32), vector 0x017C. The block has
+              one line: UM V1.00 Table 12-1 (PDF p. 615) leaves INTID 96 unnamed,
+              where V0.92 listed a GPU_DVFS source. The binding takes one
+              (interrupts: maxItems 1).
+  clocks      core = CLK_GPU0 (the module clock), mem = CLK_MBUS_GPU0 (the GPU's
+              MBUS port), sys = CLK_BUS_GPU0 (its own bus gate). The fourth gate,
+              the AHB matrix port, has no slot in a three-name binding and is
+              reached as bus-gpu0's parent -- `clk-sunxi-ng-a733-gpu-pll-module-clock-bus-gates-and-reset` carries that decision and its
+              falsifier.
+  resets      RST_BUS_GPU0, the single GPU0_GATING bit 16. Binding: maxItems 1,
+              and the hardware has exactly one.
+
+dma-coherent is deliberately absent. Whether this GPU's master port is coherent
+on this SoC is not established, and claiming it wrongly corrupts rendering in a
+way that reads as a driver bug. Non-coherent is the safe default.
+
+VERIFICATION
+--------------------------------------------------------------------------------
+- applies: patch -p1 --fuzz=0 clean in the full ordered series (local, 2026-08-27).
+- builds: DTC 0 warnings.
+- read back from the ARTEFACT, not the source: dtc -I dtb on
+  sun60i-a733-cubie-a7s-minimal.dtb shows gpu@1800000 with reg
+  <0x0 0x1800000 0x0 0x90000>, interrupts <0x0 0x3f 0x4> (SPI 63), clocks
+  <ccu 82>, <ccu 85>, <ccu 83> = CLK_GPU0 / CLK_MBUS_GPU0 / CLK_BUS_GPU0,
+  resets <ccu 31>, power-domains <pck600 5>, <pck600 6>, status "disabled".
+- ⚠ NOT hardware-proven, and cannot be: a disabled node binds nothing. The
+  enabling patch is board work and owes both falsifiers above.
+
+Assisted-by: Claude
+---
+
+diff --git a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -2723,6 +2723,84 @@ cpupll_ccu: clock-controller@8870000 {
+ 			clock-names = "dcxo";
+ 			#clock-cells = <1>;
+ 		};
++
++		/*
++		 * The GPU -- Imagination PowerVR B-Series BXM-4-64 MC1, named
++		 * as such in the UM and matched by mainline's
++		 * own drm/imagination through the generic "img,img-rogue"
++		 * (pvr_drv.c dt_match[]); no SoC-specific string is needed and
++		 * none is invented here.
++		 *
++		 * ⚠ THE NODE IS DISABLED ON PURPOSE, and the two reasons are
++		 * named rather than left to be discovered:
++		 *
++		 *   1. The firmware. drm/imagination loads a BVNC-named blob,
++		 *      and the BVNC this SoC needs is not established on our
++		 *      own silicon -- 36.56.104.183 comes from this project's
++		 *      earlier Armbian-based port, not from a ROGUE_CR_CORE_ID__PBVNC read here.
++		 *      Debian's
++		 *      firmware-misc-nonfree carries 36.53.104.796 and
++		 *      33.15.11.3, neither of which is that.
++		 *   2. The power domains below are UNVERIFIED indices. The
++		 *      PCK-600 header says so itself: only PD_USB2 = 8 is
++		 *      silicon-confirmed, the rest "follow the A733 hardware
++		 *      domain map". Attaching a live block to the wrong
++		 *      domain index power-manages a different block, so this
++		 *      node stays inert until both are read on a board.
++		 *
++		 * Falsifiers, both cheap once a board is in front of someone:
++		 * the domain status registers at 0x07060000 + N * 0x1000 + 0x8
++		 * (so 0x07065008 for TOP and 0x07066008 for CORE) must track
++		 * the GPU, and ROGUE_CR_CORE_ID__PBVNC must read the BVNC the
++		 * firmware file is named for.
++		 *
++		 * ⚠ power-domains IS EFFECTIVELY MANDATORY for this driver,
++		 * which the binding does not say. pvr_probe() calls
++		 * pvr_power_domains_init() before anything else, and that
++		 * function opens with of_count_phandle_with_args(...,
++		 * "power-domains", ...) and returns the count on a negative
++		 * value -- so a node WITHOUT the property fails probe with
++		 * -ENOENT. With exactly one domain it returns 0 early and the
++		 * platform core attaches it; with two it attaches them by the
++		 * names "a" and "b", which is what this SoC's TOP/CORE split
++		 * needs (pvr_power.c:607-660).
++		 *
++		 * WHERE THE VALUES COME FROM
++		 *
++		 *   reg     0x01800000, 576K -- the memory map's whole GPU0
++		 *           aperture, 0x01800000-0x0188FFFF, group GPU_SYS
++		 *          .
++		 *   interrupts  INTID 95 -> GIC_SPI 63 (SPI = INTID - 32),
++		 *           vector 0x017C (
++		 *           A733 user manual). The block has one line: UM
++		 *           V1.00 Table 12-1 leaves INTID 96 unnamed. The
++		 *           binding takes one (interrupts: maxItems 1).
++		 *   clocks  core = the module clock, mem = the GPU's MBUS
++		 *           port, sys = its own bus gate. The fourth gate,
++		 *           the AHB matrix port, has no slot in a three-name
++		 *           binding and is reached as bus-gpu0's parent; the
++		 *           CCU patch carries that decision and its falsifier.
++		 *   resets  the single GPU0_GATING bit 16 (binding: maxItems
++		 *           1, and the hardware has exactly one).
++		 *
++		 * dma-coherent is deliberately absent: whether the GPU's
++		 * master port is coherent on this SoC is not established, and
++		 * claiming it wrongly corrupts rendering in a way that looks
++		 * like a driver bug. Non-coherent is the safe default.
++		 */
++		gpu: gpu@1800000 {
++			compatible = "img,img-bxm-4-64", "img,img-rogue";
++			reg = <0x0 0x01800000 0x0 0x90000>;
++			interrupts = <GIC_SPI 63 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&ccu CLK_GPU0>, <&ccu CLK_MBUS_GPU0>,
++				 <&ccu CLK_BUS_GPU0>;
++			clock-names = "core", "mem", "sys";
++			resets = <&ccu RST_BUS_GPU0>;
++			power-domains = <&pck600 PD_GPU_TOP>,
++					<&pck600 PD_GPU_CORE>;
++			power-domain-names = "a", "b";
++			status = "disabled";
++		};
+ 	};
+ };
+ 

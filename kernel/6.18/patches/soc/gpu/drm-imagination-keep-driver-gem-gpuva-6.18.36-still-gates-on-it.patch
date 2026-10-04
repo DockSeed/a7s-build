@@ -1,0 +1,48 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] drm/imagination: keep DRIVER_GEM_GPUVA -- 6.18.36 still gates on it
+
+The mainline driver imported by `drm-imagination-carry-the-mainline-driver` does not set DRIVER_GEM_GPUVA. That is
+correct upstream and wrong here, and the difference is one line of drm core:
+
+  mainline  drm_gem.c:235   drm_gem_gpuva_init(obj);
+  6.18.36   drm_gem.c:195   if (drm_core_check_feature(dev, DRIVER_GEM_GPUVA))
+                                    drm_gem_gpuva_init(obj);
+
+Upstream made the init unconditional and then dropped the now-pointless flag
+from pvr_drv.c. Importing that file into 6.18.36 therefore leaves
+obj->gpuva.list with .next == NULL for every PowerVR GEM object.
+
+MEASURED, not reasoned backwards from: a run on the 8 GiB board, first ioctl that
+walks the list:
+
+  Unable to handle kernel paging request at virtual address ffffffffffffffd8
+  pc : drm_gpuvm_bo_obtain_locked+0x4c/0x16c [drm_gpuvm]
+  lr : pvr_vm_map+0xf8/0x2bc [powervr]
+  x19: ffffffffffffffd8
+
+0xffffffffffffffd8 is NULL - 0x28, and 0x28 is offsetof(struct drm_gpuvm_bo,
+list.entry.gem) -- i.e. list_for_each_entry() in drm_gpuvm_bo_find() doing
+container_of() on a NULL list head. Not a corrupted pointer: an uninitialised
+one.
+
+Blast radius of the flag in this tree is exactly two call sites,
+drm_gem.c:195 and the "gpuvas" debugfs node (drm_debugfs.h:51). No other
+driver's behaviour changes.
+
+The alternative -- backporting the drm core change that makes the init
+unconditional -- would touch every DRM driver in the tree to fix one. This
+does not.
+
+Assisted-by: Claude
+
+--- a/drivers/gpu/drm/imagination/pvr_drv.c
++++ b/drivers/gpu/drm/imagination/pvr_drv.c
+@@ -1379,7 +1379,7 @@
+ DEFINE_DRM_GEM_FOPS(pvr_drm_driver_fops);
+ 
+ static struct drm_driver pvr_drm_driver = {
+-	.driver_features = DRIVER_GEM | DRIVER_RENDER |
++	.driver_features = DRIVER_GEM | DRIVER_GEM_GPUVA | DRIVER_RENDER |
+ 			   DRIVER_SYNCOBJ | DRIVER_SYNCOBJ_TIMELINE,
+ 	.open = pvr_drm_driver_open,
+ 	.postclose = pvr_drm_driver_postclose,

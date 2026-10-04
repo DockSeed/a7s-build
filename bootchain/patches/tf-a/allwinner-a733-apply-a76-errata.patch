@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Sat, 3 Oct 2026 17:13:14 +0200
+Subject: [PATCH] fix(allwinner): A733: apply Cortex-A76 errata
+
+The A733's two big cores read MIDR_EL1 0x414fd0b1, Cortex-A76 r4p1. The
+platform enabled no A76 erratum. Four items of the Arm Cortex-A76
+Software Developer Errata Notice (SDEN-885749) are present in r4p1 and
+open, and TF-A carries a workaround for each behind a flag that
+defaults to 0:
+
+- 1946160 (Cat B), "Atomic instructions with acquire semantics might
+  not be ordered with respect to older stores with release semantics":
+  the reset handler programs three instruction-patch slots
+  (S3_6_C15_C8_0..3) so the core inserts a DMB ST before an acquire
+  atomic without release semantics. It runs on the cold boot and on
+  every wake from power-down.
+- 2743102 (Cat B), "The core might deadlock during powerdown sequence":
+  a DSB before the ISB that follows CPUPWRCTLR_EL1.CORE_PWRDN_EN in
+  cortex_a76_core_pwr_dwn. With native CPU_SUSPEND that sequence runs on
+  every A76 deep-idle entry, not only on CPU_OFF.
+- 2356586 (Cat B), "Continuous failing STREX because of another PE
+  executing prefetch for store behind consistently mispredicted branch":
+  the reset handler sets CPUACTLR2_EL1[0], so PLDW / PRFM PST behave like
+  PLD / PRFM PLD. Arm notes a small slowdown for some workloads that
+  share data.
+- 4193800 = CVE-2025-10263 (Cat B), "Completion of affected memory
+  accesses might not be guaranteed by completion of a TLBI": software
+  that issues a broadcast TLBI must follow it with one more TLBI and DSB,
+  and if any core in the system is affected, all of them must, hence a
+  platform flag. In this BL31 it changes nothing that runs: the xlat
+  TLBI path is compiled only with PLAT_XLAT_TABLES_DYNAMIC, which the
+  A733 does not set, so the linked BL31 has no broadcast TLBI. It is on
+  so a future one is covered and the errata report is true. Linux does
+  its own side (ARM64_ERRATUM_4118414).
+
+cortex_a76.S checks the revision at run time, so the A55 cores never run
+any of these. The A55 erratum 1530923 stays on; the A55 cores are r2p0,
+and no other A55 erratum applies to r2p0.
+
+The vendor BL31 is a blob (v2.5), built before most of these
+workarounds existed; whether it applies any cannot be checked.
+
+Assisted-by: Claude
+---
+ plat/allwinner/sun60i_a733/platform.mk | 27 ++++++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/plat/allwinner/sun60i_a733/platform.mk b/plat/allwinner/sun60i_a733/platform.mk
+index f57854e34..a18b4cd64 100644
+--- a/plat/allwinner/sun60i_a733/platform.mk
++++ b/plat/allwinner/sun60i_a733/platform.mk
+@@ -61,6 +61,33 @@ BL31_SOURCES		+=	${AW_PLAT}/${PLAT}/sunxi_cpu_back_pll.c
+ # Cortex-A55 r2p0
+ ERRATA_A55_1530923	:=	1
+ 
++# Cortex-A76 errata open on the A733's big cores, r4p1 (MIDR_EL1 0x414fd0b1),
++# from the Arm Cortex-A76 Software Developer Errata Notice SDEN-885749.
++# cortex_a76.S checks the revision, so each is applied only where it matches.
++#   1946160 (Cat B): an atomic with acquire semantics might not be ordered
++#     against an older store with release semantics. The reset handler
++#     programs three instruction-patch slots (S3_6_C15_C8_0-3) that insert a
++#     DMB ST before acquire atomics without release semantics.
++#   2743102 (Cat B): the core might deadlock in the hardware cache flush of
++#     its power-down sequence. A DSB before the ISB that follows
++#     CPUPWRCTLR_EL1.CORE_PWRDN_EN in cortex_a76_core_pwr_dwn, which runs on
++#     every A76 CPU_SUSPEND power-down and on CPU_OFF.
++#   2356586 (Cat B): continuous failing STREX because another PE executes a
++#     prefetch for store behind a consistently mispredicted branch. The
++#     reset handler sets CPUACTLR2_EL1[0], so PLDW / PRFM PST behave like
++#     PLD / PRFM PLD.
++#   4193800 = CVE-2025-10263 (Cat B): completion of affected memory accesses
++#     might not be guaranteed by completion of a TLBI; software that issues a
++#     broadcast TLBI must repeat TLBI + DSB. Platform wide, because one
++#     affected core in the system is enough. In this BL31 there is no
++#     broadcast TLBI (the xlat TLBI path needs PLAT_XLAT_TABLES_DYNAMIC), so
++#     it is on to keep any future one covered.
++# The A55 cores are r2p0; no other A55 erratum applies to r2p0.
++ERRATA_A76_1946160		:=	1
++ERRATA_A76_2743102		:=	1
++ERRATA_A76_2356586		:=	1
++WORKAROUND_CVE_2025_10263	:=	1
++
+ USE_COHERENT_MEM		:=	0
+ WARMBOOT_ENABLE_DCACHE_EARLY	:=	1
+ HW_ASSISTED_COHERENCY		:=	1

@@ -1,0 +1,548 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Fri, 2 Oct 2026 08:00:00 +0200
+Subject: [PATCH] drm/a733: dp: DisplayPort audio through DRM_BRIDGE_OP_DP_AUDIO
+
+WHAT
+The A733 DisplayPort transmitter (Trilinear DP 1.4, 0x05740000) has an audio
+half, the SEC0 block, UM 15.4.7.65-87 (0x0900-0x0958). This patch drives it from
+the bridge: DRM_BRIDGE_OP_DP_AUDIO with dp_audio_startup / prepare / shutdown /
+mute_stream, hdmi_audio_dev = the DP device, 8 I2S channels, dai_port -1.
+drm_bridge_connector then registers an hdmi-codec under the DP node
+(drm_hdmi_audio_helper.c:184) and a simple-audio-card reaches it as
+`sound-dai = <&edp0>` (the component's of_node is its parent's,
+soc-core.c:827-835). The CPU side is I2S3 (UM ch17 assigns it to HDMI or eDP).
+
+WHERE EVERY VALUE COMES FROM
+Sequence (15.4.7.65: control registers set first, enable last):
+  0x0900 AUDIO_ENABLE        <- 0x2 (mute, packets off; UM reset value; also the
+                                only clear of FIFO overflow, 15.4.7.87)
+  0x0904 AUDIO_INPUT_SELECT  <- 0, "00 = I2S" (15.4.7.66)
+  0x0908 CHANNEL_COUNT       <- 0x2 / 0x3 (2ch+LFE) / 0x6 / 0x8 (15.4.7.67);
+                                other counts are refused: the UM lists no code
+  0x0920 AUDIO_CLOCK_MODE    <- 0, asynchronous (15.4.7.73); MAUD/NAUD (0x0918,
+                                0x091C) only matter in synchronous mode
+                                (15.4.7.71/72) and are not written -> no rate
+                                table, no link-rate dependency
+  0x0954 AUDIO_CHANNEL_MAP   <- 0x76543210 identity (15.4.7.86, values 0-7)
+  0x0940-0x094C channel status <- fields of hparms->iec.status, bit positions
+                                named by the UM (15.4.7.81-84), byte layout from
+                                include/sound/asoundef.h
+  0x0934/0x0938/0x0914/0x0910 audio InfoFrame via
+                                hdmi_audio_infoframe_pack_for_dp(), version 0x11
+                                (mtk_dp.c:52, msm/dp/dp_audio.c:68)
+  0x0900 AUDIO_ENABLE        <- 0x3 (packets on, still muted)
+  .mute_stream: 0x1 / 0x3 (AUDIO_MUTE = VBID mute bit, 15.4.7.65)
+  .shutdown: 0x2, InfoFrame enable bit cleared.
+Callback contract and bridge fields: include/drm/drm_bridge.h:812-870,
+drm_bridge_connector.c:455-549, 718-732, 797-815; same wiring as
+msm/dp/dp_drm.c:329-335 and rockchip/cdn-dp-core.c:1003-1009.
+zynqmp_dp_audio.c / zynqmp_dp.c:1383-1415 (register-similar core) is an ASoC
+DAI with its own DMA, not a bridge: only its order (channels, clocks, one
+enable write last) is borrowed.
+Presence check: CORE_CAPABILITIES (0x00F8) AUDIO_PRESENT bit 9 (UM 15.4.7).
+Kconfig: select DRM_DISPLAY_HDMI_AUDIO_HELPER, imply SND_SOC_HDMI_CODEC
+(imply, not select: this driver is =y, SND_SOC is =m on the product kernel).
+
+WHAT THIS COVERS THAT THE VENDOR DRIVER DOES NOT, AND WHERE IT DIFFERS
+(trilinear_dp14.c:1009-1100, sunxi_drm_edp.c:4918-4988)
+ - Vendor runs synchronous mode with a MAUD/NAUD table for 1.62 and 2.7 Gb/s.
+   The UM offers asynchronous mode; this takes it. The vendor table also has a
+   row labelled 90600 Hz whose M/N are those of 96 kHz.
+ - Vendor audio_disable() sets bit 1 (the MUTE bit) of AUDIO_ENABLE and never
+   clears the packet-enable bit 0: "disable" is a mute.
+ - Vendor writes CHANNEL_COUNT 0x3 for stereo ("fix some displayport panel no
+   audio ouput issue") although 0x3 is 2ch+LFE in the UM and 0x2 is stereo; it
+   maps 5 channels to 0x6, any other count to 0x8. Not ported: this takes the
+   UM codes and refuses counts the UM has no code for.
+ - Vendor never writes the audio InfoFrame, channel status or channel map.
+ - Vendor supports SPDIF input (source 3 = "OWA, future enhancement" in the UM);
+   not ported, I2S only.
+ - The I2S3/I2S4 -> eDP source select is NOT ported (see below).
+
+VENDOR-ONLY, TO BE READ BACK ON SILICON
+Nothing in the driver is vendor-only. The one vendor-only fact is deliberately
+not in code: SYSCFG 0x0300023C bit 0 (EDP_I2S_SEL, snd_sun60iw2_syscfg.c:30-47)
+with enum text {"I2S3","I2S4"}, i.e. 0 = I2S3, 1 = I2S4. The UM has no such
+register (grep of the whole UM text: nothing). Not implemented because I2S3 is
+the path this patch wires and, if the reset value is 0, the default already
+selects it. If `devmem 0x0300023C` reads bit 0 = 1 at boot, I2S3 audio will
+not arrive: that is the trigger to add a syscon property and one
+regmap_update_bits(); until then a write would only be an unproven guess.
+Needed for I2S4 (2-lane, max 4 channels) only.
+
+VERIFIED
+Applies on the 6.18.54 series and builds warning-free:
+  make drivers/gpu/drm/sun60i/ allwinner/sun60i-a733-cubie-a7s-minimal.dtb W=1
+Nothing else. Never run on hardware; the bridge callbacks have never been
+reached, because no hdmi-codec is registered without a KMS driver.
+
+OWED ON SILICON
+ 1. CORE_CAPABILITIES (0x057400F8) bit 9 reads 1 with the block enabled (UM
+    default 0x01441f04).
+ 2. `devmem 0x0300023C` bit 0 == 0 (I2S3 selected): READ 2026-10-02 on
+    the 8 GiB board, our 6.18.54 kernel, no sink: 0x00000000, so the reset state selects
+    I2S3 and no write is needed for this path.
+ 3. With a sink that has speakers: EDID CEA audio block / drm connector ELD
+    non-empty (/proc/asound/cardN/eld#0.0), then `speaker-test -c2 -r48000`.
+    After prepare: 0x0900 reads 0x3, 0x0904 0, 0x0908 2, 0x0920 0, 0x0954
+    0x76543210; after unmute 0x0900 = 0x1; 0x0958 stays 0 (overflow);
+    0x095C SEC0_PACKET_COUNT counts up.
+ 4. Asynchronous clock mode actually produces sound. If not:
+    devmem 0x05740918 32 512; devmem 0x0574091c 32 5625; devmem 0x05740920 32 1
+    (48 kHz at 2.7 Gb/s, DP 1.4 2.2.5.2.2; 44.1 kHz = 784/9375).
+ 5. The audio InfoFrame byte layout: the UM does not say whether HB0-HB3 are part
+    of the bytes written to SDP_BUFFER_DATA, nor the slot length; slot 0 is this
+    driver's choice. Check on the sink (e.g. a DP analyzer or the monitor's
+    speaker allocation); the audio stream itself does not depend on it.
+ 6. Channel map: identity written; if L/R arrive swapped or all on one speaker,
+    the reset value 0 was a bypass and the write is the culprit.
+ 7. SEC0_CS_COPYRIGHT / CS_USER_DATA left at 0 (polarity of the copyright bit is
+    unspecified).
+ 8. Channels 3/6/8 need TDM layout on I2S3's four lanes; the card declares
+    stereo only. Untested.
+ 9. A modeset with a running stream: the SEC0 registers survive a video soft
+    reset (15.4.7.15: the register set is unaffected) but not aux_disable (reset);
+    after a hot-plug the stream must be re-prepared (audio_on is cleared).
+10. I2S3 clocking: the DP core is the I2S slave; I2S3 must be bit/frame master.
+    How the core derives its audio clock in asynchronous mode (BCLK, LRCK or a
+    separate pin) is not stated in the UM.
+
+Assisted-by: Claude
+---
+
+diff --git a/drivers/gpu/drm/sun60i/Kconfig b/drivers/gpu/drm/sun60i/Kconfig
+--- a/drivers/gpu/drm/sun60i/Kconfig
++++ b/drivers/gpu/drm/sun60i/Kconfig
+@@ -24,6 +24,15 @@ config DRM_SUN60I_DP
+ 	# by construction and the select needs no condition.
+ 	select DRM_AUX_HPD_BRIDGE
+ 	select GENERIC_PHY
++	# DRM_BRIDGE_OP_DP_AUDIO: drm_bridge_connector registers an hdmi-codec
++	# through the helper below. The codec itself is a platform driver found
++	# by name at run time, so it is imply, not select: this driver is
++	# built in on the product kernel and SND_SOC is a module there, and a
++	# select of a symbol that depends on SND_SOC from a =y symbol is an
++	# unmet-dependency warning (mainline's `select ... if SND_SOC` idiom has
++	# the same hole, rockchip/Kconfig:20).
++	select DRM_DISPLAY_HDMI_AUDIO_HELPER
++	imply SND_SOC_HDMI_CODEC
+ 	help
+ 	  Enable this for the DisplayPort transmitter of the Allwinner A733
+ 	  (sun60iw2): the AUX channel that carries DPCD and EDID, the main link
+diff --git a/drivers/gpu/drm/sun60i/sun60i-dp.c b/drivers/gpu/drm/sun60i/sun60i-dp.c
+--- a/drivers/gpu/drm/sun60i/sun60i-dp.c
++++ b/drivers/gpu/drm/sun60i/sun60i-dp.c
+@@ -64,6 +64,7 @@
+ #include <linux/clk.h>
+ #include <linux/debugfs.h>
+ #include <linux/delay.h>
++#include <linux/hdmi.h>
+ #include <linux/i2c.h>
+ #include <linux/io.h>
+ #include <linux/iopoll.h>
+@@ -81,6 +82,9 @@
+ #include <linux/uaccess.h>
+ #include <linux/unaligned.h>
+ 
++#include <sound/asoundef.h>
++#include <sound/hdmi-codec.h>
++
+ #include <drm/bridge/aux-bridge.h>
+ #include <drm/display/drm_dp.h>
+ #include <drm/display/drm_dp_helper.h>
+@@ -180,6 +184,63 @@ static const unsigned int sun60i_dp_link_rates[] = { 810000, 540000, 270000, 162
+ #define DP_INPUT_SOURCE_ENABLE		0x0094		/* 15.4.7.16 */
+ #define  INPUT_SOURCE_ENABLE_SST	BIT(0)		/* "only bit 0 is valid" */
+ 
++/*
++ * Audio: the SEC0 block, UM 15.4.7.65-87 (register list 15.4.6, "SEC0_AUDIO_*"
++ * at 0x0900-0x0958). Field names are the UM's own.
++ */
++#define DP_CORE_CAPABILITIES		0x00f8		/* 15.4.7, read-only */
++#define  CORE_CAP_AUDIO_PRESENT		BIT(9)		/* "AUDIO_PRESENT" */
++#define DP_SEC0_AUDIO_ENABLE		0x0900		/* 15.4.7.65, reset 0x2 */
++#define  SEC0_AUDIO_PACKET_ENABLE	BIT(0)
++#define  SEC0_AUDIO_MUTE		BIT(1)		/* the VBID audio-mute bit */
++#define DP_SEC0_AUDIO_INPUT_SELECT	0x0904		/* 15.4.7.66 */
++#define  SEC0_AUDIO_SRC_MASK		GENMASK(1, 0)
++#define  SEC0_AUDIO_SRC_I2S		0		/* "00 = I2S" */
++#define DP_SEC0_CHANNEL_COUNT		0x0908		/* 15.4.7.67 */
++#define  SEC0_CHANNEL_COUNT_MASK	GENMASK(3, 0)
++#define DP_SEC0_INFOFRAME_ENABLE	0x0910		/* 15.4.7.69, bits 6:0 */
++#define DP_SEC0_INFOFRAME_RATE		0x0914		/* 15.4.7.70, bits 6:0 */
++#define DP_SEC0_AUDIO_CLOCK_MODE	0x0920		/* 15.4.7.73 */
++#define  SEC0_AUDIO_CLOCK_ASYNC		0		/* "0 ... asynchronous" */
++#define DP_SEC0_INFOFRAME_SELECT	0x0934		/* 15.4.7.78 */
++#define DP_SEC0_SDP_BUFFER_DATA		0x0938		/* 15.4.7.79 */
++#define DP_SEC0_CS_SOURCE_FORMAT	0x0940		/* 15.4.7.81 */
++#define  CS_SOURCE_NUMBER		GENMASK(7, 4)
++#define  CS_LINEAR_PCM			BIT(3)		/* 0 = linear PCM */
++#define  CS_PCM_AUDIO_FORMAT		GENMASK(2, 0)	/* CS bits 5-3 */
++#define DP_SEC0_CS_CATEGORY_CODE	0x0944		/* 15.4.7.82 */
++#define DP_SEC0_CS_LENGTH_ORIG_FREQ	0x0948		/* 15.4.7.83 */
++#define  CS_SAMPLE_WORD_LENGTH		GENMASK(7, 4)	/* CS bits 32-35 */
++#define  CS_ORIG_SAMPLING_FREQ		GENMASK(3, 0)	/* CS bits 36-39 */
++#define DP_SEC0_CS_FREQ_CLOCK_ACCURACY	0x094c		/* 15.4.7.84 */
++#define  CS_SAMPLING_FREQ		GENMASK(7, 4)	/* CS bits 24-27 */
++#define  CS_CLOCK_ACCURACY		GENMASK(3, 0)	/* CS bits 28-29 */
++#define DP_SEC0_AUDIO_CHANNEL_MAP	0x0954		/* 15.4.7.86 */
++#define  SEC0_CHANNEL_MAP_IDENTITY	0x76543210	/* CHANNEL_n_MAP = n */
++#define DP_SEC0_AUDIO_FIFO_OVERFLOW	0x0958		/* 15.4.7.87, read-only */
++
++/*
++ * SEC0_CHANNEL_COUNT[3:0], UM 15.4.7.67: 0010 = 2 ch, 0011 = 2 ch + LFE,
++ * 0110 = 5.1, 1000 = 7.1. Those are the only codes the UM lists, so
++ * those are the only counts accepted: 2, 3 (2.1), 6 and 8.
++ */
++#define SEC0_CHANNELS_2			0x2
++#define SEC0_CHANNELS_2_LFE		0x3
++#define SEC0_CHANNELS_6			0x6
++#define SEC0_CHANNELS_8			0x8
++
++/*
++ * Which of the seven generic-SDP slots (SEC0_INFOFRAME_SELECT "valid values 0
++ * through 6", 15.4.7.78) carries the audio InfoFrame. The UM gives the slots no
++ * meaning, so 0 is this driver's own choice, not a documented assignment.
++ */
++#define SEC0_INFOFRAME_AUDIO		0
++
++/* DP audio InfoFrame SDP header version, HB3 bits 7:2 (mtk_dp.c:52 and
++ * msm/dp/dp_audio.c:68 both use 0x11 for DP 1.4).
++ */
++#define SUN60I_DP_SDP_VERSION		0x11
++
+ /*
+  * ⚠ 0x0800 and 0x0804 have NO ROW in the UM's register list: 15.4.6 runs from
+  * CORE_ID at 0x00FC straight to SRC0_SECONDARY_DATA_WINDOW at 0x0808. They are
+@@ -375,6 +436,11 @@ struct sun60i_dp {
+ 	u8			bpc;
+ 	bool			video_configured;
+ 	bool			video_on;
++	/* An audio stream has been programmed by dp_audio_prepare and not shut
++	 * down; .mute_stream only touches the core while it is true. Guarded
++	 * by dp->lock like every field here.
++	 */
++	bool			audio_on;
+ 	/* The KMS half. Not a pointer: devm_drm_bridge_alloc() allocates this
+ 	 * whole struct with the bridge embedded in it, which is why the
+ 	 * container_of() below is the standard shape for a bridge driver.
+@@ -1328,6 +1394,10 @@ static void sun60i_dp_aux_disable(struct sun60i_dp *dp)
+ 	drm_dp_dpcd_set_powered(&dp->aux, false);
+ 
+ 	sun60i_dp_video_disable(dp);
++	/* The block is about to be reset, which takes the SEC0 programming with
++	 * it: an audio stream that survives this has to be prepared again.
++	 */
++	dp->audio_on = false;
+ 	sun60i_dp_link_release(dp);
+ 	/* Only the adapter this function's counterpart added. The core's one
+ 	 * outlives an aux_enable cycle and is removed by .detach.
+@@ -2913,6 +2983,274 @@ static void sun60i_dp_bridge_detach(struct drm_bridge *bridge)
+ 	sun60i_dp_aux_unregister_locked(dp);
+ }
+ 
++/*
++ * AUDIO, as a DRM_BRIDGE_OP_DP_AUDIO bridge: drm_bridge_connector registers an
++ * hdmi-codec under this device (drm_hdmi_audio_helper.c:184, parent =
++ * bridge->hdmi_audio_dev) and forwards its startup / prepare / shutdown /
++ * mute_stream here (drm_bridge_connector.c:455-549). The codec's DAI is what
++ * a simple-audio-card names with `sound-dai = <&edp0>`: the component's of_node
++ * is its parent device's (soc-core.c:827-835). The CPU side is I2S3, which the
++ * UM assigns to HDMI or eDP (ch17) and which reaches this
++ * core over an internal wire, not a pad.
++ *
++ * Mainline's own DP audio bridges are the model for the callback contract
++ * (msm/dp/dp_audio.c, mediatek/mtk_dp.c, rockchip/cdn-dp-core.c) but none of
++ * them has this register file, and zynqmp_dp_audio.c, whose core is
++ * register-similar (AUDIO_CONTROL / AUDIO_CHANNELS / M_AUD / N_AUD,
++ * zynqmp_dp.c:1383-1415), is an ASoC DAI driver with its own DMA and not a
++ * bridge, so only its shape is borrowed: channels, then clocks, then one
++ * enable write, and the enable write last.
++ *
++ * THE SEQUENCE, from the UM. 15.4.7.65: the control registers have to be
++ * programmed before the secondary-channel audio is enabled, so
++ * SEC0_AUDIO_ENABLE is written last. Before: 0x0904 source = I2S, 0x0908
++ * channel count, 0x0920 clock mode, 0x0954 channel map, 0x0940-0x094c channel
++ * status, then the InfoFrame (0x0934 select, 0x0938 bytes, 0x0914 rate, 0x0910
++ * enable).
++ *
++ * CLOCK MODE. 15.4.7.73 offers asynchronous mode (0, the reset value) and
++ * 15.4.7.71/72 say MAUD/NAUD matter only when the audio clock generation is
++ * in synchronous mode. Asynchronous is therefore chosen and
++ * MAUD/NAUD are not written: no rate table, no dependency on the link rate.
++ * The vendor does the opposite -- synchronous mode with a 2.7/1.62 Gb/s table
++ * (trilinear_dp14.c:57-80, :1056-1066) -- and that table has a typo (a "90600"
++ * row whose M/N are 96 kHz's). If asynchronous mode produces no sound on
++ * silicon, the fallback needs no rebuild: DP 1.4 section 2.2.5.2.2 gives
++ * Maud/Naud = 512 * fs / link-symbol-clock reduced (48 kHz at 2.7 Gb/s is
++ * 512/5625, 44.1 kHz is 784/9375, matching the vendor's rows),
++ * `devmem 0x05740918 32 512; devmem 0x0574091c 32 5625; devmem 0x05740920 32 1`.
++ */
++static int sun60i_dp_audio_channel_code(unsigned int channels)
++{
++	switch (channels) {
++	case 2:
++		return SEC0_CHANNELS_2;
++	case 3:
++		return SEC0_CHANNELS_2_LFE;
++	case 6:
++		return SEC0_CHANNELS_6;
++	case 8:
++		return SEC0_CHANNELS_8;
++	default:
++		return -EINVAL;
++	}
++}
++
++/*
++ * Channel status, UM 15.4.7.81-84. The UM names each field by its IEC 60958-3
++ * channel-status bit numbers; the byte layout of the same bits in
++ * struct snd_aes_iec958 is include/sound/asoundef.h's, and hdmi-codec fills it
++ * from the stream parameters (snd_pcm_create_iec958_consumer_hw_params()).
++ *
++ * Not written: SEC0_CS_COPYRIGHT (0x0950) and SEC0_CS_USER_DATA (0x0960). The
++ * UM does not say whether register bit 0 is the channel-status bit 2 itself
++ * (0 = copyright asserted) or an "asserted" flag (1 = asserted), and a wrong
++ * guess flips the assertion. They stay at their reset value, 0.
++ */
++static void sun60i_dp_audio_channel_status(struct sun60i_dp *dp, const u8 *cs)
++{
++	writel(FIELD_PREP(CS_SOURCE_NUMBER, cs[2] & 0xf) |
++	       FIELD_PREP(CS_LINEAR_PCM, !!(cs[0] & IEC958_AES0_NONAUDIO)) |
++	       FIELD_PREP(CS_PCM_AUDIO_FORMAT,
++			  (cs[0] & IEC958_AES0_CON_EMPHASIS) >> 3),
++	       dp->base + DP_SEC0_CS_SOURCE_FORMAT);
++	writel(cs[1], dp->base + DP_SEC0_CS_CATEGORY_CODE);
++	writel(FIELD_PREP(CS_SAMPLE_WORD_LENGTH, cs[4] & 0xf) |
++	       FIELD_PREP(CS_ORIG_SAMPLING_FREQ, cs[4] >> 4),
++	       dp->base + DP_SEC0_CS_LENGTH_ORIG_FREQ);
++	writel(FIELD_PREP(CS_SAMPLING_FREQ, cs[3] & 0xf) |
++	       FIELD_PREP(CS_CLOCK_ACCURACY,
++			  (cs[3] & IEC958_AES3_CON_CLOCK) >> 4),
++	       dp->base + DP_SEC0_CS_FREQ_CLOCK_ACCURACY);
++}
++
++/*
++ * The audio InfoFrame, through the generic-SDP mechanism of UM 15.4.7.69,
++ * .70, .78 and .79: clear the slot's enable bit, select the slot (which
++ * points the SRAM offset at the first byte of the chosen
++ * packet), stream the bytes into SDP_BUFFER_DATA, then set the rate bit
++ * (continuous, once per frame) and the enable bit.
++ *
++ * ⚠ THE UM DOES NOT SAY WHAT THE BYTES ARE. It only names the data register as
++ * the byte written into the SDP SRAM, and is silent on whether HB0-HB3 are part of
++ * what is written, or on how long a slot is. This writes what
++ * hdmi_audio_infoframe_pack_for_dp() produces -- header, then payload, 14
++ * bytes -- which is the layout every mainline DP SDP register file takes
++ * (mtk_dp_setup_sdp_aui(), msm_dp_audio_setup_sdp()), and writes no more than
++ * the packet so that a short slot is not overrun. Unproven here, owed on
++ * silicon; the vendor driver never writes an audio InfoFrame at all
++ * (trilinear_dp14.c:1091-1099), so it is no evidence either way. A sink that
++ * rejects the packet loses the speaker allocation, not the audio: the audio
++ * stream packets carry their own channel count.
++ */
++static int sun60i_dp_audio_infoframe(struct sun60i_dp *dp,
++				     const struct hdmi_audio_infoframe *frame)
++{
++	struct dp_sdp sdp = {};
++	ssize_t len;
++	u32 val;
++	int i;
++
++	len = hdmi_audio_infoframe_pack_for_dp(frame, &sdp, SUN60I_DP_SDP_VERSION);
++	if (len < 0)
++		return len;
++
++	val = readl(dp->base + DP_SEC0_INFOFRAME_ENABLE);
++	writel(val & ~BIT(SEC0_INFOFRAME_AUDIO),
++	       dp->base + DP_SEC0_INFOFRAME_ENABLE);
++
++	writel(SEC0_INFOFRAME_AUDIO, dp->base + DP_SEC0_INFOFRAME_SELECT);
++	for (i = 0; i < len; i++)
++		writel(((const u8 *)&sdp)[i], dp->base + DP_SEC0_SDP_BUFFER_DATA);
++
++	val = readl(dp->base + DP_SEC0_INFOFRAME_RATE);
++	writel(val | BIT(SEC0_INFOFRAME_AUDIO),
++	       dp->base + DP_SEC0_INFOFRAME_RATE);
++	val = readl(dp->base + DP_SEC0_INFOFRAME_ENABLE);
++	writel(val | BIT(SEC0_INFOFRAME_AUDIO),
++	       dp->base + DP_SEC0_INFOFRAME_ENABLE);
++
++	return 0;
++}
++
++/*
++ * Audio needs a live main link: the secondary-data packets ride in the video
++ * blanking, so with no stream there is nothing to carry them, and the SEC0
++ * registers are only reachable while the block is clocked and out of reset.
++ * AUDIO_PRESENT in CORE_CAPABILITIES is the core's own answer to whether the
++ * audio half was built in.
++ */
++static int sun60i_dp_audio_check_locked(struct sun60i_dp *dp)
++{
++	lockdep_assert_held(&dp->lock);
++
++	if (!dp->enabled || !dp->video_on)
++		return -ENODEV;
++
++	if (!(readl(dp->base + DP_CORE_CAPABILITIES) & CORE_CAP_AUDIO_PRESENT))
++		return -ENODEV;
++
++	return 0;
++}
++
++static int sun60i_dp_audio_startup(struct drm_bridge *bridge,
++				   struct drm_connector *connector)
++{
++	struct sun60i_dp *dp = bridge_to_dp(bridge);
++
++	guard(mutex)(&dp->lock);
++
++	return sun60i_dp_audio_check_locked(dp);
++}
++
++static int sun60i_dp_audio_prepare(struct drm_bridge *bridge,
++				   struct drm_connector *connector,
++				   struct hdmi_codec_daifmt *fmt,
++				   struct hdmi_codec_params *hparms)
++{
++	struct sun60i_dp *dp = bridge_to_dp(bridge);
++	int chan, ret;
++
++	/* 15.4.7.66: "00 = I2S" is the only source this driver selects. The
++	 * UM's I2S figure (15.4.4.2) is the plain I2S shape; left- and
++	 * right-justified are not offered.
++	 */
++	if (fmt->fmt != HDMI_I2S)
++		return -EINVAL;
++
++	chan = sun60i_dp_audio_channel_code(hparms->channels);
++	if (chan < 0)
++		return chan;
++
++	guard(mutex)(&dp->lock);
++
++	ret = sun60i_dp_audio_check_locked(dp);
++	if (ret)
++		return ret;
++
++	/* Packets off and muted first: it is also the only way the UM gives to
++	 * clear a FIFO overflow (15.4.7.87), and it keeps a re-prepare from
++	 * sending a half-programmed stream.
++	 */
++	writel(SEC0_AUDIO_MUTE, dp->base + DP_SEC0_AUDIO_ENABLE);
++
++	writel(FIELD_PREP(SEC0_AUDIO_SRC_MASK, SEC0_AUDIO_SRC_I2S),
++	       dp->base + DP_SEC0_AUDIO_INPUT_SELECT);
++	writel(FIELD_PREP(SEC0_CHANNEL_COUNT_MASK, chan),
++	       dp->base + DP_SEC0_CHANNEL_COUNT);
++	writel(SEC0_AUDIO_CLOCK_ASYNC, dp->base + DP_SEC0_AUDIO_CLOCK_MODE);
++	/* No remap: input channel n to output channel n. The reset value 0
++	 * read literally maps every input to output 0; the vendor never writes
++	 * this register and plays stereo, so the reset state is probably a
++	 * bypass and identity is the same thing -- unproven, see item 6 of
++	 * OWED ON SILICON in the commit message.
++	 */
++	writel(SEC0_CHANNEL_MAP_IDENTITY, dp->base + DP_SEC0_AUDIO_CHANNEL_MAP);
++
++	sun60i_dp_audio_channel_status(dp, hparms->iec.status);
++
++	ret = sun60i_dp_audio_infoframe(dp, &hparms->cea);
++	if (ret)
++		dev_warn(dp->dev, "audio InfoFrame not sent: %d\n", ret);
++
++	/* Last, and still muted: .mute_stream opens the stream once ALSA has
++	 * started the I2S side.
++	 */
++	writel(SEC0_AUDIO_PACKET_ENABLE | SEC0_AUDIO_MUTE,
++	       dp->base + DP_SEC0_AUDIO_ENABLE);
++	dp->audio_on = true;
++
++	return 0;
++}
++
++static void sun60i_dp_audio_shutdown(struct drm_bridge *bridge,
++				     struct drm_connector *connector)
++{
++	struct sun60i_dp *dp = bridge_to_dp(bridge);
++	u32 val;
++
++	guard(mutex)(&dp->lock);
++
++	dp->audio_on = false;
++
++	/* Nothing to write into a block that is already clocked off and reset;
++	 * its registers are back at their reset values.
++	 */
++	if (!dp->enabled)
++		return;
++
++	/* Reset value of 15.4.7.65: packets off, VBID mute set. */
++	writel(SEC0_AUDIO_MUTE, dp->base + DP_SEC0_AUDIO_ENABLE);
++
++	val = readl(dp->base + DP_SEC0_INFOFRAME_ENABLE);
++	writel(val & ~BIT(SEC0_INFOFRAME_AUDIO),
++	       dp->base + DP_SEC0_INFOFRAME_ENABLE);
++}
++
++static int sun60i_dp_audio_mute_stream(struct drm_bridge *bridge,
++				       struct drm_connector *connector,
++				       bool enable, int direction)
++{
++	struct sun60i_dp *dp = bridge_to_dp(bridge);
++
++	if (direction != SNDRV_PCM_STREAM_PLAYBACK)
++		return 0;
++
++	guard(mutex)(&dp->lock);
++
++	if (!dp->enabled || !dp->audio_on)
++		return 0;
++
++	/* AUDIO_MUTE is the VBID audio-mute bit (15.4.7.65): the sink is told
++	 * the stream is silent, and the packets keep flowing so unmuting does
++	 * not wait for the sink to re-lock.
++	 */
++	writel(SEC0_AUDIO_PACKET_ENABLE | (enable ? SEC0_AUDIO_MUTE : 0),
++	       dp->base + DP_SEC0_AUDIO_ENABLE);
++
++	return 0;
++}
++
+ static const struct drm_bridge_funcs sun60i_dp_bridge_funcs = {
+ 	/* The three state helpers are what make this bridge atomic at all --
+ 	 * drm_bridge_is_atomic() tests for .atomic_reset (drm_bridge.c:382), and
+@@ -2930,6 +3268,10 @@ static const struct drm_bridge_funcs sun60i_dp_bridge_funcs = {
+ 	.hpd_notify		= sun60i_dp_bridge_hpd_notify,
+ 	.atomic_enable		= sun60i_dp_bridge_atomic_enable,
+ 	.atomic_disable		= sun60i_dp_bridge_atomic_disable,
++	.dp_audio_startup	= sun60i_dp_audio_startup,
++	.dp_audio_prepare	= sun60i_dp_audio_prepare,
++	.dp_audio_shutdown	= sun60i_dp_audio_shutdown,
++	.dp_audio_mute_stream	= sun60i_dp_audio_mute_stream,
+ };
+ 
+ static void sun60i_dp_teardown(void *data)
+@@ -3160,7 +3502,20 @@ static int sun60i_dp_probe(struct platform_device *pdev)
+ 	 */
+ 	dp->bridge.of_node = dev->of_node;
+ 	dp->bridge.type = DRM_MODE_CONNECTOR_DisplayPort;
+-	dp->bridge.ops = DRM_BRIDGE_OP_DETECT | DRM_BRIDGE_OP_EDID;
++	dp->bridge.ops = DRM_BRIDGE_OP_DETECT | DRM_BRIDGE_OP_EDID |
++			 DRM_BRIDGE_OP_DP_AUDIO;
++
++	/*
++	 * The hdmi-codec's parent is this device, which is what makes
++	 * `sound-dai = <&edp0>` resolve to it (soc-core.c:827-835). Eight I2S
++	 * channels: SEC0_CHANNEL_COUNT's top code is 7.1 (UM 15.4.7.67), and
++	 * I2S3 has four data lanes (ch17). dai_port -1: the codec
++	 * is addressed by phandle, not by an OF-graph endpoint (the same as
++	 * msm/dp/dp_drm.c:335 and rockchip/cdn-dp-core.c:1009).
++	 */
++	dp->bridge.hdmi_audio_dev = dev;
++	dp->bridge.hdmi_audio_max_i2s_playback_channels = 8;
++	dp->bridge.hdmi_audio_dai_port = -1;
+ 
+ 	ret = devm_add_action_or_reset(dev, sun60i_dp_teardown, dp);
+ 	if (ret)

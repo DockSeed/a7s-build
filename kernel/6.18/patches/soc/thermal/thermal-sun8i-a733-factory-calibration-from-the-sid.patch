@@ -1,0 +1,199 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] thermal: sun8i: A733 factory calibration from the SID
+
+The A733 entry had no calibration: sun60i_a733_ths pointed .calibrate at
+the H6 function, which is never reached without an nvmem cell and would
+divide by the unset .scale if it were. Every THSn_CDATA field stayed at
+its 0x800 reset value.
+
+THE DATA
+
+Three little-endian SID words at 0x44/0x48/0x4c (ARM 0x03006244..): a
+dense array of 12-bit fields, ft_temp in 0.1 C first, then the raw code
+each of the five sensors read at that temperature. Not in the UM: its
+Table 7-1 names SID 0x14 for a single sensor, which reads zero on our
+dies. Layout and transform come from the vendor's
+sun60iw2_ths_calibrate() (radxa/allwinner-bsp dd2a41a2,
+drivers/thermal/sunxi_thermal.c:613, SUN60IW2_CAL_COM = 0), which a
+vendor kernel's live CDATA reproduced 5 of 5 on one die (2026-08-16).
+
+Ported from: Allwinner BSP drivers/thermal/sunxi_thermal.c,
+sun60iw2_ths_calibrate() (radxa/allwinner-bsp, GPL-2.0): the SID layout and the
+calibration transform are that function's, re-expressed in this driver.
+
+THE TRANSFORM, AND WHAT THE HARDWARE DOES WITH IT
+
+  cdata = 0x800 - (calc_temp(raw) - ft_temp) / 62
+
+62 mC per code is the slope of the segment every factory code falls in
+(raw ~2400 at 25 C, the breakpoint is raw 1770 at ~65 C).
+
+What CDATA does is not in the UM either. Measured on the 6 GiB board,
+2026-09-25, THS4_CDATA set live, THS4_DATA averaged over 12 samples:
+0x800 -> 2322, 0x780 -> 2446, 0x880 -> 2189, 0x800 -> 2317. So
+raw = raw_uncalibrated - (CDATA - 0x800), one code per code, and a sensor
+that reads warm at ft_temp gets a lower cdata and reads cooler -- the sign
+the formula produces.
+
+WHAT THE VENDOR DOES NOT DO, AND THIS DOES
+
+- It reads the SID through a private vendor API. This takes the
+  "calibration" nvmem cell, as every other sun8i chip does.
+- It returns success on a zero ft_temp, and a blank sensor field (raw 0)
+  is refused only because the cdata it produces happens to overflow 12
+  bits. Here both are refused explicitly, with a warning.
+- It truncates the division toward zero, which shrinks every correction
+  by up to one code (62 mC). This rounds to nearest; on the 6 GiB board
+  that moves sensors 2 and 3 by one code against the vendor.
+
+EXPECTED ON THE 6 GiB BOARD
+
+Fuses 0x729770f6 0xd98197c9 0x00000496: ft_temp 246 (24.6 C), raw codes
+2423 2418 2428 2433 2413, CDATA 0x7fe 0x7f9 0x803 0x808 0x7f4, i.e.
+THS0_THS1_CDATA 0x07f907fe, THS2_THS3_CDATA 0x08080803, THS4_CDATA
+0x000007f4. Corrections of -0.74..+0.50 C: inside the sensor's +-3 C.
+
+Verified: applies at fuzz 0, builds (W=1 clean), the object carries
+sun60i_a733_ths_calibrate. Pending on silicon: the CDATA readback above on
+the 6 GiB board, and the 8 GiB board's CDATA against its own fuses.
+Needs arm64-dts-a733-ths-calibration-nvmem-cell for the cell.
+
+Assisted-by: Claude
+---
+diff -uNr a/drivers/thermal/sun8i_thermal.c b/drivers/thermal/sun8i_thermal.c
+--- a/drivers/thermal/sun8i_thermal.c
++++ b/drivers/thermal/sun8i_thermal.c
+@@ -22,6 +22,7 @@
+ #include <linux/reset.h>
+ #include <linux/slab.h>
+ #include <linux/thermal.h>
++#include <linux/unaligned.h>
+ 
+ #include "thermal_hwmon.h"
+ 
+@@ -440,6 +441,95 @@
+ 	return 0;
+ }
+ 
++/*
++ * A733 factory calibration.  The SID carries three little-endian words at
++ * 0x44/0x48/0x4c: a dense array of 12-bit fields, ft_temp (the factory test
++ * temperature in 0.1 C) first, then the raw code each of the five sensors
++ * read at that temperature, straddling word boundaries.
++ *
++ * The transform is the H6's with the A733 scale: the sensor's reading at
++ * ft_temp is converted with calc_temp(), and the error, in codes of the
++ * fuse-side segment (-62 mC per code, the segment every factory code on our
++ * dies falls in), becomes the offset from the 0x800 zero point:
++ *
++ *	cdata = 0x800 - (calc_temp(raw) - ft_temp) / 62
++ *
++ * Silicon on a Cubie A7S, 2026-09-25: THSn_DATA follows
++ * raw = raw_uncalibrated - (CDATA - 0x800), one code per code -- moving
++ * THS4_CDATA by -128 and +128 moved the averaged raw word by +124..129 and
++ * -128..133 -- so a sensor that reads warm at ft_temp gets a lower cdata and
++ * reads cooler, which is the sign this formula produces.
++ *
++ * Derived from the vendor's sun60iw2_ths_calibrate() (radxa/allwinner-bsp,
++ * drivers/thermal/sunxi_thermal.c), which a vendor kernel's live CDATA
++ * reproduces 5 of 5.  What it does not do, and this does:
++ *  - it reads the SID through a private vendor API; this takes an nvmem
++ *    cell like every other sun8i chip;
++ *  - it treats a zero ft_temp as "calibrated" and returns success, and a
++ *    blank sensor field (raw 0) is caught only because the resulting cdata
++ *    happens to overflow 12 bits; here both are refused explicitly;
++ *  - it truncates the division toward zero, which shrinks every correction
++ *    by up to one code (62 mC); this rounds to nearest.
++ */
++static int sun60i_a733_ths_calibrate(struct ths_device *tmdev,
++				     u16 *caldata, int callen)
++{
++	struct device *dev = tmdev->dev;
++	u32 w[3];
++	int i, ft_temp;
++
++	if (callen < sizeof(w))
++		return -EINVAL;
++
++	for (i = 0; i < ARRAY_SIZE(w); i++)
++		w[i] = get_unaligned_le32((u8 *)caldata + 4 * i);
++
++	ft_temp = (w[0] & FT_TEMP_MASK) * 100;
++	if (!ft_temp) {
++		dev_warn(dev, "no factory calibration in the SID\n");
++		return -ENODATA;
++	}
++
++	for (i = 0; i < tmdev->chip->sensor_num; i++) {
++		int raw, cdata, offset;
++
++		switch (i) {
++		case 0:
++			raw = w[0] >> 12;
++			break;
++		case 1:
++			raw = (w[0] >> 24) | (w[1] << 8);
++			break;
++		case 2:
++			raw = w[1] >> 4;
++			break;
++		case 3:
++			raw = w[1] >> 16;
++			break;
++		default:
++			raw = (w[1] >> 28) | (w[2] << 4);
++			break;
++		}
++		raw &= TEMP_CALIB_MASK;
++
++		cdata = CALIBRATE_DEFAULT -
++			DIV_ROUND_CLOSEST(tmdev->chip->calc_temp(tmdev, i, raw) -
++					  ft_temp, 62);
++		if (!raw || (cdata & ~TEMP_CALIB_MASK)) {
++			dev_warn(dev, "sensor%d is not calibrated\n", i);
++			continue;
++		}
++
++		offset = (i % 2) * 16;
++		regmap_update_bits(tmdev->regmap,
++				   SUN50I_H6_THS_TEMP_CALIB + (i / 2 * 4),
++				   TEMP_CALIB_MASK << offset,
++				   cdata << offset);
++	}
++
++	return 0;
++}
++
+ static int sun8i_ths_calibrate(struct ths_device *tmdev)
+ {
+ 	struct nvmem_cell *calcell;
+@@ -914,15 +1004,11 @@
+  * and whose CCU reset default is OFF -- hence has_mod_clk as well as
+  * has_bus_clk_reset.
+  *
+- * No calibration cell. The A733 does have per-die factory data in the SID
+- * fuses, and the fuse-to-CDATA transform is known from the vendor's
+- * sun60iw2_ths_calibrate() (SID 0x44/0x48/0x4c, cdata = 0x800 - delta),
+- * verified 5 of 5 against a vendor board's live CDATA -- but this driver does
+- * not implement it, and sun8i_ths_calibrate() continues without it. Measured
+- * cost of shipping uncalibrated on this part: CDATA reads 0x7F4..0x807 across
+- * five sensors on two dies, i.e. -12..+7 LSB from the 0x800 reset default, or
+- * -0.74..+0.43 C at 62 mC/LSB -- an order of magnitude inside the sensor's own
+- * +-3 C rating. Calibration is a refinement here, not a dependency.
++ * Factory calibration through the SID's "calibration" nvmem cell, see
++ * sun60i_a733_ths_calibrate().  Without the cell the sensors run on the
++ * 0x800 reset default; on the two dies read so far that is off by -8..+12
++ * codes, up to 0.74 C -- inside the sensor's own +-3 C, so a refinement,
++ * not a dependency.
+  */
+ static const struct ths_thermal_chip sun60i_a733_ths = {
+ 	.sensor_num = 5,
+@@ -939,7 +1025,7 @@
+ 	 */
+ 	.trend_hyst = 6000,
+ 	.temp_data_base = SUN50I_H6_THS_TEMP_DATA,
+-	.calibrate = sun50i_h6_ths_calibrate,
++	.calibrate = sun60i_a733_ths_calibrate,
+ 	.init = sun60i_a733_thermal_init,
+ 	.irq_ack = sun50i_h6_irq_ack,
+ 	.calc_temp = sun60i_a733_calc_temp,

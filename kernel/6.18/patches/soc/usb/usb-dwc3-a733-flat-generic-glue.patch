@@ -1,0 +1,184 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] usb: dwc3: bring the A733 up through the flattened generic glue
+
+USB3 links at 10 Gbps on this board and still does not come up on a normal
+boot: dwc3 prints "this is not a DesignWare USB3 DRD Core" and no xHCI appears.
+Neither the hardware nor any register value is at fault. The controller reads
+GSNPSID before it touches a PHY, and the SERDES bus gates that make that
+register answer were being turned on by the combo-PHY's probe (`phy-allwinner-a733-add-serdes-combophy`), whose own
+comment names the phys= devlink as the thing that ordered it first. That
+ordering stopped existing when the Type-C connector arrived: the connector's
+ports graph closes a ring -- connector -> dwc3 -> combophy -> connector -- and
+fw_devlink resolves a ring by relaxing every link inside it, the phys= link
+included.
+
+Proven twice on the 8 GiB board with a kernel built from main, 2026-07-29: re-binding dwc3
+by hand after boot brings up xHCI at 10 Gbps immediately, and booting the same
+Image with a dtb whose ring is cut brings it up unattended at 9.3 s. Probe
+order is not a contract in Linux; the fix is to stop needing one.
+
+`clk-sunxi-ng-a733-add-serdes-subsystem-clocks` turns the two gates into clocks. This patch gives the controller a driver
+that takes them: 6.18's flattened glue. drivers/usb/dwc3/glue.h exports
+dwc3_core_probe() and dwc3-generic-plat.c is exactly the shape needed here --
+take every clock with devm_clk_bulk_get_all_enabled() regardless of name or
+count, handle the reset, then hand the ready block to the core with
+ignore_clocks_and_resets. The core device does not exist until the block is
+live, which makes the bring-up immune to devlink cycle relaxation, module load
+order and any future edge in the DT graph, rather than merely un-broken for
+today's graph. Its Kconfig text invites precisely this ("Say 'Y' or 'M' here if
+your platform integrates DWC3 in a similar way"), so the change to the driver
+is one line in the match table.
+
+Why a glue and not just the clock provider: dwc3 enables only clocks it knows
+by name -- bus_early/bus_clk, ref, suspend, utmi, pipe (core.c:2044-2098). This
+controller needs five clocks up: the two SERDES bus gates plus USB2_U2_REF,
+USB2_MF and USB2_SUSPEND. Two of the five are measured on the 8 GiB board by booting the
+same Image without them -- dropping MF gives "DWC3 controller soft reset failed
+/ -ETIMEDOUT / -110", and so does dropping U2_REF while naming MF as ref.
+SUSPEND has never been removed on a boot, and the two SERDES gates have never
+existed as modelled clocks on any boot, so for those three the requirement is
+reasoned from the register tables, not measured; the first board test of this
+glue settles them; until then they stay
+open. MF is misnamed for a dwc3 clock name (the UM calls it the USB2
+Microframe clock, while bus_early is documented as an AHB/AXI bus clock in
+snps,dwc3.yaml:48) and it is also indispensable, so there is no honest set of dwc3 names that covers five
+clocks. utmi and pipe are not spare slots for it:
+on the 6 GiB board with a live SuperSpeed link, USB2_U3_UTMI and USB2_U2_PIPE both read 0,
+consistent with SUBSYS_USB3P1_BGR bits 20/21 selecting the PHY as the source.
+With a bulk get, the count stops mattering and no name has to be bent.
+
+The binding is new rather than an addition to snps,dwc3.yaml because the
+compatible is ours; it refs snps,dwc3-common.yaml for everything the core reads
+(the quirks, dr_mode, the connector graph) and adds only reg/interrupts/clocks/
+resets.
+
+Verified: applies at fuzz 0, builds, the new compatible is present in the built
+dwc3-generic-plat object, and the observable this patch was written for is met on
+hardware (the 8 GiB board, 2026-08-01): xHCI registers unattended at 10.28 s --
+bus 5 and 6, "Host supports USB 3.1 Enhanced SuperSpeed", irq 448, io mem
+0x06a00000 -- with no hand re-bind and no cut in the connector graph. The log
+still reports "Fixed dependency cycle(s) with .../usb-pd@4e/connector", so
+fw_devlink relaxes exactly as before and it no longer decides anything.
+
+NOT verified: the SuperSpeed link. J4 was empty in every session -- a roothub
+reporting 10000 is not a device. And that boot ran with a foreign module
+(dwc3_sun60i_a733, not from this repo) blacklisted on the command line, because
+it claims this patch's compatible and bound first; that collision needs a
+decision of its own.
+
+Assisted-by: Claude
+
+diff --git a/drivers/usb/dwc3/Kconfig b/drivers/usb/dwc3/Kconfig
+--- a/drivers/usb/dwc3/Kconfig
++++ b/drivers/usb/dwc3/Kconfig
+@@ -195,7 +195,7 @@
+ 	default USB_DWC3
+ 	help
+ 	  Support USB3 functionality in simple SoC integrations.
+-	  Currently supports SpacemiT DWC USB3. Platforms using
++	  Currently supports SpacemiT and Allwinner A733 DWC USB3. Platforms using
+ 	  dwc3-of-simple can easily switch to dwc3-generic by flattening
+ 	  the dwc3 child node in the device tree.
+ 	  Say 'Y' or 'M' here if your platform integrates DWC3 in a similar way.
+diff --git a/drivers/usb/dwc3/dwc3-generic-plat.c b/drivers/usb/dwc3/dwc3-generic-plat.c
+--- a/drivers/usb/dwc3/dwc3-generic-plat.c
++++ b/drivers/usb/dwc3/dwc3-generic-plat.c
+@@ -143,6 +143,7 @@
+ };
+ 
+ static const struct of_device_id dwc3_generic_of_match[] = {
++	{ .compatible = "allwinner,sun60i-a733-dwc3", },
+ 	{ .compatible = "spacemit,k1-dwc3", },
+ 	{ /* sentinel */ }
+ };
+diff --git a/Documentation/devicetree/bindings/usb/allwinner,sun60i-a733-dwc3.yaml b/Documentation/devicetree/bindings/usb/allwinner,sun60i-a733-dwc3.yaml
+new file mode 100644
+--- a/Documentation/devicetree/bindings/usb/allwinner,sun60i-a733-dwc3.yaml
++++ b/Documentation/devicetree/bindings/usb/allwinner,sun60i-a733-dwc3.yaml
+@@ -0,0 +1,86 @@
++# SPDX-License-Identifier: (GPL-2.0 OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/usb/allwinner,sun60i-a733-dwc3.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Allwinner A733 SuperSpeed DWC3 USB controller
++
++maintainers:
++  - DockSeed <dockseed@proton.me>
++
++description: |
++  The Allwinner A733 (sun60iw2) embeds a DWC3 USB IP core with a USB2.0 UTMI+
++  companion PHY and a SuperSpeed lane pair routed through the COMB0 combo-PHY
++  to a Type-C connector.
++
++  The controller is described as a flat node: the glue owns the clocks and the
++  reset, so no dwc3 child node is used.
++
++  Two of the five clocks do not come from the CCU. The AHB and AXI bus clocks of
++  the USB3 block are gated inside the SERDES subsystem page
++  (allwinner,sun60i-a733-serdes-ccu), and the controller cannot even be
++  identified while they are off.
++
++allOf:
++  - $ref: snps,dwc3-common.yaml#
++
++properties:
++  compatible:
++    const: allwinner,sun60i-a733-dwc3
++
++  reg:
++    maxItems: 1
++
++  interrupts:
++    maxItems: 1
++
++  clocks:
++    items:
++      - description: USB2 reference clock
++      - description: USB2 microframe clock
++      - description: suspend clock
++      - description: USB3 AXI bus clock
++      - description: USB3 AHB bus clock
++
++  clock-names:
++    items:
++      - const: ref
++      - const: mf
++      - const: suspend
++      - const: aclk
++      - const: hclk
++
++  resets:
++    maxItems: 1
++    description: USB3 controller reset
++
++required:
++  - compatible
++  - reg
++  - interrupts
++  - clocks
++  - clock-names
++  - resets
++  - phys
++  - phy-names
++
++unevaluatedProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/interrupt-controller/arm-gic.h>
++
++    usb@6a00000 {
++        compatible = "allwinner,sun60i-a733-dwc3";
++        reg = <0x06a00000 0x10000>;
++        interrupts = <GIC_SPI 155 IRQ_TYPE_LEVEL_HIGH>;
++        clocks = <&ccu 49>, <&ccu 51>, <&ccu 50>,
++                 <&serdes_ccu 0>, <&serdes_ccu 1>;
++        clock-names = "ref", "mf", "suspend", "aclk", "hclk";
++        resets = <&ccu 20>;
++        phys = <&u2phy>, <&combophy0>;
++        phy-names = "usb2-phy", "usb3-phy";
++        dr_mode = "host";
++        maximum-speed = "super-speed-plus";
++    };

@@ -1,0 +1,123 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: a733: cubie-a7s: let the eMMC run HS400 with enhanced strobe
+
+WHY
+---
+`mmc-sunxi-stop-claiming-the-controller-cannot-do-enhanced-strobe` implemented ->hs400_enhanced_strobe and stopped the probe from masking
+MMC_CAP2_HS400_ES out, and then nothing happened: the board DT never said
+mmc-hs400-enhanced-strobe, so the core kept selecting plain HS400 and the
+implementation only ever ran as a negative control. That is the proof debt
+`mmc-sunxi-stop-claiming-the-controller-cannot-do-enhanced-strobe` carries, and this property is what closes it.
+
+The reason to want the mode is not throughput, it is determinism. In plain
+HS400 the card's CMD responses are sampled with the controller's clock, so the
+response path depends on a sampling delay. With enhanced strobe the card
+returns them framed by the data strobe it sends with the data, and the
+controller samples them off that strobe.
+
+WHERE THE VALUES COME FROM
+--------------------------
+Card, read on the 8 GiB board 2026-09-19:
+  EXT_CSD[184] STROBE_SUPPORT = 0x01   the card offers it
+  EXT_CSD[196] DEVICE_TYPE    = 0x57   HS400-1.8V among the rest
+
+Controller, A733 UM 11.3.8.41: SMHC_CQE_CTRL (0x1A0) bit [8] DS_SAMP_RESP_EN
+(enables response sampling on the data strobe). Searched end to end in V0.92 and V1.00:
+that bit is the only place the manual mentions an enhanced strobe. No general
+enable exists, and no CQE has to be running for it -- the bit lives in the CQE
+control register, which is a placement, not a dependency. `mmc-sunxi-stop-claiming-the-controller-cannot-do-enhanced-strobe`'s header carries
+that reading.
+
+Core, drivers/mmc/core/:
+  host.c:399               parses the property -> MMC_CAP2_HS400_ES
+  mmc.c mmc_select_card_type()  offers HS400ES only with caps2 && strobe_support
+                           && HS400 available
+  mmc.c mmc_select_hs400es()    HS -> bus width 8 with EXT_CSD_BUS_WIDTH_STROBE
+                           -> HS400 -> ios.enhanced_strobe = true ->
+                           host->ops->hs400_enhanced_strobe()
+
+WHAT IT CHANGES
+---------------
+One property in the mmc2 node. The switch sequence changes with it: HS400ES
+goes HS -> DDR-8bit-with-strobe -> HS400 and never passes through HS200, so
+HS200 tuning does not run on the way in.
+
+WHAT IT DOES NOT CLAIM
+----------------------
+- No throughput claim. The strobe frames the response, not the payload, and
+  the read side is already at 324 MB/s decimal against the part's stated 300.
+- It does NOT remove the data-strobe sweep from init. mmc_init_card() calls
+  ->execute_hs400_tuning for an hs400es card as well (mmc.c:1848), so `mmc-sunxi-tune-the-sample-delay-instead-of-running-it-at-zero`'s
+  sweep still runs and still decides DS_DL. Whether that sweep should exist at
+  all is a separate question and a separate patch.
+- It is not a fix for the DS_DL problem: a DS_DL of 21 wedges a sustained read today, and
+  nothing here changes which delay the sweep lands on.
+
+VERIFIED / NOT VERIFIED
+-----------------------
+- Applies clean at fuzz 0 on a fresh unpack with the series in order: yes.
+- dtc: the decompiled dtb must carry mmc-hs400-enhanced-strobe in the mmc2
+  node -- checked on the built dtb, not asserted here.
+- Silicon: NOT proven. The observable, on the 8 GiB board:
+    * dmesg names HS400ES, not HS400 -- the core's own timing string, and
+      ios.enhanced_strobe = 1
+    * SMHC_CQE_CTRL (0x0402_21A0) reads bit 8 set while the card is up
+    * a 2 GiB sequential read and write verify clean (verify_bad = 0) at the
+      rates plain HS400 gives today: read ~309 MiB/s, write ~140 MiB/s
+  What falsifies it: the card fails to switch (mmc_select_hs400es reports an
+  error and init falls back or fails), or the bit does not read back set,
+  which would mean the CQE control register needs the CQE block powered.
+
+ISSUE
+-----
+The `mmc-sunxi-stop-claiming-the-controller-cannot-do-enhanced-strobe` proof debt of that patch; the determinism half of the
+HS400 goal.
+
+Assisted-by: Claude
+---
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -906,6 +906,43 @@
+ 			mmc-hs400-1_8v;
+ 
+ 			/*
++			 * Enhanced Strobe. With it the card returns CMD
++			 * responses framed by the data strobe instead of by
++			 * the controller's sampling clock, so the response
++			 * path stops depending on a delay that was chosen at
++			 * runtime.
++			 *
++			 * Card side, measured on the 8 GiB board (2026-09-19): EXT_CSD[184]
++			 * STROBE_SUPPORT = 0x01, and EXT_CSD[196] DEVICE_TYPE
++			 * = 0x57 already carries HS400-1.8V. The core needs
++			 * both plus the host cap before it offers HS400ES
++			 * (drivers/mmc/core/mmc.c, mmc_select_card_type():
++			 * caps2 & MMC_CAP2_HS400_ES && strobe_support &&
++			 * avail_type & EXT_CSD_CARD_TYPE_HS400).
++			 *
++			 * Controller side: SMHC_CQE_CTRL[8] DS_SAMP_RESP_EN,
++			 * (data-strobe response sampling enable, A733 UM
++			 * 11.3.8.41) -- the only place the manual mentions an
++			 * enhanced strobe at all. `mmc-sunxi-stop-claiming-the-controller-cannot-do-enhanced-strobe` implements
++			 * ->hs400_enhanced_strobe and writes exactly that bit;
++			 * without this property it never ran positively, which
++			 * is the proof debt this closes.
++			 *
++			 * Reader for the property: drivers/mmc/core/host.c:399
++			 * -> MMC_CAP2_HS400_ES.
++			 *
++			 * ⚠ This does NOT remove the data-strobe sweep from
++			 * init. mmc_init_card() calls ->execute_hs400_tuning
++			 * for an hs400es card too (drivers/mmc/core/mmc.c:1848),
++			 * so `mmc-sunxi-tune-the-sample-delay-instead-of-running-it-at-zero`'s sweep still runs and still decides DS_DL.
++			 * What changes is the response path and the switch
++			 * sequence: hs400es goes HS -> DDR-8bit-with-strobe ->
++			 * HS400 without the HS200 stage and without HS200
++			 * tuning.
++			 */
++			mmc-hs400-enhanced-strobe;
++
++			/*
+ 			 * Soldered eMMC at footprint U8A. ⚠ The schematic
+ 			 * symbol carries KLM8G1GETF-B041 (V1.10 p9); the part
+ 			 * actually fitted on the 8 GiB board is a SanDisk iNAND

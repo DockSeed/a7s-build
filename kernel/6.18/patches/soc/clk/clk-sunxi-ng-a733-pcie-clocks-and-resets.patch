@@ -1,0 +1,195 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] clk: sunxi-ng: A733 add the PCIe controller clocks and resets
+
+PCIe support needs four things from the main CCU before a PCIe node can claim anything:
+the controller's aux clock, its AXI slave clock, the two resets that hold the
+controller down, and the ITS gate in front of it. None of them were modelled,
+because nothing in this tree drove PCIe.
+
+  0x1380 PCIE0_AUX_CLK_REG      bit31 gate, bit24 src (0 SYS_CLK24M, 1 RTC_32K),
+                                [4:0] linear M
+  0x1384 PCIE0_AXI_SLV_CLK_REG  bit31 gate, [26:24] src (000 PERI0_600M,
+                                001 PERI0_480M, 010 PERI0_400M), [4:0] M
+  0x138C PCIE0_BGR_REG          bit17 PCIE0_RST, bit16 PCIE0_PWRUP_RST,
+                                0 = assert. No gate bit in this register.
+  0x0574 ITS0_BGR_REG           bit1 ITS_PCIE0_ACLK gate, bit16 ITS_PCIE0_RST
+
+Fields are from the A733 UM V1.00 clock chapter over CCU base 0x02002000, and
+each one is corroborated by a readback taken on the 6 GiB board while the vendor stack had
+a trained link and a bound NVMe: 0x1380 = 0x80000000 (gate on, SYS_CLK24M,
+M = 0), 0x1384 = 0x82000000 (gate on, PERI0_400M, M = 0), 0x138C = 0x00030000
+(both resets de-asserted), 0x0574 = 0x00010002. Those readings come from the
+vendor stack; they are a
+target to reach, not proof of this patch.
+
+⚠ Neither clock here is the PCIe reference clock. The 100 MHz serial refclk is
+generated inside the COMB1 PMA PLL and has no CCU register at all -- the CCU
+side of PCIe is bus and housekeeping only. This has been a reliable way to get
+the block wrong, so the driver comment says it too.
+
+The ITS gate and reset read 1 out of reset, so PCIe would come up without
+claiming them. They are modelled anyway: a subsystem that depends on a reset
+value nobody sets is a subsystem that breaks the first time someone else clears
+it, and the ITS is shared.
+
+Deliberately NOT added: the COMBPHY0/COMBPHY1 gates at 0x15C0/0x15C4. Nothing in
+this tree drives them -- the combo-PHY driver runs off serdes-phy-cfg and the
+RTC DCXO gates -- and an id without a consumer is dead text in a binding header
+that we then have to keep forever.
+
+On the ids themselves: the names are the ones the A733 CCU series in review
+upstream uses (CLK_PCIE_AUX, CLK_PCIE_AXI_SLV, CLK_BUS_ITS_PCIE0_ACLK,
+RST_BUS_PCIE, RST_BUS_PCIE_PWRUP, RST_BUS_ITS_PCIE0), so a later convergence is
+a renumbering rather than a rename. The numbers are ours and continue this
+tree's dense sequence, because upstream's start at 223 where ours end at 93 --
+taking theirs for new clocks only would leave a 130-wide hole and a header that
+matches neither tree.
+
+Verified: compile-check (A733 clk + pinctrl + mmc + phy + dwc3 + pwm + hwmon +
+pmdomain + drm + dtb) passes. No hardware effect on its own -- these clocks have
+no consumer until the PCIe node lands, which is where the HW proof belongs.
+
+One line in here is not a new clock and is easy to miss: the provider's
+.num was CLK_MBUS_IOMMU1 + 1, a hard ceiling at 94. Adding ids without moving
+it means of_clk_hw_onecell_get() rejects every new index at runtime while the
+build stays green -- so it now reads CLK_BUS_ITS_PCIE0_ACLK + 1.
+
+Assisted-by: Claude
+
+diff --git a/include/dt-bindings/clock/sun60i-a733-ccu.h b/include/dt-bindings/clock/sun60i-a733-ccu.h
+--- a/include/dt-bindings/clock/sun60i-a733-ccu.h
++++ b/include/dt-bindings/clock/sun60i-a733-ccu.h
+@@ -160,4 +160,16 @@
+ #define CLK_IOMMU1_SYS_HCLK	92
+ #define CLK_MBUS_IOMMU1		93
+ 
++/*
++ * PCIe. The names follow the A733 CCU series in review upstream, so a
++ * later convergence is a renumbering and not a rename; the numbers are ours,
++ * because ours run dense from 0 while theirs start at 223.
++ *
++ * The COMBPHY0/COMBPHY1 gates at 0x15C0/0x15C4 are deliberately absent:
++ * nothing in this tree drives them, and an id without a consumer is dead text.
++ */
++#define CLK_PCIE_AUX		94
++#define CLK_PCIE_AXI_SLV	95
++#define CLK_BUS_ITS_PCIE0_ACLK	96
++
+ #endif /* _DT_BINDINGS_CLK_SUN60I_A733_CCU_H_ */
+diff --git a/include/dt-bindings/reset/sun60i-a733-ccu.h b/include/dt-bindings/reset/sun60i-a733-ccu.h
+--- a/include/dt-bindings/reset/sun60i-a733-ccu.h
++++ b/include/dt-bindings/reset/sun60i-a733-ccu.h
+@@ -74,4 +74,9 @@
+ #define RST_BUS_IOMMU0		32
+ #define RST_BUS_IOMMU1		33
+ 
++/* PCIe. Upstream's names, our numbers -- see the clock header. */
++#define RST_BUS_PCIE_PWRUP	34
++#define RST_BUS_PCIE		35
++#define RST_BUS_ITS_PCIE0	36
++
+ #endif /* _DT_BINDINGS_RST_SUN60I_A733_CCU_H_ */
+diff --git a/drivers/clk/sunxi-ng/ccu-sun60iw2.c b/drivers/clk/sunxi-ng/ccu-sun60iw2.c
+--- a/drivers/clk/sunxi-ng/ccu-sun60iw2.c
++++ b/drivers/clk/sunxi-ng/ccu-sun60iw2.c
+@@ -365,6 +365,56 @@
+ 				      0);
+ 
+ /*
++ * PCIe controller clocks.
++ *
++ * PCIE0_AUX_CLK_REG 0x1380: bit31 gate, bit24 source (0 = SYS_CLK24M,
++ * 1 = RTC_32K), [4:0] linear M. The controller's always-on side; the board
++ * runs it straight off SYS_CLK24M with M = 0 (read on the 6 GiB board with a trained
++ * link: 0x1380 = 0x80000000).
++ *
++ * PCIE0_AXI_SLV_CLK_REG 0x1384: bit31 gate, [26:24] source (000 PERI0_600M,
++ * 001 PERI0_480M, 010 PERI0_400M), [4:0] linear M -- the AXI slave clock of
++ * the controller's bus side; same board reads 0x82000000, PERI0_400M
++ * undivided.
++ *
++ * Fields from the A733 UM V1.00 clock chapter over CCU base 0x02002000.
++ * NEITHER of these is the PCIe reference clock: the 100 MHz serial refclk is
++ * generated inside the COMB1 PMA PLL and has no CCU register at all. That is
++ * the one thing worth remembering when reading this block.
++ */
++static const struct clk_parent_data pcie_aux_parents[] = {
++	{ .fw_name = "hosc" },			/* sys24M */
++	{ .fw_name = "losc" },			/* rtc 32k */
++};
++static SUNXI_CCU_M_DATA_WITH_MUX_GATE(pcie_aux_clk, "pcie-aux",
++				      pcie_aux_parents, 0x1380,
++				      0, 5,	/* M */
++				      24, 1,	/* mux */
++				      BIT(31),	/* gate */
++				      0);
++
++static const struct clk_parent_data pcie_axi_slv_parents[] = {
++	{ .hw = &pll_peri0_600m_clk.hw },
++	{ .hw = &pll_peri0_480m_clk.common.hw },
++	{ .hw = &pll_peri0_400m_clk.hw },
++};
++static SUNXI_CCU_M_DATA_WITH_MUX_GATE(pcie_axi_slv_clk, "pcie-axi-slv",
++				      pcie_axi_slv_parents, 0x1384,
++				      0, 5,	/* M */
++				      24, 3,	/* mux */
++				      BIT(31),	/* gate */
++				      0);
++
++/*
++ * ITS0_BGR_REG 0x0574: bit1 gates the ACLK of the GIC ITS in front of PCIe0,
++ * bit16 is its reset. Both read 1 out of reset (0x00010002), which is why
++ * nothing has needed them so far; they are modelled so the PCIe node can
++ * claim them instead of depending on a reset value staying what it is.
++ */
++static SUNXI_CCU_GATE_HWS(bus_its_pcie0_aclk_clk, "bus-its-pcie0-aclk",
++			  ahb_hws, 0x0574, BIT(1), 0);
++
++/*
+  * USB3 DRD (dwc3/xHCI @0x06A00000) controller clocks (read on the 8 GiB board, gate bit31):
+  *   usb2-u2-ref  0x1348 (= 0x80000000) - gate-only, mux/M default to 24 MHz
+  *   usb2-mf      0x1354 (= 0x80000000) - gate-only, mux/M default to 24 MHz
+@@ -1786,6 +1836,9 @@
+ 	&res_dcap_24m_clk.common,
+ 	&bus_serdes_clk.common,
+ 	&mbus_serdes_clk.common,
++	&pcie_aux_clk.common,
++	&pcie_axi_slv_clk.common,
++	&bus_its_pcie0_aclk_clk.common,
+ 	&bus_gmac0_clk.common,
+ 	&bus_ths_clk.common,
+ 	&gpadc0_24m_clk.common,
+@@ -1884,6 +1937,9 @@
+ 		[CLK_RES_DCAP_24M]	= &res_dcap_24m_clk.common.hw,
+ 		[CLK_BUS_SERDES]	= &bus_serdes_clk.common.hw,
+ 		[CLK_MBUS_SERDES]	= &mbus_serdes_clk.common.hw,
++		[CLK_PCIE_AUX]		= &pcie_aux_clk.common.hw,
++		[CLK_PCIE_AXI_SLV]	= &pcie_axi_slv_clk.common.hw,
++		[CLK_BUS_ITS_PCIE0_ACLK] = &bus_its_pcie0_aclk_clk.common.hw,
+ 		[CLK_BUS_GMAC0]		= &bus_gmac0_clk.common.hw,
+ 		[CLK_MBUS_GMAC0]	= &mbus_gmac0_clk.common.hw,
+ 		[CLK_BUS_THS]		= &bus_ths_clk.common.hw,
+@@ -1926,7 +1982,7 @@
+ 		[CLK_IOMMU1_SYS_HCLK]	= &iommu1_sys_hclk_clk.common.hw,
+ 		[CLK_MBUS_IOMMU1]	= &mbus_iommu1_clk.common.hw,
+ 	},
+-	.num	= CLK_MBUS_IOMMU1 + 1,
++	.num	= CLK_BUS_ITS_PCIE0_ACLK + 1,
+ };
+ 
+ static struct ccu_reset_map sun60iw2_ccu_resets[] = {
+@@ -1964,6 +2020,14 @@
+ 	[RST_BUS_GPU0]		= { 0x0B24, BIT(16) },
+ 	[RST_BUS_IOMMU0]	= { 0x058C, BIT(16) },
+ 	[RST_BUS_IOMMU1]	= { 0x05B4, BIT(16) },
++	/*
++	 * PCIE0_BGR_REG 0x138C carries two resets and no gate: bit16
++	 * PCIE0_PWRUP_RST and bit17 PCIE0_RST, both 0 = assert. The 6 GiB board
++	 * with a trained link reads 0x00030000 -- both de-asserted.
++	 */
++	[RST_BUS_PCIE_PWRUP]	= { 0x138C, BIT(16) },
++	[RST_BUS_PCIE]		= { 0x138C, BIT(17) },
++	[RST_BUS_ITS_PCIE0]	= { 0x0574, BIT(16) },
+ };
+ 
+ static const struct sunxi_ccu_desc sun60iw2_ccu_desc = {

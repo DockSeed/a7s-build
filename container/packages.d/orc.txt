@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# Debian packages the build-orc stage needs; the loadupdb check runs the arm64 library under qemu-user off an arm64 host.
+curl
+patch
+meson
+ninja-build
+binutils
+dpkg-dev
+gcc-aarch64-linux-gnu
+libc6-dev-arm64-cross
+qemu-user-static

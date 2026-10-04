@@ -1,0 +1,101 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] clk: sunxi-ng: a733: r-ccu: APBS source 100 is SYS_CLK24M, not PERI0_300M
+
+`clk-sunxi-ng-a733-add-minimal-r-ccu` gives the R-CCU's three bus clocks one parent table. The A733 UM gives
+them two: AHBS_CLK's index 100 is PERI0_300M (V0.92, 4.2.5.1), while APBS0_CLK
+and APBS1_CLK both read "100: SYS_CLK24M" (4.2.5.2, 4.2.5.3). Modelling all
+three from AHBS's list puts pll-periph-300m under APBS0 and APBS1, which is a
+12.5x error in the reported rate whenever either of them sits on that index.
+
+APBS1 does sit on it. Read back on an A733 board (Radxa Cubie A7S, our
+6.18.36):
+
+  R-CCU +0x010 (APBS1_CLK) = 0x04000000   source 100, M = 1
+  clk_summary: r-apb1 ... 300000000
+
+and r-apb1 is the parent of bus-r-i2c0 and bus-r-i2c1, so both R_I2C
+controllers inherit the wrong tclk. i2c-mv64xxx computes its divider from
+clk_get_rate() linearly (mv64xxx_calc_freq(), tclk / (10 * (m + 1) * (1 << n))
+for allwinner,sun6i-a31-i2c), so a rate that is 12.5x too high produces a bus
+that is 12.5x too slow. Measured on the PMIC bus, differencing two transfer
+sizes so process overhead cancels:
+
+  TWI_CCR = 0x0000004D    CLK_N = 5, CLK_M = 9   -> divisor 3200
+  i2ctransfer r128        172, 167, 170 ms
+  i2ctransfer r8           23,  21,  21 ms
+  delta 148 ms / 120 bytes = 1233 us/byte = 9 bits -> SCL 7297 Hz
+
+7.3 kHz against the 7.5 kHz the 24 MHz parent predicts, and against the
+93.75 kHz that divider was chosen for. Every AXP318W register access costs
+about 12.8x what the device tree asks for. Nothing fails -- I2C has no minimum
+clock -- which is why this went unnoticed.
+
+So give APBS0 and APBS1 their own table with index 100 pointing at the 24 MHz
+oscillator, and leave AHBS on the one it had.
+
+What this patch does NOT fix: index 000. The same registers give it as the
+DCXO, which is 26 MHz on this SoC, while the DT passes the 24 MHz osc24M as
+"hosc" for all of them; APBS0 sits on index 000 under our boot chain and the
+kernel reports r-apb0 at 24 MHz. That is a separate defect with a separate
+falsifier and is deliberately left alone here, so that the A/B for this change
+reads.
+
+Falsifier: clk_summary must report r-apb1 at 24000000 with the register
+unchanged at 0x04000000, and the i2c core must then pick a divider about 12.8x
+smaller for the same 100 kHz target, with the transfer timing landing near
+100 kHz on the wire.
+
+Assisted-by: Claude
+
+--- a/drivers/clk/sunxi-ng/ccu-sun60iw2-r.c
++++ b/drivers/clk/sunxi-ng/ccu-sun60iw2-r.c
+@@ -29,26 +29,44 @@
+ 
+ #include "ccu-sun60iw2-r.h"
+ 
+-static const struct clk_parent_data r_ahb_apb_parents[] = {
++static const struct clk_parent_data r_ahb_parents[] = {
+ 	{ .fw_name = "hosc" },			/* 000: DCXO 24M */
+ 	{ .fw_name = "losc" },			/* 001: RTC 32k */
+ 	{ .fw_name = "iosc" },			/* 010: RC 16M */
+ 	{ .fw_name = "pll-periph-200m" },	/* 011: PERIPLL-200M */
+-	{ .fw_name = "pll-periph-300m" },	/* 100: PERI0-300M */
++	{ .fw_name = "pll-periph-300m" },	/* 100: PERI0_300M */
++};
++
++/*
++ * APBS0 and APBS1 do not share AHBS's source list: index 100 is SYS_CLK24M on
++ * both of them, where AHBS has PERI0_300M (A733 UM V0.92 4.2.5.1 AHBS_CLK
++ * "100: PERI0_300M", 4.2.5.2 APBS0_CLK and 4.2.5.3 APBS1_CLK both
++ * "100: SYS_CLK24M"). Modelling all three from one table made r-apb1 report
++ * 300 MHz where the silicon runs it at 24, and i2c-mv64xxx derives its SCL
++ * divider linearly from that rate -- measured on an A733 board with APBS1 on
++ * index 100: TWI_CCR 0x4D on the PMIC bus, which is a divisor of 3200, giving
++ * 7.3 kHz on the wire against the 100 kHz the device tree asks for.
++ */
++static const struct clk_parent_data r_apbs_parents[] = {
++	{ .fw_name = "hosc" },			/* 000: DCXO 24M */
++	{ .fw_name = "losc" },			/* 001: RTC 32k */
++	{ .fw_name = "iosc" },			/* 010: RC 16M */
++	{ .fw_name = "pll-periph-200m" },	/* 011: PERIPLL-200M */
++	{ .fw_name = "hosc" },			/* 100: SYS_CLK24M */
+ };
+ 
+ static SUNXI_CCU_M_DATA_WITH_MUX(r_ahb_clk, "r-ahb",
+-				 r_ahb_apb_parents, 0x000,
++				 r_ahb_parents, 0x000,
+ 				 0, 5,	/* M */
+ 				 24, 3,	/* mux */
+ 				 0);
+ static SUNXI_CCU_M_DATA_WITH_MUX(r_apb0_clk, "r-apb0",
+-				 r_ahb_apb_parents, 0x00c,
++				 r_apbs_parents, 0x00c,
+ 				 0, 5,	/* M */
+ 				 24, 3,	/* mux */
+ 				 0);
+ static SUNXI_CCU_M_DATA_WITH_MUX(r_apb1_clk, "r-apb1",
+-				 r_ahb_apb_parents, 0x010,
++				 r_apbs_parents, 0x010,
+ 				 0, 5,	/* M */
+ 				 24, 3,	/* mux */
+ 				 0);

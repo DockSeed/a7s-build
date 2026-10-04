@@ -1,0 +1,626 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Sat, 3 Oct 2026 17:11:20 +0200
+Subject: [PATCH] feat(allwinner): A733: native PSCI CPU_SUSPEND
+
+Without an SCP, plat_setup_psci_ops() installs sunxi_native_psci_ops,
+which declares neither pwr_domain_suspend nor validate_power_state, so
+psci_setup() never grants PSCI_CPU_SUSPEND_AARCH64 and every
+CPU_SUSPEND answers SMC_UNK. Add a native core-level suspend for the
+A733: no new firmware, no SCP, no blob.
+
+THE HARDWARE. SUNXI_R_CPUCFG_BASE (0x07050000) is the A733 UM's
+"CPUIDLE" block, whose registers the UM does not describe. Read on
+silicon it holds Arm PPU v1.1 components that identify themselves (CIDR
+0xB105F00D, part 0x0B6, JEP106 Arm, IIDR 0x0B61143B, AIDR 0x11), so the
+register fields come from Arm DEN0051E and the wake path from the Arm
+GIC-600 TRM. Instance assignment is stimulus-proven: DSU PPU at
++0x1000, core n at +0x2000 + n * 0x1000.
+
+WHY IT NEEDS ALMOST NO CODE. The cores carry PWR_DYN_EN = 1, and with
+dynamic transitions PWR_POLICY is the MINIMUM power mode (DEN0051E
+5.2.1). Cores 1-7 sit at PWR_POLICY = OFF, so the hardware may gate them
+the moment they drop their P-Channel ON request, which is what
+CPUPWRCTLR_EL1.CORE_PWRDN_EN + WFI does. Core 0 was released by boot0
+and reads PWR_POLICY = ON; sunxi_cpu_suspend_setup() writes OFF for the
+boot core once, read-modify-write, with a read-back.
+
+THE BOOT CORE'S RESET STATE. A core the PPU turns back on starts at its
+reset vector; RVBARADDR is that vector only in AArch64 state, and the
+state is CLU0_CPUn_CTRL_REG.AA64nAA32 (UM V1.00 5.1.6.6, reset 0 =
+AArch32), sampled at reset. sunxi_cpu_on() sets it for the core it
+starts, but the boot core never goes through it (silicon: CPU0 0x0,
+CPU1-7 0x1). Its first power-down wake ran the BROM in the middle of
+the running kernel ("HELLO! BOOT0 is starting!" 1.22 s into Linux, then
+RCU stalls). plat_setup_psci_ops() now sets the bit for every core,
+next to RVBAR, wherever the platform's cpucfg header defines
+SUNXI_CPUCFG_CPU_CTRL_REG. The suspend setup reads both back and
+refuses the state to a core whose reset would not land in BL31.
+
+THE GIC. The generic GIC driver does exactly the GIC-600 TRM 3.6.2
+sequence around the suspend: gicv3_cpuif_disable() before
+pwr_domain_suspend (ProcessorSleep = 1, so the redistributor raises
+wake_request; the redistributor stays powered) and gicv3_cpuif_enable()
+after pwr_domain_suspend_finish (no gicv3_rdistif_init(), whose
+defaults would disable every SGI and PPI, the arch timer among them).
+SUNXI_PSCI_NATIVE_SUSPEND therefore requires USE_GIC_DRIVER.
+
+WHAT IS GATED. validate_power_state decodes the power level (the
+StateID is 0) and accepts the core level only. sunxi_cpu_can_suspend()
+re-reads the core's PWPR on every CPU_SUSPEND and refuses the state
+unless PWR_DYN_EN is set and PWR_POLICY is OFF, unless the PPU's own
+IDR0 advertises STA_OFF_SPT and DYN_OFF_SPT, and unless the core
+resets into BL31. A core that does not match loses deep idle; it does
+not hang.
+
+THE WFI. The PSCI library executes the WFI after pwr_domain_suspend. If
+it returned, the library would call the CPU's power-down hook again to
+unwind and panic unless the hook acknowledges a powerdown abandon
+(psci_pwrdown_cpu_end_wakeup(), prepare_cpu_pwr_up()). The A55 and A76
+cannot abandon: with CPUPWRCTLR_EL1.CORE_PWRDN_EN set, a WFI masks all
+interrupts and wake-up events and only a reset ends it (Arm Cortex-A55
+TRM 100442_0200_03_en, 2.4.8, p. 44-45; Arm Cortex-A76 TRM
+100798_0401_01_en, 5.9, p. 44-45), and cortex_a55_core_pwr_dwn() and
+cortex_a76_core_pwr_dwn() set that bit and issue an ISB before PSCI
+reaches the WFI. A wake event that is already pending takes the core
+down and straight back up through reset, the same warm boot as any other
+wake; the unwind path is not reached.
+
+EL3 STACKS. The common default, 0x1000 shared by eight cores, is 512 B
+per core; the deepest chain from the SMC handler through CPU_SUSPEND
+to a print is 928 B (gcc -fcallgraph-info=su on the link-time optimised
+release build), and the stacks are contiguous. SUNXI_PLAT_STACK_SIZE
+sets a per-core size, and the A733 uses 2048.
+
+The boot core prints one line at cold boot:
+  PSCI: native CPU_SUSPEND armed 0xff, core 0 PWPR 00000108->00000100,
+  reset to BL31 0xff
+
+Silicon (8 GiB board): all eight cores power down and wake
+(2026-09-23); an 8 h load/idle soak with ~2.8 M power-downs and zero
+errors (2026-09-24); idle wall power -0.162 W against WFI only.
+
+Assisted-by: Claude
+---
+ plat/allwinner/common/allwinner-common.mk     |  25 ++
+ plat/allwinner/common/include/platform_def.h  |   8 +
+ plat/allwinner/common/include/sunxi_private.h |  11 +
+ plat/allwinner/common/sunxi_native_pm.c       | 118 +++++++++
+ plat/allwinner/common/sunxi_pm.c              |  24 +-
+ plat/allwinner/sun60i_a733/platform.mk        |  12 +
+ .../allwinner/sun60i_a733/sunxi_cpu_suspend.c | 233 ++++++++++++++++++
+ 7 files changed, 430 insertions(+), 1 deletion(-)
+ create mode 100644 plat/allwinner/sun60i_a733/sunxi_cpu_suspend.c
+
+diff --git a/plat/allwinner/common/allwinner-common.mk b/plat/allwinner/common/allwinner-common.mk
+index 248933332..adff56aa1 100644
+--- a/plat/allwinner/common/allwinner-common.mk
++++ b/plat/allwinner/common/allwinner-common.mk
+@@ -62,6 +62,31 @@ endif
+ BL31_SOURCES		+=	${AW_PLAT}/common/sunxi_native_pm.c
+ endif
+ 
++# Native PSCI CPU_SUSPEND (core-level power-down without an SCP). Off by
++# default: it needs a per-SoC sunxi_cpu_suspend.c that knows how that SoC lets
++# a core power itself down and be woken again, and getting that wrong leaves a
++# core in WFI that nothing can wake. It leaves the GIC to the generic driver,
++# which the PSCI library calls around the suspend. A platform opts in by
++# setting this to 1 BEFORE including this file.
++SUNXI_PSCI_NATIVE_SUSPEND	?=	0
++$(call assert_boolean,SUNXI_PSCI_NATIVE_SUSPEND)
++$(eval $(call add_define,SUNXI_PSCI_NATIVE_SUSPEND))
++
++ifeq (${SUNXI_PSCI_NATIVE_SUSPEND},1)
++ifeq (${SUNXI_PSCI_USE_NATIVE},0)
++$(error "SUNXI_PSCI_NATIVE_SUSPEND needs SUNXI_PSCI_USE_NATIVE")
++endif
++ifeq (${USE_GIC_DRIVER},0)
++$(error "SUNXI_PSCI_NATIVE_SUSPEND needs USE_GIC_DRIVER")
++endif
++BL31_SOURCES		+=	${AW_PLAT}/${PLAT}/sunxi_cpu_suspend.c
++endif
++
++# EL3 stack per core in bytes, 0 = the default 0x1000 / PLATFORM_CORE_COUNT.
++SUNXI_PLAT_STACK_SIZE		?=	0
++$(call assert_numeric,SUNXI_PLAT_STACK_SIZE)
++$(eval $(call add_define,SUNXI_PLAT_STACK_SIZE))
++
+ ifeq (${SUNXI_PSCI_USE_SCPI},1)
+ ifneq (${USE_GIC_DRIVER},0)
+ $(error "SUNXI_PSCI_USE_SCPI drives the GICv2 itself and cannot be used with USE_GIC_DRIVER")
+diff --git a/plat/allwinner/common/include/platform_def.h b/plat/allwinner/common/include/platform_def.h
+index 156c06547..e4ef396fa 100644
+--- a/plat/allwinner/common/include/platform_def.h
++++ b/plat/allwinner/common/include/platform_def.h
+@@ -72,7 +72,15 @@
+ #define PLATFORM_CLUSTER_COUNT		U(1)
+ #define PLATFORM_CORE_COUNT		(PLATFORM_CLUSTER_COUNT * \
+ 					 PLATFORM_MAX_CPUS_PER_CLUSTER)
++/*
++ * 0x1000 shared by all cores, unless the platform sets SUNXI_PLAT_STACK_SIZE
++ * per core.
++ */
++#if defined(SUNXI_PLAT_STACK_SIZE) && (SUNXI_PLAT_STACK_SIZE != 0)
++#define PLATFORM_STACK_SIZE		SUNXI_PLAT_STACK_SIZE
++#else
+ #define PLATFORM_STACK_SIZE		(0x1000 / PLATFORM_CORE_COUNT)
++#endif
+ 
+ /* For the generic GIC driver (USE_GIC_DRIVER). */
+ #define PLAT_ARM_GICD_BASE		SUNXI_GICD_BASE
+diff --git a/plat/allwinner/common/include/sunxi_private.h b/plat/allwinner/common/include/sunxi_private.h
+index 75216a7b4..b83e3acc9 100644
+--- a/plat/allwinner/common/include/sunxi_private.h
++++ b/plat/allwinner/common/include/sunxi_private.h
+@@ -24,6 +24,17 @@ void sunxi_cpu_power_off_others(void);
+ void sunxi_cpu_power_off_self(void);
+ void sunxi_power_down(void);
+ 
++#if SUNXI_PSCI_NATIVE_SUSPEND
++/*
++ * Provided per SoC, next to sunxi_cpu_power_off_self(): the registers that
++ * permit a core to power itself down are not the same on every Allwinner
++ * part, and on the A733 they are an Arm PPU that the SoC manual does not
++ * document.
++ */
++void sunxi_cpu_suspend_setup(uintptr_t sec_entrypoint);
++bool sunxi_cpu_can_suspend(unsigned int core);
++#endif
++
+ #if SUNXI_PSCI_USE_NATIVE
+ void sunxi_set_native_psci_ops(const plat_psci_ops_t **psci_ops);
+ #else
+diff --git a/plat/allwinner/common/sunxi_native_pm.c b/plat/allwinner/common/sunxi_native_pm.c
+index 4c2a97a76..d36812c4e 100644
+--- a/plat/allwinner/common/sunxi_native_pm.c
++++ b/plat/allwinner/common/sunxi_native_pm.c
+@@ -4,6 +4,10 @@
+  * SPDX-License-Identifier: BSD-3-Clause
+  */
+ 
++#include <assert.h>
++
++#include <platform_def.h>
++
+ #include <arch_helpers.h>
+ #include <common/debug.h>
+ #if !USE_GIC_DRIVER
+@@ -12,6 +16,7 @@
+ #include <drivers/delay_timer.h>
+ #include <lib/mmio.h>
+ #include <lib/psci/psci.h>
++#include <plat/common/platform.h>
+ 
+ #include <sunxi_mmap.h>
+ #include <sunxi_private.h>
+@@ -46,6 +51,110 @@ static void sunxi_pwr_domain_on_finish(const psci_power_state_t *target_state)
+ #endif
+ }
+ 
++#if SUNXI_PSCI_NATIVE_SUSPEND
++/*
++ * The only StateID this platform defines. The device tree encodes core
++ * power-down as 0x00010000: type POWERDOWN in bit 16, affinity level 0 in
++ * bits [25:24], StateID zero.
++ */
++#define SUNXI_STATEID_PWRDN		U(0)
++
++/*
++ * Native CPU_SUSPEND, core level.
++ *
++ * The state carries StateID 0 -- its meaning is in the power-level field,
++ * bits [25:24] -- so this decodes the level and NOT the StateID. A StateID
++ * pass-through validator (see sunxi_scpi_pm.c) would return all-RUN for
++ * StateID 0, psci_find_target_suspend_lvl() would answer
++ * PSCI_INVALID_PWR_LVL and psci_main.c would panic().
++ *
++ * A level the platform does not implement is refused, and the device tree
++ * must not declare it: Linux never retires a state the firmware refuses --
++ * cpuidle counts the rejection and the idle loop asks for the same state
++ * again at once, spinning through SMCs instead of sleeping.
++ */
++static int sunxi_validate_power_state(unsigned int power_state,
++				      psci_power_state_t *req_state)
++{
++	unsigned int pwr_lvl  = psci_get_pstate_pwrlvl(power_state);
++	unsigned int type     = psci_get_pstate_type(power_state);
++	unsigned int state_id = psci_get_pstate_id(power_state);
++	unsigned int i;
++
++	assert(req_state != NULL);
++
++	if (type != PSTATE_TYPE_POWERDOWN) {
++		return PSCI_E_INVALID_PARAMS;
++	}
++
++	/*
++	 * Level 1 (the cluster) and level 2 (the system) are not
++	 * implemented. PLAT_MAX_PWR_LVL is 2 and the topology is root / one
++	 * cluster / the cores (sunxi_topology.c), so a level-1 request is
++	 * well-formed -- it is refused for what it asks, not for how it is
++	 * encoded.
++	 */
++	if (pwr_lvl != PSCI_CPU_PWR_LVL) {
++		return PSCI_E_INVALID_PARAMS;
++	}
++
++	if (state_id != SUNXI_STATEID_PWRDN) {
++		return PSCI_E_INVALID_PARAMS;
++	}
++
++	/*
++	 * Hardware gate. If this core's power controller is not in the
++	 * configuration the down path assumes, refuse the state rather than
++	 * quiesce the GIC around a core that will not gate and then cannot be
++	 * woken. PSCI_E_DENIED would be more expressive, but psci_main.c
++	 * asserts that validate_power_state returns only INVALID_PARAMS.
++	 */
++	if (!sunxi_cpu_can_suspend(plat_my_core_pos())) {
++		return PSCI_E_INVALID_PARAMS;
++	}
++
++	for (i = PSCI_CPU_PWR_LVL; i <= PLAT_MAX_PWR_LVL; ++i) {
++		req_state->pwr_domain_state[i] = (i <= pwr_lvl) ?
++			PLAT_MAX_OFF_STATE : PSCI_LOCAL_STATE_RUN;
++	}
++
++	return PSCI_E_SUCCESS;
++}
++
++/*
++ * By the time this runs the PSCI library has set
++ * CPUPWRCTLR_EL1.CORE_PWRDN_EN (prepare_cpu_pwr_dwn()) and the generic GIC
++ * driver has run gicv3_cpuif_disable(): the GIC-600 TRM 3.6.2 core
++ * power-down sequence, ending in GICR_WAKER.ProcessorSleep = 1, which makes
++ * the redistributor assert wake_request for this core -- the only thing
++ * that brings it back. The redistributor stays powered (no
++ * gicv3_rdistif_off(), which is right for CPU_OFF and fatal here), and
++ * GIC_WAKEUP_DISABLE, which sunxi_cpu_off() sets for CPU_OFF, stays clear.
++ *
++ * No power-controller write: PWR_POLICY is OFF since setup and re-checked
++ * in sunxi_validate_power_state(). The core gates at the WFI that follows,
++ * which drops its P-Channel ON request.
++ */
++static void sunxi_pwr_domain_suspend(const psci_power_state_t *target_state)
++{
++	assert(is_local_state_off(
++		target_state->pwr_domain_state[PSCI_CPU_PWR_LVL]) != 0);
++	assert(is_local_state_run(
++		target_state->pwr_domain_state[PSCI_CPU_PWR_LVL + 1U]) != 0);
++}
++
++/*
++ * The generic GIC driver runs gicv3_cpuif_enable() after this, which clears
++ * GICR_WAKER.ProcessorSleep (and so drops wake_request) and restores the
++ * ICC_* system registers. It does not re-run gicv3_rdistif_init(), whose
++ * defaults would disable every SGI and PPI the OS had enabled.
++ */
++static void sunxi_pwr_domain_suspend_finish(
++		const psci_power_state_t *target_state)
++{
++}
++#endif /* SUNXI_PSCI_NATIVE_SUSPEND */
++
+ static void sunxi_system_off(void)
+ {
+ #if !USE_GIC_DRIVER
+@@ -137,6 +246,15 @@ static const plat_psci_ops_t sunxi_native_psci_ops = {
+ 	.pwr_domain_on			= sunxi_pwr_domain_on,
+ 	.pwr_domain_off			= sunxi_pwr_domain_off,
+ 	.pwr_domain_on_finish		= sunxi_pwr_domain_on_finish,
++#if SUNXI_PSCI_NATIVE_SUSPEND
++	/*
++	 * psci_setup.c grants PSCI_CPU_SUSPEND_AARCH64 only when all three of
++	 * these are present.
++	 */
++	.pwr_domain_suspend		= sunxi_pwr_domain_suspend,
++	.pwr_domain_suspend_finish	= sunxi_pwr_domain_suspend_finish,
++	.validate_power_state		= sunxi_validate_power_state,
++#endif
+ 	.system_off			= sunxi_system_off,
+ 	.system_reset			= sunxi_system_reset,
+ 	.validate_ns_entrypoint		= sunxi_validate_ns_entrypoint,
+diff --git a/plat/allwinner/common/sunxi_pm.c b/plat/allwinner/common/sunxi_pm.c
+index ebc406b91..ec7e3b20f 100644
+--- a/plat/allwinner/common/sunxi_pm.c
++++ b/plat/allwinner/common/sunxi_pm.c
+@@ -58,14 +58,36 @@ int plat_setup_psci_ops(uintptr_t sec_entrypoint,
+ 			mmio_write_32(SUNXI_ALT_RVBAR_HI_REG(cpu),
+ 				      sec_entrypoint >> 32);
+ 		}
++#ifdef SUNXI_CPUCFG_CPU_CTRL_REG
++		/*
++		 * The execution state the core resets into. RVBAR is the
++		 * AArch64 reset vector only; with AA64nAA32 = 0 a reset lands
++		 * in the BROM instead. sunxi_cpu_on() sets the bit for the core
++		 * it starts, but the boot core was released by the BROM/boot0
++		 * in AArch32 and switched with an RMR warm reset, which leaves
++		 * the bit at its reset value 0 -- so its first power-down wake
++		 * would run the BROM while the OS runs on. Set here for every
++		 * core, next to RVBAR, before any core can reset.
++		 */
++		mmio_setbits_32(SUNXI_CPUCFG_CPU_CTRL_REG(cpu),
++				SUNXI_CPUCFG_CPU_CTRL_AA64);
++#endif
+ 	}
+ 
+ 	if (sunxi_set_scpi_psci_ops(psci_ops) == 0) {
+ 		INFO("PSCI: Suspend is available via SCPI\n");
+ 		psci_is_scpi = true;
+ 	} else {
+-		INFO("PSCI: Suspend is unavailable\n");
+ 		sunxi_set_native_psci_ops(psci_ops);
++#if SUNXI_PSCI_NATIVE_SUSPEND
++		/*
++		 * Arm the platform's own CPU_SUSPEND. Prints its own summary,
++		 * including which cores ended up able to offer the state.
++		 */
++		sunxi_cpu_suspend_setup(sec_entrypoint);
++#else
++		INFO("PSCI: Suspend is unavailable\n");
++#endif
+ 	}
+ 
+ 	return 0;
+diff --git a/plat/allwinner/sun60i_a733/platform.mk b/plat/allwinner/sun60i_a733/platform.mk
+index f70de3ad2..3b9e6e367 100644
+--- a/plat/allwinner/sun60i_a733/platform.mk
++++ b/plat/allwinner/sun60i_a733/platform.mk
+@@ -32,6 +32,18 @@ SUNXI_NEW_MPIDR_FMT := 1
+ SUNXI_PSCI_USE_SCPI := 0
+ SUNXI_PSCI_USE_NATIVE := 1
+ 
++# Native PSCI CPU_SUSPEND: core-level power-down through the per-core Arm
++# PPUs in the CPUIDLE block, with no SCP (sunxi_cpu_suspend.c).
++SUNXI_PSCI_NATIVE_SUSPEND := 1
++
++# EL3 stack per core. The common default, 0x1000 shared by eight cores =
++# 512 B each, is not enough for the CPU_SUSPEND path as soon as anything on
++# it prints (gcc -fcallgraph-info=su on the link-time optimised release
++# build, deepest chain from std_svc_smc_handler: 928 B). The stacks are
++# contiguous, so an overflow silently corrupts the next core's frames.
++# 2 KiB, in the NOBITS region.
++SUNXI_PLAT_STACK_SIZE := 2048
++
+ # GIC-600, driven by the generic GICv3 driver.
+ USE_GIC_DRIVER := 3
+ GICV3_SUPPORT_GIC600 := 1
+diff --git a/plat/allwinner/sun60i_a733/sunxi_cpu_suspend.c b/plat/allwinner/sun60i_a733/sunxi_cpu_suspend.c
+new file mode 100644
+index 000000000..56423f30b
+--- /dev/null
++++ b/plat/allwinner/sun60i_a733/sunxi_cpu_suspend.c
+@@ -0,0 +1,233 @@
++/*
++ * Copyright (c) 2026, DockSeed. All rights reserved.
++ *
++ * SPDX-License-Identifier: BSD-3-Clause
++ */
++
++/*
++ * A733 (sun60iw2) CPU-subsystem PPU access for native PSCI CPU_SUSPEND.
++ *
++ * WHAT THIS BLOCK IS. The A733 UM memory map calls 0x07050000-0x0705FFFF
++ * (64K, SUNXI_R_CPUCFG_BASE) "CPUIDLE" (the block it calls "PPU" is a
++ * different instance at 0x07060000, the peripheral PCK-600). The UM
++ * documents no registers in the CPUIDLE block. What the block contains, read
++ * on silicon, is Arm PPU components that identify themselves:
++ *
++ *   CIDR = 0xB105F00D, PIDR part 0x0B6 / JEP106 0x43B = Arm,
++ *   IIDR = 0x0B61143B, AIDR = 0x11 -> PPU architecture v1.1
++ *
++ * Every register field below therefore comes from Arm DEN0051E (PPU
++ * Architecture Specification v1.1), and every value is checked against the
++ * instance's own PPU_IDR0 before it is relied on.
++ *
++ * WHICH INSTANCE IS WHICH. Proven by stimulus, not inferred from order:
++ * taking cpu3 offline moves only 0x07055008 and cpu7 only 0x07059008, both
++ * reversibly, while 0x07051008 never moves. So the DSU PPU is at +0x1000 and
++ * core N is at +0x2000 + N * 0x1000, as the hotplug code in
++ * sunxi_cpu_new_ops.c has it.
++ *
++ * WHAT THIS FILE DOES, AND WHY SO LITTLE. Cores 1-7 already sit at
++ * PWR_POLICY = OFF with PWR_DYN_EN = 1, i.e. the hardware is already allowed
++ * to gate them when they ask; suspend needs no write for them at all. Core 0
++ * was released by boot0 and never went through sunxi_cpu_on(), so it reads
++ * PWR_POLICY = ON -- and with dynamic transitions enabled the policy is the
++ * MINIMUM power mode (DEN0051E 5.2.1), so core 0 can never gate. That
++ * asymmetry is the only thing this file writes.
++ *
++ * The same history leaves core 0 a second asymmetry: CLU0_CPU0_CTRL_REG
++ * AA64nAA32 = 0 (sunxi_cpu_on() sets it only for the core it starts), so a
++ * reset of core 0 lands in AArch32 at the BROM instead of at RVBAR. It is
++ * set for every core in plat_setup_psci_ops() (sunxi_pm.c), next to RVBAR;
++ * this file only reads both back and refuses the state to a core whose
++ * reset would not land in BL31.
++ */
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#include <platform_def.h>
++
++#include <common/debug.h>
++#include <lib/cassert.h>
++#include <lib/mmio.h>
++#include <lib/utils_def.h>
++#include <plat/common/platform.h>
++
++#include <sunxi_cpucfg.h>
++#include <sunxi_mmap.h>
++#include <sunxi_private.h>
++
++/* PPU instance apertures inside the CPUIDLE block, from +0x2000 on. */
++#define A733_PPU_CPU(n)			(SUNXI_R_CPUCFG_BASE + U(0x2000) + \
++					 (n) * U(0x1000))
++
++/* The whole map has to stay inside the 64K the UM gives the block. */
++CASSERT(A733_PPU_CPU(PLATFORM_CORE_COUNT - 1) + U(0xFFF) <
++	SUNXI_R_CPUCFG_BASE + U(0x10000),
++	assert_a733_ppu_map_fits_cpuidle_block);
++
++/* Arm PPU register offsets, DEN0051E Table 5-1. */
++#define PPU_PWPR			U(0x000)
++#define PPU_IDR0			U(0xFB0)
++
++/* DEN0051E Table 5-2 (PWPR). */
++#define PPU_PWR_POLICY_MASK		U(0xF)		/* PWPR [3:0] */
++#define PPU_PWR_DYN_EN			BIT_32(8)	/* PWPR [8]   */
++
++/*
++ * DEN0051E Table 3-2, and independently the A733 UM v0.92 Table 5-2
++ * (its table of the Cortex-A76 power modes), which prints OFF as 0b000000.
++ */
++#define PPU_MODE_OFF			U(0x0)
++
++/* DEN0051E Table 5-26. */
++#define PPU_IDR0_STA_OFF_SPT		BIT_32(8)
++#define PPU_IDR0_DYN_OFF_SPT		BIT_32(20)
++
++/*
++ * This code decodes the original PSCI power-state format: the DT declares
++ * 0x00010000, whose StateID field is zero and whose meaning is carried by
++ * bits [25:24]. PSCI_EXTENDED_STATE_ID is 0 by default
++ * (make_helpers/defaults.mk) and no Allwinner platform overrides it. Fail the
++ * build rather than silently misread the parameter if that ever changes.
++ */
++#if PSCI_EXTENDED_STATE_ID
++#error "sun60i_a733 native suspend decodes the original power-state format"
++#endif
++
++/*
++ * Per-core, set once at setup: does this core's PPU instance report that OFF
++ * is supported at all, statically and as a dynamic transition. An instance
++ * that is not implemented reads as zero and fails this, which is the answer
++ * we want.
++ */
++static bool cpu_ppu_off_capable[PLATFORM_CORE_COUNT];
++
++/*
++ * Per-core, set once at setup: does a reset of this core land in BL31's warm
++ * entry point. A core the PPU turns back on after a power-down starts at its
++ * reset vector, and that is RVBARADDR only in AArch64 state
++ * (CLU0_CPUn_CTRL_REG.AA64nAA32 = 1, sunxi_cpucfg_ncat3.h). Both are
++ * programmed for every core by plat_setup_psci_ops() just before setup and
++ * read back here. With the bit at 0, the boot core's first power-down wake
++ * ran the BROM and boot0 in the middle of the running kernel.
++ */
++static bool cpu_resets_to_bl31[PLATFORM_CORE_COUNT];
++
++/*
++ * True when this core's PPU is in the exact configuration the suspend path
++ * assumes. Called on every CPU_SUSPEND, before anything is committed.
++ *
++ * One MMIO read. PWPR[8] is read rather than PWSR[8] deliberately: DEN0051E
++ * notes a dynamic-enable write may take time to appear in PWSR, but we never
++ * write that bit, and PWPR is the register whose PWR_POLICY we have to read
++ * anyway.
++ */
++bool sunxi_cpu_can_suspend(unsigned int core)
++{
++	uint32_t pwpr;
++
++	if ((core >= PLATFORM_CORE_COUNT) || !cpu_ppu_off_capable[core] ||
++	    !cpu_resets_to_bl31[core]) {
++		return false;
++	}
++
++	pwpr = mmio_read_32(A733_PPU_CPU(core) + PPU_PWPR);
++
++	/*
++	 * With PWR_DYN_EN clear, PWR_POLICY is the TARGET power mode rather
++	 * than the minimum (DEN0051E 5.2.1) and this whole model does not
++	 * apply -- a core in that state must not be offered the idle state.
++	 */
++	if ((pwpr & PPU_PWR_DYN_EN) == 0U) {
++		return false;
++	}
++
++	/*
++	 * Anything above OFF is a floor this core cannot go below, so it will
++	 * not gate. Offering the state anyway would mean setting
++	 * GICR_WAKER.ProcessorSleep on a core that stays ON, which the GIC-600
++	 * TRM (3.6.2) forbids and which leaves the core unwakeable in WFI.
++	 */
++	return (pwpr & PPU_PWR_POLICY_MASK) == PPU_MODE_OFF;
++}
++
++/*
++ * Called once from plat_setup_psci_ops(), on the boot core, before any
++ * secondary has been started.
++ *
++ * Reads are safe on a core that has never run: the PPU is the controller, not
++ * the controlled domain, and sunxi_cpu_on() polls PPU_PWSR of an off core.
++ *
++ * The write is deliberately confined to the calling core. Cores 1-7 are
++ * measured to reach PWR_POLICY = OFF by themselves once sunxi_cpu_on() has
++ * run, so writing their policy here -- before they have ever been started,
++ * in a state nobody has measured -- would risk SMP bring-up to fix something
++ * that is not broken. If a secondary ever does come up with a different
++ * policy, sunxi_cpu_can_suspend() refuses it the idle state; it does not hang
++ * it.
++ */
++void sunxi_cpu_suspend_setup(uintptr_t sec_entrypoint)
++{
++	unsigned int self = plat_my_core_pos();
++	unsigned int core;
++	unsigned int mask = 0U;
++	unsigned int reset_ok = 0U;
++	uint32_t before, after;
++	uintptr_t ppu;
++
++	for (core = 0U; core < PLATFORM_CORE_COUNT; ++core) {
++		uint32_t idr0 = mmio_read_32(A733_PPU_CPU(core) + PPU_IDR0);
++		uint32_t need = PPU_IDR0_STA_OFF_SPT | PPU_IDR0_DYN_OFF_SPT;
++
++		cpu_ppu_off_capable[core] = ((idr0 & need) == need);
++
++		cpu_resets_to_bl31[core] =
++			((mmio_read_32(SUNXI_CPUCFG_CPU_CTRL_REG(core)) &
++			  SUNXI_CPUCFG_CPU_CTRL_AA64) != 0U) &&
++			(mmio_read_32(SUNXI_CPUCFG_RVBAR_LO_REG(core)) ==
++			 (uint32_t)sec_entrypoint) &&
++			(mmio_read_32(SUNXI_CPUCFG_RVBAR_HI_REG(core)) ==
++			 (uint32_t)(sec_entrypoint >> 32));
++		if (cpu_resets_to_bl31[core]) {
++			reset_ok |= BIT_32(core);
++		}
++	}
++
++	ppu = A733_PPU_CPU(self);
++	before = mmio_read_32(ppu + PPU_PWPR);
++	after = before;
++
++	if (cpu_ppu_off_capable[self] && cpu_resets_to_bl31[self] &&
++	    ((before & PPU_PWR_POLICY_MASK) != PPU_MODE_OFF)) {
++		/*
++		 * Read-modify-write: PWR_DYN_EN, LOCK_EN, OP_POLICY and
++		 * OP_DYN_EN are preserved. The value written is the one seven
++		 * of the eight cores already carry continuously on this
++		 * silicon, and hotplug works in both directions through it.
++		 */
++		mmio_write_32(ppu + PPU_PWPR,
++			      (before & ~PPU_PWR_POLICY_MASK) | PPU_MODE_OFF);
++		/*
++		 * Read back. DEN0051E: programming an unsupported policy makes
++		 * the PPU revert PWPR. Never assume the write took.
++		 */
++		after = mmio_read_32(ppu + PPU_PWPR);
++	}
++
++	for (core = 0U; core < PLATFORM_CORE_COUNT; ++core) {
++		if (sunxi_cpu_can_suspend(core)) {
++			mask |= BIT_32(core);
++		}
++	}
++
++	/*
++	 * One line at every cold boot: which cores will actually offer the
++	 * state (0xff expected), the boot core's policy write, and which cores
++	 * reset into BL31 (AArch64, RVBAR = warm entry; 0xff expected, a core
++	 * missing from it is refused the state). NOTICE, so that a release
++	 * build (LOG_LEVEL 20) prints it.
++	 */
++	NOTICE("PSCI: native CPU_SUSPEND armed 0x%02x, core %u PWPR %08x->%08x, reset to BL31 0x%02x\n",
++	       mask, self, before, after, reset_ok);
++}

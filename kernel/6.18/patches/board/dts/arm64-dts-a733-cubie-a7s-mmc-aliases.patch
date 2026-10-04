@@ -1,0 +1,55 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: a733: cubie-a7s: mmc aliases so the card indexes stop moving
+
+Without an "mmc" alias the mmc core hands out host indexes in probe order:
+mmc_alloc_host() reads of_alias_get_id(dev->of_node, "mmc") and, when there is
+none, falls back to the first non-reserved index (drivers/mmc/core/host.c:532,
+6.18.36). Probe order is not stable on this board -- the SD card came up as
+mmcblk0 on two boots of one kernel and as mmcblk1 on a third, 2026-09-10 --
+so every path that names a number is a coin flip, and the board's selftest
+already works around it by picking the device through
+/sys/block/mmcblkN/device/type instead.
+
+The alias id is the controller index, which is what the node names anyway:
+
+  mmc0 -> mmc@4020000, SMHC0, the SD socket (allwinner,sun60i-a733-mmc)
+  mmc2 -> mmc@4022000, SMHC2, the soldered eMMC (allwinner,sun60i-a733-emmc)
+
+Where those two come from: the bases are the UM's (SMHC0 0x04020000, SMHC2 0x04022000). Which controller
+carries what is read off the board, not inferred -- 4020000.mmc logs "Got CD
+GPIO" and only the SD socket has a card detect, and the eMMC answers on
+4022000.mmc, where its EXT_CSD names the part DV4032 (read 2026-09-19).
+
+mmc1 and mmc3 stay unallocated: our DT models SMHC0 and SMHC2 only. Whether
+SMHC1's pins (PG0-PG5 at selector 2) go anywhere on this
+board is unmeasured -- the WiFi part is not on them, it sits behind the on-board
+USB hub (out-of-tree/aic8800/README.md).
+
+This changes only what the numbers are, not what boots: the image's extlinux
+entry names root=PARTUUID=... (scripts/stages/image.sh), so nothing in the boot path
+reads an mmcblk number.
+
+⚠ Placed late in the series on purpose: the hunk's context is the /aliases node as
+`arm64-dts-a733-ethernet0-alias-for-uboot-mac` leaves it (ethernet0 + serial0). That patch
+applies well after the eMMC patches such as `arm64-dts-a733-emmc-declare-the-soldered-card`,
+so placing this one next to them would break at fuzz 0.
+`arm64-dts-a733-uart1-on-pg6-pg7-pinctrl-proof` is placed late for the same reason.
+
+Verified: applies clean at --fuzz=0; the dtb built from the patched tree carries
+mmc0 = /soc/mmc@4020000 and mmc2 = /soc/mmc@4022000 (fdtget, local 2026-09-19).
+Pending on silicon: three cold boots with the SD at mmcblk0 and the eMMC at
+mmcblk2, and an acceptance run.
+
+Assisted-by: Claude
+---
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -36,6 +36,8 @@
+ 
+ 	aliases {
+ 		ethernet0 = &gmac0;
++		mmc0 = &mmc0;
++		mmc2 = &mmc2;
+ 		serial0 = &uart0;
+ 		serial1 = &uart1;
+ 	};

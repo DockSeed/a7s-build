@@ -1,0 +1,161 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] mmc: sunxi: switch the pad I/O voltage when there is no vqmmc
+
+License: GPL-2.0 (driver patch).
+
+sunxi_mmc_volt_switch() knows exactly two worlds: a variable vqmmc regulator,
+or no switch at all. Without vqmmc it returns 0 for MMC_SIGNAL_VOLTAGE_330 and
+-EINVAL for everything else, so a 1.8 V request can only fail. On SoCs where the
+bank's I/O voltage is switched inside the SoC -- the A733's PF bank via
+GPIO_POW_VAL_SET_CTL -- there is a third world it cannot reach, and UHS is
+unavailable on any board wired that way.
+
+This is not a theoretical gap. On 2026-08-03 the A733 SD UHS series was proven
+on hardware to fail exactly here: the pinctrl handler for the pad voltage works
+(it runs, it writes the register, the read-back confirms it), and the state
+carrying 1.8 V was never selected because nothing in the tree selects it. The
+DT half had invented a "mmc_1v8" pinctrl-name on the assumption that this driver
+looks it up. It does not -- this file had no pinctrl reference at all.
+
+So give it the third world, in the shape mainline already has one for:
+
+ - probe optionally picks up a pad state per signalling voltage. Names follow
+   the *documented* Tegra pair, nvidia,tegra20-sdhci.yaml: "sdmmc-3v3" and
+   "sdmmc-1v8", described there as "pad configuration for 3.3 V / 1.8 V", which
+   is precisely the semantics here. No new name is invented.
+ - both states are required together. One alone cannot switch anything, and
+   accepting it would leave the driver believing it can.
+ - everything is optional: a board without the pair keeps the old fixed-3.3 V
+   behaviour, byte for byte. Boards with a real vqmmc keep the regulator path,
+   which is still tried first.
+
+Two details worth stating rather than leaving to the reader:
+
+ - the new path tests ios->signal_voltage, the voltage the core is *asking*
+   for. The pre-existing fallback below tests mmc->ios.signal_voltage, the
+   current one. That looks like a latent bug, but changing it would alter
+   behaviour on every other sunxi SoC on a patch that is not about it, so it
+   stays as it is and is called out here instead.
+ - pinctrl_select_state()'s return value is propagated. A voltage switch that
+   silently "succeeded" is what cost this topic three board sessions.
+
+Assisted-by: Claude
+---
+--- a/drivers/mmc/host/sunxi-mmc.c
++++ b/drivers/mmc/host/sunxi-mmc.c
+@@ -31,6 +31,7 @@
+ #include <linux/of_platform.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
++#include <linux/pinctrl/consumer.h>
+ #include <linux/regulator/consumer.h>
+ #include <linux/reset.h>
+ #include <linux/scatterlist.h>
+@@ -349,6 +350,15 @@
+ 	/* vqmmc */
+ 	bool		vqmmc_enabled;
+ 
++	/*
++	 * Pad I/O voltage states, for boards whose signalling voltage is
++	 * switched in the SoC's pad control rather than by a variable vqmmc
++	 * regulator. Both NULL unless the DT carries the pair.
++	 */
++	struct pinctrl		*pinctrl;
++	struct pinctrl_state	*pins_3v3;
++	struct pinctrl_state	*pins_1v8;
++
+ 	/* timings */
+ 	bool		use_new_timings;
+ 
+@@ -1180,6 +1190,8 @@
+ 
+ static int sunxi_mmc_volt_switch(struct mmc_host *mmc, struct mmc_ios *ios)
+ {
++	struct sunxi_mmc_host *host = mmc_priv(mmc);
++	struct pinctrl_state *state;
+ 	int ret;
+ 
+ 	/* vqmmc regulator is available */
+@@ -1188,6 +1200,31 @@
+ 		return ret < 0 ? ret : 0;
+ 	}
+ 
++	/*
++	 * No vqmmc, but the DT gives us a pad state per signalling voltage:
++	 * the SoC switches the bank's I/O voltage instead of a regulator.
++	 * Note this tests the *requested* voltage in ios, not the current one
++	 * in mmc->ios -- the fallback below deliberately keeps the latter.
++	 */
++	if (host->pins_3v3 && host->pins_1v8) {
++		switch (ios->signal_voltage) {
++		case MMC_SIGNAL_VOLTAGE_330:
++			state = host->pins_3v3;
++			break;
++		case MMC_SIGNAL_VOLTAGE_180:
++			state = host->pins_1v8;
++			break;
++		default:
++			return -EINVAL;
++		}
++
++		ret = pinctrl_select_state(host->pinctrl, state);
++		dev_dbg(mmc_dev(mmc), "pad state -> %s: %d\n",
++			ios->signal_voltage == MMC_SIGNAL_VOLTAGE_180 ?
++				"1.8 V" : "3.3 V", ret);
++		return ret;
++	}
++
+ 	/* no vqmmc regulator, assume fixed regulator at 3/3.3V */
+ 	if (mmc->ios.signal_voltage == MMC_SIGNAL_VOLTAGE_330)
+ 		return 0;
+@@ -1739,6 +1776,41 @@
+ 		reset_control_assert(host->reset);
+ }
+ 
++/*
++ * Optional: a pad state per signalling voltage, for boards where the SoC
++ * switches the bank's I/O voltage instead of a variable vqmmc regulator.
++ * Names follow the documented Tegra pair (nvidia,tegra20-sdhci.yaml):
++ * "sdmmc-3v3" and "sdmmc-1v8".
++ *
++ * Everything here is optional and failure is not fatal -- a board without the
++ * pair simply keeps the old fixed-3.3 V behaviour. Both states are required
++ * together: one alone cannot switch anything, and taking it would leave the
++ * driver believing it can.
++ */
++static void sunxi_mmc_get_pad_states(struct device *dev,
++				     struct sunxi_mmc_host *host)
++{
++	host->pinctrl = devm_pinctrl_get(dev);
++	if (IS_ERR(host->pinctrl)) {
++		dev_dbg(dev, "no pinctrl, no pad voltage states: %ld\n",
++			PTR_ERR(host->pinctrl));
++		host->pinctrl = NULL;
++		return;
++	}
++
++	host->pins_3v3 = pinctrl_lookup_state(host->pinctrl, "sdmmc-3v3");
++	host->pins_1v8 = pinctrl_lookup_state(host->pinctrl, "sdmmc-1v8");
++
++	if (IS_ERR(host->pins_3v3) || IS_ERR(host->pins_1v8)) {
++		host->pins_3v3 = NULL;
++		host->pins_1v8 = NULL;
++		dev_dbg(dev, "no sdmmc-3v3/sdmmc-1v8 pad states\n");
++		return;
++	}
++
++	dev_dbg(dev, "pad voltage states available (sdmmc-3v3/sdmmc-1v8)\n");
++}
++
+ static int sunxi_mmc_resource_request(struct sunxi_mmc_host *host,
+ 				      struct platform_device *pdev)
+ {
+@@ -1752,6 +1824,8 @@
+ 	if (ret)
+ 		return ret;
+ 
++	sunxi_mmc_get_pad_states(&pdev->dev, host);
++
+ 	host->reg_base = devm_platform_ioremap_resource(pdev, 0);
+ 	if (IS_ERR(host->reg_base))
+ 		return PTR_ERR(host->reg_base);

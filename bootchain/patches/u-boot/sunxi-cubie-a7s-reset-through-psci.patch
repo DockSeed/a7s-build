@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000004 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Mon, 14 Sep 2026 00:00:00 +0000
+Subject: [PATCH] sunxi: cubie-a7s: reset through PSCI, as Linux does
+
+U-Boot's `reset` command on this board is not the reset Linux uses. With
+SYSRESET=y and SYSRESET_PSCI not set, do_reset() walks the sysreset
+uclass (drivers/sysreset/sysreset-uclass.c). The one device there that
+handles a cold or warm reset is the wdt-reboot device
+SYSRESET_WATCHDOG_AUTO binds to WDT0 (ARCH_SUNXI implies both,
+arch/arm/Kconfig); the AXP PMIC's sysreset device handles power-off only
+(drivers/power/pmic/axp.c). By the source, that path programs WDT0 to its
+0.5 s interval, waits 600 ms, and gives up with "System reset not
+supported on this platform" and hang() if the board is still running. At
+the prompt on 2026-09-14 five `reset` commands all reset the board, three
+of them only after that line and hang()
+(measured). Linux's `reboot` and panic reset
+through BL31's PSCI SYSTEM_RESET.
+
+The change: SYSRESET_PSCI=y. psci_bind() then binds psci-sysreset
+(drivers/firmware/psci.c) to the PSCI node the A733 DT already carries
+(compatible "arm,psci-0.2", method smc), and ARM_PSCI_FW is already on.
+psci_sysreset_request() calls SYSTEM_RESET for a cold or warm reset
+(drivers/sysreset/sysreset_psci.c). uclass_first_device() walks devices
+in bind order (drivers/core/uclass.c). psci-sysreset binds when initr_dm
+rebinds the device model after relocation (common/board_r.c); wdt-reboot
+binds later, when initr_watchdog probes WDT0 (drivers/watchdog/
+wdt-uclass.c). So by the source the walk reaches PSCI first; the watchdog
+device stays bound behind it.
+
+Role models: imx8mm-mx8menlo_defconfig and imx8mp_debix_model_a_defconfig
+enable SYSRESET_PSCI next to SYSRESET_WATCHDOG, generic-rk3399_defconfig
+SYSRESET_PSCI alone; 71 *_defconfig files in this tree set it.
+
+Resolved configuration (make radxa-cubie-a7s_defconfig on radxa's series
+plus sunxi-cubie-a7s-watchdog-autostart, sunxi-cubie-a7s-bootcount-rtc-gpr
+and this patch): the only CONFIG_ line gained is CONFIG_SYSRESET_PSCI=y.
+The watchdog autostart and the boot counter are untouched.
+
+Assisted-by: Claude
+
+--- a/src/configs/radxa-cubie-a7s_defconfig
++++ b/src/configs/radxa-cubie-a7s_defconfig
+@@ -76,3 +76,4 @@ CONFIG_SYS_BOOTCOUNT_ADDR=0x0709011C
+ CONFIG_SYS_BOOTCOUNT_SINGLEWORD=y
+ CONFIG_BOOTCOUNT_ALTBOOTCMD="setenv boot_targets mmc_auto; setenv boot_syslinux_conf extlinux/extlinux-fallback.conf; run distro_bootcmd; env default -f boot_targets boot_syslinux_conf; run distro_bootcmd"
+ CONFIG_CMD_BOOTCOUNT=y
++CONFIG_SYSRESET_PSCI=y

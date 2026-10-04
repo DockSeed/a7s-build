@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Thu, 24 Sep 2026 13:00:00 +0200
+Subject: [PATCH] arm64: dts: a733: give the IOMMUs the VE's MBUS port gates
+
+Name each video engine master's MBUS matrix port gate as a "masterN" clock
+of the IOMMU that serves it, so that `iommu-sun60i-add-the-allwinner-a733-iommu-driver` (revision of 2026-09-24)
+holds the gate while the master translates. A master's register block
+inside the IOMMU does not answer while its port is gated; the access
+stalls the bus.
+
+  iommu1  master0, master1  CLK_MBUS_VE_DEC   MBUS_MAT_CLK_GATING bit 14
+          (VE_MBUS0, VE_MBUS1 -- the decoder's two masters, one port gate)
+  iommu0  master3           CLK_MBUS_VE_ENC0  MBUS_MAT_CLK_GATING bit 12
+          (VE_ENC)
+
+  Source  the master indices: UM V1.00 ch. 10 and `arm64-dts-a733-the-two-iommus`'s table (four and
+          six master blocks read on silicon). The gate per master: measured on the
+          8 GB board, 2026-09-22 -- with the VE released, the per-master
+          range invalidation (+0x054) of IOMMU1 completes with bit 14 set
+          alone and times out with every other decoder clock, gate and
+          reset set alone; for IOMMU0 the same with bit 12. Decoder held
+          alone: IOMMU1 clears, IOMMU0 times out; encoder alone: the
+          reverse.
+  Ids     CLK_MBUS_VE_DEC 108, CLK_MBUS_VE_ENC0 107, from `clk-sunxi-ng-a733-ve-plls-module-clocks-gates-and-resets`, which is
+          why this is not in `arm64-dts-a733-the-two-iommus`: the ids do not exist yet at `arm64-dts-a733-the-two-iommus`.
+
+DE0 (iommu1 master 2) gets no entry: its port (bit 11, DESYS) read 1 in
+every state measured, display off included. The other masters
+(USB, CSI, ISP, DI, G2D, EINK) have no consumer and no measured gate.
+
+No consumer lists `iommus` for a VE master on this tree, so nothing
+changes at runtime: `iommu-sun60i-add-the-allwinner-a733-iommu-driver` enables a master clock only for a master with a
+user. The clocks become active as soon as a VE node lists `iommus` (for example
+in a test DTB).
+
+VERIFIED: applies at fuzz 0 on main after `arm64-dts-a733-cpu-opp-clock-latency-measured`; the dtb builds, and the
+decompiled dtb carries clock-names "mclk", "pclk", "hclk", "mbus",
+"master3" on iommu@3900000 and "mclk", "pclk", "hclk", "mbus", "master0",
+"master1" on iommu@3910000; CHECK_DTBS against `iommu-sun60i-add-the-allwinner-a733-iommu-driver`'s binding reports
+nothing for either node.
+
+HARDWARE-PROVEN on the 8 GB board, 2026-09-24 (6.18.36-t407 and 6.18.53-t407,
+with a test script): with the VE behind the IOMMUs, bits 12
+and 14 stay set while both engines are runtime-suspended (VE_BGR_REG 0:
+resets asserted, bus gates masked) and 1001 IOMMU1 unmaps complete; the
+same kernel with these clocks removed from the dtb stalls the bus on the
+first unmap, like the kernel before `iommu-sun60i-add-the-allwinner-a733-iommu-driver`'s revision. On the product dtb
+the gates follow the engines, and the idle draw is the same either way
+(3.711 against 3.709 W, 0.1 W resolution).
+
+Assisted-by: Claude
+---
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -1138,8 +1138,15 @@ iommu0: iommu@3900000 {
+ 			clocks = <&ccu CLK_IOMMU0_SYS_MCLK>,
+ 				 <&ccu CLK_IOMMU0_SYS_PCLK>,
+ 				 <&ccu CLK_IOMMU0_SYS_HCLK>,
+-				 <&ccu CLK_MBUS_IOMMU0>;
+-			clock-names = "mclk", "pclk", "hclk", "mbus";
++				 <&ccu CLK_MBUS_IOMMU0>,
++				 <&ccu CLK_MBUS_VE_ENC0>;
++			/*
++			 * master3: VE_ENC's MBUS matrix port gate
++			 * (MBUS_MAT_CLK_GATING bit 12). Its master block does
++			 * not answer while the port is gated; the driver holds
++			 * the gate while the master translates.
++			 */
++			clock-names = "mclk", "pclk", "hclk", "mbus", "master3";
+ 			resets = <&ccu RST_BUS_IOMMU0>;
+ 			#iommu-cells = <1>;
+ 		};
+@@ -1151,8 +1158,18 @@ iommu1: iommu@3910000 {
+ 			clocks = <&ccu CLK_IOMMU1_SYS_MCLK>,
+ 				 <&ccu CLK_IOMMU1_SYS_PCLK>,
+ 				 <&ccu CLK_IOMMU1_SYS_HCLK>,
+-				 <&ccu CLK_MBUS_IOMMU1>;
+-			clock-names = "mclk", "pclk", "hclk", "mbus";
++				 <&ccu CLK_MBUS_IOMMU1>,
++				 <&ccu CLK_MBUS_VE_DEC>,
++				 <&ccu CLK_MBUS_VE_DEC>;
++			/*
++			 * master0/master1: VE_MBUS0/VE_MBUS1, both behind the
++			 * decoder's one MBUS matrix port gate (bit 14), measured
++			 * as the one bit that lets their invalidation complete.
++			 * DE0 (master2) has no entry: its port (bit 11,
++			 * DESYS) read 1 in every state measured.
++			 */
++			clock-names = "mclk", "pclk", "hclk", "mbus",
++				      "master0", "master1";
+ 			resets = <&ccu RST_BUS_IOMMU1>;
+ 			#iommu-cells = <1>;
+ 		};

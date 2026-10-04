@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Fri, 2 Oct 2026 05:00:00 +0200
+Subject: [PATCH] dt-bindings: sound: allwinner: add the A733 I2S, S/PDIF and DMIC
+
+The A733's audio blocks are register-compatible with blocks the bindings
+already describe, compared field by field against the A733 UM V1.00
+chapter 17:
+
+- I2S/PCM: the R329 register file (CTL, FMT0/1, FCTL, INT, CLKD, CHCFG,
+  TXn/RX channel select and map), plus an ASRC block at
+  0x80 on I2S2 only, which resets disabled.
+- OWA: the H616 S/PDIF block. CTL bit 2 is LOOP here where the H616 has
+  MCLKOUTEN; the driver never writes that bit.
+- DMIC: the H6 block.
+
+Each gets a SoC compatible with the existing one as fallback.
+
+Assisted-by: Claude
+---
+--- a/Documentation/devicetree/bindings/sound/allwinner,sun4i-a10-i2s.yaml
++++ b/Documentation/devicetree/bindings/sound/allwinner,sun4i-a10-i2s.yaml
+@@ -33,7 +33,9 @@ properties:
+       - const: allwinner,sun50i-h6-i2s
+       - const: allwinner,sun50i-r329-i2s
+       - items:
+-          - const: allwinner,sun20i-d1-i2s
++          - enum:
++              - allwinner,sun20i-d1-i2s
++              - allwinner,sun60i-a733-i2s
+           - const: allwinner,sun50i-r329-i2s
+ 
+   reg:
+--- a/Documentation/devicetree/bindings/sound/allwinner,sun4i-a10-spdif.yaml
++++ b/Documentation/devicetree/bindings/sound/allwinner,sun4i-a10-spdif.yaml
+@@ -29,6 +29,9 @@ properties:
+       - items:
+           - const: allwinner,sun50i-a64-spdif
+           - const: allwinner,sun8i-h3-spdif
++      - items:
++          - const: allwinner,sun60i-a733-spdif
++          - const: allwinner,sun50i-h616-spdif
+ 
+   reg:
+     maxItems: 1
+--- a/Documentation/devicetree/bindings/sound/allwinner,sun50i-h6-dmic.yaml
++++ b/Documentation/devicetree/bindings/sound/allwinner,sun50i-h6-dmic.yaml
+@@ -18,6 +18,7 @@ properties:
+       - items:
+           - enum:
+               - allwinner,sun20i-d1-dmic
++              - allwinner,sun60i-a733-dmic
+           - const: allwinner,sun50i-h6-dmic
+       - const: allwinner,sun50i-h6-dmic
+ 

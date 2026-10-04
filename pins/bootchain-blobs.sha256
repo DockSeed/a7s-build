@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# sha256 of every prebuilt file the boot chain takes from radxa-pkg/u-boot-dlan17
+# (paths relative to the fetched package tree; the commit is pinned in
+# scripts/stages/bootchain.sh). fetch-bootchain checks them after the fetch and
+# build-bootchain again before the build; any difference stops the stage.
+#   awbin/a733/boot0_*.bin      boot0 incl. DRAM init (sdcard is what the chain uses)
+#   awbin/a733/header-info.bin  header prepended to U-Boot in the package
+#   awbin/a733/boot_package.cfg the packer's list of what goes into the package
+#   spl_libdram/libdram         DRAM training library
+#   libar100s.a                 closed SCP library, linked into the SCP firmware
+#   dragonsecboot               x86-64 packer for boot_package.fex
+# awbin/a733/bl31.bin is NOT listed: the overlay stops using it.
+85fcc9b1b8ebd7a4c06c63810a207339d21fc766919e049f2a72a018463ad893  awbin/a733/boot0_sdcard.bin
+074b378d35b82a6dc7d34b13312967fec85f97f726a28a615b95e92a4f3824b3  awbin/a733/boot0_spinor.bin
+af6d5dc643a6ab6c0d99daa733931270a0cb969ab56f0282fb885ed77b840d31  awbin/a733/boot0_ufs.bin
+d1aad2ef421f8b489c681ce813694e128ea0b858c7332ebecd101c089fe41406  awbin/a733/header-info.bin
+7c4ea9d0d8e99e603cc0e7c1977f98074196115a1541b69fb663f922739c498a  awbin/a733/sys_partition_nor.bin
+bf5e66696d42a59afca32ffc2d012aaa41011aaa94ecba85ad1c88a3f746d586  awbin/a733/boot_package.cfg
+5361d148fa097ccc14e15a173523783d0eb1a71969bc76d57eb8e1229ddc6d90  allwinner-dramlib/sun60iw2p1/spl_libdram/libdram
+5c15da6e0863ec6cd7836242f94efdb69cb3b8a7c012f2c663a46b31eb0e0103  allwinner-dramlib/sun60iw2p1/arisc_liboem/libar100s.a
+a533b05676e74a067fabacce4eac3b0bb9c27ce3c890e1f595ce321a1d8b3e48  tools/pack/pctools/linux/openssl/dragonsecboot

@@ -1,0 +1,370 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] clk: sunxi-ng: a733: the GPU's PLL, module clock, bus gates and reset
+
+The GPU is the last compute block on this SoC with nothing in our CCU. PLL_GPU0,
+GPU0_CLK_REG and GPU0_GATING_REG keep whatever the boot chain left in them and
+no consumer can claim them. This patch adds six clocks and one reset and does
+nothing else -- nothing in the tree references any of them until the device tree
+in `arm64-dts-a733-add-the-gpu-node-disabled` does, and that node lands disabled.
+
+This patch has to be applied after these:
+
+  `clk-sunxi-ng-a733-add-gmac0-clocks` `clk-sunxi-ng-a733-add-ths-and-gpadc-clocks` `clk-sunxi-ng-a733-add-pwm0-pwm1-gates-and-resets` `clk-sunxi-ng-a733-add-edp-bus-gate-and-reset` `clk-sunxi-ng-a733-video-plls-and-edp-tv-pixel-clock` `clk-sunxi-ng-a733-display-engine-clock-gate-reset` `clk-sunxi-ng-a733-npu-pll-module-clock-and-resets`
+
+-- because all of them append to the same three places this one does: the tail of
+the clock id header, the tail of the reset id header, and the end of
+sun60iw2_hw_clks including its .num line. Inserting six ids and six array entries
+ahead of them moves the context every one of those hunks was generated against.
+`clk-sunxi-ng-a733-add-gmac0-clocks` is hardware-proven GMAC0 and `clk-sunxi-ng-a733-npu-pll-module-clock-and-resets` is the NPU; neither may be regenerated to
+make a number prettier. Measured 2026-08-27 with the series applied to
+a 6.18.36 source tree up to the GPU patches, this patch applied, then the remainder attempted.
+
+WHAT THE HARDWARE IS
+--------------------------------------------------------------------------------
+Imagination PowerVR B-Series BXM-4-64 MC1, core window
+0x01800000-0x0188FFFF, 576K, group GPU_SYS. Six clocks and one
+reset, each naming one register field, every offset cross-checked against
+the A733 user manual (UM v0.92):
+
+  pll-gpu0    PLL_GPU0_CTRL_REG 0x00E0
+  gpupll      the same register's single output tap, [22:20] P0 + bit 27 gate
+  gpu0        GPU0_CLK_REG     0x0B20
+  bus-gpu0    GPU0_GATING_REG  0x0B24 bit 0
+  ahb-gpu0    AHB_MAT_CLK_GATING_REG  0x05C0 bit 7
+  mbus-gpu0   MBUS_MAT_CLK_GATING_REG 0x05E0 bit 16
+  RST_BUS_GPU0  GPU0_GATING_REG 0x0B24 bit 16, 0 = Assert, 1 = De-assert
+
+THE THREE THINGS THAT MAKE THIS BLOCK DIFFERENT
+--------------------------------------------------------------------------------
+1. THE DIVIDER MASKS, IT DOES NOT DIVIDE. For the GPU clock, FACTOR_M counts
+   how many of every 16 cycles are masked: GPU_CLK = CLK_SRC*((16-M)/16)
+   (UM 4.1.4.4). The UM contrasts this with the other working clocks, which
+   divide by counting cycles, so the exception is the UM's own statement,
+   not a reading.
+   Only M = 0, 8, 12, 14, 15 land on an integer ratio (/1 /2 /4 /8 /16); those
+   five are the clk_div_table. A ccu_div without a table, or a ccu_mp, would
+   read the field as a linear or power-of-two divisor and be wrong everywhere
+   but at M = 0.
+
+2. GPU0_UPD (bit 27) IS MANDATORY AND ITS ABSENCE IS INVISIBLE. GPU0 is one of
+   the four clocks -- with NSI, MBUS and DRAM0 -- whose SEL, DIV1 and GATING
+   fields take effect only after an explicit update; until the update is
+   triggered, a readback returns the old parameters, not the new ones
+   (UM 4.1.4.5). A driver that forgets it writes a rate that
+   neither takes effect nor appears in a register dump. Mainline already has the
+   mechanism: CCU_FEATURE_UPDATE_BIT with CCU_SUNXI_UPDATE_BIT = BIT(27)
+   (ccu_common.h), honoured by ccu_div, ccu_mux and ccu_gate alike, and used by
+   ccu-sun55i-a523.c for its mbus and dram clocks. This is its first use in our
+   CCU.
+
+3. THE UM CONSTRAINS THE ORDER, NOT ONLY THE VALUES. Going to a higher
+   frequency, the divider is set first and the clock source second; going to
+   a lower one, the reverse.
+   CLK_SET_RATE_NO_REPARENT keeps the framework from crossing the
+   mux on a rate request, so a rate change moves the divider alone and the rule
+   cannot be broken by accident; which source drives the GPU stays a device-tree
+   decision. The mux itself is glitch-free by the UM's own note,
+   and all six of its sources -- GPUPLL, PERI0_800M/600M/400M/300M/200M -- are
+   clocks this CCU already models, so no .index = -1 placeholder is needed.
+
+ONE MODELLED DECISION, NAMED AS SUCH
+--------------------------------------------------------------------------------
+bus-gpu0's parent is ahb-gpu0, not ahb. The GPU binding names at most three
+clocks (core, mem, sys) and this block has four gates; an unclaimed gate is not
+harmless, because it reads 1 at reset, nothing references it, and
+clk_disable_unused() switches it off at late_initcall -- leaving the GPU without
+its AHB port on the bus matrix. Chaining makes the dependency expressible. The
+order is the plausible one (the block's gate behind its matrix port) but the UM
+tabulates the two registers separately and states no relationship, so this is
+modelled topology and the header says so. Falsifier, board work: with the chain
+in place 0x05C0 bit 7 must read 1 whenever the GPU is bound and resumed; a
+working GPU seen with that bit clear refutes the chain, and the fix is then a
+fourth clock carrying CLK_IGNORE_UNUSED.
+
+THE PLL
+--------------------------------------------------------------------------------
+Fvco 1.26G-2.52G, 1/2 pre-divider, P0 1~8 (UM Table 4-2, PLL_GPU0 row).
+The floor modelled here is 1272 MHz because the VCO is 24 MHz * N
+and 1272 is the first multiple of 24 at or above the datasheet minimum -- the
+same arithmetic `clk-sunxi-ng-a733-npu-pll-module-clock-and-resets` used for PLL_NPU. N = PLL_N + 1 with a UM minimum of 11 for
+the PLL_N field, so N >= 12; M1 is the one-bit PLL_INPUT_DIV.
+Reset value 0x4010_4500 decodes to N 70, P0 2 -> 840 MHz, which is what a GPU
+left at reset runs at; the vendor operating point is 1008 MHz (N 84, and the
+vendor's own OPP table pairs it with 960 mV, allwinner-bsp
+configs/linux-6.6/sun60iw2p1.dtsi gpu-opp-table). Choosing a rate belongs to the
+consumer, so this patch sets none.
+
+PLL_GPU0_LOCK_CTRL 0x00E4, PAT0 0x00E8 and PAT1 0x00EC (CCU register list of the A733 user manual; decimal offsets 228/232/236)
+are not modelled: they are the lock window and the spread-spectrum/fractional
+pattern controls, nothing here needs a fractional rate, and the same three are
+unmodelled for PLL_NPU. Named so the absence reads as a decision.
+
+VERIFICATION
+--------------------------------------------------------------------------------
+- applies: patch -p1 --fuzz=0 clean in the full ordered series on a freshly
+  unpacked 6.18.36 (local, 2026-08-27).
+- builds: a compile check passed, ccu-sun60iw2.o warning-free.
+- the OBJECT was inspected, not the exit code, and the sizes were predicted
+  before they were read: sun60iw2_ccu_clks 0x248 = 584 B = 73 entries (was 67),
+  sun60iw2_hw_clks 0x2b8 = 696 B = 8 + 86*8 so .num really is CLK_MBUS_GPU0 + 1,
+  sun60iw2_ccu_resets 0x100 = 256 B = 32 entries (was 31). All six clocks and the
+  reset are in the maps, not only in the headers -- the RST_BUS_GMAC0
+  silent-no-op trap.
+- a binding-id consistency check passed over all 8 A733 headers; clock ids 80-85 and
+  reset id 31 are the next free ones on main.
+- ⚠ NOT hardware-proven. No register on a live GPU has been read for this patch,
+  and `arm64-dts-a733-add-the-gpu-node-disabled` lands the consumer disabled for two separate reasons of its own.
+
+Assisted-by: Claude
+---
+--- a/include/dt-bindings/clock/sun60i-a733-ccu.h
++++ b/include/dt-bindings/clock/sun60i-a733-ccu.h
+@@ -125,4 +125,21 @@
+ #define CLK_AHB_NPU		78
+ #define CLK_MBUS_NPU		79
+ 
++/*
++ * The GPU. Six clocks, each naming one register field: PLL_GPU0's VCO
++ * (PLL_GPU0_CTRL 0x00E0, N and M1) and its single output tap "GPUPLL"
++ * ([22:20] P0 + output gate bit 27), the module clock GPU0_CLK 0x0B20, the
++ * block's own bus gate GPU0_GATING 0x0B24 bit 0, and the two bus-matrix
++ * master gates the GPU needs as an AHB/MBUS master -- AHB_MAT_CLK_GATING
++ * 0x05C0 bit 7 and MBUS_MAT_CLK_GATING 0x05E0 bit 16.
++ *
++ * 80-85 are the next free ids on main; 74-79 are the NPU's, added by `clk-sunxi-ng-a733-npu-pll-module-clock-and-resets`.
++ */
++#define CLK_PLL_GPU0		80
++#define CLK_GPUPLL		81
++#define CLK_GPU0		82
++#define CLK_BUS_GPU0		83
++#define CLK_AHB_GPU0		84
++#define CLK_MBUS_GPU0		85
++
+ #endif /* _DT_BINDINGS_CLK_SUN60I_A733_CCU_H_ */
+--- a/include/dt-bindings/reset/sun60i-a733-ccu.h
++++ b/include/dt-bindings/reset/sun60i-a733-ccu.h
+@@ -58,4 +58,12 @@
+ #define RST_BUS_NPU_AXI		29
+ #define RST_BUS_NPU_AHB		30
+ 
++/*
++ * GPU -- GPU0_GATING_REG 0x0B24 bit16 (0 = Assert, 1 = De-assert). The
++ * register's other modelled bit is the bus gate at bit 0, which is a clock,
++ * not a reset. 31 is the next free reset id on main;
++ * 28-30 are the NPU's.
++ */
++#define RST_BUS_GPU0		31
++
+ #endif /* _DT_BINDINGS_RST_SUN60I_A733_CCU_H_ */
+--- a/drivers/clk/sunxi-ng/ccu-sun60iw2.c
++++ b/drivers/clk/sunxi-ng/ccu-sun60iw2.c
+@@ -1501,6 +1501,172 @@
+  *                       DE-asserted, and no consumer asks for it.
+  */
+ 
++/*
++ * The GPU: Imagination PowerVR B-Series BXM-4-64 MC1, core window
++ * 0x01800000-0x0188FFFF (576K). Six clocks and one reset, each
++ * naming one register field:
++ *
++ *   pll-gpu0    PLL_GPU0_CTRL 0x00E0 -- the VCO (N [15:8], M1 [1])
++ *   gpupll      the same register's single output tap, [22:20] P0 gated by
++ *               PLL_OUTPUT_GATE bit 27
++ *   gpu0        GPU0_CLK_REG 0x0B20 -- mux [26:24], divider [3:0], gate bit31
++ *   bus-gpu0    GPU0_GATING_REG 0x0B24 bit 0 -- the block's own bus gate
++ *   ahb-gpu0    AHB_MAT_CLK_GATING_REG  0x05C0 bit 7
++ *   mbus-gpu0   MBUS_MAT_CLK_GATING_REG 0x05E0 bit 16
++ *   RST_BUS_GPU0  GPU0_GATING_REG 0x0B24 bit 16 (0 = Assert, 1 = De-assert)
++ *
++ * ⚠ THE DIVIDER DOES NOT DIVIDE, IT MASKS. The UM says so in its own section
++ * rather than leaving it to be inferred: for the GPU clock, FACTOR_M counts
++ * how many of every 16 cycles are masked, GPU_CLK =
++ * CLK_SRC*((16-M)/16) (4.1.4.4), unlike the other working clocks, which
++ * divide by counting cycles, as the UM says one
++ * sentence earlier. Only five of the sixteen field values land on an integer
++ * ratio -- M = 0, 8, 12, 14, 15 give /1, /2, /4, /8, /16 -- and those five are
++ * the table below. A plain ccu_div or ccu_mp would read the field as a linear
++ * or power-of-two divisor and be wrong at every value but 0.
++ *
++ * ⚠ GPU0_UPD (bit 27) IS NOT OPTIONAL, AND ITS ABSENCE IS INVISIBLE. GPU0 is
++ * one of the four clocks (with NSI, MBUS and DRAM0) whose SEL, DIV1 and
++ * GATING fields need an explicit update: write 1 to the GPU0_UPD bit to
++ * latch the configured parameters; until then, a readback returns the
++ * original state, and after it the updated parameters
++ * (4.1.4.5). Without it a rate write neither takes effect
++ * nor shows up in a register dump -- it reads back as the old value, which is
++ * the failure mode that looks like "the clock is already right".
++ * CCU_FEATURE_UPDATE_BIT is mainline's name for exactly this, and
++ * CCU_SUNXI_UPDATE_BIT is BIT(27) (ccu_common.h); ccu_div, ccu_mux and
++ * ccu_gate all set it when the feature is on, so the whole clock is covered
++ * and not only its rate.
++ *
++ * ⚠ The UM's ordering rule is a constraint on any consumer that changes both
++ * halves at once: going up in frequency, program the divider
++ * before the clock source; going down, do it the other way round,
++ * source first and divider second. Changing only the divider, as done
++ * here, never violates it.
++ * CLK_SET_RATE_NO_REPARENT keeps the framework from wandering
++ * across the mux on a rate request, so a rate change moves the divider alone
++ * and the rule cannot be broken by accident; which source drives the GPU is a
++ * device-tree decision. The same rule's other half -- the reset is
++ * released first and the gating clock is opened afterwards
++ * -- belongs to the consumer's probe order, not here.
++ *
++ * The mux's six sources are the UM's. All six are
++ * modelled: ccu_mux_helper_get_parent() hands the raw field back as an index,
++ * so a short array does not fail loudly, it mis-names or (at 110/111, which
++ * the UM leaves undocumented for a 3-bit field) returns a parentless clock.
++ * Every one of the six is a clock this CCU already has, which is why none of
++ * them needs the .index = -1 placeholder the NPU mux uses for the VE PLLs.
++ *
++ * ⚠ ahb-gpu0 and mbus-gpu0 share their REGISTERS with the SERDES gates above
++ * and with the NPU's, one bit apart; they are separate clocks, not aliases.
++ * Both read 1 at reset (GPU0_AHB_GATE_SW_CFG bit 7 default
++ * 0x1, GPU0_MBUS_GATE_SW_CFG bit 16 default 0x1), and the NPU's pair was
++ * measured CLEAR on a vendor-kernel board with its block runtime-suspended -- so they
++ * are per-use software gates, not a documentation artefact. Modelled for the
++ * same reason: a master that cannot reach the bus matrix is a GPU that faults
++ * on its first fetch. Parented to ahb because this driver does not model the
++ * MBUS root; that is a topology stand-in, not a rate claim -- neither gate
++ * divides anything.
++ *
++ * ⚠ PLL_GPU0 has three more registers this driver does not model:
++ * PLL_GPU0_LOCK_CTRL 0x00E4, PAT0 0x00E8 and PAT1 0x00EC (the CCU register list of the A733 user manual offsets
++ * 228/232/236). They are the lock-window and the spread-spectrum/fractional
++ * pattern controls. Nothing here needs a fractional rate -- every operating
++ * point the vendor uses is an integer multiple of 24 MHz -- and the same
++ * three are unmodelled for PLL_NPU. Named so their absence reads as a
++ * decision.
++ *
++ * Fvco 1.26G-2.52G with a 1/2 pre-divider and P0 1~8 (UM Table 4-2, PLL_GPU0
++ * row). The floor here is 1272 MHz, not 1260: the VCO is
++ * 24 MHz * N and 1272 is the first multiple of 24 at or above the datasheet
++ * minimum. N = PLL_N + 1 with a UM minimum of 11 for PLL_N,
++ * so N >= 12. Reset value 0x4010_4500 = N 70, P0 2 -> 840 MHz, which
++ * is the rate a GPU left at reset would run; the vendor operating point is
++ * 1008 MHz (N 84), and choosing it belongs to the consumer's device tree.
++ */
++#define SUN60IW2_PLL_GPU0_REG		0x00E0
++#define SUN60IW2_PLL_GPU0_MIN_VCO	1272000000U
++#define SUN60IW2_PLL_GPU0_MAX_VCO	2520000000U
++
++static struct ccu_nm pll_gpu0_clk = {
++	.enable		= BIT(31),
++	.lock		= BIT(28),
++	.n		= _SUNXI_CCU_MULT_OFFSET_MIN_MAX(8, 8, 1, 12, 255),
++	.m		= _SUNXI_CCU_DIV(1, 1),
++	.min_rate	= SUN60IW2_PLL_GPU0_MIN_VCO,
++	.max_rate	= SUN60IW2_PLL_GPU0_MAX_VCO,
++	.common		= {
++		.reg		= SUN60IW2_PLL_GPU0_REG,
++		.hw.init	= CLK_HW_INIT_PARENTS_HW("pll-gpu0",
++				pll_ref_hws, &ccu_nm_ops,
++				CLK_SET_RATE_UNGATE),
++	},
++};
++
++static const struct clk_hw *pll_gpu0_hws[] = { &pll_gpu0_clk.common.hw };
++
++static SUNXI_CCU_M_HWS_WITH_GATE(gpupll_clk, "gpupll", pll_gpu0_hws,
++				 SUN60IW2_PLL_GPU0_REG, 20, 3, BIT(27),
++				 CLK_SET_RATE_PARENT);
++
++static const struct clk_parent_data gpu0_parents[] = {
++	{ .hw = &gpupll_clk.common.hw },		/* 000 GPUPLL     */
++	{ .hw = &pll_peri0_800m_clk.common.hw },	/* 001 PERI0_800M */
++	{ .hw = &pll_peri0_600m_clk.hw },		/* 010 PERI0_600M */
++	{ .hw = &pll_peri0_400m_clk.hw },		/* 011 PERI0_400M */
++	{ .hw = &pll_peri0_300m_clk.hw },		/* 100 PERI0_300M */
++	{ .hw = &pll_peri0_200m_clk.hw },		/* 101 PERI0_200M */
++};
++
++/* GPU0_DIV1 [3:0]: masked cycles per 16, so the ratio is 16/(16-M). */
++static struct clk_div_table gpu0_div_table[] = {
++	{ .val = 0,  .div = 1  },
++	{ .val = 8,  .div = 2  },
++	{ .val = 12, .div = 4  },
++	{ .val = 14, .div = 8  },
++	{ .val = 15, .div = 16 },
++	{ /* sentinel */ }
++};
++
++static struct ccu_div gpu0_clk = {
++	.enable		= BIT(31),
++	.div		= _SUNXI_CCU_DIV_TABLE(0, 4, gpu0_div_table),
++	.mux		= _SUNXI_CCU_MUX(24, 3),
++	.common		= {
++		.reg		= 0x0B20,
++		.features	= CCU_FEATURE_UPDATE_BIT,
++		.hw.init	= CLK_HW_INIT_PARENTS_DATA("gpu0",
++				gpu0_parents, &ccu_div_ops,
++				CLK_SET_RATE_PARENT |
++				CLK_SET_RATE_NO_REPARENT),
++	},
++};
++
++static SUNXI_CCU_GATE_HWS(ahb_gpu0_clk,  "ahb-gpu0",  ahb_hws, 0x05C0, BIT(7),  0);
++
++static const struct clk_hw *ahb_gpu0_hws[] = { &ahb_gpu0_clk.common.hw };
++
++/*
++ * ⚠ bus-gpu0 hangs off ahb-gpu0 AND THAT PARENT IS A DECISION, not a reading.
++ * The binding this GPU uses names at most three clocks -- core, mem, sys
++ * (Documentation/devicetree/bindings/gpu/img,powervr-rogue.yaml) -- and this
++ * block has four gates. An unclaimed gate is not harmless: it reads 1 at
++ * reset, nothing takes a reference on it, and clk_disable_unused() turns it
++ * off at late_initcall, which would leave the GPU without its AHB port on the
++ * bus matrix. Chaining makes the dependency expressible: the device tree
++ * claims bus-gpu0 as "sys", and enabling it enables the matrix port with it.
++ * The order is the plausible one -- the block's own gate sits behind its port
++ * -- but the UM tabulates the two registers separately and states no
++ * relationship between them, so this is modelled topology.
++ *
++ * Falsifier, and it needs a board: with the chain in place 0x05C0 bit 7 must
++ * read 1 whenever the GPU is bound and resumed. If a GPU that works is ever
++ * seen with that bit clear, the chain is wrong and the fix is a fourth clock
++ * with CLK_IGNORE_UNUSED, not a rate or a reset change.
++ */
++static SUNXI_CCU_GATE_HWS(bus_gpu0_clk,  "bus-gpu0",  ahb_gpu0_hws, 0x0B24, BIT(0), 0);
++static SUNXI_CCU_GATE_HWS(mbus_gpu0_clk, "mbus-gpu0", ahb_hws, 0x05E0, BIT(16), 0);
++
+ /* ccu_common-based clocks (registered and reset-mapped by the core). */
+ static struct ccu_common *sun60iw2_ccu_clks[] = {
+ 	&pll_ref_clk.common,
+@@ -1570,6 +1736,12 @@
+ 	&bus_npu_clk.common,
+ 	&ahb_npu_clk.common,
+ 	&mbus_npu_clk.common,
++	&pll_gpu0_clk.common,
++	&gpupll_clk.common,
++	&gpu0_clk.common,
++	&ahb_gpu0_clk.common,
++	&bus_gpu0_clk.common,
++	&mbus_gpu0_clk.common,
+ };
+ 
+ static struct clk_hw_onecell_data sun60iw2_hw_clks = {
+@@ -1654,8 +1826,14 @@
+ 		[CLK_BUS_NPU]		= &bus_npu_clk.common.hw,
+ 		[CLK_AHB_NPU]		= &ahb_npu_clk.common.hw,
+ 		[CLK_MBUS_NPU]		= &mbus_npu_clk.common.hw,
++		[CLK_PLL_GPU0]		= &pll_gpu0_clk.common.hw,
++		[CLK_GPUPLL]		= &gpupll_clk.common.hw,
++		[CLK_GPU0]		= &gpu0_clk.common.hw,
++		[CLK_BUS_GPU0]		= &bus_gpu0_clk.common.hw,
++		[CLK_AHB_GPU0]		= &ahb_gpu0_clk.common.hw,
++		[CLK_MBUS_GPU0]		= &mbus_gpu0_clk.common.hw,
+ 	},
+-	.num	= CLK_MBUS_NPU + 1,
++	.num	= CLK_MBUS_GPU0 + 1,
+ };
+ 
+ static struct ccu_reset_map sun60iw2_ccu_resets[] = {
+@@ -1690,6 +1868,7 @@
+ 	[RST_BUS_NPU]		= { 0x0B04, BIT(16) },
+ 	[RST_BUS_NPU_AXI]	= { 0x0B04, BIT(17) },
+ 	[RST_BUS_NPU_AHB]	= { 0x0B04, BIT(18) },
++	[RST_BUS_GPU0]		= { 0x0B24, BIT(16) },
+ };
+ 
+ static const struct sunxi_ccu_desc sun60iw2_ccu_desc = {

@@ -1,0 +1,591 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] drm: allwinner: A733 DisplayPort AUX channel
+
+[Recipe cut: the debugfs files aux_enable, dpcd and edid are not carried
+(DRM provides the DPCD and EDID views itself). The sections below that describe
+them, and the W=1 claim, refer to the uncut patch.]
+
+The first piece of the A733's DisplayPort transmitter, and deliberately only one
+piece: the AUX channel. No link training, no video, no mode setting, no KMS. AUX
+is what carries DPCD and EDID, so it is the part whose result can be checked
+against what the sink says about itself rather than against a register we wrote
+ourselves -- which is why it comes first.
+
+THIS IS A TRANSCRIPTION, NOT AN INVESTIGATION
+---------------------------------------------
+
+Every register and every field below is from chapter 15.4.7 of the A733 user manual,
+and the whole sequence was driven by hand
+through /dev/mem on the 8 GiB board on 2026-08-18 before a line of this file existed. That
+run returned DPCD rev 1.2 / MAX_LINK_RATE 0x0A / four lanes with enhanced
+framing, and then a checksum-valid EDID naming the attached ThinkVision T23d-10
+at 1920x1200.
+
+So the observable this patch owes is not "does the hardware work" -- that is
+answered -- but "does the driver reproduce what the hand run did".
+
+WHAT NEEDED NO TRANSLATION
+--------------------------
+
+AUX_COMMAND[11:8] is documented as using the AUX command encoding of the
+DisplayPort specification (2.4.1), and the UM's list -- 0x8 write,
+0x9 read, 0x0 twi write, 0x4 twi write MOT, 0x1 twi read, 0x5 twi read MOT -- is
+bit for bit DP_AUX_NATIVE_WRITE/_READ and DP_AUX_I2C_WRITE/_READ | DP_AUX_I2C_MOT
+from <drm/display/drm_dp.h>. So `msg->request & 0xf` goes straight into the
+field, and bit 0 of the request is the read bit under both encodings at once.
+AUX_REPLY_CODE[3:0] is the DP reply field in the same way, so it is handed back
+in msg->reply and the DP core decides what a DEFER means -- this driver runs no
+retry loop of its own.
+
+THE ONE PART THAT IS NOT A TRANSCRIPTION, AND WHY
+-------------------------------------------------
+
+Completion is waited on through the LATCHED INTERRUPT_STATE bits 2/3, not
+through AUX_STATUS bit 0, and that is a deliberate departure from what the hand
+run did.
+
+AUX_STATUS bit 0 is a level that the UM says clears once the request controller
+has started a transaction -- which is not the instant of the
+AUX_COMMAND write. Between the two it still carries the previous transaction's
+1. The hand run shows exactly that: its second transaction logged
+`status before = 0x00000001` with nothing in flight. It produced correct data
+only because devmem puts milliseconds between accesses, so the previous
+transaction really had finished. A driver polls nanoseconds later and would read
+completion immediately, then pop the previous reply out of the FIFO.
+
+INTERRUPT_STATE bits 2 (REPLY_RECEIVED) and 3 (REPLY_TIMEOUT) are the latched
+pair the UM offers for systems that poll rather than take interrupts,
+cleared only by a read of INTERRUPT_CAUSE -- which this function
+does before every request. They therefore describe this transaction and nothing
+earlier. Credit where due: the vendor driver polls the same latch and its bug is
+the missing read-to-clear, not the register choice.
+
+THE DIVIDER IS COMPUTED, NOT COPIED
+-----------------------------------
+
+AUX_CLOCK_DIVIDER takes the bus clock in MHz (valid 10..400). The vendor
+hardcodes 200 behind a FIXME while its own CCU parents that gate on the 26 MHz
+DCXO; with either value AUX runs 7.7x off and looks like a dead cable. Here
+it comes from clk_get_rate() and is range-checked. Silicon agrees with the
+arithmetic: at 200 the core reports AUX_REPLY_CLOCK_WIDTH 99, and the vendor's
+live link reports the same.
+
+NOTHING HAPPENS AT BIND
+-----------------------
+
+probe() maps registers, takes the clock, the reset and the AUX PHY, calls
+drm_dp_aux_init() and stops. The AUX channel is brought up explicitly, because
+powering the analog front end while the Type-C mux is not in a DP state is
+what causes the 34 AUX timeouts per boot seen on the vendor kernel. In the
+original series the trigger was a debugfs file (not carried here); in this recipe the DP bridge
+added later in the series calls the same function.
+
+drm_dp_aux_register() is NOT used: it opens with WARN_ON_ONCE(!aux->drm_dev) and
+this tree has no drm_device -- there is no KMS driver for this SoC yet. Its own
+kerneldoc names the case ("drivers which need to use the aux channel before
+either of the two points mentioned above need to call drm_dp_aux_init()"), so
+the init happens at probe and the enable path adds the one thing that would
+otherwise be missing and that EDID needs: the I2C-over-AUX adapter. The chardev
+is left out, being the part that wants the DRM parent.
+
+THE TWO READ-ONLY VIEWS ARE THERE BECAUSE THE IMAGE HAS NO USERSPACE FOR THIS
+-----------------------------------------------------------------------------
+
+`dpcd` and `edid` under debugfs go through drm_dp_dpcd_read_data() and
+i2c_transfer() on the AUX adapter, i.e. through the upstream helpers -- what they
+exercise is drm_dp_i2c_algo doing real transactions, not a private copy of the
+sequence. They exist because the delivery rootfs has no i2c-tools and no DRM
+userspace, so a driver provable only from userspace would not be provable on the
+image it ships in.
+
+VERIFIED
+--------
+
+Verified: applies at fuzz 0 in the full series, compile-check green, W=1
+warning-free, checkpatch --strict 0 errors / 0 warnings / 0 checks. NOT verified:
+the board.
+
+Assisted-by: Claude
+
+diff --git a/drivers/gpu/drm/Kconfig b/drivers/gpu/drm/Kconfig
+--- a/drivers/gpu/drm/Kconfig
++++ b/drivers/gpu/drm/Kconfig
+@@ -317,6 +317,8 @@ source "drivers/gpu/drm/renesas/Kconfig"
+ 
+ source "drivers/gpu/drm/sun4i/Kconfig"
+ 
++source "drivers/gpu/drm/sun60i/Kconfig"
++
+ source "drivers/gpu/drm/omapdrm/Kconfig"
+ 
+ source "drivers/gpu/drm/tilcdc/Kconfig"
+diff --git a/drivers/gpu/drm/Makefile b/drivers/gpu/drm/Makefile
+--- a/drivers/gpu/drm/Makefile
++++ b/drivers/gpu/drm/Makefile
+@@ -194,6 +194,7 @@ obj-$(CONFIG_DRM_ATMEL_HLCDC)	+= atmel-hlcdc/
+ obj-y			+= renesas/
+ obj-y			+= omapdrm/
+ obj-$(CONFIG_DRM_SUN4I) += sun4i/
++obj-$(CONFIG_DRM_SUN60I_DP) += sun60i/
+ obj-y			+= tilcdc/
+ obj-$(CONFIG_DRM_QXL) += qxl/
+ obj-$(CONFIG_DRM_VIRTIO_GPU) += virtio/
+diff --git a/drivers/gpu/drm/sun60i/Kconfig b/drivers/gpu/drm/sun60i/Kconfig
+new file mode 100644
+--- /dev/null
++++ b/drivers/gpu/drm/sun60i/Kconfig
+@@ -0,0 +1,17 @@
++# SPDX-License-Identifier: GPL-2.0-only
++config DRM_SUN60I_DP
++	tristate "Allwinner A733 (sun60iw2) DisplayPort AUX"
++	depends on DRM && OF
++	depends on ARCH_SUNXI || COMPILE_TEST
++	select DRM_DISPLAY_HELPER
++	select DRM_DISPLAY_DP_HELPER
++	select GENERIC_PHY
++	help
++	  Enable this for the DisplayPort transmitter of the Allwinner A733
++	  (sun60iw2). At present this driver implements the AUX channel only --
++	  the path that carries DPCD and EDID -- and no link training, no video
++	  and no mode setting. It is the first piece of that block whose result
++	  can be checked against what the sink says about itself.
++
++	  Say M here if you want DisplayPort alternate mode over the Type-C
++	  port to be able to identify the attached sink.
+diff --git a/drivers/gpu/drm/sun60i/Makefile b/drivers/gpu/drm/sun60i/Makefile
+new file mode 100644
+--- /dev/null
++++ b/drivers/gpu/drm/sun60i/Makefile
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: GPL-2.0-only
++obj-$(CONFIG_DRM_SUN60I_DP) += sun60i-dp.o
+diff --git a/drivers/gpu/drm/sun60i/sun60i-dp.c b/drivers/gpu/drm/sun60i/sun60i-dp.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/gpu/drm/sun60i/sun60i-dp.c
+@@ -0,0 +1,425 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Allwinner A733 (sun60iw2) DisplayPort AUX channel.
++ *
++ * The A733's DisplayPort transmitter is a Trilinear DP 1.4 core at 0x05740000,
++ * fed by TCON_TV1 and driving the SERDES COMB0 lanes out of the Type-C
++ * connector. This driver implements exactly one part of it -- the AUX channel --
++ * and deliberately nothing else: no link training, no video, no KMS. AUX is what
++ * carries DPCD and EDID, so it is the first piece whose result can be checked
++ * against something the sink says about itself rather than against a register we
++ * wrote ourselves.
++ *
++ * Every register offset and field below comes from the UM's own register list
++ * (chapter 15.4.7 of the A733 user manual) and
++ * every one of them has been exercised on silicon before this driver existed:
++ * the whole sequence was first driven by hand through /dev/mem on the 8 GiB board on
++ * 2026-08-18, returning DPCD rev 1.2 and a checksum-valid EDID from a
++ * ThinkVision T23d-10.
++ * This file is the transcription of that run into a driver.
++ *
++ * WHY THE COMMAND FIELD NEEDS NO TRANSLATION. AUX_COMMAND[11:8] is documented as
++ * using the AUX command encoding of the DisplayPort
++ * specification (2.4.1), and the UM then lists 0x8 write / 0x9 read / 0x0 twi write /
++ * 0x4 twi write MOT / 0x1 twi read / 0x5 twi read MOT. That is bit for bit
++ * DP_AUX_NATIVE_WRITE / _READ and DP_AUX_I2C_WRITE / _READ | DP_AUX_I2C_MOT from
++ * <drm/display/drm_dp.h>, so `msg->request & 0xf` goes straight into the field.
++ * The reply code register is the DP reply field in the same way.
++ *
++ * WHAT GATES THE AUX CHANNEL, AND WHY IT IS NOT AUTOMATIC. Powering the AUX
++ * analog front end while the Type-C mux is not in a DP state is the vendor
++ * stack's own bug: it probes AUX at bind and logs 34 timeouts over 4.5 s on
++ * every boot into a front end whose bias is still off. This driver therefore
++ * does nothing at bind -- probe() maps registers and returns -- and the AUX
++ * channel is brought up explicitly, by the consumer of the
++ * bridge, through the same two functions.
++ *
++ * Copyright (c) 2026 DockSeed
++ */
++
++#include <linux/bitfield.h>
++#include <linux/clk.h>
++#include <linux/debugfs.h>
++#include <linux/delay.h>
++#include <linux/i2c.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/phy/phy.h>
++#include <linux/platform_device.h>
++#include <linux/reset.h>
++#include <linux/seq_file.h>
++
++#include <drm/display/drm_dp.h>
++#include <drm/display/drm_dp_helper.h>
++#include <drm/drm_edid.h>
++
++/* A733 user manual 15.4.7 register descriptions. Only the AUX block and the core id
++ * are named here; the rest of the 4 KiB window belongs to link training and
++ * video, which this driver does not touch.
++ */
++#define DP_CORE_ID			0x00fc
++#define  DP_CORE_ID_A733		0x000a0509	/* the UM's documented value */
++#define DP_AUX_COMMAND			0x0100
++#define  AUX_COMMAND_ADDRESS_ONLY	BIT(12)
++#define  AUX_COMMAND_CMD		GENMASK(11, 8)
++#define  AUX_COMMAND_BYTES		GENMASK(3, 0)
++#define DP_AUX_WRITE_FIFO		0x0104
++#define DP_AUX_ADDRESS			0x0108
++#define DP_AUX_CLOCK_DIVIDER		0x010c
++#define DP_AUX_REPLY_DATA		0x0134
++#define DP_AUX_REPLY_CODE		0x0138
++#define  AUX_REPLY_CODE_MASK		GENMASK(3, 0)
++#define DP_INTERRUPT_STATE		0x0130
++#define  INTERRUPT_STATE_REPLY_RECEIVED	BIT(2)
++#define  INTERRUPT_STATE_REPLY_TIMEOUT	BIT(3)
++#define DP_INTERRUPT_CAUSE		0x0140		/* read-to-clear */
++#define DP_REPLY_DATA_COUNT		0x0148
++#define  REPLY_DATA_COUNT_MASK		GENMASK(4, 0)
++#define DP_AUX_STATUS			0x014c
++#define  AUX_STATUS_REPLY_RECEIVED	BIT(0)
++#define  AUX_STATUS_REPLY_IN_PROGRESS	BIT(1)
++#define  AUX_STATUS_REQUEST_IN_PROGRESS	BIT(2)
++#define  AUX_STATUS_REPLY_ERROR		BIT(3)
++
++/*
++ * The divider is the APB clock frequency in MHz, valid 10..400 (UM 15.4.7.24).
++ * It is computed from the clock rather than hardcoded, because the vendor's own
++ * value is a #define behind a FIXME and its CCU parents this gate on the 26 MHz
++ * DCXO -- a driver that trusted either would run AUX 7.7x too fast and see a
++ * dead channel. Measured on the 8 GiB board: with the divider at 200 the core reports
++ * AUX_REPLY_CLOCK_WIDTH = 100, against 99 on a live vendor link.
++ */
++#define AUX_DIVIDER_MIN			10
++#define AUX_DIVIDER_MAX			400
++
++/* A reply must arrive well inside the DP specification's 300 us; the bound is
++ * this driver's own, not the core's, because the core's REPLY_TIMEOUT is only a
++ * latch in INTERRUPT_CAUSE. Poll 10 us apart so a normal reply costs one or two
++ * reads.
++ */
++#define AUX_REPLY_POLL_US		10
++#define AUX_REPLY_TIMEOUT_US		3000
++
++#define AUX_MAX_PAYLOAD			16
++
++struct sun60i_dp {
++	struct device		*dev;
++	void __iomem		*base;
++	struct clk		*bus_clk;
++	struct reset_control	*reset;
++	struct phy		*aux_phy;
++	struct drm_dp_aux	aux;
++	struct mutex		lock;		/* serialises enable/disable */
++	bool			enabled;
++};
++
++static inline struct sun60i_dp *aux_to_dp(struct drm_dp_aux *aux)
++{
++	return container_of(aux, struct sun60i_dp, aux);
++}
++
++/*
++ * One AUX transaction, in the order the UM prescribes: address first, payload
++ * next when there is one, command last, because writing the command register
++ * is what starts the AUX state machines transmitting.
++ *
++ */
++static ssize_t sun60i_dp_aux_transfer(struct drm_dp_aux *aux,
++				      struct drm_dp_aux_msg *msg)
++{
++	struct sun60i_dp *dp = aux_to_dp(aux);
++	u8 *buf = msg->buffer;
++	u32 cmd, status, irq;
++	size_t count;
++	bool is_read;
++	int ret, i;
++
++	if (msg->size > AUX_MAX_PAYLOAD)
++		return -E2BIG;
++
++	if (readl(dp->base + DP_AUX_STATUS) & AUX_STATUS_REQUEST_IN_PROGRESS)
++		return -EBUSY;
++
++	/* Read-to-clear, so a timeout latched by an earlier transaction cannot
++	 * be reported as this one's. The vendor's driver polls that latch and
++	 * clears it only in its IRQ handler, which is the most plausible reason
++	 * its AUX failures arrive in bursts.
++	 */
++	readl(dp->base + DP_INTERRUPT_CAUSE);
++
++	writel(msg->address, dp->base + DP_AUX_ADDRESS);
++
++	/*
++	 * Bit 0 of the request is the read bit in both encodings at once:
++	 * DP_AUX_NATIVE_READ is 0x9 against DP_AUX_NATIVE_WRITE 0x8, and
++	 * DP_AUX_I2C_READ is 0x1 against DP_AUX_I2C_WRITE 0x0, with
++	 * DP_AUX_I2C_MOT at 0x4 leaving it alone. So one test covers all four.
++	 */
++	is_read = msg->request & DP_AUX_I2C_READ;
++
++	if (msg->size && !is_read)
++		for (i = 0; i < msg->size; i++)
++			writel(buf[i], dp->base + DP_AUX_WRITE_FIFO);
++
++	cmd = FIELD_PREP(AUX_COMMAND_CMD, msg->request & 0xf);
++	if (msg->size)
++		cmd |= FIELD_PREP(AUX_COMMAND_BYTES, msg->size - 1);
++	else
++		cmd |= AUX_COMMAND_ADDRESS_ONLY;
++
++	writel(cmd, dp->base + DP_AUX_COMMAND);
++
++	/*
++	 * Wait on the LATCHED bits, not on AUX_STATUS.
++	 *
++	 * AUX_STATUS bit 0 is a level: the UM says it clears once the request
++	 * controller has started a transaction, which is not
++	 * the same instant as the AUX_COMMAND write. Between the two it still
++	 * carries the *previous* transaction's 1, so a driver polling it reads
++	 * completion immediately and then pops the previous reply out of the FIFO.
++	 * That is not theory: in the by-hand run this driver transcribes, the
++	 * second transaction logged `status before = 0x00000001` while nothing was
++	 * in flight. It only
++	 * produced correct data because devmem puts milliseconds between accesses
++	 * and the previous transaction had genuinely finished.
++	 *
++	 * INTERRUPT_STATE bits 2 and 3 are the latched pair, documented as
++	 * meant for systems that poll instead of taking interrupts, and cleared
++	 * only by a read of INTERRUPT_CAUSE -- which is exactly what this function
++	 * already does before starting. So they are guaranteed to describe this
++	 * transaction and nothing earlier.
++	 */
++	ret = readl_poll_timeout(dp->base + DP_INTERRUPT_STATE, irq,
++				 irq & (INTERRUPT_STATE_REPLY_RECEIVED |
++					INTERRUPT_STATE_REPLY_TIMEOUT),
++				 AUX_REPLY_POLL_US, AUX_REPLY_TIMEOUT_US);
++	if (ret) {
++		dev_dbg(dp->dev, "AUX poll expired, state 0x%08x status 0x%08x\n",
++			irq, readl(dp->base + DP_AUX_STATUS));
++		return -ETIMEDOUT;
++	}
++
++	if (irq & INTERRUPT_STATE_REPLY_TIMEOUT) {
++		dev_dbg(dp->dev, "AUX reply timeout reported by the core\n");
++		return -ETIMEDOUT;
++	}
++
++	status = readl(dp->base + DP_AUX_STATUS);
++	if (status & AUX_STATUS_REPLY_ERROR) {
++		dev_dbg(dp->dev, "AUX reply error, status 0x%08x\n", status);
++		return -EIO;
++	}
++
++	/*
++	 * Hand the sink's own reply code back and let the DP core decide: a
++	 * DEFER is not this driver's error to retry, and drm_dp_dpcd_access()
++	 * already bounds the retries at 32.
++	 */
++	msg->reply = readl(dp->base + DP_AUX_REPLY_CODE) & AUX_REPLY_CODE_MASK;
++
++	if (msg->reply != DP_AUX_NATIVE_REPLY_ACK &&
++	    msg->reply != DP_AUX_I2C_REPLY_ACK)
++		return 0;
++
++	if (!msg->size)
++		return 0;
++
++	if (is_read) {
++		count = readl(dp->base + DP_REPLY_DATA_COUNT) &
++			REPLY_DATA_COUNT_MASK;
++		count = min(count, msg->size);
++		for (i = 0; i < count; i++)
++			buf[i] = readl(dp->base + DP_AUX_REPLY_DATA);
++		return count;
++	}
++
++	return msg->size;
++}
++
++/*
++ * Bring the AUX channel up. Split out from probe() on purpose: it is what a
++ * consumer calls once DisplayPort alt mode has actually been entered and the
++ * Type-C mux is in a DP state, and it is the whole of the no-blind-AUX rule.
++ */
++static int sun60i_dp_aux_enable(struct sun60i_dp *dp)
++{
++	unsigned long rate_mhz;
++	u32 core_id;
++	int ret;
++
++	ret = clk_prepare_enable(dp->bus_clk);
++	if (ret)
++		return dev_err_probe(dp->dev, ret, "bus clock\n");
++
++	ret = reset_control_deassert(dp->reset);
++	if (ret) {
++		dev_err(dp->dev, "reset de-assert failed: %d\n", ret);
++		goto err_clk;
++	}
++
++	/*
++	 * Both the gate and the reset are required before a single register of
++	 * this block is reachable -- measured, not assumed: with the gate alone
++	 * the entire 4 KiB window reads zero. So the first read here is also the
++	 * proof that the block is alive, and it is checked rather than logged.
++	 */
++	core_id = readl(dp->base + DP_CORE_ID);
++	if (core_id != DP_CORE_ID_A733) {
++		dev_err(dp->dev, "DP core id 0x%08x, expected 0x%08x\n",
++			core_id, DP_CORE_ID_A733);
++		ret = -ENODEV;
++		goto err_reset;
++	}
++
++	ret = phy_init(dp->aux_phy);
++	if (ret) {
++		dev_err(dp->dev, "AUX phy init: %d\n", ret);
++		goto err_reset;
++	}
++
++	ret = phy_power_on(dp->aux_phy);
++	if (ret) {
++		dev_err(dp->dev, "AUX phy power on: %d\n", ret);
++		goto err_phy_exit;
++	}
++
++	rate_mhz = clk_get_rate(dp->bus_clk) / 1000000;
++	if (rate_mhz < AUX_DIVIDER_MIN || rate_mhz > AUX_DIVIDER_MAX) {
++		dev_err(dp->dev, "bus clock %lu MHz is outside the AUX divider range %u..%u\n",
++			rate_mhz, AUX_DIVIDER_MIN, AUX_DIVIDER_MAX);
++		ret = -ERANGE;
++		goto err_phy_off;
++	}
++	writel(rate_mhz, dp->base + DP_AUX_CLOCK_DIVIDER);
++
++	/*
++	 * Not drm_dp_aux_register(): that one opens with
++	 * WARN_ON_ONCE(!aux->drm_dev), and this tree has no drm_device to give
++	 * it -- there is no KMS driver for this SoC yet. Its own kerneldoc names
++	 * this case: "drivers which need to use the aux channel before either of
++	 * the two points mentioned above need to call drm_dp_aux_init()". So the
++	 * init is done at probe and what is added here is the one thing the
++	 * register path would add on top and that we do need: the I2C-over-AUX
++	 * adapter, which is what carries EDID. The chardev is deliberately left
++	 * out -- it is the part that needs the DRM parent.
++	 */
++	dp->aux.ddc.owner = THIS_MODULE;
++	dp->aux.ddc.dev.parent = dp->dev;
++	strscpy(dp->aux.ddc.name, dev_name(dp->dev), sizeof(dp->aux.ddc.name));
++
++	ret = i2c_add_adapter(&dp->aux.ddc);
++	if (ret) {
++		dev_err(dp->dev, "I2C-over-AUX adapter: %d\n", ret);
++		goto err_phy_off;
++	}
++
++	dp->enabled = true;
++	dev_info(dp->dev, "AUX up: core 0x%08x, divider %lu\n",
++		 core_id, rate_mhz);
++
++	return 0;
++
++err_phy_off:
++	phy_power_off(dp->aux_phy);
++err_phy_exit:
++	phy_exit(dp->aux_phy);
++err_reset:
++	reset_control_assert(dp->reset);
++err_clk:
++	clk_disable_unprepare(dp->bus_clk);
++
++	return ret;
++}
++
++static void sun60i_dp_aux_disable(struct sun60i_dp *dp)
++{
++	i2c_del_adapter(&dp->aux.ddc);
++	phy_power_off(dp->aux_phy);
++	phy_exit(dp->aux_phy);
++	reset_control_assert(dp->reset);
++	clk_disable_unprepare(dp->bus_clk);
++	dp->enabled = false;
++}
++
++static void sun60i_dp_teardown(void *data)
++{
++	struct sun60i_dp *dp = data;
++
++	scoped_guard(mutex, &dp->lock)
++		if (dp->enabled)
++			sun60i_dp_aux_disable(dp);
++}
++
++static int sun60i_dp_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct sun60i_dp *dp;
++	int ret;
++
++	dp = devm_kzalloc(dev, sizeof(*dp), GFP_KERNEL);
++	if (!dp)
++		return -ENOMEM;
++
++	dp->dev = dev;
++	platform_set_drvdata(pdev, dp);
++
++	ret = devm_mutex_init(dev, &dp->lock);
++	if (ret)
++		return ret;
++
++	dp->base = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(dp->base))
++		return PTR_ERR(dp->base);
++
++	dp->bus_clk = devm_clk_get(dev, "bus");
++	if (IS_ERR(dp->bus_clk))
++		return dev_err_probe(dev, PTR_ERR(dp->bus_clk), "bus clock\n");
++
++	dp->reset = devm_reset_control_get_exclusive(dev, NULL);
++	if (IS_ERR(dp->reset))
++		return dev_err_probe(dev, PTR_ERR(dp->reset), "reset\n");
++
++	/*
++	 * The AUX differential pair goes to the Type-C SBU pins through its own
++	 * analog front end, which is a PHY of its own and not part of the COMB0
++	 * lanes. COMB0 carries the main link and contributes nothing here.
++	 */
++	dp->aux_phy = devm_phy_get(dev, "aux-phy");
++	if (IS_ERR(dp->aux_phy))
++		return dev_err_probe(dev, PTR_ERR(dp->aux_phy), "AUX phy\n");
++
++	dp->aux.name = dev_name(dev);
++	dp->aux.dev = dev;
++	dp->aux.transfer = sun60i_dp_aux_transfer;
++	drm_dp_aux_init(&dp->aux);
++
++	ret = devm_add_action_or_reset(dev, sun60i_dp_teardown, dp);
++	if (ret)
++		return ret;
++
++	dev_info(dev, "A733 DisplayPort AUX on %s, idle until a consumer enables it\n",
++		 dev_name(dev));
++
++	return 0;
++}
++
++static const struct of_device_id sun60i_dp_of_match[] = {
++	{ .compatible = "allwinner,sun60i-a733-dp" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, sun60i_dp_of_match);
++
++static struct platform_driver sun60i_dp_driver = {
++	.probe	= sun60i_dp_probe,
++	.driver	= {
++		.name		= "sun60i-a733-dp",
++		.of_match_table	= sun60i_dp_of_match,
++	},
++};
++module_platform_driver(sun60i_dp_driver);
++
++MODULE_DESCRIPTION("Allwinner A733 DisplayPort AUX channel");
++MODULE_LICENSE("GPL");

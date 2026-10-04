@@ -1,0 +1,908 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] PM / devfreq: add the Allwinner A733 DSU devfreq driver
+
+What. A devfreq driver for the A733's DynamIQ Shared Unit (L3 cache and
+snoop filter of all eight cores), with a governor of its own fed by a
+cpufreq transition notifier. It carries the policy of Allwinner's BSP
+driver: the DSU runs at 75 % of the fastest core, rounded down to an
+operating point, but never above the highest point whose voltage the A55
+cluster already holds on the rail the two share; while the A76 runs at
+1488 MHz or more, the DSU stays at least at the highest point of its
+lowest voltage. The OPP table is the vendor's per-bin voltage table
+(arm64-dts-a733-let-the-dsu-follow-the-cpu-policies); the driver selects
+the column by speed bin like the CPU tables do: opp-supported-hw bit
+<bin>, prop_name "speed<bin>", index 0 = the unnamed worst case.
+
+Why. UM V1.00 5.1.4.1 (page 244) recommends running the cluster at no
+less than 75% of the frequency of the fastest core. Boot0
+leaves the DSU at 780 MHz, and the DSU clock limits L3-sized and DRAM
+latency.
+
+Ported from: Allwinner BSP drivers/dsufreq/sunxi-dsufreq.c, Copyright (c)
+2020-2023 Allwinner Technology Co., Ltd., author panzhijian
+<panzhijian@allwinnertech.com>, radxa/allwinner-bsp aiot-linux-v1.4.9
+(194b5eb3), unchanged in cubie-aiot-v1.5.0 (c83016d2). Read in full; the
+policy is re-derived above. Structure after mtk-cci-devfreq.c (OPP core,
+devm) and tegra30-devfreq.c (a governor registered by its driver).
+
+Where the vendor driver differs, and what this one does:
+  - Ordering by hooks in its own cpufreq-dt (set_dsufreq_cb, a scale-down
+    call before and a scale-up call after the CPU OPP change); mainline
+    has no such hooks. Here the DSU holds its own consumer on the shared
+    regulator, so the regulator core keeps the rail at the DSU's request
+    until the DSU has come down -- ordering-safe without touching
+    cpufreq-dt.
+  - It binds a "dsu" OPP regulator (the board DT sets dsu-supply) but only
+    ever sets the clock, so no voltage is voted and nothing holds the rail
+    while the A55 lowers it. Here the OPP core sets voltage and clock in
+    the right order.
+  - The voltage cap compares for equality: an A55 voltage between two
+    DSU voltages drops the DSU to its lowest cap. Here: the highest point
+    not above the A55's voltage.
+  - Which policy is the A55 is assumed from CPU order (policy[0]). Here:
+    the policy holding the CPU whose cpu-supply is our dsu-supply, read
+    from DT per policy (cpu-supply sits on one CPU per cluster). An offline
+    CPU is skipped instead of deferring the probe forever; an offline A76
+    cluster leaves the DSU following the A55 alone.
+  - A global singleton and a static init flag; BUG_ON() when the lowest
+    DSU voltage exceeds the lowest A55 voltage; of_iomap() checked with
+    IS_ERR(). Here: per-device state, probe refused with a message.
+  - A "dsu_cooling" knob writes bits 12:4 of CLUSTER_CFG + 0x10
+    (0x08860010), an offset the UM's CLUSTER_CFG register list does not
+    have (UM V1.00 5.1.5.4, page 250: 0x0004 is followed by 0x1000). Not
+    ported.
+  - Its own sysfs class; here the standard devfreq interface
+    (available_frequencies, trans_stat, min/max_freq).
+  - The target is snapped to an exact operating point here, because
+    devfreq's default rounding is upwards and would cross the cap.
+
+Speed bin: judged like sun60i_a733_efuse_xlate() in sun50i-cpufreq-nvmem.c
+-- a programmed second copy (bits 23:16), bin 0, a bin beyond 31, or a bin
+not described by every OPP table selects index 0, the worst-case column.
+"Every table" is the DSU's own ANDed with each CPU table, the rule
+sunxi_cpufreq_dt_speed_mask() applies across the CPUs, so the DSU never
+runs a column for a bin the CPU side has rejected: with today's CPU tables
+(bins 4 and 5) the DSU's other columns are carried but not selected. One
+difference: an unreadable speed cell fails the CPU driver's probe, and
+selects the worst case here (the DSU then waits for cpufreq anyway).
+
+Speed-bin fallback: the CPU side now falls back to its index 1
+(the vendor's vf0100 set), the DSU keeps index 0. Both read the unnamed
+worst-case voltages, and the DSU stays capped by the A55's vote.
+
+Rail: that the DSU shares DCDC5 with the A55 was a vendor-DT hint (no DSU
+net in the datasheet, the board or the reference schematic). An edge
+experiment on the 6 GiB board (DSU moved by hand
+with AXI/GIC/APB at DSU/4, both clusters pinned) settles it: at DCDC5
+800 mV the DSU passes 1378 MHz and fails 1430 MHz; at 840 mV it passes
+1482 MHz and fails 1534 MHz; at 800 mV with DCDC3 (A76) raised to 900 mV,
+1482 MHz fails within 0.3 s. Every failure is an undefined-instruction oops.
+
+Identity: at probe the driver reads CLUSTERIDR_EL1, CLUSTERCFR_EL1 (DSU TRM
+100453 r4p1, B1.7/B1.9: no traps or enables from EL1/EL2) and the L3's
+CCSIDR_EL1, and prints them raw and decoded, so the 1 MiB L3 (UM V1.00
+page 23) and its geometry, which the UM gives only as the IP's option list
+(page 261, "optional 16-way"), are read off the silicon on every boot.
+
+A min_freq written to the devfreq device overrides the policy, cap
+included; the DSU's own vote then raises the shared rail. A transition
+notifier rules out cpufreq fast switching; cpufreq-dt does not implement it.
+
+AXI: with the optional "axi" clock (clk-sunxi-ng-a733-dsu-axi-divider)
+the AXI runs at DSU/1 up to 637 MHz and at DSU/2 above -- 637 MHz being the
+highest AXI rate run on silicon (DSU 1274 MHz at /2). Going up, the
+divider moves to /2 before the DSU; going down, the DSU moves first, so no
+step, the PERI0_600M park included, crosses 637 MHz. UM 5.1.4.1 allows 1:1
+or 2:1; the vendor keeps 2:1 everywhere. GIC and APB stay at boot0's /2
+(they cannot divide by 1).
+
+Verified: fresh 6.18.54 tree 250/250 at fuzz 0; compile-check green with no
+warning at sun60i-a733-dsu.o; check-defconfig clean. On silicon, 6 GiB
+board (bin 4), 6.18.54 test kernel, 2026-09-29:
+  - probe: "speed bin 4", "9 points 312-1274 MHz, floor 910 MHz";
+  - policy proof, both policies pinned through eleven A55/A76
+    pairs: the DSU PLL (0x08873000, EXT_DIVP from 0x0887301c) lands on the
+    point the policy names in 11/11 cases, and DCDC5 reads exactly the A55's
+    voltage in every one -- the DSU never raises the rail; 312 MHz is
+    26 x 48 / 4, 598 MHz is 26 x 46 / 2; A76 at 2002 MHz with idle A55
+    gives the 910 MHz floor at 800 mV;
+  - 30 min at defaults (schedutil, nothing pinned), stress-ng --verify in
+    all/A55/A76/idle phases: 45 phases failed 0, 26 174 DSU changes, 953 s
+    at 1274 MHz (AXI/GIC/APB 637 MHz), max 71.7 C, no DSU kernel line.
+
+AXI verified: 6 GiB board (bin 4), 6.18.54-t896, 2026-09-29:
+policy proof 11/11 with AXI /1 at 312 and 598 MHz and /2 above; 30 min at
+defaults 45 phases failed 0, 10 262 DSU changes (about 2 300 straight
+between 312 and 1274 MHz, across the 637 MHz limit), AXI /1 in exactly the
+samples at 312/598 MHz, max 71.6 C, no DSU kernel line. Bin 5
+(8 GiB board): policy proof 11/11 and 45 soak phases failed 0 on the
+policy without the AXI divider.
+
+Assisted-by: Claude
+---
+
+diff --git a/Documentation/devicetree/bindings/interconnect/allwinner,sun60i-a733-dsu.yaml b/Documentation/devicetree/bindings/interconnect/allwinner,sun60i-a733-dsu.yaml
+new file mode 100644
+index 0000000..628fd05
+--- /dev/null
++++ b/Documentation/devicetree/bindings/interconnect/allwinner,sun60i-a733-dsu.yaml
+@@ -0,0 +1,100 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/interconnect/allwinner,sun60i-a733-dsu.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Allwinner A733 DynamIQ Shared Unit frequency scaling
++
++maintainers:
++  - DockSeed <dockseed@proton.me>
++
++description:
++  The DynamIQ Shared Unit (DSU) of the Allwinner A733 holds the L3 cache and
++  the snoop filter shared by its Cortex-A55 and Cortex-A76 cores. Its clock
++  can follow the CPU frequency policies; its voltage comes from the supply it
++  shares with the Cortex-A55 cluster. The OPP table carries one voltage per
++  CPU speed bin (opp-microvolt-speed<bin>, <bin> the raw fuse value) and an
++  unnamed worst-case voltage for parts without a usable bin.
++
++properties:
++  compatible:
++    const: allwinner,sun60i-a733-dsu
++
++  clocks:
++    minItems: 1
++    items:
++      - description: The DSU clock multiplexer of the CPU clock controller.
++      - description:
++          The DSU's AXI clock divider. With it, the driver runs the AXI at
++          DSU/1 at the low operating points and at DSU/2 above them.
++
++  clock-names:
++    minItems: 1
++    items:
++      - const: dsu
++      - const: axi
++
++  operating-points-v2: true
++
++  opp-table:
++    type: object
++
++  dsu-supply:
++    description:
++      The regulator that supplies the DSU, shared with the Cortex-A55
++      cluster.
++
++  nvmem-cells:
++    items:
++      - description: The eFuse word that holds the CPU speed bin in bits 15:8.
++
++  nvmem-cell-names:
++    items:
++      - const: speed
++
++dependencies:
++  nvmem-cells: [ nvmem-cell-names ]
++
++required:
++  - compatible
++  - clocks
++  - operating-points-v2
++  - dsu-supply
++
++additionalProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/clock/sun60i-a733-cpu-ccu.h>
++
++    dsu {
++        compatible = "allwinner,sun60i-a733-dsu";
++        clocks = <&cpupll_ccu CLK_CPU_DSU>, <&cpupll_ccu CLK_CPU_DSU_AXI>;
++        clock-names = "dsu", "axi";
++        operating-points-v2 = <&dsu_opp_table>;
++        dsu-supply = <&reg_dcdc5>;
++        nvmem-cells = <&cpu_speed_grade>;
++        nvmem-cell-names = "speed";
++    };
++
++    dsu_opp_table: opp-table-dsu {
++        compatible = "operating-points-v2";
++
++        opp-780000000 {
++            opp-hz = /bits/ 64 <780000000>;
++            opp-microvolt = <800000 800000 1050000>;
++            opp-microvolt-speed4 = <800000 800000 1050000>;
++            opp-microvolt-speed5 = <800000 800000 1050000>;
++            opp-supported-hw = <0x00000031>;
++        };
++
++        opp-1066000000 {
++            opp-hz = /bits/ 64 <1066000000>;
++            opp-microvolt = <950000 950000 1050000>;
++            opp-microvolt-speed4 = <840000 840000 1050000>;
++            opp-microvolt-speed5 = <800000 800000 1050000>;
++            opp-supported-hw = <0x00000031>;
++        };
++    };
++...
+diff --git a/drivers/devfreq/Kconfig b/drivers/devfreq/Kconfig
+index c999c4a..1b23ee3 100644
+--- a/drivers/devfreq/Kconfig
++++ b/drivers/devfreq/Kconfig
+@@ -152,6 +152,18 @@ config ARM_RK3399_DMC_DEVFREQ
+ 	  It sets the frequency for the memory controller and reads the usage counts
+ 	  from hardware.
+ 
++config ARM_SUN60I_A733_DSU_DEVFREQ
++	tristate "Allwinner A733 DSU DEVFREQ Driver"
++	depends on ARCH_SUNXI || COMPILE_TEST
++	depends on CPU_FREQ
++	select PM_OPP
++	help
++	  This adds a devfreq driver for the DynamIQ Shared Unit (L3 cache
++	  and snoop filter) of the Allwinner A733. The DSU runs at 75 % of
++	  the fastest core, capped at the highest point the A55 cluster's
++	  voltage already covers, through a governor of its own; its voltage
++	  request is held on the regulator it shares with the A55 cluster.
++
+ config ARM_SUN8I_A33_MBUS_DEVFREQ
+ 	tristate "sun8i/sun50i MBUS DEVFREQ Driver"
+ 	depends on ARCH_SUNXI || COMPILE_TEST
+diff --git a/drivers/devfreq/Makefile b/drivers/devfreq/Makefile
+index 404179d..6fb5c8c 100644
+--- a/drivers/devfreq/Makefile
++++ b/drivers/devfreq/Makefile
+@@ -14,6 +14,7 @@ obj-$(CONFIG_ARM_IMX_BUS_DEVFREQ)	+= imx-bus.o
+ obj-$(CONFIG_ARM_IMX8M_DDRC_DEVFREQ)	+= imx8m-ddrc.o
+ obj-$(CONFIG_ARM_MEDIATEK_CCI_DEVFREQ)	+= mtk-cci-devfreq.o
+ obj-$(CONFIG_ARM_RK3399_DMC_DEVFREQ)	+= rk3399_dmc.o
++obj-$(CONFIG_ARM_SUN60I_A733_DSU_DEVFREQ)	+= sun60i-a733-dsu.o
+ obj-$(CONFIG_ARM_SUN8I_A33_MBUS_DEVFREQ)	+= sun8i-a33-mbus.o
+ obj-$(CONFIG_ARM_TEGRA_DEVFREQ)		+= tegra30-devfreq.o
+ 
+diff --git a/drivers/devfreq/sun60i-a733-dsu.c b/drivers/devfreq/sun60i-a733-dsu.c
+new file mode 100644
+index 0000000..2a8fcfb
+--- /dev/null
++++ b/drivers/devfreq/sun60i-a733-dsu.c
+@@ -0,0 +1,638 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Allwinner A733 DSU (DynamIQ Shared Unit) devfreq driver
++ *
++ * The DSU clocks the L3 cache and the snoop filter of all eight cores. Boot
++ * firmware leaves it at 780 MHz and nothing else in Linux touches it.
++ *
++ * Policy (the vendor's, from sunxi-dsufreq.c): the DSU runs at 75 % of the
++ * fastest core -- the A733 user manual's recommendation (5.1.4.1) --, rounded
++ * down to an operating point, but never above the highest point whose
++ * voltage the A55 cluster already holds. The DSU has no rail of its own; it
++ * shares the A55's (DCDC5). No document says so -- the datasheet and both
++ * schematics carry no DSU net --, the silicon does: at a fixed DSU rate,
++ * raising DCDC5 by 40 mV moves the DSU's failure edge up, raising the A76's
++ * DCDC3 by 100 mV does not (measured on 2026-09-29).
++ * The vendor's per-bin table is built so that the DSU rides on that voltage
++ * rather than raising it. One exception: while the
++ * A76 runs at 1488 MHz or more, the DSU is kept at least at the highest
++ * point of its lowest voltage, so a busy big core with idle little cores
++ * does not starve on L3.
++ *
++ * Voltage: the driver still holds its own consumer on the shared regulator
++ * and lets the OPP core set it, although by the policy above its request
++ * never exceeds the A55's. That vote is what makes the ordering safe: when
++ * the A55 lowers its voltage before the DSU has come down, the regulator
++ * core keeps the rail at the DSU's request until it has.
++ *
++ * AXI: the DSU's AXI clock (the path to DRAM) runs at DSU/1 while the DSU is
++ * at or below A733_DSU_AXI_1TO1_MAX_HZ and at DSU/2 above it (UM 5.1.4.1
++ * allows 1:1 or 2:1; boot0 and the vendor keep 2:1 everywhere). The limit is
++ * the highest AXI rate that has run on silicon, 1274 MHz / 2, so the AXI
++ * never runs faster than it already has. Going up, the divider moves to /2
++ * before the DSU does; going down, the DSU moves first and the divider
++ * follows, so no step crosses the limit -- including the DSU's park on
++ * PERI0_600M during a relock (600 MHz). Without an "axi" clock the divider
++ * is left alone.
++ *
++ * Mechanism: a governor of its own, fed by a cpufreq transition notifier,
++ * because the passive governor has no way to express the voltage cap. A
++ * transition notifier rules out cpufreq fast switching; cpufreq-dt, which
++ * drives both clusters here, does not implement it.
++ *
++ * A min_freq written to the devfreq device overrides the policy, cap
++ * included: the DSU's own vote then raises the shared rail.
++ *
++ * Speed bin: the OPP table is the vendor's per-bin voltage table. The bin is
++ * read from the eFuse through the "speed" nvmem cell, bits [15:8], and used
++ * as the CPU OPP tables use it (sun60i_a733_efuse_xlate() in
++ * sun50i-cpufreq-nvmem.c): opp-supported-hw bit <bin>, voltages from
++ * opp-microvolt-speed<bin>. Index 0 is the worst-case column (the unnamed
++ * opp-microvolt), taken for a programmed second copy in bits [23:16], bin 0,
++ * a bin beyond 31, or a bin that the DSU table or either CPU table does not
++ * describe. So the DSU never runs a column for a bin the CPU side has
++ * rejected, and a die without its own column never inherits one measured on
++ * a better die. The CPU side falls back to its index 1 instead (the vendor's
++ * vf0100 set, sun60i_a733_efuse_xlate()); both fallbacks read the unnamed
++ * worst-case voltages, and the DSU stays capped by the A55's vote.
++ *
++ * Which columns have run on silicon: bin 4 (the 6 GiB board: policy proof,
++ * soaks, and the DCDC5 rail edge) and bin 5 (the 8 GiB board: policy
++ * proof). The columns of bins 1, 2, 3, 6, 20 and 21 are the vendor's
++ * values, carried unchanged, and have never run on a die of that bin; the
++ * test-only fuse override proves which column is selected, not that its
++ * voltages carry the DSU. A die of those bins runs the DSU on vendor
++ * values alone.
++ *
++ * Identity: at probe the driver reads the DSU's own registers --
++ * CLUSTERIDR_EL1 (revision), CLUSTERCFR_EL1 (cores, L3 present) and the L3's
++ * CCSIDR_EL1 (sets, ways, line) -- and prints them raw and decoded, so the
++ * cache geometry the DT states is checked against the silicon on every boot.
++ * CLUSTERIDR and CLUSTERCFR have no traps or enables from EL1 or EL2 (DSU
++ * TRM 100453 r4p1, B1.7 and B1.9); the field layout printed is r4p1's.
++ *
++ * Based on the Allwinner BSP driver sunxi-dsufreq.c (Copyright (c) 2020-2023
++ * Allwinner Technology Co., Ltd., panzhijian@allwinnertech.com), and on the
++ * structure of mtk-cci-devfreq.c and tegra30-devfreq.c.
++ */
++
++#include <linux/bitfield.h>
++#include <linux/bitops.h>
++#include <linux/clk.h>
++#include <linux/cpu.h>
++#include <linux/cpufreq.h>
++#include <linux/devfreq.h>
++#include <linux/err.h>
++#include <linux/module.h>
++#include <linux/nvmem-consumer.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/pm_opp.h>
++
++#include <asm/sysreg.h>
++
++#include "governor.h"
++
++#define A733_DSU_SPEED_BIN(v)	(((v) >> 8) & 0xff)
++#define A733_DSU_SPEED_BAK(v)	(((v) >> 16) & 0xff)
++#define A733_DSU_WORST_CASE	0
++
++/* The highest AXI rate run on silicon (DSU 1274 MHz, AXI /2). */
++#define A733_DSU_AXI_1TO1_MAX_HZ	637000000UL
++
++/* DSU TRM 100453 r4p1, table B1-2. */
++#define SYS_A733_CLUSTERCFR_EL1	sys_reg(3, 0, 15, 3, 0)
++#define SYS_A733_CLUSTERIDR_EL1	sys_reg(3, 0, 15, 3, 1)
++
++/* The vendor's big-core threshold for the floor below (sunxi-dsufreq.c). */
++#define A733_DSU_BIG_FLOOR_HZ	1488000000UL
++
++struct sun60i_a733_dsu_opp {
++	unsigned long hz;
++	unsigned long uv;
++};
++
++struct sun60i_a733_dsu {
++	struct device *dev;
++	struct clk *clk;
++	struct clk *axi;			/* optional */
++	struct devfreq *devfreq;
++	struct devfreq_dev_profile profile;
++	struct notifier_block nb;
++
++	struct sun60i_a733_dsu_opp *opps;	/* ascending */
++	unsigned int opp_count;
++	unsigned long floor_hz;			/* highest point at the lowest voltage */
++
++	struct device *little_dev;		/* the CPU supplied by our rail */
++	unsigned int little_cpu;		/* any CPU of the A55 policy */
++	int big_cpu;				/* any CPU of the A76 policy, or -1 */
++	unsigned long little_hz, big_hz;	/* last known policy rates */
++};
++
++static int sun60i_a733_dsu_target(struct device *dev, unsigned long *freq,
++				  u32 flags)
++{
++	struct sun60i_a733_dsu *dsu = dev_get_drvdata(dev);
++	struct dev_pm_opp *opp;
++	bool one_to_one;
++	unsigned long hz;
++	int ret;
++
++	opp = devfreq_recommended_opp(dev, freq, flags);
++	if (IS_ERR(opp))
++		return PTR_ERR(opp);
++	hz = dev_pm_opp_get_freq(opp);
++	one_to_one = hz <= A733_DSU_AXI_1TO1_MAX_HZ;
++
++	/* Above the limit: AXI to /2 before the DSU rises. */
++	if (dsu->axi && !one_to_one) {
++		ret = clk_set_rate(dsu->axi, clk_get_rate(dsu->clk) / 2);
++		if (ret)
++			goto out;
++	}
++
++	ret = dev_pm_opp_set_opp(dev, opp);
++	if (ret)
++		goto out;
++
++	/* At or below it: the DSU is down, AXI to /1. */
++	if (dsu->axi && one_to_one)
++		ret = clk_set_rate(dsu->axi, hz);
++out:
++	dev_pm_opp_put(opp);
++
++	return ret;
++}
++
++static int sun60i_a733_dsu_get_cur_freq(struct device *dev,
++					unsigned long *freq)
++{
++	struct sun60i_a733_dsu *dsu = dev_get_drvdata(dev);
++
++	*freq = clk_get_rate(dsu->clk);
++
++	return 0;
++}
++
++/* Voltage the A55 policy holds at @hz, or 0 if its table does not know it. */
++static unsigned long sun60i_a733_dsu_little_uv(struct sun60i_a733_dsu *dsu,
++					       unsigned long hz)
++{
++	struct dev_pm_opp *opp;
++	unsigned long uv;
++
++	opp = dev_pm_opp_find_freq_ceil(dsu->little_dev, &hz);
++	if (IS_ERR(opp))
++		return 0;
++	uv = dev_pm_opp_get_voltage(opp);
++	dev_pm_opp_put(opp);
++
++	return uv;
++}
++
++/*
++ * Returns an exact operating point, so the devfreq core has nothing left to
++ * round: its default rounding is upwards, which would cross the voltage cap.
++ */
++static unsigned long sun60i_a733_dsu_pick(struct sun60i_a733_dsu *dsu,
++					  unsigned long little_hz,
++					  unsigned long big_hz)
++{
++	unsigned long want, pick = dsu->opps[0].hz, uv;
++	unsigned int i;
++
++	/* 75 % of the fastest core. */
++	want = max(little_hz, big_hz) / 4 * 3;
++
++	/*
++	 * The highest point not above that and not above the voltage the A55
++	 * already holds. The vendor compares the voltages for equality, which
++	 * drops to the lowest cap whenever the A55 sits between two DSU
++	 * voltages; "not above" is what the rule means.
++	 */
++	uv = sun60i_a733_dsu_little_uv(dsu, little_hz);
++	for (i = 0; i < dsu->opp_count; i++)
++		if (dsu->opps[i].hz <= want && dsu->opps[i].uv <= uv)
++			pick = dsu->opps[i].hz;
++
++	if (big_hz >= A733_DSU_BIG_FLOOR_HZ && pick < dsu->floor_hz)
++		pick = dsu->floor_hz;
++
++	return pick;
++}
++
++static int sun60i_a733_dsu_get_target_freq(struct devfreq *devfreq,
++					   unsigned long *freq)
++{
++	struct sun60i_a733_dsu *dsu = dev_get_drvdata(devfreq->dev.parent);
++
++	*freq = sun60i_a733_dsu_pick(dsu, READ_ONCE(dsu->little_hz),
++				     READ_ONCE(dsu->big_hz));
++
++	return 0;
++}
++
++static void sun60i_a733_dsu_update(struct sun60i_a733_dsu *dsu,
++				   struct devfreq *devfreq)
++{
++	int ret = 0;
++
++	mutex_lock(&devfreq->lock);
++	/* Most CPU transitions leave the pick where it is. */
++	if (sun60i_a733_dsu_pick(dsu, READ_ONCE(dsu->little_hz),
++				 READ_ONCE(dsu->big_hz)) != devfreq->previous_freq)
++		ret = update_devfreq(devfreq);
++	mutex_unlock(&devfreq->lock);
++	if (ret)
++		dev_err(dsu->dev, "cannot follow the CPUs: %d\n", ret);
++}
++
++static int sun60i_a733_dsu_cpufreq_notify(struct notifier_block *nb,
++					  unsigned long event, void *ptr)
++{
++	struct sun60i_a733_dsu *dsu = container_of(nb, struct sun60i_a733_dsu, nb);
++	struct cpufreq_freqs *freqs = ptr;
++	unsigned long hz;
++
++	if (event != CPUFREQ_POSTCHANGE || !freqs)
++		return NOTIFY_DONE;
++
++	hz = (unsigned long)freqs->new * 1000;
++	if (cpumask_test_cpu(dsu->little_cpu, freqs->policy->related_cpus))
++		WRITE_ONCE(dsu->little_hz, hz);
++	else
++		WRITE_ONCE(dsu->big_hz, hz);
++
++	sun60i_a733_dsu_update(dsu, dsu->devfreq);
++
++	return NOTIFY_OK;
++}
++
++/* Current rate of the policy holding @cpu, in Hz; 0 if it has none now. */
++static unsigned long sun60i_a733_dsu_policy_hz(int cpu)
++{
++	struct cpufreq_policy *policy;
++	unsigned long hz;
++
++	if (cpu < 0)
++		return 0;
++	policy = cpufreq_cpu_get(cpu);
++	if (!policy)
++		return 0;
++	hz = (unsigned long)policy->cur * 1000;
++	cpufreq_cpu_put(policy);
++
++	return hz;
++}
++
++static int sun60i_a733_dsu_event(struct devfreq *devfreq, unsigned int event,
++				 void *data)
++{
++	struct sun60i_a733_dsu *dsu = dev_get_drvdata(devfreq->dev.parent);
++	int ret;
++
++	switch (event) {
++	case DEVFREQ_GOV_START:
++		/* The notifier may fire before devfreq_add_device() returns. */
++		dsu->devfreq = devfreq;
++		dsu->nb.notifier_call = sun60i_a733_dsu_cpufreq_notify;
++		ret = cpufreq_register_notifier(&dsu->nb,
++						CPUFREQ_TRANSITION_NOTIFIER);
++		if (ret)
++			return ret;
++		/* Catch a transition that landed before the notifier existed. */
++		WRITE_ONCE(dsu->little_hz,
++			   sun60i_a733_dsu_policy_hz(dsu->little_cpu));
++		WRITE_ONCE(dsu->big_hz, sun60i_a733_dsu_policy_hz(dsu->big_cpu));
++		mutex_lock(&devfreq->lock);
++		ret = update_devfreq(devfreq);
++		mutex_unlock(&devfreq->lock);
++		return ret;
++	case DEVFREQ_GOV_STOP:
++		return cpufreq_unregister_notifier(&dsu->nb,
++						   CPUFREQ_TRANSITION_NOTIFIER);
++	}
++
++	return 0;
++}
++
++static struct devfreq_governor sun60i_a733_dsu_governor = {
++	.name		= "a733-dsu",
++	.flags		= DEVFREQ_GOV_FLAG_IMMUTABLE,
++	.get_target_freq = sun60i_a733_dsu_get_target_freq,
++	.event_handler	= sun60i_a733_dsu_event,
++};
++
++/* OR of every opp-supported-hw value in @dev's OPP table; 0 without one. */
++static u32 sun60i_a733_dsu_opp_mask(struct device *dev)
++{
++	struct device_node *np __free(device_node) =
++		dev_pm_opp_of_get_opp_desc_node(dev);
++	u32 mask = 0, val;
++
++	if (!np)
++		return 0;
++
++	for_each_child_of_node_scoped(np, opp)
++		if (!of_property_read_u32(opp, "opp-supported-hw", &val))
++			mask |= val;
++
++	return mask;
++}
++
++/*
++ * The bins every table describes: the DSU's own, ANDed with each CPU that
++ * has an OPP table -- the rule sunxi_cpufreq_dt_speed_mask() applies to the
++ * CPU tables.
++ */
++static u32 sun60i_a733_dsu_speed_mask(struct device *dev)
++{
++	u32 mask = sun60i_a733_dsu_opp_mask(dev);
++	unsigned int cpu;
++
++	for_each_possible_cpu(cpu) {
++		struct device *cpu_dev = get_cpu_device(cpu);
++		struct device_node *np __free(device_node) =
++			cpu_dev ? dev_pm_opp_of_get_opp_desc_node(cpu_dev) : NULL;
++
++		if (np)
++			mask &= sun60i_a733_dsu_opp_mask(cpu_dev);
++	}
++
++	return mask;
++}
++
++/* Speed index (0 = worst case) on success, or a negative errno. */
++static int sun60i_a733_dsu_speed_index(struct device *dev)
++{
++	u32 fuse, bin;
++	int ret;
++
++	ret = nvmem_cell_read_u32(dev, "speed", &fuse);
++	if (ret) {
++		if (ret == -EPROBE_DEFER)
++			return ret;
++		dev_warn(dev, "no speed bin (%d), using the worst-case column\n",
++			 ret);
++		return A733_DSU_WORST_CASE;
++	}
++
++	bin = A733_DSU_SPEED_BIN(fuse);
++	if (A733_DSU_SPEED_BAK(fuse) || !bin || bin >= BITS_PER_TYPE(u32)) {
++		dev_warn(dev, "no usable speed bin in fuse word 0x%08x, using the worst-case column\n",
++			 fuse);
++		return A733_DSU_WORST_CASE;
++	}
++
++	if (!(sun60i_a733_dsu_speed_mask(dev) & BIT(bin))) {
++		dev_warn(dev, "speed bin %u is not described by every OPP table, using the worst-case column\n",
++			 bin);
++		return A733_DSU_WORST_CASE;
++	}
++
++	dev_info(dev, "speed bin %u\n", bin);
++
++	return bin;
++}
++
++/* The CPU of @policy whose cpu-supply is @rail, or NULL. */
++static struct device *sun60i_a733_dsu_rail_cpu(struct cpufreq_policy *policy,
++					       struct device_node *rail)
++{
++	unsigned int cpu;
++
++	for_each_cpu(cpu, policy->related_cpus) {
++		struct device *cpu_dev = get_cpu_device(cpu);
++		struct device_node *np __free(device_node) =
++			cpu_dev ? of_parse_phandle(cpu_dev->of_node,
++						   "cpu-supply", 0) : NULL;
++
++		if (np == rail)
++			return cpu_dev;
++	}
++
++	return NULL;
++}
++
++/*
++ * The A55 policy is the one holding the CPU whose cpu-supply is our own
++ * dsu-supply; the other one is the A76's. Decided per policy from the DT:
++ * cpufreq-dt reads cpu-supply from one CPU per cluster, so the other CPUs
++ * carry none. An offline CPU has no policy to ask and is skipped; an
++ * offline A76 cluster leaves the DSU following the A55 alone.
++ */
++static int sun60i_a733_dsu_find_policies(struct sun60i_a733_dsu *dsu)
++{
++	struct device_node *rail __free(device_node) =
++		of_parse_phandle(dsu->dev->of_node, "dsu-supply", 0);
++	bool little = false;
++	unsigned int cpu;
++
++	if (!rail)
++		return -ENODEV;
++
++	dsu->big_cpu = -1;
++	for_each_possible_cpu(cpu) {
++		struct cpufreq_policy *policy;
++		struct device *rail_cpu;
++
++		policy = cpufreq_cpu_get(cpu);
++		if (!policy) {
++			if (cpu_online(cpu))
++				return -EPROBE_DEFER;
++			continue;
++		}
++
++		rail_cpu = sun60i_a733_dsu_rail_cpu(policy, rail);
++		if (rail_cpu && !little) {
++			dsu->little_dev = rail_cpu;
++			dsu->little_cpu = cpu;
++			little = true;
++		} else if (!rail_cpu && dsu->big_cpu < 0) {
++			dsu->big_cpu = cpu;
++		}
++		cpufreq_cpu_put(policy);
++	}
++
++	if (!little)
++		return -ENODEV;
++	if (dsu->big_cpu < 0)
++		dev_warn(dsu->dev, "no second CPU policy, following the A55 alone\n");
++
++	return 0;
++}
++
++static int sun60i_a733_dsu_read_table(struct sun60i_a733_dsu *dsu)
++{
++	struct device *dev = dsu->dev;
++	struct dev_pm_opp *opp;
++	unsigned long hz, little_min_uv;
++	unsigned int i;
++	int count;
++
++	count = dev_pm_opp_get_opp_count(dev);
++	if (count <= 0)
++		return count ? count : -ENODEV;
++
++	dsu->opps = devm_kcalloc(dev, count, sizeof(*dsu->opps), GFP_KERNEL);
++	if (!dsu->opps)
++		return -ENOMEM;
++
++	for (i = 0, hz = 0; i < count; i++, hz++) {
++		opp = dev_pm_opp_find_freq_ceil(dev, &hz);
++		if (IS_ERR(opp))
++			return PTR_ERR(opp);
++		dsu->opps[i].hz = hz;
++		dsu->opps[i].uv = dev_pm_opp_get_voltage(opp);
++		dev_pm_opp_put(opp);
++	}
++	dsu->opp_count = count;
++
++	dsu->floor_hz = dsu->opps[0].hz;
++	for (i = 1; i < count && dsu->opps[i].uv == dsu->opps[0].uv; i++)
++		dsu->floor_hz = dsu->opps[i].hz;
++
++	/*
++	 * The policy needs the DSU's lowest point to be reachable at the
++	 * A55's lowest voltage. The vendor BUG()s here; refusing to probe
++	 * leaves the DSU where boot firmware put it.
++	 */
++	little_min_uv = sun60i_a733_dsu_little_uv(dsu, 0);
++	if (dsu->opps[0].uv > little_min_uv)
++		return dev_err_probe(dev, -EINVAL,
++				     "lowest DSU point needs %lu uV, the A55 floor is %lu uV\n",
++				     dsu->opps[0].uv, little_min_uv);
++
++	return 0;
++}
++
++/* The DSU's own identity and the L3's geometry, read from the silicon. */
++static void sun60i_a733_dsu_identify(struct device *dev)
++{
++	unsigned long flags;
++	u64 idr, cfr, ccsidr;
++	u32 sets, ways, line;
++
++	idr = read_sysreg_s(SYS_A733_CLUSTERIDR_EL1);
++	cfr = read_sysreg_s(SYS_A733_CLUSTERCFR_EL1);
++
++	/* CSSELR selects level 3 (Level = 2), unified; keep the pair atomic. */
++	local_irq_save(flags);
++	write_sysreg(2 << 1, csselr_el1);
++	isb();
++	ccsidr = read_sysreg(ccsidr_el1);
++	local_irq_restore(flags);
++
++	sets = FIELD_GET(GENMASK(27, 13), ccsidr) + 1;
++	ways = FIELD_GET(GENMASK(12, 3), ccsidr) + 1;
++	line = 16 << FIELD_GET(GENMASK(2, 0), ccsidr);
++
++	dev_info(dev, "CLUSTERIDR 0x%08llx (r%llup%llu), CLUSTERCFR 0x%08llx (%llu cores, %llu PEs, L3 %s, bus %llu)\n",
++		 idr, (idr >> 4) & 0xf, idr & 0xf, cfr,
++		 (cfr & 0x7) + 1, ((cfr >> 24) & 0xf) + 1,
++		 cfr & BIT(4) ? "present" : "absent", (cfr >> 9) & 0x3);
++	dev_info(dev, "L3 CCSIDR 0x%08llx: %u sets x %u ways x %u B = %u KiB\n",
++		 ccsidr, sets, ways, line, sets * ways * line / 1024);
++}
++
++static int sun60i_a733_dsu_probe(struct platform_device *pdev)
++{
++	static const char * const reg_names[] = { "dsu", NULL };
++	struct device *dev = &pdev->dev;
++	struct dev_pm_opp_config config = {
++		.regulator_names	= reg_names,
++		.supported_hw_count	= 1,
++	};
++	struct sun60i_a733_dsu *dsu;
++	char prop_name[sizeof("speed31")];
++	u32 supported_hw;
++	int index, ret;
++
++	dsu = devm_kzalloc(dev, sizeof(*dsu), GFP_KERNEL);
++	if (!dsu)
++		return -ENOMEM;
++	dsu->dev = dev;
++	platform_set_drvdata(pdev, dsu);
++
++	sun60i_a733_dsu_identify(dev);
++
++	ret = sun60i_a733_dsu_find_policies(dsu);
++	if (ret)
++		return dev_err_probe(dev, ret, "cannot find both CPU policies\n");
++
++	dsu->clk = devm_clk_get(dev, NULL);
++	if (IS_ERR(dsu->clk))
++		return dev_err_probe(dev, PTR_ERR(dsu->clk),
++				     "cannot get the DSU clock\n");
++
++	dsu->axi = devm_clk_get_optional(dev, "axi");
++	if (IS_ERR(dsu->axi))
++		return dev_err_probe(dev, PTR_ERR(dsu->axi),
++				     "cannot get the AXI clock\n");
++
++	index = sun60i_a733_dsu_speed_index(dev);
++	if (index < 0)
++		return index;
++	supported_hw = BIT(index);
++	config.supported_hw = &supported_hw;
++	/* No opp-microvolt-speed0 exists: index 0 falls back to the unnamed one. */
++	snprintf(prop_name, sizeof(prop_name), "speed%d", index);
++	config.prop_name = prop_name;
++
++	/* The OPP core takes the clock from the device's own "clocks" entry. */
++	ret = devm_pm_opp_set_config(dev, &config);
++	if (ret < 0)
++		return dev_err_probe(dev, ret, "cannot configure the OPP table\n");
++
++	ret = devm_pm_opp_of_add_table(dev);
++	if (ret)
++		return dev_err_probe(dev, ret, "cannot add the OPP table\n");
++
++	ret = sun60i_a733_dsu_read_table(dsu);
++	if (ret)
++		return ret;
++
++	ret = devm_devfreq_add_governor(dev, &sun60i_a733_dsu_governor);
++	if (ret)
++		return dev_err_probe(dev, ret, "cannot add the governor\n");
++
++	dsu->profile.target = sun60i_a733_dsu_target;
++	dsu->profile.get_cur_freq = sun60i_a733_dsu_get_cur_freq;
++	dsu->profile.initial_freq = clk_get_rate(dsu->clk);
++
++	dsu->devfreq = devm_devfreq_add_device(dev, &dsu->profile,
++					       sun60i_a733_dsu_governor.name,
++					       NULL);
++	if (IS_ERR(dsu->devfreq))
++		return dev_err_probe(dev, PTR_ERR(dsu->devfreq),
++				     "cannot add the devfreq device\n");
++
++	dev_info(dev, "DSU at %lu Hz, %u points %lu-%lu MHz, floor %lu MHz, AXI 1:1 up to %lu MHz%s, following the CPU policies\n",
++		 dsu->profile.initial_freq, dsu->opp_count,
++		 dsu->opps[0].hz / 1000000,
++		 dsu->opps[dsu->opp_count - 1].hz / 1000000,
++		 dsu->floor_hz / 1000000, A733_DSU_AXI_1TO1_MAX_HZ / 1000000,
++		 dsu->axi ? "" : " (no axi clock: left alone)");
++
++	return 0;
++}
++
++static const struct of_device_id sun60i_a733_dsu_of_match[] = {
++	{ .compatible = "allwinner,sun60i-a733-dsu" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, sun60i_a733_dsu_of_match);
++
++static struct platform_driver sun60i_a733_dsu_driver = {
++	.probe	= sun60i_a733_dsu_probe,
++	.driver	= {
++		.name			= "sun60i-a733-dsu",
++		.of_match_table		= sun60i_a733_dsu_of_match,
++		.suppress_bind_attrs	= true,
++	},
++};
++module_platform_driver(sun60i_a733_dsu_driver);
++
++MODULE_DESCRIPTION("Allwinner A733 DSU devfreq driver");
++MODULE_LICENSE("GPL");

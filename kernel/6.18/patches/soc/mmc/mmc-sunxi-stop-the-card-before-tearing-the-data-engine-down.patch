@@ -1,0 +1,558 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] mmc: sunxi: stop the card before tearing the data engine down
+
+A failed data transfer is finished in two steps here, and they are in the wrong
+order. sunxi_mmc_finalize_request() disables the DMA path, resets the DMA
+engine and the FIFO in hard IRQ; only afterwards does
+sunxi_mmc_handle_manual_stop() send CMD12 with SMHC_CMD's STOP_ABT_CMD. The
+card is still sending in between, and the stop then reports failure.
+
+THE FACT
+--------
+Measured on the 8 GiB board, 2026-09-19, kernel 6.18.36-t0137, eMMC
+SDINBDV4-32G in HS400 200 MHz 8 bit, with a 512 MiB O_DIRECT read at
+hs400_ds_dl = 21 -- a data-strobe delay inside the window the driver's own init
+sweep accepts, so the transfer errors but the card stays alive. The read never
+returns; the task sits in D state, and the only way out is a power cycle.
+Register state with the transfer wedged:
+
+    RINTSTS 0x38 = 0x00000020   only RX_DATA_REQUEST -- no error bit standing
+    IMASK   0x30 = 0x0000BBC6   the mask for a command WITHOUT data
+    STATUS  0x3C = 0x01CE9503   FSM_BUSY=1, FIFO 235 of 256
+    CMDR    0x18 = 0x0000014D   START clear, opcode 13
+    TBC0    0x48 = 0x00021400   TBC1 0x4C = 0x00020FC4   difference 1084
+
+and in the log, in this order:
+
+    sunxi-mmc 4022000.mmc: data error, sending stop command
+    sunxi-mmc 4022000.mmc: send stop command failed
+
+Three things are in that capture. The strayed CMD18 has already been
+finalized -- IMASK is the no-data mask and host->mrq points at a later CMD13.
+The card is one FIFO ahead of the DMA: TBC0 - TBC1 = 1084 = FIFO level x 4.
+And FSM_BUSY is standing with nothing left to service it, which is why
+everything issued afterwards waits for ever. The capture was taken on
+2026-09-19; the symptom is the permanently hung read described above.
+
+WHAT THE UM SAYS
+----------------
+a733-um-v0.92, 11.3.8.1, SMHC_CTRL at offset 0x0000:
+
+  [5] DMA_ENB   R/W 0x0  global DMA enable: 0 moves data over the AHB bus
+                          instead, 1 uses DMA
+  [1] FIFO_RST  R/W 0x0  FIFO reset, clears itself when done
+  [0] SOFT_RST  R/W 0x0  software reset of the controller (1 = reset),
+                          clears itself when done
+
+DMA_ENB = 0 does not end a transfer -- it re-routes the data path to the AHB
+bus, and this driver has no PIO path that would read it there, while
+SMHC_FIFO_AC_MOD[31] still says DMA. So the teardown leaves the card sending
+into a FIFO that nothing drains and that has just been emptied for it.
+
+11.3.8.7, SMHC_CMD bit 14 STOP_ABT_CMD: marks the command as a stop or abort
+of the data transfer in progress. That is the one mechanism the controller
+offers for ending the data phase, and it is issued after the data path has
+already been taken apart.
+
+SOFT_RST is the only thing that returns the state machines to idle, and this
+driver writes it exactly once, in sunxi_mmc_init_host(). The error path resets
+the DMA engine and the FIFO and never the controller, so a stop that does not
+take leaves FSM_BUSY standing with no way back.
+
+THE THREE DEFECTS
+-----------------
+1. Order. The data engine is released before the card is stopped
+   (sunxi_mmc_finalize_request(), hard IRQ) instead of after it.
+
+2. The stop is judged by events that are not its own. The poll loop exits on
+   SDXC_INTERRUPT_ERROR_BIT, which contains the data-side bits --
+   DATA_CRC_ERROR, DATA_TIMEOUT, FIFO_RUN_ERROR, START_BIT_ERROR,
+   END_BIT_ERROR. Those belong to the transfer being aborted, and with the
+   card still driving an unread FIFO they keep latching. At a 200 MHz HS400
+   clock the 1 KiB FIFO refills in a few microseconds, which is well inside
+   the wakeup latency of the threaded handler, so the first read of RINTSTS
+   can already carry an overflow error and the loop ends before the CIU has
+   run the command. The "failed" line is then printed for a stop that was
+   never judged.
+
+3. No recovery. Whatever the stop did, nothing resets the controller
+   afterwards, which is what turns one failed stop into a host that is
+   finished until the next power cycle.
+
+WHERE THE VENDOR DRIVER DIFFERS, AND WHAT THIS PATCH DOES
+---------------------------------------------------------
+Read from the A733 BSP's sunxi-mmc.c (the SoC ops in sunxi-mmc-v4p5x.c carry
+nothing stop-related; the stop path is entirely in the vendor core).
+
+Taken over: its poll loop calls cond_resched(). Ours spun a CPU for
+up to a second in a threaded IRQ; this patch yields the same way and says so at
+the call site.
+
+Not taken over:
+
+  - Same ordering defect. Its sunxi_mmc_finalize_request() does the identical
+    teardown -- REG_IDST 0x337, IDMAC soft reset, DMA_RESET, DMA_ENB cleared,
+    FIFO_RESET -- in the interrupt path, before the stop. It does not get the
+    order right; it survives it by bracketing the stop with two full controller
+    resets (sunxi_mmc_clk_gating_reset(), i.e. regs_save, bus clock and reset
+    line off and on again, regs_restore) plus a clock update on each side. That
+    recovers from the ordering instead of avoiding it, and it costs a save/restore
+    of ten registers plus the SoC-specific set on every data error.
+
+  - Same verdict defect. Its sunxi_mmc_send_manual_stop() polls on the same
+    full SDXC_INTERRUPT_ERROR_BIT mask and never clears SMHC_RINTSTS before
+    issuing the command. Its reset-before-stop clears the register as a side
+    effect.
+
+  - It suppresses the failure message. The "send manual stop command failed" line is
+    suppressed whenever host->execute_tuning_runing is set -- exactly the case
+    that produces failed stops most often. This tree keeps the line and adds
+    the register state to it; diagnostic lines in this tree are never
+    removed, only lowered in visibility once the hardware has proven a fix.
+
+  - Its barrier comment does not match its code: the comment asks for the
+    command before the argument, while the wmb() sits after the arg write and
+    before the command write. Not copied. Two writel()s to the same device are ordered on arm64.
+
+  - Its watchdog (sunxi_timerout_work, 5 s, gated on
+    SUNXI_SC_EN_TIMEOUT_DETECT) is not a blueprint for the hang either: for a
+    read whose command has already completed its handler re-arms and does
+    nothing.
+
+WHAT MAINLINE DOES
+------------------
+dw_mmc, from which this controller family descends, sends the abort first and
+stops the DMA second, at all three of its data-error sites:
+
+    send_stop_abort(host, data);
+    dw_mci_stop_dma(host);
+
+(drivers/mmc/host/dw_mmc.c, STATE_SENDING_CMD / STATE_SENDING_DATA /
+STATE_DATA_BUSY). In STATE_SENDING_STOP it then calls dw_mci_reset() when the
+data command errored -- CTRL_RESET | FIFO_RESET | DMA_RESET, followed by
+SDMMC_CMD_UPD_CLK, because a controller reset costs the CIU its clock.
+
+mtk-sd calls msdc_reset_hw() -- MSDC_CFG_RST plus a FIFO clear -- on every data
+error.
+
+Both of those are what this patch does. Neither of them has our second defect,
+because neither judges a stop by polling a shared raw status register.
+
+WHAT THIS CHANGES
+-----------------
+- sunxi_mmc_release_data_engine() is the old teardown, unchanged in content,
+  factored out of sunxi_mmc_finalize_request(). Its comment says what DMA_ENB
+  actually does, so the next reader does not mistake it for a way to stop a
+  transfer.
+
+- finalize defers it when the request still owes the card a stop
+  (host->manual_stop_mrq set). The threaded handler sends the stop first, then
+  releases the data engine. Nothing changes for a request that needs no stop,
+  which is every successful one.
+
+- sunxi_mmc_send_manual_stop() clears SMHC_RINTSTS immediately before the
+  command and judges the result on SDXC_STOP_ERROR_BITS -- RESP_ERROR,
+  RESP_CRC_ERROR, RESP_TIMEOUT, HARD_WARE_LOCKED. HARD_WARE_LOCKED stays in on
+  purpose: that is the CIU refusing to load the command, which is this
+  command's own failure. It returns whether the controller reported
+  COMMAND_DONE, and on failure logs RINTSTS, SMHC_STATUS and SMHC_CMD, so the
+  three cases -- command never run, command refused, card did not answer --
+  are distinguishable in a log instead of sharing one sentence.
+
+- sunxi_mmc_reset_after_failed_stop() runs only when the stop failed: SOFT_RST
+  | FIFO_RST | DMA_RST as a read-modify-write on SMHC_CTRL, the register
+  written back afterwards, everything sunxi_mmc_init_host() programs after its
+  own reset programmed again, and a clock update. The read-modify-write is
+  deliberate -- sunxi_mmc_reset_host() writes SMHC_CTRL whole and is only safe
+  at init. The re-programming is deliberate too: the UM does not list what
+  SOFT_RST clears, but it does say that SMHC_EXT_CMD's AUTO_CMD23_EN (11.3.8.34)
+  is cleared by SOFT_RST, so nothing in the register
+  file is assumed to have survived. That bit in particular is already re-armed
+  per request by `mmc-sunxi-a733-emmc-hardware-auto-cmd23`, which is why a reset here does not cost auto-CMD23.
+
+- sunxi_mmc_program_host() is the second half of sunxi_mmc_init_host(), split
+  out so the recovery can call it. No behaviour change at init.
+
+THESIS
+------
+The stop fails because the data path is taken apart before the card is told to
+stop, and because the stop's verdict is read from a status register that the
+still-running transfer keeps writing into. Stop first, judge the stop by its
+own events, and reset the controller when it still does not take.
+
+FALSIFIER
+---------
+On the 8 GiB board, with hs400_ds_dl = 21 and the same sustained O_DIRECT read:
+
+  - PASS: the log shows "data error, sending stop command" and no "send stop
+    command failed"; the read ends in an I/O error instead of D state; a second
+    sustained read at hs400_ds_dl = 11 immediately afterwards runs at the
+    normal ~139 MiB/s without a power cycle.
+
+  - REFUTED, and the order was not the cause: "send stop command failed" still
+    appears. Then read the new fields on that line. rint carrying
+    HARD_WARE_LOCKED means the CIU refuses the command while the data FSM is
+    busy, and a stop cannot be the first step -- the reset has to come first,
+    which is what the vendor does and would then be right for a reason we did
+    not have. rint with no bit at all and cmdr with START still set means the
+    command was never loaded, same conclusion. A response error means the card
+    ignored a CMD12 it should honour, and the question moves to the card.
+
+  - PARTIALLY REFUTED: the stop succeeds but the device is still unusable
+    afterwards. Then SMHC_STATUS FSM_BUSY after the stop is the observable, and
+    sunxi_mmc_reset_after_failed_stop() has to run unconditionally rather than
+    only on failure.
+
+This patch does not claim to fix the absence of a data timeout. A transfer
+that stalls and raises no error at all never reaches this path; that is a
+separate defect and a separate patch. What it claims is that once an error IS
+raised, the recovery works instead of wedging the host.
+
+VERIFIED / NOT VERIFIED
+-----------------------
+- Applies clean at fuzz 0 on a fresh unpack of 6.18.36 with the full series in
+  numeric order: yes, 190/190 (local, 2026-09-20).
+- Builds: NOT claimed here -- the compile gate is the automated build job, not this header.
+- Silicon: NOT proven. The falsifier above is the whole hardware claim, and it
+  is one run on the 8 GiB board with the sysfs knob from `mmc-sunxi-a-landed-knob-for-the-hs400-data-strobe-delay`.
+- Not exercised by any other path in this tree today: the manual stop only runs
+  on a data error, and the only reproducible data error we have is the strobe
+  sweep's own failures and the hs400_ds_dl = 21 case.
+
+ISSUE
+-----
+ Symptom it is meant to remove: the permanently hung read described above.
+
+Assisted-by: Claude
+---
+--- a/drivers/mmc/host/sunxi-mmc.c
++++ b/drivers/mmc/host/sunxi-mmc.c
+@@ -37,6 +37,7 @@
+ #include <linux/regulator/consumer.h>
+ #include <linux/reset.h>
+ #include <linux/scatterlist.h>
++#include <linux/sched.h>
+ #include <linux/slab.h>
+ #include <linux/spinlock.h>
+ #include <linux/workqueue.h>
+@@ -255,6 +256,22 @@
+ #define SDXC_INTERRUPT_DONE_BIT \
+ 	(SDXC_AUTO_COMMAND_DONE | SDXC_DATA_OVER | \
+ 	 SDXC_COMMAND_DONE | SDXC_VOLTAGE_CHANGE_DONE)
++/*
++ * What can go wrong with the manual stop command itself, as opposed to with
++ * the transfer it aborts.
++ *
++ * The data-side bits -- SDXC_DATA_CRC_ERROR, SDXC_DATA_TIMEOUT,
++ * SDXC_FIFO_RUN_ERROR, SDXC_START_BIT_ERROR, SDXC_END_BIT_ERROR -- belong to
++ * that transfer. The card is still driving data while the stop is issued, so
++ * they go on latching in SMHC_RINTSTS while the stop runs, and reading them as
++ * the stop's verdict reports a failure for a command that was never judged.
++ *
++ * SDXC_HARD_WARE_LOCKED stays in: that is the CIU refusing to take the command
++ * at all, which is this command's own failure and the one worth seeing here.
++ */
++#define SDXC_STOP_ERROR_BITS \
++	(SDXC_RESP_ERROR | SDXC_RESP_CRC_ERROR | SDXC_RESP_TIMEOUT | \
++	 SDXC_HARD_WARE_LOCKED)
+ 
+ /* status */
+ #define SDXC_RXWL_FLAG			BIT(0)
+@@ -538,13 +555,14 @@
+ 	return 0;
+ }
+ 
+-static int sunxi_mmc_init_host(struct sunxi_mmc_host *host)
++/*
++ * Everything sunxi_mmc_init_host() programs after its reset, on its own so
++ * that the stop-path recovery can program it again after the reset it does.
++ */
++static void sunxi_mmc_program_host(struct sunxi_mmc_host *host)
+ {
+ 	u32 rval;
+ 
+-	if (sunxi_mmc_reset_host(host))
+-		return -EIO;
+-
+ 	/*
+ 	 * FIFO burst size and trigger levels. The historic value is burst 8,
+ 	 * RX trigger 7, TX trigger 8; a cfg may override it, because the
+@@ -577,6 +595,14 @@
+ 	/* Undocumented, but found in Allwinner code */
+ 	rval &= ~SDXC_ACCESS_DONE_DIRECT;
+ 	mmc_writel(host, REG_GCTRL, rval);
++}
++
++static int sunxi_mmc_init_host(struct sunxi_mmc_host *host)
++{
++	if (sunxi_mmc_reset_host(host))
++		return -EIO;
++
++	sunxi_mmc_program_host(host);
+ 
+ 	return 0;
+ }
+@@ -692,7 +718,15 @@
+ 		   SDXC_IDMAC_FIX_BURST | SDXC_IDMAC_IDMA_ON);
+ }
+ 
+-static void sunxi_mmc_send_manual_stop(struct sunxi_mmc_host *host,
++/*
++ * Stop the card's data phase: CMD12, or for SDIO an I/O abort written through
++ * the CCCR. SMHC_CMD's STOP_ABT_CMD (bit 14) is what makes the controller
++ * treat it as an abort of a transfer in progress, so the card is still driving
++ * data when this runs and SMHC_RINTSTS is a moving target while it does.
++ *
++ * Returns true when the controller reported COMMAND_DONE for this command.
++ */
++static bool sunxi_mmc_send_manual_stop(struct sunxi_mmc_host *host,
+ 				       struct mmc_request *req)
+ {
+ 	u32 arg, cmd_val, ri;
+@@ -711,30 +745,114 @@
+ 	}
+ 
+ 	/*
+-	 * A busy clear that latched after the failed write must not read as
+-	 * an error of this stop command.
++	 * Give the command a clean status register. Everything standing in it
++	 * belongs to the transfer being aborted -- including the busy clear
++	 * that latches after a failed write, which is why this used to clear
++	 * that one bit by itself.
+ 	 */
+-	if (host->cfg->can_wait_busy)
+-		mmc_writel(host, REG_RINTR, SDXC_WRITE_BUSY_CLEAR);
++	mmc_writel(host, REG_RINTR, 0xffff);
+ 
+ 	mmc_writel(host, REG_CARG, arg);
+ 	mmc_writel(host, REG_CMDR, cmd_val);
+ 
++	/*
++	 * Up to a second of polling, in a threaded IRQ or a work item. The
++	 * vendor stack yields here (cond_resched() in its own poll loop) and
++	 * that part of it is right; without it this spins a CPU for the whole
++	 * timeout on a kernel that does not preempt.
++	 */
+ 	do {
+ 		ri = mmc_readl(host, REG_RINTR);
+-	} while (!(ri & (SDXC_COMMAND_DONE | SDXC_INTERRUPT_ERROR_BIT)) &&
+-		 time_before(jiffies, expire));
++		if (ri & (SDXC_COMMAND_DONE | SDXC_STOP_ERROR_BITS))
++			break;
++		cond_resched();
++	} while (time_before(jiffies, expire));
+ 
+-	if (!(ri & SDXC_COMMAND_DONE) || (ri & SDXC_INTERRUPT_ERROR_BIT)) {
+-		dev_err(mmc_dev(host->mmc), "send stop command failed\n");
++	if (!(ri & SDXC_COMMAND_DONE) || (ri & SDXC_STOP_ERROR_BITS)) {
++		/*
++		 * Say which of the three it was, because they need different
++		 * answers: no COMMAND_DONE and no error bit means the CIU
++		 * never ran the command, SDXC_HARD_WARE_LOCKED means it
++		 * refused to load it, a response error means the card did not
++		 * answer it. SMHC_STATUS carries FSM_BUSY and the FIFO level,
++		 * which say whether the card is still sending.
++		 */
++		dev_err(mmc_dev(host->mmc),
++			"send stop command failed: rint %08x status %08x cmdr %08x\n",
++			ri, mmc_readl(host, REG_STAS),
++			mmc_readl(host, REG_CMDR));
+ 		if (req->stop)
+ 			req->stop->resp[0] = -ETIMEDOUT;
+-	} else {
+-		if (req->stop)
+-			req->stop->resp[0] = mmc_readl(host, REG_RESP0);
++		mmc_writel(host, REG_RINTR, 0xffff);
++		return false;
+ 	}
+ 
++	if (req->stop)
++		req->stop->resp[0] = mmc_readl(host, REG_RESP0);
++
+ 	mmc_writel(host, REG_RINTR, 0xffff);
++	return true;
++}
++
++static int sunxi_mmc_oclk_onoff(struct sunxi_mmc_host *host, u32 oclk_en);
++
++/*
++ * The stop did not take. Put the controller's state machines back to idle.
++ *
++ * Nothing else in this driver does that on an error. SMHC_CTRL SOFT_RST --
++ * the controller reset, UM 11.3.8.1 -- is written exactly once, by
++ * sunxi_mmc_init_host(); the error path resets the DMA path and the FIFO and
++ * leaves the data state machine alone. So a failed stop leaves SMHC_STATUS
++ * FSM_BUSY standing with the card still sending, and every later command waits
++ * behind it: measured on the 8 GiB board as a task in D state for more than ten minutes
++ * while the controller still answered register reads, with a power cycle the
++ * only way out.
++ *
++ * Both mainline drivers this controller is related to reset at exactly this
++ * point: dw_mmc calls dw_mci_reset() in STATE_SENDING_STOP when the data
++ * command errored, mtk-sd calls msdc_reset_hw() on every data error.
++ *
++ * sunxi_mmc_reset_host() is not usable here: it writes SMHC_CTRL whole, which
++ * is only safe at init where everything is programmed afterwards. Here the
++ * register is saved and written back, because the UM does say elsewhere that a
++ * soft reset takes register state with it (11.3.8.34: SMHC_EXT_CMD's
++ * AUTO_CMD23_EN is cleared by SOFT_RST) without ever
++ * listing what else. So everything sunxi_mmc_init_host() programs after its
++ * reset is programmed again, and the CIU's clock -- which a controller reset
++ * loses -- is updated again, the same way dw_mmc follows its reset with
++ * SDMMC_CMD_UPD_CLK.
++ */
++static void sunxi_mmc_reset_after_failed_stop(struct sunxi_mmc_host *host)
++{
++	unsigned long expire = jiffies + msecs_to_jiffies(250);
++	u32 gctrl, rval;
++
++	gctrl = mmc_readl(host, REG_GCTRL);
++	mmc_writel(host, REG_GCTRL, gctrl | SDXC_HARDWARE_RESET);
++	do {
++		rval = mmc_readl(host, REG_GCTRL);
++	} while (time_before(jiffies, expire) && (rval & SDXC_HARDWARE_RESET));
++
++	if (rval & SDXC_HARDWARE_RESET) {
++		dev_err(mmc_dev(host->mmc),
++			"stop recovery: controller reset did not complete, ctrl %08x\n",
++			rval);
++		return;
++	}
++
++	/*
++	 * The three reset bits are auto-cleared; the mode bits in the same
++	 * register are not ours to drop. Write back what it held.
++	 */
++	mmc_writel(host, REG_GCTRL, gctrl & ~SDXC_HARDWARE_RESET);
++	sunxi_mmc_program_host(host);
++
++	if (sunxi_mmc_oclk_onoff(host, 1))
++		return;
++
++	dev_err(mmc_dev(host->mmc),
++		"stop recovery: controller reset, status %08x\n",
++		mmc_readl(host, REG_STAS));
+ }
+ 
+ static u32 sunxi_mmc_error_bits(struct sunxi_mmc_host *host,
+@@ -862,12 +980,50 @@
+ 	return SDXC_INTERRUPT_ERROR_BIT;
+ }
+ 
++/*
++ * Release the data engine of a request that is over: disarm the busy-clear
++ * interrupt, stop the IDMAC, reset the DMA path and the FIFO, unmap.
++ *
++ * This does not stop a transfer, and must not be used as though it did.
++ * SMHC_CTRL DMA_ENB (bit 5), A733 UM 11.3.8.1: 0 selects the AHB bus for
++ * the data path instead of DMA. Clearing it routes the data path to AHB, and
++ * this driver has no PIO path to read it with; the card goes on sending, and
++ * the FIFO reset only makes room for it to fill again. Ending the data phase
++ * is the stop command's job, so on the error path this runs after it.
++ */
++static void sunxi_mmc_release_data_engine(struct sunxi_mmc_host *host,
++					  struct mmc_data *data)
++{
++	u32 rval;
++
++	/*
++	 * Disarm the busy-clear interrupt with the request it was armed for,
++	 * so that bit 13 on a later command without data keeps its error
++	 * meaning.
++	 */
++	if (host->cfg->can_wait_busy) {
++		rval = mmc_readl(host, REG_THLD);
++		mmc_writel(host, REG_THLD, rval & ~SDXC_CARD_BCIG);
++	}
++
++	mmc_writel(host, REG_IDST, 0x337);
++	mmc_writel(host, REG_DMAC, 0);
++	rval = mmc_readl(host, REG_GCTRL);
++	rval |= SDXC_DMA_RESET;
++	mmc_writel(host, REG_GCTRL, rval);
++	rval &= ~SDXC_DMA_ENABLE_BIT;
++	mmc_writel(host, REG_GCTRL, rval);
++	rval |= SDXC_FIFO_RESET;
++	mmc_writel(host, REG_GCTRL, rval);
++	dma_unmap_sg(mmc_dev(host->mmc), data->sg, data->sg_len,
++		     mmc_get_dma_dir(data));
++}
++
+ /* Called in interrupt context, or from busy_work/done_work under host->lock */
+ static irqreturn_t sunxi_mmc_finalize_request(struct sunxi_mmc_host *host)
+ {
+ 	struct mmc_request *mrq = host->mrq;
+ 	struct mmc_data *data = mrq->data;
+-	u32 rval;
+ 
+ 	mmc_writel(host, REG_IMASK, host->sdio_imask);
+ 	mmc_writel(host, REG_IDIE, 0);
+@@ -907,29 +1063,14 @@
+ 			data->bytes_xfered = data->blocks * data->blksz;
+ 	}
+ 
+-	if (data) {
+-		/*
+-		 * Disarm the busy-clear interrupt with the request it was armed
+-		 * for, so that bit 13 on a later command without data keeps its
+-		 * error meaning.
+-		 */
+-		if (host->cfg->can_wait_busy) {
+-			rval = mmc_readl(host, REG_THLD);
+-			mmc_writel(host, REG_THLD, rval & ~SDXC_CARD_BCIG);
+-		}
+-
+-		mmc_writel(host, REG_IDST, 0x337);
+-		mmc_writel(host, REG_DMAC, 0);
+-		rval = mmc_readl(host, REG_GCTRL);
+-		rval |= SDXC_DMA_RESET;
+-		mmc_writel(host, REG_GCTRL, rval);
+-		rval &= ~SDXC_DMA_ENABLE_BIT;
+-		mmc_writel(host, REG_GCTRL, rval);
+-		rval |= SDXC_FIFO_RESET;
+-		mmc_writel(host, REG_GCTRL, rval);
+-		dma_unmap_sg(mmc_dev(host->mmc), data->sg, data->sg_len,
+-			     mmc_get_dma_dir(data));
+-	}
++	/*
++	 * A request that still owes the card a stop keeps its data engine
++	 * until sunxi_mmc_handle_manual_stop() has sent it. Tearing it down
++	 * here would disable the DMA path and clear a FIFO that the card
++	 * immediately refills -- see sunxi_mmc_release_data_engine().
++	 */
++	if (data && !host->manual_stop_mrq)
++		sunxi_mmc_release_data_engine(host, data);
+ 
+ 	mmc_writel(host, REG_RINTR, 0xffff);
+ 
+@@ -1275,6 +1416,7 @@
+ 	struct sunxi_mmc_host *host = dev_id;
+ 	struct mmc_request *mrq;
+ 	unsigned long iflags;
++	bool stopped;
+ 
+ 	spin_lock_irqsave(&host->lock, iflags);
+ 	mrq = host->manual_stop_mrq;
+@@ -1295,7 +1437,21 @@
+ 	 * Additionally we have wait states within this function
+ 	 * so having it in a lock is a very bad idea.
+ 	 */
+-	sunxi_mmc_send_manual_stop(host, mrq);
++	stopped = sunxi_mmc_send_manual_stop(host, mrq);
++
++	/*
++	 * Only now: the card has left the data phase, so the data engine can
++	 * be taken down without the card refilling what is reset. This is the
++	 * order dw_mmc uses at each of its three data-error sites --
++	 * send_stop_abort() and then dw_mci_stop_dma().
++	 */
++	spin_lock_irqsave(&host->lock, iflags);
++	if (mrq->data)
++		sunxi_mmc_release_data_engine(host, mrq->data);
++	spin_unlock_irqrestore(&host->lock, iflags);
++
++	if (!stopped)
++		sunxi_mmc_reset_after_failed_stop(host);
+ 
+ 	spin_lock_irqsave(&host->lock, iflags);
+ 	host->manual_stop_mrq = NULL;

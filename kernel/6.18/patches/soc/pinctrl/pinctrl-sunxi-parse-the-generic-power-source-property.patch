@@ -1,0 +1,98 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] pinctrl: sunxi: parse the generic power-source property
+
+sunxi supplies its own dt_node_to_map(), so the generic pinconf parser never
+sees these nodes: sunxi_pctrl_build_pin_config() walks the node by hand and
+knows exactly two properties, drive-strength and bias. "power-source" is in
+pinconf-generic's table (pinconf-generic.c, "power-source" ->
+PIN_CONFIG_POWER_SOURCE) and is therefore accepted by the schema and silently
+dropped by this driver.
+
+That is not theoretical. On 2026-07-29 an A733 patch pair added a
+PIN_CONFIG_POWER_SOURCE handler for the SD bank's I/O voltage and a DT that
+carries power-source in the mmc_1v8 pinctrl state. It passed the automated checks
+and review, but did nothing on hardware: the handler never ran and the voltage register
+kept its reset default. The DT half then made it worse than a no-op, because
+advertising sd-uhs-sdr104 without the pads following made the mmc core switch
+the card to 1.8 V against 3.3 V pads and the card stopped enumerating.
+
+So parse it, in the same shape as the two properties already there: a
+has_*_prop() for the count, a parse_*_prop() that reads the u32, and one more
+pinconf_to_config_packed() in the builder. Drivers that do not implement
+PIN_CONFIG_POWER_SOURCE are unaffected -- sunxi_pconf_set() returns -ENOTSUPP
+for a parameter its register map does not cover, exactly as before, and a node
+without the property produces the same config array as today.
+
+The argument stays as written in the DT. pinconf-generic deliberately leaves
+its meaning to the driver; on the sunxi controllers that can switch a bank's
+I/O voltage it is microvolts, which is what the consumer's regulator would
+otherwise supply. That contract belongs in the SoC driver that implements the
+parameter, and is documented there.
+
+Placed early in the series, ahead of its SD/MMC consumer: this is the shared
+pinctrl core and the capability is generic to sunxi, not A733-specific. The
+A733 half -- the register write for bank PF -- stays with the storage patches.
+
+Verified: applies at fuzz 0, builds. NOT verified: any hardware effect. The
+observable that decides it is the A733 SD bank switching to 1.8 V through this
+path, which needs the SoC handler and the DT that consume it.
+
+Assisted-by: Claude
+
+diff --git a/drivers/pinctrl/sunxi/pinctrl-sunxi.c b/drivers/pinctrl/sunxi/pinctrl-sunxi.c
+--- a/drivers/pinctrl/sunxi/pinctrl-sunxi.c
++++ b/drivers/pinctrl/sunxi/pinctrl-sunxi.c
+@@ -253,6 +253,26 @@
+ 		of_property_present(node, "allwinner,drive");
+ }
+ 
++static bool sunxi_pctrl_has_power_source_prop(struct device_node *node)
++{
++	return of_property_present(node, "power-source");
++}
++
++/*
++ * The generic binding leaves the meaning of the argument to the driver; on
++ * sunxi the pin controllers that can switch a bank's I/O voltage take it in
++ * microvolts, matching the regulator the pads would otherwise follow.
++ */
++static int sunxi_pctrl_parse_power_source_prop(struct device_node *node)
++{
++	u32 val;
++
++	if (of_property_read_u32(node, "power-source", &val))
++		return -EINVAL;
++
++	return val;
++}
++
+ static int sunxi_pctrl_parse_bias_prop(struct device_node *node)
+ {
+ 	u32 val;
+@@ -359,6 +379,8 @@
+ 		configlen++;
+ 	if (sunxi_pctrl_has_bias_prop(node))
+ 		configlen++;
++	if (sunxi_pctrl_has_power_source_prop(node))
++		configlen++;
+ 
+ 	/*
+ 	 * If we don't have any configuration, bail out
+@@ -395,6 +417,17 @@
+ 		pinconfig[idx++] = pinconf_to_config_packed(pull, arg);
+ 	}
+ 
++	if (sunxi_pctrl_has_power_source_prop(node)) {
++		int uV = sunxi_pctrl_parse_power_source_prop(node);
++
++		if (uV < 0) {
++			ret = uV;
++			goto err_free;
++		}
++
++		pinconfig[idx++] = pinconf_to_config_packed(PIN_CONFIG_POWER_SOURCE,
++							   uV);
++	}
+ 
+ 	*len = configlen;
+ 	return pinconfig;

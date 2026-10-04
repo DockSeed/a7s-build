@@ -1,0 +1,129 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: a733: describe the DisplayPort transmitter
+
+The device-tree side of `drm-allwinner-a733-displayport-aux`. One node, and it describes a block rather than a
+display pipeline: there is no TCON, no display engine and no output port graph
+in this tree yet, so none of that is invented here.
+
+Identity is not assumed. With the block ungated by hand on the 8 GiB board, CORE_ID at
+0x057400FC reads 0x000A0509 -- the value UM 15.4.7 documents for this core -- and
+the AUX channel behind it returned DPCD and a checksum-valid EDID. So the compatible names a
+block that has answered on this silicon.
+
+reg
+---
+
+`<0x0 0x05740000 0x0 0x1000>`, the control window (and the head
+of the vendor's own capture window).
+
+⚠ **The vendor also maps eDP_REG_PAD at 0x05760000 and this node deliberately
+does not.** Its clock gates (`LNK_CLK_GATING`, `VID0/VID1`) read 0x00000000
+through an entire successful AUX session including a full 128-byte EDID fetch --
+measured, not assumed -- so nothing on the AUX path needs them. The window goes
+in when a patch is shown to need it, which is most likely the one that first
+drives pixels.
+
+interrupts
+----------
+
+INTID 94 "EDP" = **GIC_SPI 62** (A733 user manual). The driver polls AUX_STATUS's latched companion and does not
+request this interrupt yet. It is here because the node's job is to describe the
+hardware, and because link training will want it -- not because anything reads
+it today. That is stated so nobody later reads its presence as a claim.
+
+clocks and resets
+-----------------
+
+`CLK_BUS_EDP` and `RST_BUS_EDP` from `clk-sunxi-ng-a733-add-edp-bus-gate-and-reset`. **Both are required**, and that is a
+measurement rather than a convention: with the gate set and the reset still
+asserted the entire 4 KiB window reads 0x00000000; only with EDP_RST de-asserted
+does CORE_ID answer. A node that carried the clock alone would build, probe, and
+read zeros.
+
+No `assigned-clock-rates`: the AUX divider is computed from the bus clock at
+runtime rather than the clock being bent to fit a hardcoded divider.
+
+phys
+----
+
+`<&aux_hpd>` only, `phy-names = "aux-phy"`. The AUX differential pair runs to the
+Type-C SBU pins through its own analog front end (`phy-allwinner-a733-aux-hpd-phy` and `arm64-dts-a733-aux-hpd-phy-node`), and COMB0 -- which
+carries the four main-link lanes -- is not on this path at all: the by-hand run
+completed a full EDID fetch with COMB0 untouched by this block. The vendor's
+shape is `phys = <&combo0_dp>, <&aux_hpd_phy>`, and reproducing it would mean
+giving the HW-proven USB3 combo-PHY node a second phy cell for no present
+consumer. The main link joins when something drives it.
+
+no supplies
+-----------
+
+The vendor's `vdd-edp` / `vcc-edp` are panel rails, enabled from its panel path;
+this board has no panel, so there is nothing to name. The rail that does feed
+this path is AVDD-HPD-AUX and it belongs to the AUX/HPD node, where it is
+recorded as unnamed rather than filled with a `regulator-fixed` stand-in.
+
+Verified: applies at fuzz 0 on the full series, the dtb builds with no new dtc
+warning, and the compiled dtb carries displayport@5740000 with its compatible,
+reg, interrupt, clock, reset and phy. NOT verified: the board.
+
+Assisted-by: Claude
+
+diff --git a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -1300,6 +1300,55 @@
+ 		 * The old note here said "IRQ 185" and mixed the two numbering
+ 		 * spaces: INTID 185 is PCIE0_MSI.
+ 		 */
++		/*
++		 * The DisplayPort transmitter -- a Trilinear DP 1.4 core, identified
++		 * by its own CORE_ID register reading 0x000A0509, the value UM
++		 * 15.4.7 documents (measured on the 8 GiB board 2026-08-18 after ungating the
++		 * block by hand).
++		 *
++		 * Only the AUX channel is driven today, so this node describes the
++		 * block and not yet a display pipeline: no TCON, no display engine,
++		 * no output port graph. Those arrive with the KMS work and extend
++		 * this node rather than replacing it.
++		 *
++		 * reg: the 4 KiB control window. The second window the vendor also
++		 * maps -- eDP_REG_PAD at 0x05760000 -- is deliberately NOT here: its
++		 * clock gates read 0x00000000 through an entire successful AUX
++		 * session including a full EDID fetch, so nothing on this path needs
++		 * it. It goes in when something is shown to need it.
++		 *
++		 * interrupts: INTID 94 "EDP" = GIC_SPI 62 (interrupt list of the
++		 * A733 user manual). The AUX driver polls AUX_STATUS and does not
++		 * request this yet; it is here because it describes the hardware,
++		 * which is this file's job, and because link training will want it.
++		 *
++		 * clocks/resets: the eDP bus gate and reset, EDP_BGR_REG bit 0 and
++		 * bit 16. BOTH are required before a single register of the block is
++		 * reachable -- with the gate alone the whole window reads zero,
++		 * measured, so the reset is not a formality here.
++		 *
++		 * phys: the AUX differential pair runs to the Type-C SBU pins through
++		 * its own analog front end (`phy-allwinner-a733-aux-hpd-phy` and `arm64-dts-a733-aux-hpd-phy-node`), not through COMB0. COMB0
++		 * carries the four main-link lanes and is reached through the Type-C
++		 * mux instead, so it is deliberately absent from this list.
++		 *
++		 * No supplies. The vendor's `vdd-edp`/`vcc-edp` are panel rails and
++		 * this board has no panel; the rail that does feed this path is
++		 * AVDD-HPD-AUX and it belongs to the AUX/HPD node. A regulator-fixed
++		 * stand-in would satisfy the binding and prove nothing.
++		 */
++		edp0: displayport@5740000 {
++			compatible = "allwinner,sun60i-a733-dp";
++			reg = <0x0 0x05740000 0x0 0x1000>;
++			interrupts = <GIC_SPI 62 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&ccu CLK_BUS_EDP>;
++			clock-names = "bus";
++			resets = <&ccu RST_BUS_EDP>;
++			phys = <&aux_hpd>;
++			phy-names = "aux-phy";
++			status = "okay";
++		};
++
+ 		usb3: usb@6a00000 {
+ 			compatible = "allwinner,sun60i-a733-dwc3";
+ 			reg = <0x0 0x06a00000 0x0 0x10000>;

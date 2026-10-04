@@ -1,0 +1,227 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: a733: the display-engine node and the TCON-to-DisplayPort edge
+
+Two things the pixel path's device tree has been missing, and one comment that
+is no longer true.
+
+THE PIPELINE NODE. `arm64-dts-a733-display-engine-node-and-de-to-tcon-edge` added the display engine and the DE -> TCON_TV1 edge
+and deliberately left out the node that names the pipeline as a whole, saying
+in its own header that "the patch that settles the driver shape adds it". `drm-a733-kms-drm-device-for-the-display-pipe`
+settles it, so it is here:
+
+    display-engine {
+            compatible = "allwinner,sun60i-a733-display-engine";
+            allwinner,pipelines = <&mixer0>;
+    };
+
+It carries no reg, no clock and no interrupt because it is not a block -- it is
+the list of pipelines a KMS driver has to bring up together, which is why it
+sits at the root beside `soc` rather than inside it. `allwinner,pipelines` is
+mainline sun4i-drm's own property (sun4i_drv.c walks it to build its component
+match list), reused verbatim rather than invented, on the same bet `arm64-dts-a733-display-engine-node-and-de-to-tcon-edge` made
+when it claimed mainline's DE33 mixer compatible: write the device tree in the
+shape the driver we intend to converge on already expects, so converging is a
+code change and not a device-tree change.
+
+ONE ENTRY, and `drm-a733-kms-drm-device-for-the-display-pipe` refuses more. This SoC's display engine has two display
+outputs and could drive a second pipe, but only
+disp0 -> TCON_TV1 -> DisplayPort has ever been on a board.
+
+THE TCON -> TRANSMITTER EDGE. tcon_tv1 gains ports/port@1 and edp0 gains
+ports/port@0. This is what of_drm_find_bridge() resolves: `drm-a733-kms-drm-device-for-the-display-pipe` asks
+devm_drm_of_get_bridge() for port 1 endpoint 0 of the TCON node, follows the
+graph to the transmitter, and finds the drm_bridge `drm-a733-dp-register-a-drm-bridge` published with
+drm_bridge_add(). Port 1 is the output side by the same convention port@0 uses
+for the input, and the numbers are read by the driver, not by a binding.
+
+⚠ THE COMMENT THAT WAS TRUE AND IS NOT. `arm64-dts-a733-display-engine-node-and-de-to-tcon-edge`'s mixer0 node carried a paragraph
+saying this edge was "deliberately NOT here" because the DP's shape -- bridge
+or encoder component -- was undecided, and recording the debt. It is decided
+and the debt is paid, so the paragraph is deleted rather than struck through,
+per this tree's rule that a file holds only what is true now.
+
+WHAT THIS DOES NOT ADD, named so it is not read as an oversight
+----------------------------------------------------------------
+
+⬜ THE CONNECTOR IS STILL NOT DESCRIBED. The Type-C receptacle's `displayport`
+property -- what would let dp_altmode_probe() find the transmitter node's
+connector for out-of-band hot-plug -- exists in displayport.c:800-804 and in NO
+binding: usb-connector.yaml is `unevaluatedProperties: false` and documents
+only an `altmodes/displayport` CHILD NODE, which does not satisfy that lookup.
+`drm-a733-dp-register-a-drm-bridge` records the same debt from the driver side. It is closed by one
+observation once a connector exists -- plug the monitor and read
+/sys/class/drm/<card>-DP-1/status -- and not by adding a property no schema
+accepts.
+
+⬜ NO BINDING SCHEMA. No display node in this tree has one -- not the mixer,
+not the TCON, not the transmitter -- so a schema for the pipeline node alone
+would describe the least of it. The debt is the display track's, not this
+patch's.
+
+That is the same exception `clk-sunxi-ng-a733-add-edp-bus-gate-and-reset` to `arm64-dts-a733-display-engine-node-and-de-to-tcon-edge` already carry and each states in its
+own header. Highest misc number in the applied tree is `arm64-dts-a733-display-engine-node-and-de-to-tcon-edge` (`clk-sunxi-ng-a733-display-engine-clock-gate-reset` and `arm64-dts-a733-display-engine-node-and-de-to-tcon-edge` are in
+flight on display/engine-ccu-dt); next free is `arm64-dts-a733-display-engine-node-and-tcon-dp-edge`, which is this one.
+
+WHAT IS VERIFIED
+-----------------
+
+✅ Applies at --fuzz=0 and the dtb compiles (`compile-check` builds
+sun60i-a733-cubie-a7s-minimal.dtb).
+
+⬜ NOTHING HERE HAS BEEN ON A BOARD. A device-tree node that nothing binds
+changes no register, and until `drm-a733-kms-drm-device-for-the-display-pipe` binds it this one changes nothing at all.
+The observable it serves is `drm-a733-kms-drm-device-for-the-display-pipe`'s: /dev/fb0 at 1920x1200.
+
+Assisted-by: Claude
+
+diff --git a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -627,6 +627,32 @@
+ 		};
+ 	};
+ 
++	/*
++	 * The display pipe as a whole -- the node a KMS driver binds, and the
++	 * only one here that describes no hardware. It carries no reg, no
++	 * clock and no interrupt because it is not a block: it is the list of
++	 * pipelines the driver has to bring up together, which is why it sits
++	 * at the root beside `soc` rather than inside it.
++	 *
++	 * `allwinner,pipelines` is mainline sun4i-drm's own property
++	 * (sun4i_drv.c walks it to build its component match list) and it is
++	 * reused verbatim rather than invented. That is the same bet `arm64-dts-a733-display-engine-node-and-de-to-tcon-edge` made
++	 * when it claimed mainline's DE33 mixer compatible for the engine: the
++	 * device tree is written in the shape the driver we intend to converge
++	 * on already expects, so converging is a code change and not a device
++	 * tree change.
++	 *
++	 * ONE ENTRY, and the driver refuses more. This SoC's display engine has
++	 * two display outputs and could drive a second pipe,
++	 * but only disp0 -> TCON_TV1 -> DisplayPort has ever been on a board.
++	 * A second entry here would describe a pipeline nothing has proven.
++	 */
++	display-engine {
++		compatible = "allwinner,sun60i-a733-display-engine";
++		allwinner,pipelines = <&mixer0>;
++		status = "okay";
++	};
++
+ 	soc {
+ 		compatible = "simple-bus";
+ 		#address-cells = <2>;
+@@ -1523,16 +1549,9 @@
+ 			 * nibble 0x5). The graph says which TCON; the driver
+ 			 * writes the nibble.
+ 			 *
+-			 * ⚠ The next edge, TCON_TV1 -> the DisplayPort
+-			 * transmitter, is deliberately NOT here. Its shape depends
+-			 * on whether the DP lands as a drm_bridge or as an encoder
+-			 * component, which is undecided
+-			 *. Guessing it
+-			 * would put a property in the tree that nothing reads --
+-			 * the failure mode that grepping the driver for each
+-			 * new property before adding it is meant to prevent. It is owed by the patch that
+-			 * settles that question, and this comment is where the
+-			 * debt is recorded.
++			 * The next edge, TCON_TV1 -> the DisplayPort transmitter,
++			 * is on the TCON node. It is a drm_bridge on port 1, and
++			 * the KMS driver reads it with devm_drm_of_get_bridge().
+ 			 */
+ 			ports {
+ 				#address-cells = <1>;
+@@ -1605,22 +1624,24 @@
+ 			status = "okay";
+ 
+ 			/*
+-			 * The input edge, DE display pipe 0 -> TCON_TV1. Added
+-			 * with the display-engine node, because a graph edge only
+-			 * exists if both ends describe it.
+-			 *
+-			 * The endpoint carries no reg, so its id is 0 -- and that
+-			 * is what names the mixer: sun8i_mixer_of_get_id() reads
+-			 * the REMOTE endpoint's id, so this 0 is why the block on
+-			 * the other end is mixer 0. A second display pipe arrives
+-			 * as a second endpoint here with reg = <1>, which then
+-			 * needs #address-cells/#size-cells on this port.
+-			 *
+-			 * Nothing reads this today: sun60i-tcon-tv.c is a plain
+-			 * platform driver with no of_graph call, so the edge is
+-			 * inert until a KMS driver walks it. It is here because it
+-			 * is the route the hardware takes -- the register that
+-			 * performs it is DE2TCON_MUX, on the DE side.
++			 * Two edges: DE display pipe 0 in on port@0, the
++			 * DisplayPort transmitter out on port@1.
++			 *
++			 * The input endpoint carries no reg, so its id is 0 --
++			 * and that is what names the mixer:
++			 * sun8i_mixer_of_get_id() reads the REMOTE endpoint's id,
++			 * so this 0 is why the block on the other end is mixer 0.
++			 * A second display pipe arrives as a second endpoint here
++			 * with reg = <1>, which then needs
++			 * #address-cells/#size-cells on this port.
++			 *
++			 * The output edge is what of_drm_find_bridge() resolves:
++			 * the KMS driver asks devm_drm_of_get_bridge() for port 1
++			 * endpoint 0 of this node, follows it to the transmitter,
++			 * and finds the drm_bridge that driver published with
++			 * drm_bridge_add(). Port 1 is the output side by the same
++			 * convention the input uses, and the number is read by the
++			 * driver, not by a binding.
+ 			 */
+ 			ports {
+ 				#address-cells = <1>;
+@@ -1633,6 +1654,14 @@
+ 						remote-endpoint = <&mixer0_out_tcon_tv1>;
+ 					};
+ 				};
++
++				tcon_tv1_out: port@1 {
++					reg = <1>;
++
++					tcon_tv1_out_edp0: endpoint {
++						remote-endpoint = <&edp0_in_tcon_tv1>;
++					};
++				};
+ 			};
+ 		};
+ 
+@@ -1712,6 +1741,38 @@
+ 			phys = <&aux_hpd>, <&combophy0>;
+ 			phy-names = "aux-phy", "dp";
+ 			status = "okay";
++
++			/*
++			 * The input edge, TCON_TV1 -> this transmitter. Only the
++			 * other end is walked -- of_graph_get_remote_node() is
++			 * called on the TCON -- but a graph edge exists only if
++			 * both ends describe it, so this half is not optional.
++			 *
++			 * ⬜ AND THE CONNECTOR IS STILL NOT DESCRIBED HERE. The
++			 * Type-C receptacle's `displayport` property, which is
++			 * what would let dp_altmode_probe() find this node's
++			 * connector for out-of-band hot-plug, is in
++			 * displayport.c:800-804 and in NO binding:
++			 * usb-connector.yaml is `unevaluatedProperties: false`
++			 * and documents only an `altmodes/displayport` CHILD
++			 * NODE, which does not satisfy that lookup. `drm-a733-dp-register-a-drm-bridge` records
++			 * the same debt from the driver side. It is closed by one
++			 * observation once a connector exists -- plug the monitor
++			 * and read /sys/class/drm/<card>-DP-1/status -- and not
++			 * by adding a property no schema accepts.
++			 */
++			ports {
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				edp0_in: port@0 {
++					reg = <0>;
++
++					edp0_in_tcon_tv1: endpoint {
++						remote-endpoint = <&tcon_tv1_out_edp0>;
++					};
++				};
++			};
+ 		};
+ 
+ 		/*

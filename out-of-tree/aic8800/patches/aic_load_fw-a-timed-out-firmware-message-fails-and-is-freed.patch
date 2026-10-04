@@ -1,0 +1,147 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] aic_load_fw: a timed-out firmware message fails and is freed
+
+From code reading (pinned tag plus the series; kernel 6.18.53).
+
+cmd_mgr_queue() waits for a blocking message's confirmation with
+wait_for_completion_killable_timeout(). Two exits of that wait are wrong:
+
+- Timeout (0): it stores -ETIMEDOUT in cmd->result, calls cmd_complete(),
+  which sets cmd->result back to 0 for a waiting command, and returns 0.
+  rwnx_send_msg() passes that 0 on, so the caller counts the message as
+  confirmed and reads a cfm buffer the firmware never filled. The command
+  is taken off the list but never freed.
+- Killed (< 0, -ERESTARTSYS): it is treated like a confirmation and the
+  command is freed while it is still on cmd_mgr->cmds. A confirmation
+  arriving afterwards walks cmd_mgr_msgind() into freed memory, and its
+  memcpy() can land in a caller's stack buffer after that caller has
+  returned.
+
+The timeout also marks the command manager crashed, so the next message
+fails with -EPIPE; only a timeout on the last message of a sequence
+went unseen.
+
+In the vendor driver: it reuses cmd_complete(), the confirmation's
+completion path, as the timeout's cleanup, and cmd_complete() reports
+success by design; and it reads a non-zero wait result as "completed".
+
+What changes: on timeout or kill, and only if no confirmation completed
+the command in the meantime (RWNX_CMD_FLAG_DONE, read under
+cmd_mgr->lock, which cmd_mgr_msgind() holds while it touches a command),
+the command is taken off the list under the lock. A timeout returns
+-ETIMEDOUT and still marks the manager crashed; a kill returns the wait's
+error. The command is freed on every exit of a blocking message.
+
+Not taken:
+- Keeping cmd_complete() and returning cmd->result afterwards:
+  cmd_complete() would have to learn to tell a timeout from a
+  confirmation, and it also runs from the rx path.
+- Clearing the crashed state after a timeout: the vendor's reason (a
+  firmware that stopped answering) stands; the probe fails anyway.
+
+Test stimulus and counter under /sys/module/aic_load_fw/parameters:
+rx_loader_inject_cmd_timeout (0644): cmd_mgr_msgind() drops the next N
+confirmations that match a waiting command, so that command runs into its
+real timeout (RWNX_80211_CMD_TIMEOUT_MS, 2 s per queued command). A zero
+wait does not work as a stimulus: aicwf_usb_bus_txmsg() waits for its own
+URB, and the confirmation has arrived by the time cmd_mgr_queue() waits.
+rx_loader_cmd_timeouts (0444) counts timed-out messages.
+
+Falsifier, on the board, with the part at its loaded id
+(inject a command timeout):
+  modprobe -r aic8800_fdrv aic_load_fw
+  modprobe aic_load_fw
+  echo 1 > /sys/module/aic_load_fw/parameters/rx_loader_inject_cmd_timeout
+The first probe reboots the part and returns before modprobe does; the
+parameter is armed before the part comes back at its boot id. The first
+message of the second probe's system_config_8800d80() is the read of
+0x40500000. Without the fix it returns 0, and the configuration goes on
+until the next message fails on the crashed manager with -32 (-EPIPE).
+With it: "40500000 rd fail: -110", and rx_loader_cmd_timeouts 1. A -32
+with the fix refutes it.
+
+Assisted-by: Claude
+
+
+diff --git a/src/USB/driver_fw/drivers/aic8800/aic_load_fw/aicbluetooth_cmds.c b/src/USB/driver_fw/drivers/aic8800/aic_load_fw/aicbluetooth_cmds.c
+index 223cfc8..539fe03 100644
+--- a/src/USB/driver_fw/drivers/aic8800/aic_load_fw/aicbluetooth_cmds.c
++++ b/src/USB/driver_fw/drivers/aic8800/aic_load_fw/aicbluetooth_cmds.c
+@@ -44,6 +44,16 @@ static void cmd_complete(struct rwnx_cmd_mgr *cmd_mgr, struct rwnx_cmd *cmd)
+     }
+ }
+ 
++/* Test stimulus: the next N confirmations that match a waiting command
++ * are dropped, so that command runs into its real timeout.
++ */
++static int rx_loader_inject_cmd_timeout;
++module_param(rx_loader_inject_cmd_timeout, int, 0644);
++MODULE_PARM_DESC(rx_loader_inject_cmd_timeout, "Test stimulus: drop the next N confirmations of waiting firmware messages, so they time out");
++static uint rx_loader_cmd_timeouts;
++module_param(rx_loader_cmd_timeouts, uint, 0444);
++MODULE_PARM_DESC(rx_loader_cmd_timeouts, "Blocking firmware messages that timed out and were taken off the command list");
++
+ static int cmd_mgr_queue(struct rwnx_cmd_mgr *cmd_mgr, struct rwnx_cmd *cmd)
+ {
+     bool defer_push = false;
+@@ -98,21 +108,37 @@ static int cmd_mgr_queue(struct rwnx_cmd_mgr *cmd_mgr, struct rwnx_cmd *cmd)
+ 
+     if (!(cmd->flags & RWNX_CMD_FLAG_NONBLOCK)) {
+         unsigned long tout = msecs_to_jiffies(RWNX_80211_CMD_TIMEOUT_MS * cmd_mgr->queue_sz);
+-        if (!wait_for_completion_killable_timeout(&cmd->complete, tout)) {
+-            printk(KERN_CRIT"cmd timed-out\n");
+-
+-            cmd_dump(cmd);
++        long left = wait_for_completion_killable_timeout(&cmd->complete, tout);
++        int ret = 0;
++
++        if (left <= 0) {
++            /* Timed out (0) or killed (< 0). The command may still be on
++             * the list, where cmd_mgr_msgind() finds it under the lock;
++             * take it off before freeing it, and report the failure: the
++             * caller would otherwise go on with a cfm buffer the
++             * firmware never filled.
++             */
+             spin_lock_bh(&cmd_mgr->lock);
+-            cmd_mgr->state = RWNX_CMD_MGR_STATE_CRASHED;
+             if (!(cmd->flags & RWNX_CMD_FLAG_DONE)) {
+-                cmd->result = -ETIMEDOUT;
+-                cmd_complete(cmd_mgr, cmd);
++                list_del(&cmd->list);
++                cmd_mgr->queue_sz--;
++                if (left == 0) {
++                    printk(KERN_CRIT"cmd timed-out\n");
++                    cmd_dump(cmd);
++                    cmd_mgr->state = RWNX_CMD_MGR_STATE_CRASHED;
++                    rx_loader_cmd_timeouts++;
++                    ret = -ETIMEDOUT;
++                } else {
++                    ret = left;
++                }
+             }
++            /* else the confirmation completed it just after the wait
++             * ended: it is off the list and the cfm buffer is filled.
++             */
+             spin_unlock_bh(&cmd_mgr->lock);
+         }
+-        else{
+-            kfree(cmd);
+-        }
++        kfree(cmd);
++        return ret;
+     } else {
+         cmd->result = 0;
+     }
+@@ -147,6 +173,12 @@ static int cmd_mgr_msgind(struct rwnx_cmd_mgr *cmd_mgr, struct rwnx_cmd_e2amsg *
+         if (cmd->reqid == msg->id &&
+             (cmd->flags & RWNX_CMD_FLAG_WAIT_CFM)) {
+ 
++            if (unlikely(rx_loader_inject_cmd_timeout > 0)) {
++                rx_loader_inject_cmd_timeout--;
++                found = true;
++                break;
++            }
++
+             if (!cmd_mgr_run_callback(cmd_mgr, cmd, msg, cb)) {
+                 found = true;
+                 cmd->flags &= ~RWNX_CMD_FLAG_WAIT_CFM;

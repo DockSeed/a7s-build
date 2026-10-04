@@ -1,0 +1,172 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] thermal: sun8i: A733 init per the UM, query mode, no data interrupt
+
+The A733 entry reused sun50i_h6_thermal_init(). Two of its writes are the
+H6's, not this part's, and one of them costs idle power.
+
+WHAT THE UM SAYS
+
+A733 UM V1.00 7.1.6.1 (p. 344, PDF p. 365), query mode, steps 3-9:
+THS_CTRL acquire time 0x2F in [15:0] and sample divider 0x1DF in [31:16];
+THS_PER 0x3A in [31:12]; THS_FILTER enable (bit 2) and type 1 (average of
+4); calibration into THSn_CDATA; THS_EN last. Interrupt mode adds
+THS_DATA_INTC. The THS chapter of UM V0.92 is word for word the same (575
+extracted text lines, no difference).
+
+THS_PER is 4096 * (n + 1) / CLK_IN per conversion (7.1.8.3, p. 346). With
+the filter averaging four conversions and five sensors sharing the block,
+one sensor gets a new word every 4096 * (n + 1) * 4 * 5 / 24 MHz:
+0.201 s for 0x3A, 1.249 s for the H6's 365.
+
+One defect in the chapter: the THS_CTRL table (7.1.8.1, p. 345) puts
+TACQ, the ADC acquire time with its 2 us default, in bits 31:16 and marks bits 15:0 reserved.
+Only the programming guide's reading gives 2 us (48 cycles at 24 MHz); the
+table's would be 480 cycles, 20 us. The reset value, the vendor driver and
+this driver all follow the guide.
+
+WHAT THE SILICON SAYS (Cubie A7S, 6 GiB board, 2026-09-25)
+
+- Reset defaults, read after asserting and releasing THS0_BGR live, before
+  any driver write: THS_CTRL 0x01DF002F, THS_EN 0, THS_PER 0x0003A000,
+  THS_DATA_INTC 0, THS_FILTER 0x1, THS0_ALARM_CTRL 0x05A00684,
+  THS0_THS1_CDATA 0x08000800 -- all as the UM tables state. The UM's
+  period is the hardware's own reset value.
+- The period formula at two points: predicted 4.00 and 24.83 data IRQs/s
+  for n = 365 and 0x3A, measured 4.0 and 24.8.
+- Writing THS_PER while THS_EN is set stops conversion (no IRQ, frozen
+  values) until THS_EN is cleared and set again. This init writes THS_EN
+  last, as the UM orders it.
+- Idle at the greeter, 30 s per arm, values set live:
+
+    THS_PER  data IRQ  IRQ/s  A55 freq transitions  zone0 changes in 5 s
+    365      on        4.0    226                   4
+    0x3A     on        24.8   1089                  28
+    0x3A     off       0.0    116                   25
+
+WHY NO DATA INTERRUPT
+
+The zones are polled by the thermal core (polling-delay 1000 ms,
+polling-delay-passive 500 ms), and a poll reads the live THSn_DATA word, so
+the interrupt only adds wakeups. Each wakes the SCHED_FIFO irq thread, and
+without CONFIG_UCLAMP_TASK schedutil raises the A55 policy to the top OPP
+for it -- the idle frequency churn found in an earlier investigation. At the UM period that is
+24.8 wakeups/s and five times today's churn; without the interrupt, half of
+today's. A first read before the first conversion returns -EAGAIN, which the
+core rechecks after THERMAL_RECHECK_DELAY (thermal_zone_recheck()).
+THS_DATA_INTC is written 0 rather than left at its reset value, so nothing a
+previous owner enabled survives. The IRQ stays requested; it never fires.
+
+The comments on the A733 chip entry and on the trend filter described the
+old period and are rewritten; the trend filter's noise figures were
+measured at 1.25 s and are labelled so.
+
+Verified: applies at fuzz 0, builds (W=1 clean). Pending on silicon: the
+register readback after boot (THS_PER 0x0003A000, THS_FILTER 0x5,
+THS_DATA_INTC 0), no THS interrupts, zones updating about five times a
+second, and the trip behaviour at 90 C under load against the H6 init
+(the falsifier of a separate, earlier investigation) -- including whether the trend filter's trend_hyst
+still fits the noise at the shorter period.
+
+Assisted-by: Claude
+---
+diff -uNr a/drivers/thermal/sun8i_thermal.c b/drivers/thermal/sun8i_thermal.c
+--- a/drivers/thermal/sun8i_thermal.c
++++ b/drivers/thermal/sun8i_thermal.c
+@@ -206,20 +206,16 @@
+  * samples.  On this part that is a one-bit differentiator fed a signal it
+  * cannot resolve, for two measured reasons.
+  *
+- * The sensors are slow as this driver programs them -- a choice, not a
+- * property of the part.  sun50i_h6_thermal_init() writes THS_PER = 365 (the
+- * H6 value; the UM's init sequence writes 0x3A = 58, the vendor driver 28)
+- * at 24 MHz, so one conversion takes 4096 * 366 / 24e6 = 62.5 ms; THS_FILTER
+- * averages four of them and the five sensors share the block, which puts a
+- * new word in each THSn_DATA every 4096 * 366 * 4 * 5 / 24e6 = 1.2493 s.
+- * Measured on a Cubie A7S: every reported value holds for 1.22..1.26 s, and
+- * the shared data interrupt fires at 4.00 /s, i.e. 0.8 Hz per sensor.  A CPU
+- * zone polls at 500 ms, so at this period two out of three governor cycles see
+- * no new sensor data at all -- shortening the poll cannot help, and
+- * lengthening it costs response.
++ * The sensor cadence is set by sun60i_a733_thermal_init(): THS_PER = 0x3A,
++ * the UM's value and the register's reset default, so one conversion takes
++ * 4096 * 59 / 24e6 = 10.07 ms; THS_FILTER averages four of them and the five
++ * sensors share the block, which puts a new word in each THSn_DATA every
++ * 4096 * 59 * 4 * 5 / 24e6 = 0.201 s.  Every 500 ms governor cycle therefore
++ * reads a fresh value.  (Until 2026-09-25 the reused H6 init wrote 365, a
++ * 1.25 s update, and two of three cycles saw no new data at all.)
+  *
+  * The sensors are noisy.  Detrended inside sliding 10 s windows, pooled over
+- * six full-load runs, the residual on the two CPU zones is 0.93 K and
++ * six full-load runs at the old 1.25 s period, the residual on the two CPU zones is 0.93 K and
+  * 1.23 K RMS, with a 90th-percentile peak-to-peak of 4.9 K and 6.3 K.  The
+  * same magnitude appears on the DDR, NPU and GPU sensors under a CPU-only load,
+  * and the residuals are uncorrelated between sensors, so this is not the die
+@@ -666,6 +662,45 @@
+ 	return 0;
+ }
+ 
++/*
++ * A733: the UM's init sequence in query mode (A733 UM V1.00 7.1.6.1, steps
++ * 3-9, p. 344; identical in V0.92).  Every value written here is also the
++ * register's reset default except THS_FILTER's enable bit, read back on a
++ * Cubie A7S after a live THS0_BGR reset.
++ *
++ *  - THS_CTRL: acquire time 0x2F in [15:0], sample divider 0x1DF in [31:16]
++ *    (steps 3-4).  The UM's register table labels the two halves the other
++ *    way round; only the programming guide's reading gives its own 2 us.
++ *  - THS_PER = 0x3A (step 5): 4096 * 59 / 24 MHz = 10.07 ms per conversion,
++ *    0.201 s per sensor update with the filter and five sensors.  The H6
++ *    init's 365 gave 1.25 s.
++ *  - THS_FILTER: enabled, average of 4 (steps 6-7).
++ *  - Calibration (step 8) has run in sun8i_ths_resource_init() already.
++ *  - No data interrupt.  The zones are polled by the thermal core, and a poll
++ *    reads the live THSn_DATA word, so a per-sample interrupt adds nothing but
++ *    wakeups: 24.8 /s at this period, each waking the SCHED_FIFO irq thread,
++ *    for which schedutil raises the A55 policy.  Measured idle on a Cubie A7S:
++ *    1089 A55 frequency transitions in 30 s with the interrupt, 116 without
++ *    (226 with the H6 init).  THS_DATA_INTC is cleared explicitly so that
++ *    nothing a previous owner left enabled survives.
++ */
++static int sun60i_a733_thermal_init(struct ths_device *tmdev)
++{
++	regmap_write(tmdev->regmap, SUN50I_THS_CTRL0,
++		     SUN50I_THS_CTRL0_T_ACQ(48) |
++		     SUN50I_THS_CTRL0_T_SAMPLE_PER(480));
++	regmap_write(tmdev->regmap, SUN50I_H6_THS_PC,
++		     SUN50I_H6_THS_PC_TEMP_PERIOD(0x3a));
++	regmap_write(tmdev->regmap, SUN50I_H6_THS_MFC,
++		     SUN50I_THS_FILTER_EN |
++		     SUN50I_THS_FILTER_TYPE(1));
++	regmap_write(tmdev->regmap, SUN50I_H6_THS_DIC, 0);
++	regmap_write(tmdev->regmap, SUN50I_H6_THS_ENABLE,
++		     GENMASK(tmdev->chip->sensor_num - 1, 0));
++
++	return 0;
++}
++
+ static int sun8i_ths_register(struct ths_device *tmdev)
+ {
+ 	int i;
+@@ -871,10 +906,9 @@
+  * the DT cell becomes sensor[i].id and addresses temp_data_base + 4 * i.
+  * Register-compatible with the H6 layout: every SUN50I_H6_*
+  * offset lands on a live, correctly shaped register on this part, and the
+- * vendor driver programs CTRL0 and MFC with the same constants this driver
+- * writes. THS_PER (SUN50I_H6_THS_PC) is not the same: the reused
+- * sun50i_h6_thermal_init() writes 365, the vendor 28, the UM's init sequence
+- * 0x3A = 58 -- 1.25 s per sensor update here against 0.10 s and 0.20 s.
++ * vendor driver programs CTRL0 and MFC with the same constants. The init is
++ * its own, sun60i_a733_thermal_init(), because THS_PER and the data
++ * interrupt are not the H6's -- see there.
+  *
+  * Two clocks: the bus gate, and a 24 MHz conversion clock that the ADC needs
+  * and whose CCU reset default is OFF -- hence has_mod_clk as well as
+@@ -906,7 +940,7 @@
+ 	.trend_hyst = 6000,
+ 	.temp_data_base = SUN50I_H6_THS_TEMP_DATA,
+ 	.calibrate = sun50i_h6_ths_calibrate,
+-	.init = sun50i_h6_thermal_init,
++	.init = sun60i_a733_thermal_init,
+ 	.irq_ack = sun50i_h6_irq_ack,
+ 	.calc_temp = sun60i_a733_calc_temp,
+ };

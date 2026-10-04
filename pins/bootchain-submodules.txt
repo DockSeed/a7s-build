@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# The submodules radxa-pkg/u-boot-dlan17 @ 7bfda4c83180 pins, with the URL each is
+# fetched from by commit id: `<path> <commit> <url>`. fetch-bootchain checks the
+# package tree against this list. A package bump that changes a pin changes this
+# file in the same commit; a mismatch is a finding, not a hash to refresh.
+# `atf` is checked but not fetched: the overlay replaces it with upstream TF-A
+# (ATF_UPSTREAM / ATF_BASE in bootchain/overlay/apply.sh).
+src 6a998fbcf809b28b988918713b3dc1514551fff5 https://github.com/dlan17/u-boot
+tools 2c5370f4574f2cf67512cf16000d55947cc9b82c https://gitlab.com/tina5.0_aiot/lichee/tools.git
+atf f4c0b0dba78a2d9916154c130979992caa3f3156 https://github.com/dlan17/trusted-firmware-a.git
+allwinner-arisc defd40e08c91f117f07d7d1de77544c33d190076 https://github.com/radxa/allwinner-arisc.git
+allwinner-dramlib b1c31a940733da15a127be74dc9cb90bdd01a516 https://github.com/radxa/allwinner-dramlib.git

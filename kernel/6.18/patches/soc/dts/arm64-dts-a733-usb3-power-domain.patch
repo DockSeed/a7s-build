@@ -1,0 +1,54 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: a733: attach the USB3 controller to its power domain
+
+`pmdomain-sunxi-pck600-add-a733-support` and `arm64-dts-a733-add-pck600-power-controller` have sat at "applies + builds, HW pending" since 2026-07-20 for
+one reason: nothing consumed the provider. The PCK-600 driver is attach-only
+(keep_boot_state, GENPD_FLAG_ALWAYS_ON) and the A733's USB2 domain is boot-on --
+PWSR @0x07068008 reads 0x8 on silicon -- so the provider registering changes no
+power state on its own, and a boot without a consumer looks exactly like a boot
+without the patches. The proof still owed is a boot
+with the dwc3 consumer attaching PD_USB2 instead of -EPROBE_DEFER.
+
+That consumer can exist now. Until 2026-08-01 the dwc3 controller did not come
+up on a normal boot at all (`clk-sunxi-ng-a733-add-serdes-subsystem-clocks` and `usb-dwc3-a733-flat-generic-glue`), so wiring a power domain to it would
+have proven nothing. It does now, so this is one line plus the include.
+
+Deliberately no power state is claimed. PD_USB2 = 8 comes from the A733 binding
+header `pmdomain-sunxi-pck600-add-a733-support` ships, and 8 is confirmed against the register map (domain N at
+base + N * 0x1000). The domain is boot-on and the driver holds it that way; this
+patch is about the attach, not about gating.
+
+Verified: applies at fuzz 0, dtc 0-warn, and the compiled dtb carries
+power-domains on usb@6a00000. NOT verified: the board. The one observable is
+pm_genpd_summary listing 6a00000.usb under USB2 -- and, negatively, that USB3
+still comes up, because a provider that failed would leave dwc3 deferring
+forever and take the working controller with it.
+
+Assisted-by: Claude
+
+diff --git a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -14,6 +14,7 @@
+ /dts-v1/;
+ 
+ #include <dt-bindings/interrupt-controller/arm-gic.h>
++#include <dt-bindings/power/allwinner,sun60i-a733-pck-600.h>
+ #include <dt-bindings/clock/sun60i-a733-ccu.h>
+ #include <dt-bindings/clock/sun60i-a733-r-ccu.h>
+ #include <dt-bindings/clock/sun60i-a733-rtc-ccu.h>
+@@ -1191,6 +1192,14 @@
+ 			assigned-clocks = <&ccu CLK_USB2_SUSPEND>;
+ 			assigned-clock-rates = <24000000>;
+ 			resets = <&ccu RST_USB_2>;
++			/*
++			 * The PCK-600 domain this block sits in. It is boot-on
++			 * (PWSR @0x07068008 = 0x8 on silicon) and the driver is
++			 * attach-only, so this changes no power state -- what it
++			 * changes is that the domain has a consumer at all, which
++			 * is the one thing `pmdomain-sunxi-pck600-add-a733-support` and `arm64-dts-a733-add-pck600-power-controller` were never able to show.
++			 */
++			power-domains = <&pck600 PD_USB2>;
+ 			phys = <&u2phy>, <&combophy0>;
+ 			phy-names = "usb2-phy", "usb3-phy";
+ 			dr_mode = "host";

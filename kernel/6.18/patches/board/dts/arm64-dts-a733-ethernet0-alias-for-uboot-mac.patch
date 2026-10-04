@@ -1,0 +1,33 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: a733: add an ethernet0 alias so U-Boot can set the MAC
+
+Without an "ethernet0" entry in /aliases nothing hands the board's real MAC
+address to the kernel, and stmmac falls back to a generated one. It is not
+stable across probes -- three probes in one session on the same board produced
+three different addresses. Every reboot looks like a new machine to the DHCP server and to anything keyed on the address.
+
+U-Boot already knows the right one and prints it while starting
+("Ethernet0 MAC address: ...").
+
+It hands it over in fdt_fixup_ethernet(), which walks the /aliases node looking
+for "ethernet%d" properties and writes mac-address / local-mac-address into each
+referenced node from its ethaddr / eth%daddr environment. Our DT carried only
+serial0, so the loop found nothing to fix up and the kernel was left to invent
+an address.
+
+Add the alias. This keeps the address where it belongs -- the board, not the DT
+-- so nothing has to be hardcoded here and boards with different addresses stay
+correct.
+
+Assisted-by: Claude
+---
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -31,6 +31,7 @@
+ 	#size-cells = <2>;
+ 
+ 	aliases {
++		ethernet0 = &gmac0;
+ 		serial0 = &uart0;
+ 	};
+ 

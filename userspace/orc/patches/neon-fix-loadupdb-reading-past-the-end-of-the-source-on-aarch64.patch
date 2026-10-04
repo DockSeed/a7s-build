@@ -1,0 +1,115 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] neon: fix loadupdb reading past the end of the source on aarch64
+
+loadupdb reads src[i >> 1], so a block of 1 << insn_shift output
+elements needs only half as many source elements. The single-lane path
+of the 64-bit loadupdb rule loads src->size << insn_shift bytes, twice
+that, so the last block of a row reads up to half a block past the end
+of the source array.
+
+With loop_shift 2, e.g. video_orc_convert_I420_BGRA (4-byte
+destination), the block at x = n - 4 loads 4 bytes at u + (n - 4) / 2,
+2 bytes past the end of a chroma row of n / 2 bytes. If that row is the
+last one of a buffer mapped with its exact size (e.g. a dma-buf from a
+hardware decoder), this is a SIGSEGV.
+
+Load only the bytes that are used. zip1 writes lane j of the loaded
+register to output lanes 2j and 2j + 1, so output lanes
+0 .. (1 << insn_shift) - 1 depend only on the lanes that are still
+loaded, and the result is unchanged. The multi-register path
+(size >= 16) loads 8-byte D registers, i.e. already size / 2 bytes,
+and is left as is.
+---
+Patch-management notes, not part of the commit message.
+
+  * Deliberately NO Signed-off-by: line.
+
+  * Against orc 0.4.41, orc/orcrules-neon.c, the 64-bit branch of
+    neon_rule_loadupdb(). Upstream split that file in 0.4.43; on main
+    (0.4.44) the same code is orc_neon64_rule_loadupdb() in
+    orc/orcrules-neon64.c, unchanged. Debian trixie's orc 1:0.4.41-1
+    carries no Debian patch, so this hunk is the whole source difference
+    between the liborc the image carries and Debian's.
+
+  * UPSTREAM: not reported upstream as of 2026-09-26. loadupdb for
+    aarch64 came with orc MR !53 (2020). Issue #32 / MR !72 fixed a
+    different loadupdb discrepancy on 32-bit; no orc issue or MR matches
+    this overread (GitLab API, 2026-09-26), and no release note up to
+    0.4.44 mentions a fix. Drop this patch once the orc we build from
+    carries one.
+
+  * MEASURED on the
+    6 GiB board, 2026-09-26: VE decode -> videoconvert -> kmssink,
+    1920x1088 YV12 to BGRx, ORC's NEON JIT active (no ORC_CODE):
+      Debian's liborc 1:0.4.41-1           4 of 10 to EOS, 6 SIGSEGV
+      ORC_CODE=backup (the C fallback)    10 of 10 to EOS
+      same-recipe build without this       5 of 10 to EOS
+      same-recipe build with this         10 of 10 to EOS
+    Two core dumps fault at ld1 {v0.s}[0], byte 958 of a 960-byte U
+    row, 2 bytes before the end of a 3133440-byte mapping. The JIT code
+    changes only in the loadupdb loads: in the I420->BGRA kernel the six
+    ld1 {v0.s}[0] become ld1 {v0.h}[0]. Under qemu-aarch64 with source
+    rows ending at a PROT_NONE page, 46 widths: 24-34 SIGSEGV per
+    shift-1..3 kernel without the patch, none with it, and byte-identical
+    output wherever the unpatched build survived. orc's own meson test
+    passes 10/10 either way. It does run loadupdb at shift 2: exec_parse
+    compiles every program of testsuite/test.orc, among them i420_to_ayuv
+    and video_convert_orc_convert_I420_BGRA (4-byte destinations). It
+    cannot see the overread, read in the 0.4.41 source: orc-test
+    allocates each source row as wide as the destination (64-79
+    elements), twice what loadupdb reads, so the extra bytes stay inside
+    the row; every row also carries 256 bytes of padding and 16 rows
+    above and below (EXTEND_STRIDE, EXTEND_ROWS in orc-test/orcarray.c),
+    and its out-of-bounds check looks only at destination arrays.
+
+  * FALSIFIER: the same command crashes with this liborc mapped
+    (/proc/<pid>/maps names /usr/local/lib/aarch64-linux-gnu) and
+    ORC_CODE unset.
+
+  * NOT FIXED HERE, read in the code only. The 32-bit NEON rule loads
+    size bytes too, but its odd-offset correction from !72 consumes one
+    more source element, so its size cannot be halved mechanically. The
+    aarch64 path lacks that correction for a destination not aligned to
+    16 bytes; output is the same with and without this patch under qemu.
+    Neither is the crash above.
+
+  * Applies to orc 0.4.41 at --fuzz=0 (the build-orc stage, scripts/stages/orc.sh).
+
+Assisted-by: Claude
+
+--- a/orc/orcrules-neon.c
++++ b/orc/orcrules-neon.c
+@@ -1139,15 +1139,20 @@ neon_rule_loadupdb (OrcCompiler *compile
+       code |= (opcode&0xf) << 12;
+     } else {
+       /** load one single-element structure to one lane of one register */
++      /* 1 << insn_shift outputs read only half as many source elements
++       * (src[i>>1]); loading size bytes would read past the end of the
++       * source array on the last iteration */
++      int load_size = compiler->insn_shift > 0 ? size >> 1 : size;
++
+       flag = 0;
+-      if (size == 8) {
++      if (load_size == 8) {
+         opcode = 4;
+         flag = 1; /* size==01 */
+-      } else if (size == 4) {
++      } else if (load_size == 4) {
+         opcode = 4;
+-      } else if (size == 2) {
++      } else if (load_size == 2) {
+         opcode = 2;
+-      } else if (size == 1) {
++      } else if (load_size == 1) {
+         opcode = 0;
+       } else {
+         ORC_COMPILER_ERROR(compiler,"bad unaligned load size %d",
+@@ -1155,7 +1160,7 @@ neon_rule_loadupdb (OrcCompiler *compile
+         return;
+       }
+       ORC_ASM_CODE(compiler,"  ld1 { %s }[0], [%s]\n",
+-          orc_neon64_reg_name_vector_single (compiler->tmpreg, size),
++          orc_neon64_reg_name_vector_single (compiler->tmpreg, load_size),
+           orc_arm64_reg_name (ptr_reg, 64));
+       code = 0x0d400000;
+       code |= (opcode&0x7) << 13;

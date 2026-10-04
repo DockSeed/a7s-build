@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Fri, 2 Oct 2026 14:00:00 +0200
+Subject: [PATCH] ASoC: sun4i-i2s: keep the FIFO across a pause
+
+sun4i_i2s_trigger() ran the same start path for START, RESUME and
+PAUSE_RELEASE, and that path flushes the TX (or RX) FIFO and clears its
+sample counter. On a pause the FIFO still holds the samples the DMA has
+already delivered, and the stream continues where it stopped; flushing it
+on PAUSE_RELEASE throws those samples away. Measured on the A733 (the
+8 GiB board, 6.18.54-audio, 2026-10-02) with a frame counter through I2S0's
+internal loopback: the capture jumped from u to u + F + 1, F being the TX
+FIFO fill read at the pause (TXE_CNT: 68-72 words = 34-36 stereo frames),
+up to 64 frames per pause.
+
+The A733 user manual puts the FIFO flush into initialisation (17.1.6.1,
+steps 6 and 7, before the block is enabled) and has nothing but TXEN/RXEN
+and the global enable in its enable/disable section (17.1.6.3). So:
+flush and clear the counter on START and RESUME (a system resume starts
+from an undefined FIFO), not on PAUSE_RELEASE. PAUSE_PUSH already only
+clears TXEN/RXEN and the DRQ enable, which leaves the FIFO intact.
+
+(The UM's step 6 says "writing 0 to bit[25:24]", its register description
+of FCTL says write 1, self-clearing; the driver writes 1, as the register
+description has it. Unchanged here.)
+
+The driver code is generic; this is not an A733 quirk. Only the A733 has
+been measured.
+
+Verified: applies, builds. Silicon: owed -- the pause step of
+a loopback test must show v1 = u + 1 (plus the few frames of
+the loopback test's own window) instead of u + F + 1.
+
+Assisted-by: Claude
+---
+--- a/sound/soc/sunxi/sun4i-i2s.c
++++ b/sound/soc/sunxi/sun4i-i2s.c
+@@ -959,15 +959,17 @@ static int sun4i_i2s_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
+ 	return 0;
+ }
+ 
+-static void sun4i_i2s_start_capture(struct sun4i_i2s *i2s)
++static void sun4i_i2s_start_capture(struct sun4i_i2s *i2s, bool flush)
+ {
+-	/* Flush RX FIFO */
+-	regmap_update_bits(i2s->regmap, SUN4I_I2S_FIFO_CTRL_REG,
+-			   SUN4I_I2S_FIFO_CTRL_FLUSH_RX,
+-			   SUN4I_I2S_FIFO_CTRL_FLUSH_RX);
+-
+-	/* Clear RX counter */
+-	regmap_write(i2s->regmap, SUN4I_I2S_RX_CNT_REG, 0);
++	if (flush) {
++		/* Flush RX FIFO */
++		regmap_update_bits(i2s->regmap, SUN4I_I2S_FIFO_CTRL_REG,
++				   SUN4I_I2S_FIFO_CTRL_FLUSH_RX,
++				   SUN4I_I2S_FIFO_CTRL_FLUSH_RX);
++
++		/* Clear RX counter */
++		regmap_write(i2s->regmap, SUN4I_I2S_RX_CNT_REG, 0);
++	}
+ 
+ 	/* Enable RX Block */
+ 	regmap_update_bits(i2s->regmap, SUN4I_I2S_CTRL_REG,
+@@ -980,15 +982,17 @@ static void sun4i_i2s_start_capture(struct sun4i_i2s *i2s)
+ 			   SUN4I_I2S_DMA_INT_CTRL_RX_DRQ_EN);
+ }
+ 
+-static void sun4i_i2s_start_playback(struct sun4i_i2s *i2s)
++static void sun4i_i2s_start_playback(struct sun4i_i2s *i2s, bool flush)
+ {
+-	/* Flush TX FIFO */
+-	regmap_update_bits(i2s->regmap, SUN4I_I2S_FIFO_CTRL_REG,
+-			   SUN4I_I2S_FIFO_CTRL_FLUSH_TX,
+-			   SUN4I_I2S_FIFO_CTRL_FLUSH_TX);
+-
+-	/* Clear TX counter */
+-	regmap_write(i2s->regmap, SUN4I_I2S_TX_CNT_REG, 0);
++	if (flush) {
++		/* Flush TX FIFO */
++		regmap_update_bits(i2s->regmap, SUN4I_I2S_FIFO_CTRL_REG,
++				   SUN4I_I2S_FIFO_CTRL_FLUSH_TX,
++				   SUN4I_I2S_FIFO_CTRL_FLUSH_TX);
++
++		/* Clear TX counter */
++		regmap_write(i2s->regmap, SUN4I_I2S_TX_CNT_REG, 0);
++	}
+ 
+ 	/* Enable TX Block */
+ 	regmap_update_bits(i2s->regmap, SUN4I_I2S_CTRL_REG,
+@@ -1031,15 +1035,22 @@ static int sun4i_i2s_trigger(struct snd_pcm_substream *substream, int cmd,
+ 			     struct snd_soc_dai *dai)
+ {
+ 	struct sun4i_i2s *i2s = snd_soc_dai_get_drvdata(dai);
++	/*
++	 * A pause keeps the FIFO: what it holds is the next audio of a stream
++	 * that continues. Flushing it on PAUSE_RELEASE dropped up to a full
++	 * FIFO of samples on every pause. START and RESUME (after system
++	 * suspend) begin from an undefined FIFO and still flush.
++	 */
++	bool flush = cmd != SNDRV_PCM_TRIGGER_PAUSE_RELEASE;
+ 
+ 	switch (cmd) {
+ 	case SNDRV_PCM_TRIGGER_START:
+ 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+ 	case SNDRV_PCM_TRIGGER_RESUME:
+ 		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+-			sun4i_i2s_start_playback(i2s);
++			sun4i_i2s_start_playback(i2s, flush);
+ 		else
+-			sun4i_i2s_start_capture(i2s);
++			sun4i_i2s_start_capture(i2s, flush);
+ 		break;
+ 
+ 	case SNDRV_PCM_TRIGGER_STOP:

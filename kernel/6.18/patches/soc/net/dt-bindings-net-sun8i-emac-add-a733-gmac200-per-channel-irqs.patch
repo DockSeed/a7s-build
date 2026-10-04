@@ -1,0 +1,122 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] dt-bindings: net: sun8i-emac: add the A733 GMAC200 with its per-channel interrupts
+
+The A733 (sun60iw2) GMAC0 is the GMAC200 glue the A523 has, around a DWC
+Ethernet QoS 5.30 core (MAC_VERSION 0x2053, read on silicon). The DT has named it
+"allwinner,sun60iw2-gmac200", "snps,dwmac-5.30a" since
+arm64-dts-a733-add-gmac0-ethernet, but no binding described that
+compatible. This one does:
+
+- compatible: "allwinner,sun60iw2-gmac200" with the "snps,dwmac-5.30a"
+  fallback, also added to the select list.
+- clocks, clock-names and tx/rx-internal-delay-ps as on the A523, whose
+  glue it shares. power-domains stays required for the A523 only; the A733
+  node has none. The A523's own constraints are unchanged, only split
+  across two if-blocks.
+- interrupts: either "macirq" alone, or "macirq", "tx-queue-0", "rx-queue-0".
+  The two extra lines are GMAC0_PERCH_TX_0 and GMAC0_PERCH_RX_0 (A733 User
+  Manual, Table 12-1). The form follows nxp,s32-dwmac.yaml upstream, commit
+  cc7a3435dfad ("dt-bindings: net: nxp,s32-dwmac: Declare per-queue
+  interrupts"), and the names are the ones snps,dwmac.yaml already defines.
+  Both lines or neither: the glue selects multi-IRQ mode only with both
+  (net-stmmac-dwmac-sun55i-per-channel-irqs).
+- Every other compatible in this file keeps exactly one "macirq".
+
+Left open, not decided here:
+- The compatible's name. The tree's other A733 compatibles read
+  "allwinner,sun60i-a733-*"; this one follows the vendor's "sun60iw2".
+  Renaming it touches the driver match and the DT as well, so it is a
+  change of its own; this patch documents the string the tree uses.
+- The glue's syscon node, "allwinner,sun60iw2-gmac-syscon", is still
+  undocumented.
+
+Assisted-by: Claude
+---
+diff --git a/Documentation/devicetree/bindings/net/allwinner,sun8i-a83t-emac.yaml b/Documentation/devicetree/bindings/net/allwinner,sun8i-a83t-emac.yaml
+index fc62fb2a6..19a3b1a4f 100644
+--- a/Documentation/devicetree/bindings/net/allwinner,sun8i-a83t-emac.yaml
++++ b/Documentation/devicetree/bindings/net/allwinner,sun8i-a83t-emac.yaml
+@@ -22,6 +22,7 @@ select:
+           - allwinner,sun8i-v3s-emac
+           - allwinner,sun50i-a64-emac
+           - allwinner,sun55i-a523-gmac200
++          - allwinner,sun60iw2-gmac200
+   required:
+     - compatible
+ 
+@@ -44,15 +45,25 @@ properties:
+       - items:
+           - const: allwinner,sun55i-a523-gmac200
+           - const: snps,dwmac-4.20a
++      - items:
++          - const: allwinner,sun60iw2-gmac200
++          - const: snps,dwmac-5.30a
+ 
+   reg:
+     maxItems: 1
+ 
+   interrupts:
+-    maxItems: 1
++    minItems: 1
++    maxItems: 3
+ 
+   interrupt-names:
+-    const: macirq
++    oneOf:
++      - items:
++          - const: macirq
++      - items:
++          - const: macirq
++          - const: tx-queue-0
++          - const: rx-queue-0
+ 
+   clocks:
+     minItems: 1
+@@ -220,7 +231,9 @@ allOf:
+       properties:
+         compatible:
+           contains:
+-            const: allwinner,sun55i-a523-gmac200
++            enum:
++              - allwinner,sun55i-a523-gmac200
++              - allwinner,sun60iw2-gmac200
+     then:
+       properties:
+         clocks:
+@@ -241,8 +254,6 @@ allOf:
+           multipleOf: 100
+           description:
+             External RGMII PHY TX clock delay chain value in ps.
+-      required:
+-        - power-domains
+     else:
+       properties:
+         clocks:
+@@ -251,6 +262,27 @@ allOf:
+           maxItems: 1
+         power-domains: false
+ 
++  - if:
++      properties:
++        compatible:
++          contains:
++            const: allwinner,sun55i-a523-gmac200
++    then:
++      required:
++        - power-domains
++
++  - if:
++      not:
++        properties:
++          compatible:
++            contains:
++              const: allwinner,sun60iw2-gmac200
++    then:
++      properties:
++        interrupts:
++          maxItems: 1
++        interrupt-names:
++          maxItems: 1
+ 
+ unevaluatedProperties: false
+ 

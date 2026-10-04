@@ -1,0 +1,16 @@
+# a7s-build: nvme-cli's postinst writes a host NQN and host ID, which identify
+# the machine to NVMe over Fabrics targets. The image carries neither (every
+# board would share them); each board makes its own on its first boot, the
+# same way the package does.
+[Unit]
+Description=Generate this board's own NVMe host NQN and host ID
+ConditionPathExists=|!/etc/nvme/hostnqn
+ConditionPathExists=|!/etc/nvme/hostid
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'mkdir -p /etc/nvme; [ -s /etc/nvme/hostnqn ] || nvme gen-hostnqn > /etc/nvme/hostnqn; [ -s /etc/nvme/hostid ] || uuidgen > /etc/nvme/hostid'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

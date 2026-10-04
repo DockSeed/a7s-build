@@ -1,0 +1,119 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] aic8800: let cfg80211 govern this radio, instead of claiming self-management with no domain
+
+Known issue: `phy0` is `REGULATORY_WIPHY_SELF_MANAGED`, so the regulatory
+database this image now loads correctly (`CONFIG_CRYPTO_SHA256=y`
+plus the upstream `regulatory.db`) governs nothing on this radio. Measured on the
+board 2026-08-15: `iw reg get` reports `phy#0 (self-managed)`, `country 00:
+DFS-UNSET`, `(2380 - 2520 @ 40)`, `(5140 - 5980 @ 80)` -- two rules covering
+channels 1-14 and 5150-5925 with no DFS, no indoor-only and no per-band power
+limit, against a global domain that marks 5250-5330 and 5490-5730 DFS.
+
+What the vendor driver does and what this patch changes, read in the pinned source
+(`src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/rwnx_mod_params.c`, tag
+`5.0+git20260123.5f7be68d-8`):
+
+| the vendor | ours |
+|---|---|
+| `custregd` compiled in as `true` (line 59, under a vendor comment new in 5.0 at line 58 that names both modes) | `false` -- the permissive path is opt-in |
+| `MODULE_PARM_DESC` says `(Default: 0)` for that same parameter (line 170) | the code now matches the text the vendor already wrote |
+| on the previous pin, `rwnx_custregd()` set `REGULATORY_WIPHY_SELF_MANAGED` **before** the `custregd` early return, so a build with the parameter off still declared self-management and then applied no domain at all | fixed upstream in 5.0 -- the return now comes first (lines 1845-1846) and the flag write follows it (line 1849) -- so this patch no longer moves it |
+| `REGULATORY_IGNORE_STALE_KICKOFF` still written unconditionally, in 5.0 just before that return (line 1843) | dropped: the symbol does not exist in the kernel we build against, and the driver's own `rwnx_compat.h:244,249` defines it to `0` for exactly that case, so the write ORed a zero and only read as if it did something |
+| the parameter's help text does not say what it costs | it names the consequence: the loaded `regulatory.db` governs nothing on this radio |
+
+Verified in our tree, not assumed:
+
+- `REGULATORY_IGNORE_STALE_KICKOFF` appears nowhere in `linux-6.18.36`
+  (`grep -rn` over the whole tree: no hit). The only definitions are the driver's
+  own compat header.
+- The BSP ships the same driver with the return already before the flags and
+  `custregd` defaulting to `false`
+  (`drivers/net/wireless/aic8800/aic8800_fdrv/rwnx_mod_params.c`, as found in the
+  vendor BSP). We do not copy its version guard
+  `#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)` around the stale-kickoff
+  write: we have not verified which release removed the symbol, and we do not
+  need to -- this module is built against one kernel, where the symbol is absent
+  and the compat header makes the write a no-op.
+- The firmware power-limit table is selected from the same `country_code[]`
+  buffer that the `custregd` path fills, which would make an empty country a real
+  regression -- except that `CONFIG_POWER_LIMIT = n` in the driver's own
+  `aic8800_fdrv/Makefile:118`, so `rwnx_plat_powerlimit_load_8800d80()` is not
+  compiled into what we ship. Recorded because it is the trap this change would
+  otherwise walk into.
+
+What this does NOT do, stated rather than left to be discovered:
+
+- ⚠ **In 5.0 the notifier changed, and with this patch its new branch runs.**
+  `wiphy->reg_notifier = rwnx_reg_notifier` (`rwnx_main.c:9059`). On the previous
+  pin the body only set the DFS region and forwarded the country to the firmware
+  for AIC8801, 8800DC, 8800DW, 8800D81, 8800D81X2 and 8800D89X2 -- not our D80.
+  In 5.0, whenever `custregd` is off (`rwnx_main.c:6503-6522`), it first calls
+  `regulatory_hint(wiphy, alpha2)` from inside the notifier, guarded only by a
+  100 ms "suspicious rapid reg change" check against the last alpha2, and then
+  `rwnx_send_me_chan_config_req()` for **every** part when `testmode == 0`. So
+  with this patch the D80's firmware does now receive the country, and cfg80211
+  gets a driver hint from this wiphy on each regulatory change. Neither was
+  exercised by the proof below.
+- ⓘ What the patch does buy that path: a self-managed wiphy takes its domain from
+  the driver, so the notifier only ever saw what the driver itself set. With the
+  flag gone, the DFS region it applies is the one cfg80211 resolved.
+- It sets no country. Out of the box the radio falls to the world domain until
+  something hints one (`iw reg set DE`, or `country=` in the supplicant config).
+  That is an image-side decision and is deliberately not smuggled into a driver
+  patch.
+- 5.0 refuses the driver's private country-set commands while `custregd` is off:
+  `aic_vendor.c:328`, `aic_priv_cmd.c:1392` and `:2059` log "invalid custregd"
+  and return -EINVAL. With this patch the country comes from cfg80211 only.
+
+⬜ On the previous pin this patch is HW-proven (2026-09-09: no
+`self-managed` line, and DE / US / JP resolve to DFS-ETSI / DFS-FCC / DFS-JP).
+That proof does NOT carry over to 5.0, because every hint now runs through the
+notifier's new branch. The falsifier on 5.0 is one board session: `iw reg get`
+must still not say `self-managed` for `phy#0`; `iw reg set DE` must still produce
+`country DE: DFS-ETSI` with the 5250-5330 / 5490-5730 blocks marked DFS; and with
+`aicwf_dbg_level` raised to 0xb, one `iw reg set` must not make the notifier
+re-enter itself (repeated "regulatory domain set to" lines, or "suspicious rapid
+reg change").
+
+Assisted-by: Claude
+
+diff --git a/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/rwnx_mod_params.c b/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/rwnx_mod_params.c
+index d386706..f0ed4fb 100644
+--- a/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/rwnx_mod_params.c
++++ b/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/rwnx_mod_params.c
+@@ -56,7 +56,7 @@ struct rwnx_mod_params rwnx_mod_params = {
+     COMMON_PARAM(mutx_on, true, true)
+     COMMON_PARAM(use_80, true, true)
+ /* false: use crda(iw reg set CN); true: drive self-management(wifi_test wlan0 country_set CN) */
+-    COMMON_PARAM(custregd, true, true)
++    COMMON_PARAM(custregd, false, false)
+     COMMON_PARAM(custchan, false, false)
+     COMMON_PARAM(roc_dur_max, 500, 500)
+     COMMON_PARAM(listen_itv, 0, 0)
+@@ -168,7 +168,10 @@ MODULE_PARM_DESC(use_80, "Enable 80MHz (Default: 1)");
+ 
+ module_param_named(custregd, rwnx_mod_params.custregd, bool, S_IRUGO);
+ MODULE_PARM_DESC(custregd,
+-                 "Use permissive custom regulatory rules (for testing ONLY) (Default: 0)");
++                 "Use permissive custom regulatory rules (for testing ONLY). "
++                 "Takes the wiphy out of cfg80211's regulatory control - the "
++                 "loaded regulatory.db then governs nothing on this radio. "
++                 "(Default: 0)");
+ 
+ module_param_named(custchan, rwnx_mod_params.custchan, bool, S_IRUGO);
+ MODULE_PARM_DESC(custchan,
+@@ -1839,9 +1842,11 @@ void rwnx_custregd(struct rwnx_hw *rwnx_hw, struct wiphy *wiphy)
+ // For older kernel version, the custom regulatory is applied before the wiphy
+ // registration (in rwnx_set_wiphy_params()), so nothing has to be done here
+ 
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 0, 0)
+-	wiphy->regulatory_flags |= REGULATORY_IGNORE_STALE_KICKOFF;
+-#endif
++	/* REGULATORY_IGNORE_STALE_KICKOFF is not written here. The symbol no longer
++	 * exists in the kernel this module is built against, and rwnx_compat.h
++	 * defines it to 0 for exactly that case, so the assignment ORed a zero and
++	 * only read as though it did something.
++	 */
+ 	if (!rwnx_hw->mod_params->custregd)
+ 		return;
+ 

@@ -1,0 +1,95 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Fri, 2 Oct 2026 09:00:00 +0200
+Subject: [PATCH] arm64: dts: a733: edp0 as a sound DAI and a disabled DisplayPort audio card
+
+Two pieces for drm-a733-dp-audio-through-the-bridge:
+
+- `#sound-dai-cells = <0>` on edp0: the hdmi-codec that drm_bridge_connector
+  registers under the DP device is found through its parent's of_node
+  (soc-core.c:827-835), so `sound-dai = <&edp0>` names it. Harmless without a
+  card.
+- /sound, a simple-audio-card: I2S3 (cpu, bit- and frame-clock master; per UM ch17
+  intended for HDMI/eDP, internal wire, no pins) into edp0 (codec), format
+  i2s (the UM's I2S figure 15.4.4.2 is the plain shape and the bridge refuses
+  others), two channels. DISABLED together with i2s3: the path has never been
+  heard on a sink, enabling it claims a DMA channel, and on every boot without
+  a trained sink each open fails with ENODEV. A test enables both with the two
+  fdtput lines in the /sound comment.
+
+Verified: applies, builds, the dtb carries the nodes. Silicon effect owed with
+a sink that has speakers.
+
+Assisted-by: Claude
+---
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -755,6 +755,50 @@ display-engine {
+ 		status = "okay";
+ 	};
+ 
++	/*
++	 * DisplayPort audio: I2S3 (cpu) into the DP bridge's hdmi-codec (codec).
++	 * I2S3 is meant for the HDMI/eDP path and reaches the DP core over an internal
++	 * wire (UM ch17); nothing is pinned out.
++	 *
++	 * DISABLED, together with i2s3 (see the audio block in soc): enabling
++	 * either is a hardware experiment, not a default. Nothing here has been
++	 * heard on a sink; the first run is
++	 *   fdtput -t s <dtb> /sound status okay
++	 *   fdtput -t s <dtb> /soc/i2s@2535000 status okay
++	 * The card only completes once a KMS driver has built the DP connector
++	 * (that is what registers the codec), and aplay then fails with ENODEV
++	 * until a sink is trained and streaming -- by design, the same as any
++	 * HDMI card with the cable out.
++	 *
++	 * format i2s: the UM's I2S figure (15.4.4.2, SCK/WS/SD, MSB first) is the
++	 * plain I2S shape and the bridge refuses any other DAI format. The I2S
++	 * controller drives SCK and WS and the DP core only receives them, so the
++	 * cpu DAI is clock master. 2 channels only for now: more needs TDM slots
++	 * on I2S3's four data lanes and the UM does not say how the DP core
++	 * expects them laid out.
++	 */
++	sound_dp: sound {
++		compatible = "simple-audio-card";
++		simple-audio-card,name = "A733-DP";
++		simple-audio-card,format = "i2s";
++		/* Without mclk-fs simple-card takes I2S3's first clock, the
++		 * 200 MHz bus gate, as MCLK and sun4i-i2s refuses the stream
++		 * ("oversample rate 4535"; seen on I2S0, the 8 GiB board, 2026-10-02).
++		 */
++		simple-audio-card,mclk-fs = <256>;
++		simple-audio-card,bitclock-master = <&sound_dp_cpu>;
++		simple-audio-card,frame-master = <&sound_dp_cpu>;
++		status = "disabled";
++
++		sound_dp_cpu: simple-audio-card,cpu {
++			sound-dai = <&i2s3>;
++		};
++
++		simple-audio-card,codec {
++			sound-dai = <&edp0>;
++		};
++	};
++
+ 	soc {
+ 		compatible = "simple-bus";
+ 		#address-cells = <2>;
+@@ -2020,6 +2064,17 @@ edp0: displayport@5740000 {
+ 			resets = <&ccu RST_BUS_EDP>;
+ 			phys = <&aux_hpd>, <&combophy0>;
+ 			phy-names = "aux-phy", "dp";
++			/*
++			 * The audio half of the bridge is an hdmi-codec whose
++			 * parent is this device, so a card names it with
++			 * `sound-dai = <&edp0>` and there is exactly one DAI:
++			 * zero cells. drm_bridge_connector registers it only
++			 * when a KMS driver builds the connector; the bridge
++			 * sets hdmi_audio_dai_port = -1, so no OF-graph port
++			 * addresses it (drm_hdmi_audio_helper.c:70-71,
++			 * soc-core.c:827-835 for how the phandle finds it).
++			 */
++			#sound-dai-cells = <0>;
+ 			status = "okay";
+ 
+ 			/*

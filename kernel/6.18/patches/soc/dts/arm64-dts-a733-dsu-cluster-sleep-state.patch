@@ -1,0 +1,149 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Wed, 30 Sep 2026 15:45:00 +0200
+Subject: [PATCH] arm64: dts: a733: offer the DSU cluster OFF idle state
+
+Add cluster-sleep-0, PSCI power level 1 (arm,psci-suspend-param
+0x01010000: power-down, level 1, StateID 0), and list it after the
+core-level state in every cpu@N's cpu-idle-states. There is one DSU
+cluster, so there is one state for all eight cores; with the original
+PSCI idle binding the firmware coordinates, and the cluster goes down
+only when all eight cores have asked for it.
+
+Needs the boot chain's allwinner-a733-dsu-cluster-off-state (the DSU PPU
+policy floor at OFF, level 1 accepted, the GIC-600 redistributor powered
+down around the cluster power-down). A firmware without it refuses
+0x01010000 with INVALID_PARAMETERS, and Linux's PSCI cpuidle driver then
+fails that state.
+
+The vendor device tree offers the same state with its own latencies;
+they are not used. Ours are measured on the 8 GiB board at the lowest OPP
+(247 MHz on both clusters, the worst case), with a timer wake on one A55
+and one A76 while every other core idles in this state, 6000 wakes per
+core (3000 on the first), on two boot chains (with and without PSCI_STAT):
+- entry-latency-us 100: the wake latency reaches its plateau once the
+  timer fires 100 us or more after the last core went idle (before that
+  the cluster is still going down, and the wake is shorter).
+- exit-latency-us 510: the largest wake from the fully entered state
+  (d >= 100 us), 505 us, rounded up; p50 284-294, p99 294-306 us. Wakes
+  late by whole 4 ms ticks (0.3 %) are left out: the same run with the
+  core state instead shows them at the same rate, so they belong to the
+  timer path, not to this state.
+- entry + exit = 610 us bounds every wake seen while the cluster was
+  going down (worst 534 us from the last core's entry).
+- min-residency-us 10000 is not an energy measurement: the wall meter
+  resolves no power difference between this state offered and not, so no
+  break-even could be measured. It stays above both floors that are
+  known: the core state's 3570 and entry + exit.
+
+Assisted-by: Claude
+---
+ .../sun60i-a733-cubie-a7s-minimal.dts         | 39 +++++++++++++++----
+ 1 file changed, 31 insertions(+), 8 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+index dd668bc..a0d6c2d 100644
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -91,7 +91,7 @@ cpu0: cpu@0 {
+ 			i-cache-line-size = <64>;
+ 			i-cache-sets = <128>;
+ 			next-level-cache = <&L2_0>;
+-			cpu-idle-states = <&cpu_sleep_0_a55>;
++			cpu-idle-states = <&cpu_sleep_0_a55 &cluster_sleep_0>;
+ 		};
+ 
+ 		cpu1: cpu@100 {
+@@ -108,7 +108,7 @@ cpu1: cpu@100 {
+ 			i-cache-line-size = <64>;
+ 			i-cache-sets = <128>;
+ 			next-level-cache = <&L2_1>;
+-			cpu-idle-states = <&cpu_sleep_0_a55>;
++			cpu-idle-states = <&cpu_sleep_0_a55 &cluster_sleep_0>;
+ 		};
+ 
+ 		cpu2: cpu@200 {
+@@ -125,7 +125,7 @@ cpu2: cpu@200 {
+ 			i-cache-line-size = <64>;
+ 			i-cache-sets = <128>;
+ 			next-level-cache = <&L2_2>;
+-			cpu-idle-states = <&cpu_sleep_0_a55>;
++			cpu-idle-states = <&cpu_sleep_0_a55 &cluster_sleep_0>;
+ 		};
+ 
+ 		cpu3: cpu@300 {
+@@ -142,7 +142,7 @@ cpu3: cpu@300 {
+ 			i-cache-line-size = <64>;
+ 			i-cache-sets = <128>;
+ 			next-level-cache = <&L2_3>;
+-			cpu-idle-states = <&cpu_sleep_0_a55>;
++			cpu-idle-states = <&cpu_sleep_0_a55 &cluster_sleep_0>;
+ 		};
+ 
+ 		cpu4: cpu@400 {
+@@ -159,7 +159,7 @@ cpu4: cpu@400 {
+ 			i-cache-line-size = <64>;
+ 			i-cache-sets = <128>;
+ 			next-level-cache = <&L2_4>;
+-			cpu-idle-states = <&cpu_sleep_0_a55>;
++			cpu-idle-states = <&cpu_sleep_0_a55 &cluster_sleep_0>;
+ 		};
+ 
+ 		cpu5: cpu@500 {
+@@ -176,7 +176,7 @@ cpu5: cpu@500 {
+ 			i-cache-line-size = <64>;
+ 			i-cache-sets = <128>;
+ 			next-level-cache = <&L2_5>;
+-			cpu-idle-states = <&cpu_sleep_0_a55>;
++			cpu-idle-states = <&cpu_sleep_0_a55 &cluster_sleep_0>;
+ 		};
+ 
+ 		/*
+@@ -210,7 +210,7 @@ cpu6: cpu@600 {
+ 			i-cache-line-size = <64>;
+ 			i-cache-sets = <256>;
+ 			next-level-cache = <&L2_6>;
+-			cpu-idle-states = <&cpu_sleep_0_a76>;
++			cpu-idle-states = <&cpu_sleep_0_a76 &cluster_sleep_0>;
+ 		};
+ 
+ 		cpu7: cpu@700 {
+@@ -227,7 +227,7 @@ cpu7: cpu@700 {
+ 			i-cache-line-size = <64>;
+ 			i-cache-sets = <256>;
+ 			next-level-cache = <&L2_7>;
+-			cpu-idle-states = <&cpu_sleep_0_a76>;
++			cpu-idle-states = <&cpu_sleep_0_a76 &cluster_sleep_0>;
+ 		};
+ 
+ 		cpu-map {
+@@ -284,6 +284,29 @@ cpu_sleep_0_a76: cpu-sleep-0-a76 {
+ 				min-residency-us = <3570>;
+ 				arm,psci-suspend-param = <0x00010000>;
+ 			};
++
++			/*
++			 * DSU cluster OFF (PSCI power level 1), one state
++			 * for the one DSU cluster, offered after the core state
++			 * on all eight cores. PSCI coordinates: the cluster goes
++			 * down only when all eight cores ask for it, and the DSU
++			 * cleans the L3 on the way (BL31
++			 * allwinner-a733-dsu-cluster-off-state). Latencies
++			 * measured at the lowest OPP with timer wakes on an
++			 * A55 and an A76: the cluster is down 100 us
++			 * after the last core went idle, and the largest wake
++			 * from it took 505 us. min-residency-us is not an
++			 * energy measurement; it stays above the core state's
++			 * and above entry + exit.
++			 */
++			cluster_sleep_0: cluster-sleep-0 {
++				compatible = "arm,idle-state";
++				local-timer-stop;
++				entry-latency-us = <100>;
++				exit-latency-us = <510>;
++				min-residency-us = <10000>;
++				arm,psci-suspend-param = <0x01010000>;
++			};
+ 		};
+ 	};
+ 

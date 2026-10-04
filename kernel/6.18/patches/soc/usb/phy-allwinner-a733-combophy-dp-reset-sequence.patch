@@ -1,0 +1,580 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] phy: allwinner: A733 combo-PHY -- the DisplayPort reset and link-control sequence
+
+`phy-allwinner-a733-combophy-register-a-typec-mux` registered the Type-C mux and stopped there on purpose: entering DP alt mode
+printed a warning and left COMB0 in its USB configuration, because writing a
+guessed DP setup into a PHY carrying a HW-proven 10 Gbps link is not a trade this
+tree makes. This adds the wrapper half of the DP personality -- the LINK_CTRL0
+reset staircase, the raw-serdes transmitter enable, and the two PMA handshakes --
+derived from the UM and checked against a capture of a working link.
+
+It is the reset and link-control sequence, not a DP driver. What is still missing
+is named at the end rather than implied.
+
+WHAT THE END STATE IS, AND HOW IT IS KNOWN
+------------------------------------------
+
+The 8 GiB board was run with the vendor 6.6 stack, a ThinkVision T23d-10 on Type-C J4,
+DP alt mode active (svid ff01, mode 1), pin assignment C, orientation REVERSE, and
+the COMB0 wrapper page was read back through /dev/mem. Four registers describe the
+whole wrapper side of that link:
+
+    LINK_CTRL0   0x06C01000 = 0x00001131
+    LINK_CTRL3   0x06C0100C = 0x00000011
+    LINK_STUS0   0x06C01900 = 0x00000111   (read-only -- the PHY's answer)
+    DP_RAWS_TXDW 0x06C06004 = 0x00000FF1
+
+That is the target. This patch's claim is that its sequence produces exactly those
+values; it is not a claim that a monitor lights up (see LIMITS).
+
+Field names and offsets come from A733 UM V0.92 chapter 18.2.6; the vendor's combo0_dp_phy_reset()
+(bsp/drivers/phy/sunxi-cadence-combophy.c:769-859, the radxa/allwinner-bsp tree) was used
+as a hint for the *ordering* only, and every step below is justified against the UM
+and the capture, not against it. Where the UM does not name something, this header
+says so instead of inventing a name.
+
+STEP BY STEP -- WHICH REGISTER EACH STEP ACCOUNTS FOR
+-----------------------------------------------------
+
+1. LINK_CTRL2 0x1008, clear bit1 IDDQ_EN_SEL and bit0 IDDQ_EN_SOFT.
+   Meaning: with both bits set the PHY is in IDDQ (power-down); with both clear it
+   is powered up. Accounts for: 0x06C01008, which is absent from the capture's
+   non-zero list, i.e. reads 0x00000000. Idempotent -- the USB bring-up already
+   cleared it -- and reused verbatim from a733_combophy_power_up().
+
+2. LINK_CTRL0 0x1000 written as four ABSOLUTE values, not read-modify-writes:
+
+       0x0000 | dir      everything asserted, plug direction latched
+       0x0001 | dir      + bit0 PHY_RESET_N          (UM 18.2.6.5)
+       0x0101 | dir      + bit8 DP_LINK_RESET_N_SOFT (UM 18.2.6.5)
+       0x0131 | dir      + bit4 PIPE_LINK_RESET_N_SOFT
+                         + bit5 PIPE_LINK_RESET_N_USB3P1_MASK
+
+   with 1 ms between each. Accounts for: LINK_CTRL0 = 0x00001131 (dir =
+   TYPEC_CONN_DIR = bit12, set here because the capture was taken with a REVERSE
+   plug; a normal plug gives 0x00000131). Every bit of the measured value is
+   accounted for -- 12, 8, 5, 4, 0 -- with nothing left over.
+
+   Absolute, because that is what the staircase is for: each write both releases
+   the next reset and holds the previous ones, and a read-modify-write cannot
+   express "everything else off" in the first step. The USB path (`phy-allwinner-a733-add-serdes-combophy`) reaches a
+   different value, 0x00000111, by OR-ing bits into whatever was there.
+
+   bit5 is the one bit that separates the two personalities. The USB path never
+   sets it. UM 18.2.6.5: bit5 masks the PIPE reset that the USB3P1 controller drives
+   into PHY0 (1 = masked); that reset only acts while bit5 is 0 and bit4
+   PIPE_LINK_RESET_N_SOFT is 1. So with bit5 set, bit4 becomes the only source of the
+   PIPE link reset and the dwc3 core can no longer yank it -- which is precisely
+   what is needed while the lanes carry DP and the USB3 controller is still there.
+   The capture shows it set; the USB-only silicon reading of the same register
+   shows it clear (0x00000111). Two
+   states, one differing bit, and the UM explains it.
+
+   One deliberate deviation from the vendor. UM 18.2.6.5 requires bit12 to be
+   static while phy0_reset_n is de-asserted. The vendor writes the direction
+   *after* the 0x131 step, i.e. after phy0_reset_n is already high. This patch
+   folds the direction into all four writes instead, so it is latched while
+   phy0_reset_n is still low, and the end value is identical. The vendor's own
+   ordering is usually a no-op re-affirmation for it (its set_mode and
+   combo0_configure_usb_dp write the direction beforehand), which is probably why
+   it never bit -- but the UM is the spec here and the vendor is the hint. If a
+   board ever disagrees, the vendor's literal ordering is one line away, and the
+   driver comment says so.
+
+3. Poll LINK_STUS0 0x1900 bit0 PMA_CMN_READY, budget 5 ms (vendor: 1000 x 5 us).
+   Accounts for: bit0 of LINK_STUS0 = 0x00000111.
+   UM 18.2.6.9: bit0 PMA_CMN_READY reports the PMA common block as up, and the
+   UM names it as a step of both the Raw SerDes start-up and of power-state
+   changes. Raw SerDes is
+   the DP personality -- so the UM itself puts this wait inside the DP startup,
+   and it belongs BEFORE the transmitters are switched on. The USB path does the
+   opposite: `phy-allwinner-a733-add-serdes-combophy` writes DP_RAWS_TXDW_CONV_CTRL first and only checks CMN_READY at
+   the very end, as a fallback with a PMA nudge. That ordering is left alone.
+
+4. DP_RAWS_TXDW_CONV_CTRL (top part-2 + 0x0004 = 0x06C06004) = 0x0FF1: bit0,
+   [7:4] = 0xF, [11:8] = 0xF. Accounts for: 0x06C06004 = 0x00000FF1 exactly.
+   The register summary first used for this driver listed only [11:8] (TX
+   per-lane reset) and [7:4] (TX per-lane enable), and
+   `phy-allwinner-a733-add-serdes-combophy`'s header flagged bit0 as a
+   vendor-derived name with no doc anchor. That gap is now closed from the spec:
+   UM 18.2.6.24 names every bit individually --
+   TX_PHY_CFG_LN3..LN0_RSTN = bits 11..8, TX_PHY_CFG_LN3..LN0_EN = bits 7..4,
+   TX_PHY_CFG_DATA_EN = bit0, all plain enable bits (0 = disable, 1 = enable) -- and marks 31:12
+   unimplemented. So 0xFF1 is "all four lanes' transmitters enabled and out of
+   reset, data-width conversion on", every field named by the UM, and an absolute
+   write discards nothing.
+
+5. LINK_CTRL3 0x100C bit0 PLLCLK_EN, then poll LINK_STUS0 bit4 CLOCK_EN_ACK,
+   budget 5 ms (vendor: 1000 x 5 us).
+   Accounts for: bit0 of LINK_CTRL3 = 0x00000011, and bit4 of LINK_STUS0.
+   UM 18.2.6.8 bit0 gates the PMA's data-rate clock for every lane of the link,
+   so that clock can be stopped cleanly. UM 18.2.6.9 bit4 is its
+   acknowledgement and reports whether that clock is running.
+
+6. LINK_CTRL3 [9:4] XCVR_POWER_STATE_REQ = 0x1 (A0), then poll LINK_STUS0 [13:8]
+   POWER_STATE_ACK != 0, budget 500 ms (vendor: 100000 x 5 us).
+   Accounts for: bits [9:4] of LINK_CTRL3 = 0x00000011 (0x1 << 4 = 0x10, plus
+   bit0 from step 5 = 0x11), and bits [13:8] of LINK_STUS0 = 0x00000111
+   (0x1 << 8 = 0x100, plus bit4 and bit0 = 0x111).
+   UM 18.2.6.8: the field is one-hot, 0x1 = state A0 (Tx/Rx active), and the first
+   request after reset release has to be A0 or A2 -- so this step is mandatory, not
+   optional tuning. It is written as a masked field, not OR-ed in, because a stale
+   bit in a one-hot encoding would request a second state at the same time.
+   The budget is 100x the USB path's (PMA_READY_TIMEOUT_US = 10 ms) and that is
+   kept, not trimmed: shrinking a vendor poll we cannot reproduce on a bench turns
+   a slow-but-working bring-up into a spurious error. Why the DP link needs so
+   much longer is not established here and is not claimed.
+
+7. Teardown, on the way back to TYPEC_STATE_USB / TYPEC_STATE_SAFE: LINK_CTRL0 =
+   0, DP_RAWS_TXDW_CONV_CTRL = 0, LINK_CTRL3 = 0, in that order. Returning the
+   power-state request to zero is not housekeeping: UM 18.2.6.8 says
+   pma_xcvr_power_state_req has to be acknowledged and set back to 0 before
+   the next state is requested, so leaving A0 standing would
+   block the next entry.
+
+Two registers the sequence deliberately does NOT touch: LINK_CTRL1 0x1004, which
+reads the same 0x01100001 in the DP capture as it does with SuperSpeed up, so the
+refclk routing `phy-allwinner-a733-add-serdes-combophy` programs is personality-independent; and the PMA body, which
+the vendor configures through combo0_configure_usb_dp() -- the function `phy-allwinner-a733-add-serdes-combophy`
+already ports in full, for both personalities at once, which is why this patch
+requires phy_init() to have run and says so in the log if it has not.
+
+USB3 IS NOT TOUCHED
+-------------------
+
+DP and USB3 are mutually exclusive on COMB0, and the 10 Gbps link is HW-proven, so
+every line added here is behind a DP entry:
+
+  - a733_combophy_dp_reset_seq() and a733_combophy_dp_teardown() are new functions
+    with no caller on the USB path. a733_combophy_reset_seq(), the USB sequence,
+    is not edited at all -- not one byte of it changes.
+  - The only entry is the Type-C mux .set callback, and only for the four-lane,
+    DP-only pin assignments C and E. Assignments A, B, D and F keep two lanes on
+    USB3; the vendor's path for D/F tears the link down, rewrites the entire PMA
+    config and rebuilds it, there is no capture of that state, and it is refused
+    with a warning rather than guessed.
+  - A new bool dp_active gates the teardown, so the TYPEC_STATE_USB /
+    TYPEC_STATE_SAFE transitions that every plug and unplug produces do nothing at
+    all on a board that never entered DP.
+
+One existing function does change, and it is worth being explicit about: the
+orientation switch callback now re-runs the DP sequence when dp_active is set.
+a733_combophy_param_config() updates TYPEC_CONN_DIR with a plain read-modify-write,
+which is exactly what UM 18.2.6.5 forbids while phy0_reset_n is de-asserted, so a
+direction change under a live DP link has to go back through the staircase. The
+call is guarded by dp_active, so a USB-only port never reaches it. In the normal
+TCPM flow orientation arrives at attach, before alt-mode entry, so this is a
+correctness guard rather than a hot path.
+
+Cost when DP is never entered: one bool in the private struct, and one branch in a
+callback that already existed. No change to probe, phy_ops.init, phy_ops.exit, the
+PMA tables, or the USB reset sequence.
+
+HOW TO TEST IT -- ONE OBSERVABLE PER STEP
+-----------------------------------------
+
+No board was available for this patch; it is written to be testable, and the
+kernel's own print is explicitly not the evidence. Plug a DP monitor into J4 on a
+board running this tree, then read the wrapper page back with devmem2 (this tree
+has no /sys/class/sunxi_dump -- that is a BSP interface):
+
+  step 2   devmem2 0x06C01000 -> 0x00001131 flipped plug / 0x00000131 normal.
+           The bit to look at is bit5: it is 0 in the USB-only state and must be 1
+           here. bit12 must match the plug orientation reported by
+           /sys/class/typec/port0/orientation.
+  step 3   devmem2 0x06C01900 bit0 = 1 (also covered by step 6's value).
+  step 4   devmem2 0x06C06004 -> 0x00000FF1.
+  step 5   devmem2 0x06C0100C bit0 = 1; 0x06C01900 bit4 = 1.
+  step 6   devmem2 0x06C0100C -> 0x00000011; 0x06C01900 -> 0x00000111.
+  step 7   unplug, then all three of 0x06C01000, 0x06C0100C, 0x06C06004 read 0.
+
+A failing handshake names itself: each of the three polls logs at dev_err with the
+raw LINK_STUS0, and the sequence continues instead of returning early, so a single
+run says which of the three stalled rather than only the first. The driver also
+prints all four registers in one dev_info line at the end -- that line is for
+diffing against the capture in a report, not for proving the patch; the kernel is
+the thing under test.
+
+Negative control, and the one that actually matters: with no DP monitor attached,
+none of the above may change. LINK_CTRL0 must stay 0x00000111 and 0x06C0100C must
+stay whatever the USB bring-up left, and `lsusb -t` must still show a SuperSpeed
+device at 10000M.
+
+LIMITS
+------
+
+Matching a working board's end state is a witness argument, not a mechanism proof
+-- the same caveat `phy-allwinner-a733-add-serdes-combophy` carries. It says what the wrapper looks like under a live
+link; it does not say that this sequence is what makes the link train.
+
+This patch alone is not expected to produce video, and the driver comment says so
+in the same words. Three things are still missing and are named rather than left
+implied, each with the capture value that shows the vendor writes them:
+
+  - DP lane map, COMB0_PHY_RAWS_TXD_MAP_CTRL 0x06C06C24: capture 0x00003210,
+    reset default 0xFFFF.
+  - DP AUX/HPD analog front-end, AUX_HPD_PHY_PINS_CTRL0 0x06C01E00: capture
+    0x03331131 (and 0x06C01E04 = 0x00010E0D), documented default 0x00330000. That is a different block with its own driver
+    question, and it is what carries AUX and HPD.
+  - the PMA link-rate registers the vendor writes in combo0_dp_set_rate(), plus
+    lane-count and swing/pre-emphasis. Those live in the PMA body; no
+    register documentation for it was available, and they need their own capture.
+
+Pin assignments A, B, D and F are refused, not attempted. A DP entry currently
+also ends SuperSpeed for good until phy_exit()/phy_init() run again, because
+nothing re-inits the PHY after a DP session; the teardown logs that plainly rather
+than pretending otherwise. Restoring the USB personality on DP exit is a separate,
+testable change and is deliberately not smuggled in here.
+
+Compile-tested against 6.18.36 with the series applied, W=1, no warnings;
+checkpatch --strict clean apart from the "missing commit description" note this
+header is.
+
+Assisted-by: Claude
+
+diff --git a/drivers/phy/allwinner/phy-sun60i-a733-combophy.c b/drivers/phy/allwinner/phy-sun60i-a733-combophy.c
+--- a/drivers/phy/allwinner/phy-sun60i-a733-combophy.c
++++ b/drivers/phy/allwinner/phy-sun60i-a733-combophy.c
+@@ -45,6 +45,15 @@
+ #define  DP_PHY_CFG_DATA_EN		BIT(0)
+ #define  DP_PHY_CFG_LN_EN		GENMASK(7, 4)
+ #define  DP_PHY_CFG_LN_RSTN		GENMASK(11, 8)
++/* All four DP lanes converted, enabled and out of reset -- 0x00000FF1, which is
++ * what 0x06C06004 reads on the 8 GiB board under a live 4-lane DP-alt link
++ * -- UM 18.2.6.24 names every bit
++ * of this register individually (TX_PHY_CFG_LN0..3_RSTN = 11:8,
++ * TX_PHY_CFG_LN0..3_EN = 7:4, TX_PHY_CFG_DATA_EN = bit0) and marks 31:12
++ * unimplemented, so writing it absolutely loses nothing.
++ */
++#define  DP_RAWS_TXDW_CONV_4LANE	(DP_PHY_CFG_DATA_EN | DP_PHY_CFG_LN_EN | \
++					 DP_PHY_CFG_LN_RSTN)
+ #define USB3P1_PIPE_CLK_MAP_CTRL	0x0100
+ #define USB3P1_PIPE_RXD_MAP_CTRL	0x0104
+ #define  USB3P1_PIPE_MAP_MASK		GENMASK(3, 0)
+@@ -54,8 +63,25 @@
+ #define COMB0_LINK_CTRL0		0x0000
+ #define  PHY0_TYPEC_CONN_DIR		BIT(12)
+ #define  PHY0_DP_LINK_RESET_N_SOFT	BIT(8)
++/* UM 18.2.6.5 bit5 masks the PIPE reset that the USB3P1 controller drives into PHY0
++ * (1 = masked); that reset acts only while bit5 is 0 and bit4 PIPE_LINK_RESET_N_SOFT is 1.
++ *
++ * Setting it makes bit4 the only source of the PIPE link reset and takes the dwc3 core's
++ * line out of the picture -- which is what the lanes need while they carry DP.
++ */
++#define  PHY0_PIPE_LINK_RESET_N_USB3P1_MASK	BIT(5)
+ #define  PHY0_PIPE_LINK_RESET_N_SOFT	BIT(4)
+ #define  PHY0_RESET_N			BIT(0)
++/* The DP personality releases LINK_CTRL0 as a staircase of absolute values
++ * (0x001 -> 0x101 -> 0x131, plus TYPEC_CONN_DIR), not as read-modify-writes of
++ * single bits the way the USB path does. See a733_combophy_dp_reset_seq().
++ */
++#define  COMB0_LINK_CTRL0_DP_PHY	PHY0_RESET_N
++#define  COMB0_LINK_CTRL0_DP_LINK	(COMB0_LINK_CTRL0_DP_PHY | \
++					 PHY0_DP_LINK_RESET_N_SOFT)
++#define  COMB0_LINK_CTRL0_DP_RUN	(COMB0_LINK_CTRL0_DP_LINK | \
++					 PHY0_PIPE_LINK_RESET_N_SOFT | \
++					 PHY0_PIPE_LINK_RESET_N_USB3P1_MASK)
+ #define COMB0_LINK_CTRL1		0x0004
+ #define  PHY0_PMA_CMN_PLL1_REFCLK_SEL	BIT(24)
+ #define  PHY0_PMA_CMN_PLL0_REFCLK_SEL	BIT(20)
+@@ -72,6 +98,11 @@
+ #define  PHY0_IDDQ_EN_SOFT		BIT(0)
+ #define COMB0_LINK_CTRL3		0x000C
+ #define  PHY0_PMA_XCVR_POWER_STATE_REQ_LN(n)	(((n) & 0x3f) << 4)
++#define  PHY0_PMA_XCVR_POWER_STATE_REQ	GENMASK(9, 4)
++/* UM 18.2.6.8: [9:4] is one-hot, 0x1 = A0 (Tx/Rx active); the first request
++ * after reset release has to be A0 or A2.
++ */
++#define  PHY0_PMA_XCVR_POWER_STATE_A0	PHY0_PMA_XCVR_POWER_STATE_REQ_LN(1)
+ #define  PHY0_PMA_XCVR_PLLCLK_EN_LN	BIT(0)
+ #define COMB0_LINK_STUS0		0x0900
+ #define  PHY0_PMA_CMN_READY		BIT(0)
+@@ -91,6 +122,20 @@
+ #define PHY_LOCK_TIMEOUT_US		2000
+ #define PMA_READY_TIMEOUT_US		10000
+ 
++/* DP bring-up poll budgets, kept at the vendor's values rather than shrunk to
++ * the USB ones: combo0_dp_phy_reset() allows 1000 x 5 us for PMA_CMN_READY and
++ * for CLOCK_EN_ACK, and 100000 x 5 us -- half a second -- for POWER_STATE_ACK.
++ * A shorter poll would turn a slow-but-working bring-up into a spurious error.
++ */
++#define DP_POLL_STEP_US			5
++#define DP_ACK_TIMEOUT_US		5000
++#define DP_POWER_STATE_TIMEOUT_US	500000
++/* Vendor uses msleep(1) between the LINK_CTRL0 steps; usleep_range() is the
++ * in-tree spelling for a sub-20 ms sleep and guarantees at least as long.
++ */
++#define DP_RESET_STEP_MIN_US		1000
++#define DP_RESET_STEP_MAX_US		2000
++
+ struct a733_combophy {
+ 	struct device		*dev;
+ 	void __iomem		*link;	/* combophy0 top   0x06c01000 */
+@@ -117,6 +162,11 @@
+ 	 */
+ 	struct typec_mux_dev	*mux;
+ 	unsigned long		mux_mode;
++	/* True between a DP pin-assignment entry and the return to USB/SAFE.
++	 * It is the only thing that makes the DP register writes reachable, so
++	 * a board that never enters DP alt mode never executes any of them.
++	 */
++	bool			dp_active;
+ 	bool			inited;
+ };
+ 
+@@ -560,6 +610,130 @@
+ 	return 0;
+ }
+ 
++/*
++ * combo0_dp_phy_reset(deassert = true) -- the DP counterpart of
++ * a733_combophy_reset_seq(). Same registers, materially different sequence, and
++ * every difference is deliberate; see the patch header for the derivation.
++ *
++ * Target end state, all four values measured on the 8 GiB board under a live 4-lane DP-alt
++ * link with the vendor stack:
++ *
++ *	LINK_CTRL0 0x06C01000 = 0x00001131   (0x0131 with a normal plug)
++ *	LINK_CTRL3 0x06C0100C = 0x00000011
++ *	LINK_STUS0 0x06C01900 = 0x00000111   (read-only, the PHY's answer)
++ *	DP_RAWS_TXDW 0x06C06004 = 0x00000FF1
++ *
++ * Failures are logged per step and collected, not returned early: the vendor
++ * warns and carries on, and carrying on is what tells a tester which of the
++ * three handshakes stalled instead of only the first.
++ */
++static int a733_combophy_dp_reset_seq(struct a733_combophy *cp)
++{
++	u32 dir = cp->orientation == TYPEC_ORIENTATION_REVERSE ?
++		  PHY0_TYPEC_CONN_DIR : 0;
++	u32 run = dir | COMB0_LINK_CTRL0_DP_RUN;
++	int ret, err = 0;
++	u32 v;
++
++	/* LINK_CTRL2 0x1008: out of IDDQ. Idempotent -- the USB bring-up already
++	 * did this, and 0x06C01008 reads 0x00000000 in the DP capture.
++	 */
++	a733_combophy_power_up(cp);
++
++	/*
++	 * LINK_CTRL0 0x1000, absolute values. TYPEC_CONN_DIR rides in every one
++	 * of them because UM 18.2.6.5 requires bit12 to stay static
++	 * while phy0_reset_n is de-asserted. The vendor writes the direction
++	 * after the last step, i.e. after phy0_reset_n is already high; folding
++	 * it into the staircase honours the UM instead and reaches the identical
++	 * end value. If a board ever disagrees, the vendor's literal ordering is
++	 * one line away.
++	 */
++	writel(dir, cp->link + COMB0_LINK_CTRL0);
++	writel(dir | COMB0_LINK_CTRL0_DP_PHY, cp->link + COMB0_LINK_CTRL0);
++	usleep_range(DP_RESET_STEP_MIN_US, DP_RESET_STEP_MAX_US);
++	writel(dir | COMB0_LINK_CTRL0_DP_LINK, cp->link + COMB0_LINK_CTRL0);
++	usleep_range(DP_RESET_STEP_MIN_US, DP_RESET_STEP_MAX_US);
++	writel(run, cp->link + COMB0_LINK_CTRL0);
++	usleep_range(DP_RESET_STEP_MIN_US, DP_RESET_STEP_MAX_US);
++	/* the vendor's fourth millisecond, spent on its separate direction
++	 * write; kept as settling time so the total is unchanged.
++	 */
++	usleep_range(DP_RESET_STEP_MIN_US, DP_RESET_STEP_MAX_US);
++
++	/* LINK_STUS0 0x1900 bit0, PMA common ready (UM 18.2.6.9), which the UM
++	 * ties to the Raw SerDes startup and to power-state changes --
++	 * so it is waited for BEFORE the raw-serdes transmitters are enabled,
++	 * which is the other way round from the USB path.
++	 */
++	ret = readl_poll_timeout(cp->link + COMB0_LINK_STUS0, v,
++				 v & PHY0_PMA_CMN_READY,
++				 DP_POLL_STEP_US, DP_ACK_TIMEOUT_US);
++	if (ret) {
++		dev_err(cp->dev, "DP: PMA_CMN_READY never set, LINK_STUS0 = 0x%08x\n",
++			v);
++		err = ret;
++	}
++
++	/* DP_RAWS_TXDW_CONV_CTRL 0x6004 -> 0x0FF1 */
++	writel(DP_RAWS_TXDW_CONV_4LANE, cp->top2 + DP_RAWS_TXDW_CONV_CTRL);
++
++	/* LINK_CTRL3 0x100c bit0 PLLCLK_EN, answered in LINK_STUS0 bit4 */
++	a733_rmw(cp->link, COMB0_LINK_CTRL3, 0, PHY0_PMA_XCVR_PLLCLK_EN_LN);
++	ret = readl_poll_timeout(cp->link + COMB0_LINK_STUS0, v,
++				 v & PHY0_PMA_XCVR_CLK_EN_ACK,
++				 DP_POLL_STEP_US, DP_ACK_TIMEOUT_US);
++	if (ret) {
++		dev_err(cp->dev, "DP: CLOCK_EN_ACK never set, LINK_STUS0 = 0x%08x\n",
++			v);
++		err = ret;
++	}
++
++	usleep_range(DP_RESET_STEP_MIN_US, DP_RESET_STEP_MAX_US);
++
++	/* LINK_CTRL3 [9:4] = A0. Written as a masked field, not OR-ed in: the
++	 * encoding is one-hot, so a stale bit would request a second state.
++	 */
++	a733_rmw(cp->link, COMB0_LINK_CTRL3, PHY0_PMA_XCVR_POWER_STATE_REQ,
++		 PHY0_PMA_XCVR_POWER_STATE_A0);
++	ret = readl_poll_timeout(cp->link + COMB0_LINK_STUS0, v,
++				 v & PHY0_PMA_XCVR_POWER_STATE_ACK,
++				 DP_POLL_STEP_US, DP_POWER_STATE_TIMEOUT_US);
++	if (ret) {
++		dev_err(cp->dev, "DP: POWER_STATE_ACK never set, LINK_STUS0 = 0x%08x\n",
++			v);
++		err = ret;
++	}
++
++	/* One line a tester can diff straight against the 8 GiB board's capture. It stays
++	 * at info level until the sequence has silicon behind it.
++	 */
++	dev_info(cp->dev,
++		 "DP: LINK_CTRL0 0x%08x LINK_CTRL3 0x%08x LINK_STUS0 0x%08x DP_RAWS_TXDW 0x%08x (want 0x%08x / 0x00000011 / 0x00000111 / 0x00000ff1)\n",
++		 readl(cp->link + COMB0_LINK_CTRL0),
++		 readl(cp->link + COMB0_LINK_CTRL3),
++		 readl(cp->link + COMB0_LINK_STUS0),
++		 readl(cp->top2 + DP_RAWS_TXDW_CONV_CTRL),
++		 run);
++
++	return err;
++}
++
++/*
++ * combo0_dp_phy_reset(deassert = false). Three absolute zeroes, in the vendor's
++ * order. Returning POWER_STATE_REQ to 0 is not housekeeping: UM 18.2.6.8 says
++ * pma_xcvr_power_state_req has to be acknowledged and set back to 0 before the
++ * next state is requested, so leaving
++ * A0 standing would block the next entry.
++ */
++static void a733_combophy_dp_teardown(struct a733_combophy *cp)
++{
++	writel(0, cp->link + COMB0_LINK_CTRL0);
++	writel(0, cp->top2 + DP_RAWS_TXDW_CONV_CTRL);
++	writel(0, cp->link + COMB0_LINK_CTRL3);
++	usleep_range(DP_RESET_STEP_MIN_US, DP_RESET_STEP_MAX_US);
++}
++
+ static void a733_combophy_assert_reset(void *data)
+ {
+ 	reset_control_assert(data);
+@@ -734,6 +908,13 @@
+ 	cp->orientation = orientation;
+ 	if (cp->inited)
+ 		a733_combophy_param_config(cp);
++	/* param_config() updates TYPEC_CONN_DIR with a plain read-modify-write,
++	 * which UM 18.2.6.5 forbids while phy0_reset_n is de-asserted. With DP
++	 * running the direction therefore has to be re-latched through the reset
++	 * staircase. Guarded by dp_active, so a USB-only port never gets here.
++	 */
++	if (cp->dp_active)
++		a733_combophy_dp_reset_seq(cp);
+ 	mutex_unlock(&cp->lock);
+ 
+ 	/* A non-zero return here aborts TCPM's attach, so failures are logged,
+@@ -749,44 +930,88 @@
+ 
+ /* COMB0 carries either SuperSpeed or DP, never both, and the lane routing lives
+  * inside this PHY -- there is no external mux on this board. So the DisplayPort
+- * alt-mode driver reaches the lanes through here.
++ * alt-mode driver reaches the lanes through here, and this callback is the only
++ * entry point from which a DP register write is reachable at all.
++ *
++ * Implemented: the four-lane, DP-only pin assignments C and E. C is the one the
++ * 8 GiB board's capture was taken in, and both are the cases where handing the lanes to
++ * DisplayPort does not have to negotiate with a live SuperSpeed link.
+  *
+- * What this implements is the *observation* half: it accepts the state, records
+- * it, and reports what the partner asked for. It deliberately does NOT touch the
+- * PMA, because the vendor's DP configuration fork has not been worked out
+- * and ported yet -- writing a guessed DP lane setup into a PHY that currently
+- * carries a working SuperSpeed link is exactly the trade this tree does not make.
++ * Not implemented: A, B, D, F. D and F keep two lanes on USB3 while two carry
++ * DP, and the vendor's own path for them tears the link down, rewrites the whole
++ * PMA config and rebuilds it (sunxi_cadence_combo0_dp_phy_set_mode). There is no
++ * capture of that state, and guessing it against a HW-proven 10 Gbps link is the
++ * trade this tree does not make.
+  *
+- * Returning 0 rather than an error is deliberate too: an error here aborts the
+- * alt-mode entry, and then nothing is learned about what the sink offers. The
+- * warning is the honest part -- the lanes stay in their USB configuration, so
+- * there is no video, and the log says so rather than leaving it to be discovered
+- * on a dark screen.
++ * Still missing for actual video, named rather than implied: the DP lane map at
++ * 0x06C06C24 (0x00003210 in the capture, 0xFFFF at reset), the DP AUX/HPD front
++ * end at 0x06C01E00 (0x03331131 in the capture, 0x00330000 at reset), and the PMA
++ * link-rate registers. This is the reset and link-control sequence only.
++ *
++ * Returning 0 rather than an error stays deliberate: an error aborts the
++ * alt-mode entry, and then nothing is learned about what the sink offers.
+  */
+ static int a733_combophy_typec_mux_set(struct typec_mux_dev *mux,
+ 				       struct typec_mux_state *state)
+ {
+ 	struct a733_combophy *cp = typec_mux_get_drvdata(mux);
+ 	unsigned long mode = state->mode;
++	char pin;
+ 
+ 	mutex_lock(&cp->lock);
+ 	cp->mux_mode = mode;
+-	mutex_unlock(&cp->lock);
+ 
+-	if (mode == TYPEC_STATE_SAFE || mode == TYPEC_STATE_USB)
+-		return 0;
++	if (mode == TYPEC_STATE_SAFE || mode == TYPEC_STATE_USB) {
++		if (cp->dp_active) {
++			a733_combophy_dp_teardown(cp);
++			cp->dp_active = false;
++			dev_info(cp->dev,
++				 "DP alt mode left, COMB0 links back in reset; SuperSpeed does not return without a phy_exit()/phy_init() cycle\n");
++		}
++		goto out;
++	}
++
++	if (!state->alt || state->alt->svid != USB_TYPEC_DP_SID) {
++		dev_warn(cp->dev, "unhandled Type-C mux state %lu requested\n",
++			 mode);
++		goto out;
++	}
++
++	/* TYPEC_DP_STATE_A..F are TYPEC_MODAL_STATE(0..5); the pin assignment
++	 * letter is the offset from TYPEC_STATE_MODAL.
++	 */
++	pin = 'A' + (mode - TYPEC_STATE_MODAL);
+ 
+-	if (state->alt && state->alt->svid == USB_TYPEC_DP_SID) {
+-		/* TYPEC_DP_STATE_A..F are TYPEC_MODAL_STATE(0..5); the pin
+-		 * assignment letter is the offset from TYPEC_STATE_MODAL.
+-		 */
++	if (mode != TYPEC_DP_STATE_C && mode != TYPEC_DP_STATE_E) {
+ 		dev_warn(cp->dev,
+-			 "DP alt mode entered, pin assignment %c requested: the PHY's DP personality is not implemented, lanes stay in USB configuration (no video)\n",
+-			 (char)('A' + (mode - TYPEC_STATE_MODAL)));
+-		return 0;
++			 "DP alt mode pin assignment %c is not implemented (it shares the lanes with SuperSpeed); lanes stay in USB configuration, no video\n",
++			 pin);
++		goto out;
+ 	}
+ 
+-	dev_warn(cp->dev, "unhandled Type-C mux state %lu requested\n", mode);
++	/* The DP sequence assumes the PMA the USB bring-up programmed: the
++	 * vendor's combo0_configure_usb_dp(), which our param_config() ports, is
++	 * the config for both personalities. Without phy_init() there is nothing
++	 * for PMA_CMN_READY to come up on.
++	 */
++	if (!cp->inited) {
++		dev_warn(cp->dev,
++			 "DP alt mode pin assignment %c requested before phy_init() configured the PMA; not running the DP reset, no video\n",
++			 pin);
++		goto out;
++	}
++
++	dev_info(cp->dev,
++		 "DP alt mode pin assignment %c: handing all four COMB0 lanes to DisplayPort\n",
++		 pin);
++	cp->dp_active = true;
++	if (a733_combophy_dp_reset_seq(cp))
++		dev_err(cp->dev,
++			"DP link bring-up did not complete, see the handshake errors above\n");
++
++out:
++	mutex_unlock(&cp->lock);
++	/* A non-zero return would abort TCPM's alt-mode entry. */
+ 	return 0;
+ }
+ 

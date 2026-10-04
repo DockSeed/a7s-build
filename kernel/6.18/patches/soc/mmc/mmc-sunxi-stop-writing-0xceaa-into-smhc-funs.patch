@@ -1,0 +1,70 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] mmc: sunxi: stop writing 0xceaa into SMHC_FUNS, the silicon does not take it
+
+WHY
+---
+sunxi_mmc_init_host() writes SDXC_CEATA_ON = (0xceaa << 16) into SMHC_FUNS
+(offset 0x044) under the comment "Enable CEATA support". Three things are
+wrong with that on this controller, and the third is measured:
+
+1. The A733 UM defines only bits 2:0 of SMHC_FUNS -- ABT_RDATA, READ_WAIT,
+   HOST_SEND_MMC_IRQRESQ -- with bits 31:3 listed as "/" and a reset value of
+   0x0000_0000 (11.3.8.18). There is no magic key and no enable field up there.
+2. The string "CEATA" does not appear anywhere in the 1982-page A733 User
+   Manual, in V0.92 or in V1.00.
+3. The write does not land. Silicon readback on the 8 GiB board, 2026-09-19, with the
+   controller pinned awake after a clean HS400 read:
+
+       SMHC2 0x0402_2044 = 0x00010000
+
+   The driver wrote 0xceaa0000. The register holds 0x00010000. The upper bits
+   do not latch, so whatever those bits are, they are not a 0xceaa key.
+
+The A733 vendor BSP has this exact line and keeps it commented out.
+
+WHAT IT CHANGES
+---------------
+Deletes the write and the now-unused SDXC_CEATA_ON definition. The three
+documented bits keep their reset values, which is what they already had: the
+write only ever set bits the UM does not define, and CE-ATA is not a mode this
+tree uses or intends to use.
+
+WHAT IT DOES NOT CLAIM
+----------------------
+No performance claim. This removes an undocumented write, it does not fix a
+measured failure. The reason to do it is that an undefined write is not a
+state we can reason about, and the vendor for this SoC declined the same line.
+
+VERIFIED / NOT VERIFIED
+-----------------------
+- Applies clean at fuzz 0 on a fresh unpack with the series in order: yes.
+- Silicon: NOT proven. The observable: 0x0402_2044 reads 0x00000000 after boot
+  instead of 0x00010000, and SD and eMMC keep working -- card enumerates, read
+  and write verify clean. If anything changes behaviour, the bits were doing
+  something after all and this patch is wrong.
+
+ISSUE
+-----
+Stray 0xceaa write into SMHC_FUNS, found during the A733 SMHC bring-up.
+
+Assisted-by: Claude
+---
+--- a/drivers/mmc/host/sunxi-mmc.c
++++ b/drivers/mmc/host/sunxi-mmc.c
+@@ -285,7 +285,6 @@
+ #define SDXC_FIFO_SIZE			16
+ 
+ /* Function select */
+-#define SDXC_CEATA_ON			(0xceaa << 16)
+ #define SDXC_SEND_IRQ_RESPONSE		BIT(0)
+ #define SDXC_SDIO_READ_WAIT		BIT(1)
+ #define SDXC_ABORT_READ_DATA		BIT(2)
+@@ -596,8 +595,6 @@
+ 	 * drove it, which is luck, not initialisation.
+ 	 */
+ 	mmc_writel(host, REG_A12A, 0);
+-	/* Enable CEATA support */
+-	mmc_writel(host, REG_FUNS, SDXC_CEATA_ON);
+ 	/* Set DMA descriptor list base address */
+ 	mmc_writel(host, REG_DLBA, host->sg_dma >> host->cfg->idma_des_shift);
+ 

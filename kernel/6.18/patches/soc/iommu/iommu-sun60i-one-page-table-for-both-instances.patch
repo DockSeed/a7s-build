@@ -1,0 +1,455 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] iommu: sun60i: one page table for both instances
+
+[Recipe cut: the board proof below ran with the vendor video engine and
+test-only patches on top; neither is carried in this series, the code is
+unchanged.]
+
+The video engine sits on both IOMMUs: the decoder
+(video-codec@1c0e000) is IOMMU1 masters 0 and 1, the encoder
+(video-codec@1c10000) IOMMU0 master 3. Until this patch each instance had
+its own iommu group, domain and page table.
+
+MEASURED -- the 6 GiB board, 2026-09-26, test kernel 6.18.53-t590 (this
+series as of that date plus a cedar_ve DMA-mask fix), test dtb with
+iommus = <&iommu1 0>, <&iommu1 1> on the
+decoder, <&iommu0 3> on the encoder.
+
+  * Decoder behind IOMMU1, in the display engine's group: H.264 decode 120
+    of 120 frames md5-identical to software decode, VE interrupts counted.
+  * Encoder behind IOMMU0, in a group of its own: no encoder interrupt, and
+    "sun60i-a733-iommu 3900000.iommu: L1 page table fault: iova 0xfc203000,
+    masters 0x8, data 0x0" -- master 3, the encoder.
+  * Why, from an LD_PRELOAD shim logging the buffer ioctls: the closed
+    encoder library maps EVERY buffer through the decoder's node -- 16
+    IOCTL_GET_IOMMU_ADDR (0x502) on /dev/cedar_dev, none on
+    /dev/cedar_dev_ve2; e.g. fd 22 -> IOVA 0xfc200000 in IOMMU1's domain.
+    The encoder then uses that IOVA on IOMMU0, whose table does not map it.
+
+The vendor driver writes every global register, TTB included, to both
+blocks (WRITE_EQUAL_REG): one page table for both, and
+the closed user space depends on that one IOVA space. An encoder behind
+IOMMU0 with a table of its own cannot work with it; a translating decoder
+beside an encoder in bypass is worse, the encoder would take IOVAs as
+physical DRAM addresses. The group per instance was this driver's choice,
+not the hardware's: each block walks the table its own TTB names (IOMMU1
+translating while IOMMU0 read TTB 0, 2026-09-18), so two TTBs can name one
+table.
+
+MAINLINE PRECEDENT
+
+  * mtk_iommu.c, SHARE_PGTABLE ("2 HW share pgtable"): device_group hands
+    out one group across instances (m4u_group of the first instance on the
+    shared hw_list), attach writes the one table into each instance's base
+    register at its first attach, a range flush walks every instance of the
+    hw_list.
+  * rockchip-iommu.c: one domain in several register blocks, each
+    invalidation (rk_iommu_zap_iova()) run on every IOMMU the domain is
+    attached to.
+
+WHAT CHANGES
+
+  * device_group: sun60i_iommu_device_group() replaces
+    generic_single_device_group(). One group for the masters of both
+    instances, allocated on first use and held for the life of the driver,
+    as generic_single_device_group() holds its singleton. The core allocates
+    one default domain per group, so the display engine, the decoder and the
+    encoder share one DMA domain: one IOVA space, one table.
+  * attach: the refusal of a domain allocated for a device of the other
+    instance (dom->iommu != iommu -> -EINVAL) is gone. Nothing else in
+    attach changes: an instance's TTB is written and the instance enabled
+    when its first master attaches (sun60i_iommu_hw_enable(): TTB, flush,
+    ENABLE), and it is disabled when its last master leaves.
+  * invalidation: iotlb_sync_map, iotlb_sync and flush_iotlb_all call
+    sun60i_iommu_domain_invalidate(). It runs the flush_all() flush -- +0x030, then
+    +0x18 of every master with a user -- on every instance whose TTB points
+    at the domain, one instance after the other, each under its own lock.
+    Instances are on a driver-wide list: added in probe once their clocks
+    are on and VERSION has answered, before iommu_device_register(), which
+    already attaches their devices; removed only if that fails. Lock order:
+    list lock, then instance lock; no path in the driver takes them the
+    other way round.
+  * dom->iommu keeps one job: its device is the one the tables are
+    DMA-mapped against, for the cache maintenance. Either instance would
+    do: neither node is dma-coherent, both have the 34-bit mask, and the
+    sync cleans the CPU caches to DRAM, which both walkers read.
+  * of_xlate: the "masters on both IOMMUs" refusal stays, per device, with
+    its reason corrected. It said a domain would need two tables; it no
+    longer does. What remains: a device's masters are counted on one
+    instance (client->iommu; the fwspec ids are master numbers within it).
+    The one engine with masters on both is two devices here, as in the
+    vendor DT. Lifting it needs a per-id instance in the client and an
+    attach across two instance locks; this change does not need it.
+
+WHAT STAYS PER INSTANCE, AND WHY -- decided field by field
+
+  * iommu->domain, the table this instance's TTB names: the core moves a
+    group to a new domain one device at a time, so for that moment the two
+    instances serve different domains.
+  * users[] and master_clk[]: per (instance, master), as the hardware is.
+    Attach and detach count on the device's own instance: an attach on
+    IOMMU1 never takes or drops an IOMMU0 master's port gate, and a gate is
+    released once, by the last user of that master.
+  * the lock: it serialises one block's registers.
+  * the interrupt handler: it reads and clears its own INT_STA, L1PG_INT
+    and L2PG_INT, resets only its own masters with a user, and invalidates
+    a faulting IOVA on its own instance. A stale L1PG_INT bit still
+    names a master of the same instance, never one of the other.
+    report_iommu_fault() now goes to the shared domain, with the faulting
+    instance's device.
+  * resume (iommu-sun60i-program-the-block-again-on-resume): unchanged.
+    Each instance programs itself from the domain its own TTB points at --
+    TTB, flush, ENABLE, then its masters with a user -- so both get the same
+    table address.
+
+Moved from the instance to the driver: the group, and the list of instances
+an invalidation runs on.
+
+GATED BLOCKS AND PM
+
+A register access to a gated block stalls the bus, so a flush
+over several instances must not reach one. It does not: an instance joins
+the list after its four clocks are on, the driver never gates them (they are
+CLK_IS_CRITICAL too) and has no runtime PM; per instance the flush writes
++0x030 and the +0x18 of masters with a user, whose port gate is held. An
+instance whose TTB does not point at the domain is not touched. No
+"suspended" state skips instances between suspend_late and resume_early:
+the display engine has no PM callbacks and scans through a system sleep, so
+a skipped flush would leave a stale translation live for it. Reprogramming
+after a state loss stays with resume_early.
+
+STILL REJECTED FROM THE VENDOR MODEL
+
+  * one DT node for both blocks, every global register written to both
+    whether or not it translates: two nodes here, each instance programmed
+    only while it has a master with a user (IOMMU0 without one stays at
+    ENABLE 0, TTB 0);
+  * translation switched from a DT cell with empty attach/detach: attach
+    and identity per master with user counts, BYP per master;
+  * overwriting a live entry: map still returns -EBUSY;
+  * invalidating before clearing, and the range command +0x054: clear, then
+    global flush, then per-master flush, per instance;
+  * one global domain: domain_alloc_paging still returns a fresh domain per
+    call. What is shared is the group, hence the default domain.
+
+WHAT IT COSTS
+
+Isolation. DE0 (IOMMU1 m2) already shared its table with the decoder behind
+IOMMU1; now every IOMMU0 master with "iommus" joins -- today only the
+encoder (arm64-dts-a733-ve-behind-the-iommus). The video engine can reach
+every IOVA mapped for the display engine, and the reverse. The
+vendor user space needs exactly that, and it is still narrower than bypass,
+where the engine reaches all of DRAM. A buffer unmapped through one device
+while a master behind the other instance still uses its IOVA faults on that
+other instance.
+Time. With users on both instances every sync flushes both: two +0x030 and
+one +0x18 per master with a user, each dropping by the first read, about
+3.5 us.
+
+HARDWARE-PROVEN -- the 6 GiB board, 2026-09-26, test kernel 6.18.53-t590b
+(this series with arm64-dts-a733-ve-behind-the-iommus and cedar_ve's 32-bit
+mask behind an IOMMU), arm b:
+  * one iommu_group: 1c0e000.video-codec, 1c10000.video-codec,
+    5100000.mixer, display-engine;
+  * TTB (+0x020) 0x00040508 on both IOMMUs, ENABLE 1 on both; IOMMU0 m3 and
+    IOMMU1 m0/m1/m2 BYP 0 INT_EN 1, every other master BYP 1;
+  * the encoder: +300 interrupts, 299 of 300 frames (the tail loss is separate: it is
+    the same in bypass), and the decoder decodes that stream 299/299
+    md5-identical to software; no fault line from either IOMMU;
+  * decode 120/120 md5-identical on two more streams; an address bent to
+    an unmapped IOVA faults on IOMMU1 (8 lines, master 0), no oops, and the
+    next decode is identical again;
+  * decoder and encoder used and released in turn three times, engines
+    runtime-suspended, 300 display unmaps after each (each flushing both
+    instances): no stall, MBUS_MAT_CLK_GATING 0xF1015803 (bits 12/14 held),
+    both TTBs unchanged.
+Not re-run: a test-only patch (iommu-sun60i-lose-state-across-system-sleep, not carried) on both
+instances. The resume code is unchanged, and s2idle keeps the block's state
+on this board, so the lost state it simulates does not occur here.
+
+FALSIFIER: a fault on IOMMU0 at an IOVA the decoder mapped while both TTBs
+read the same value; the two TTBs differing while both instances have a
+master with a user; decoder and encoder in two iommu_groups.
+
+VERIFIED BEFORE THE BOARD (2026-09-26)
+
+Applies at fuzz 0 in the series: 230 of 230 on a freshly unpacked 6.18.53,
+both test-only IOMMU patches unchanged on top.
+drivers/iommu/sun60i-iommu.o builds for arm64 at W=1 with no warning,
+.config from build.sh configure, test options off and on (A733_TEST_KERNEL=1:
+SUN60I_IOMMU_CMD_SELFTEST=y, SUN60I_IOMMU_PM_SELFTEST=y -- both
+are CONFIG_A733_TEST_INSTRUMENTS); a planted W=1
+warning is reported (cross gcc 16.2.1). checkpatch --strict -f on the
+driver file: 0/0/0. The object carries sun60i_iommu_device_group and
+sun60i_iommu_domain_invalidate. Object only: no Image, no lockdep run.
+
+Not in the unposted v7.3-rc4 version of the driver (see
+iommu-sun60i-add-the-allwinner-a733-iommu-driver): the in-tree driver now
+differs from it by this patch as well.
+
+Assisted-by: Claude
+
+--- a/drivers/iommu/sun60i-iommu.c
++++ b/drivers/iommu/sun60i-iommu.c
+@@ -5,8 +5,10 @@
+  * The A733 has two IOMMU instances. Each has a global register block at
+  * +0x000..+0x3ff, one 0x200-wide block per bus master from +0x400, one
+  * interrupt, and one page table base register shared by all of its masters.
+- * So one DT node is one IOMMU and one iommu group, and the single cell of
+- * "iommus" is the master index within that IOMMU.
++ * One DT node is one IOMMU, and the single cell of "iommus" is the master
++ * index within that IOMMU. The masters of both instances share one iommu
++ * group, so one domain and one page table serve both, and both TTBs point
++ * at that table (see sun60i_iommu_device_group()).
+  *
+  * This is not the generation handled by sun50i-iommu.c: that layout's
+  * ENABLE, BYPASS and TTB registers at 0x20/0x30/0x50 read as zero here, its
+@@ -33,6 +35,8 @@
+ #include <linux/iommu.h>
+ #include <linux/iopoll.h>
+ #include <linux/io.h>
++#include <linux/list.h>
++#include <linux/mutex.h>
+ #include <linux/of.h>
+ #include <linux/of_platform.h>
+ #include <linux/platform_device.h>
+@@ -182,18 +186,33 @@
+ 	 * master whose port is on whenever the IOMMU is (the display engine).
+ 	 */
+ 	struct clk *master_clk[SUN60I_IOMMU_MAX_MASTERS];
++	/* In sun60i_iommu_list. */
++	struct list_head node;
+ };
+ 
+ struct sun60i_iommu_domain {
+ 	struct iommu_domain domain;
+ 	u32 *l1;
+ 	/*
+-	 * The IOMMU of the device the domain was allocated for. Tables of one
+-	 * IOMMU are never handed to the other (attach refuses it).
++	 * The IOMMU of the device the domain was allocated for: its device is
++	 * the one the tables are DMA-mapped against. Both instances walk the
++	 * same tables; neither is DMA-coherent, and both have the same mask.
+ 	 */
+ 	struct sun60i_iommu *iommu;
+ };
+ 
++/*
++ * Every probed instance, for the invalidations of a domain whose table more
++ * than one of them walks. Instances are added before they register and never
++ * removed once registered. Taken before any instance's lock.
++ */
++static LIST_HEAD(sun60i_iommu_list);
++static DEFINE_SPINLOCK(sun60i_iommu_list_lock);
++
++/* The one group of both instances' masters, see sun60i_iommu_device_group(). */
++static struct iommu_group *sun60i_iommu_group;
++static DEFINE_MUTEX(sun60i_iommu_group_lock);
++
+ /* One per client device, dev_iommu_priv. */
+ struct sun60i_iommu_client {
+ 	struct sun60i_iommu *iommu;
+@@ -392,6 +411,30 @@
+ 	sun60i_iommu_flush_all(iommu);
+ }
+ 
++/*
++ * Invalidate [first, last] of @dom on every instance whose TTB points at its
++ * table, i.e. every instance on which a master of the domain has a user,
++ * each in the order above. Nothing else is touched: an instance's own clocks
++ * are on from before it joins the list and never gated, and flush_all()
++ * reaches only the blocks of masters whose port gate is held.
++ */
++static void sun60i_iommu_domain_invalidate(struct sun60i_iommu_domain *dom,
++					   unsigned long first,
++					   unsigned long last)
++{
++	struct sun60i_iommu *iommu;
++	unsigned long flags;
++
++	spin_lock_irqsave(&sun60i_iommu_list_lock, flags);
++	list_for_each_entry(iommu, &sun60i_iommu_list, node) {
++		spin_lock(&iommu->lock);
++		if (iommu->domain == dom)
++			sun60i_iommu_invalidate(iommu, first, last);
++		spin_unlock(&iommu->lock);
++	}
++	spin_unlock_irqrestore(&sun60i_iommu_list_lock, flags);
++}
++
+ /* Enable / disable */
+ 
+ static void sun60i_iommu_hw_enable(struct sun60i_iommu *iommu,
+@@ -623,18 +666,12 @@
+ static int sun60i_iommu_iotlb_sync_map(struct iommu_domain *domain,
+ 				       unsigned long iova, size_t size)
+ {
+-	struct sun60i_iommu_domain *dom = to_sun60i_domain(domain);
+-	struct sun60i_iommu *iommu = dom->iommu;
+-	unsigned long flags;
+-
+ 	if (!size)
+ 		return 0;
+ 
+ 	/* A walk may have cached this range while it was still invalid. */
+-	spin_lock_irqsave(&iommu->lock, flags);
+-	if (iommu->domain == dom)
+-		sun60i_iommu_invalidate(iommu, iova, iova + size - 1);
+-	spin_unlock_irqrestore(&iommu->lock, flags);
++	sun60i_iommu_domain_invalidate(to_sun60i_domain(domain), iova,
++				       iova + size - 1);
+ 
+ 	return 0;
+ }
+@@ -642,29 +679,18 @@
+ static void sun60i_iommu_iotlb_sync(struct iommu_domain *domain,
+ 				    struct iommu_iotlb_gather *gather)
+ {
+-	struct sun60i_iommu_domain *dom = to_sun60i_domain(domain);
+-	struct sun60i_iommu *iommu = dom->iommu;
+-	unsigned long flags;
+-
+ 	if (gather->start > gather->end)
+ 		return;
+ 
+-	spin_lock_irqsave(&iommu->lock, flags);
+-	if (iommu->domain == dom)
+-		sun60i_iommu_invalidate(iommu, gather->start, gather->end);
+-	spin_unlock_irqrestore(&iommu->lock, flags);
++	sun60i_iommu_domain_invalidate(to_sun60i_domain(domain), gather->start,
++				       gather->end);
+ }
+ 
+ static void sun60i_iommu_flush_iotlb_all(struct iommu_domain *domain)
+ {
+-	struct sun60i_iommu_domain *dom = to_sun60i_domain(domain);
+-	struct sun60i_iommu *iommu = dom->iommu;
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&iommu->lock, flags);
+-	if (iommu->domain == dom)
+-		sun60i_iommu_flush_all(iommu);
+-	spin_unlock_irqrestore(&iommu->lock, flags);
++	sun60i_iommu_domain_invalidate(to_sun60i_domain(domain),
++				       domain->geometry.aperture_start,
++				       domain->geometry.aperture_end);
+ }
+ 
+ static phys_addr_t sun60i_iommu_iova_to_phys(struct iommu_domain *domain,
+@@ -756,12 +782,12 @@
+ 
+ 	spin_lock_irqsave(&iommu->lock, flags);
+ 
+-	if (dom->iommu != iommu) {
+-		ret = -EINVAL;
+-		goto out;
+-	}
+-
+ 	/*
++	 * @dom may have been allocated for a device of the other instance:
++	 * both instances walk the one table of their group's domain. This
++	 * instance's TTB points at it from its first master on (below), and
++	 * the user counts and port gates are this instance's own.
++	 *
+ 	 * No master block is read here: attach runs from dma_configure, before
+ 	 * the consumer's probe, with the MBUS port in whatever state it was
+ 	 * left, and a gated port stalls the bus on the first access. The block
+@@ -907,21 +933,54 @@
+ 		client->iommu = iommu;
+ 		dev_iommu_priv_set(dev, client);
+ 	} else if (client->iommu != iommu) {
+-		/* Masters on both IOMMUs would need two tables per domain. */
+-		dev_err(dev, "masters on both IOMMUs are not supported\n");
++		/*
++		 * A domain serves masters of both instances, but a device's
++		 * masters are counted on one: client->iommu, and the ids are
++		 * master numbers within it. The one engine with masters on
++		 * both, the video engine, is two devices: the decoder on
++		 * IOMMU1, the encoder on IOMMU0.
++		 */
++		dev_err(dev, "masters on both IOMMUs in one device are not supported\n");
+ 		return -EINVAL;
+ 	}
+ 
+ 	return iommu_fwspec_add_ids(dev, &id, 1);
+ }
+ 
++/*
++ * One group for the masters of both instances, so that they share one
++ * domain: one IOVA space and one page table, which both TTBs point at
++ * (sun60i_iommu_attach_paging()). The video engine's closed user space maps
++ * every buffer through the decoder's device (IOMMU1) and hands the address
++ * to the encoder (IOMMU0) as well; with a domain per instance the encoder
++ * walks a table that does not map it. The reference taken here is held for
++ * the life of the driver, as generic_single_device_group() holds its
++ * singleton.
++ */
++static struct iommu_group *sun60i_iommu_device_group(struct device *dev)
++{
++	struct iommu_group *group;
++
++	mutex_lock(&sun60i_iommu_group_lock);
++	if (!sun60i_iommu_group) {
++		group = iommu_group_alloc();
++		if (IS_ERR(group))
++			goto out;
++		sun60i_iommu_group = group;
++	}
++	group = iommu_group_ref_get(sun60i_iommu_group);
++out:
++	mutex_unlock(&sun60i_iommu_group_lock);
++	return group;
++}
++
+ static const struct iommu_ops sun60i_iommu_ops = {
+ 	.identity_domain	= &sun60i_iommu_identity_domain,
+ 	.domain_alloc_paging	= sun60i_iommu_domain_alloc_paging,
+ 	.probe_device		= sun60i_iommu_probe_device,
+ 	.release_device		= sun60i_iommu_release_device,
+-	/* One TTB per IOMMU: all devices behind it share a group and a table. */
+-	.device_group		= generic_single_device_group,
++	/* One group, one domain, one table for the masters of both IOMMUs. */
++	.device_group		= sun60i_iommu_device_group,
+ 	.of_xlate		= sun60i_iommu_of_xlate,
+ 	.default_domain_ops = &(const struct iommu_domain_ops) {
+ 		.attach_dev		= sun60i_iommu_attach_paging,
+@@ -1076,6 +1135,7 @@
+ 	struct reset_control *rst;
+ 	unsigned int m;
+ 	struct sun60i_iommu *iommu;
++	unsigned long flags;
+ 	u32 version;
+ 	int irq, ret;
+ 
+@@ -1162,8 +1222,20 @@
+ 	if (ret)
+ 		return ret;
+ 
++	/*
++	 * Listed before it registers: registering attaches the devices behind
++	 * it, and from then on every invalidation of their domain must reach
++	 * this instance too.
++	 */
++	spin_lock_irqsave(&sun60i_iommu_list_lock, flags);
++	list_add_tail(&iommu->node, &sun60i_iommu_list);
++	spin_unlock_irqrestore(&sun60i_iommu_list_lock, flags);
++
+ 	ret = iommu_device_register(&iommu->iommu, &sun60i_iommu_ops, dev);
+ 	if (ret) {
++		spin_lock_irqsave(&sun60i_iommu_list_lock, flags);
++		list_del(&iommu->node);
++		spin_unlock_irqrestore(&sun60i_iommu_list_lock, flags);
+ 		iommu_device_sysfs_remove(&iommu->iommu);
+ 		return ret;
+ 	}
+@@ -1182,7 +1254,9 @@
+  * contents across a suspend. So there is no suspend callback, and resume
+  * programs the block again from that state, exactly as attach does:
+  * sun60i_iommu_hw_enable(), then each master with a user. A block that kept
+- * its state is programmed with the values it already holds.
++ * its state is programmed with the values it already holds. Each instance
++ * does this for itself, from the domain its own TTB points at; with one
++ * domain for both, both get the same table.
+  *
+  * The clocks are not touched on either side. The register interface needs
+  * SYS_MCLK, and an access with it gated stalls the bus; the driver enables it

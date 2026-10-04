@@ -1,0 +1,2414 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] drm: allwinner: A733 display engine -- DRAM into TCON_TV1
+
+[Recipe cut: the debugfs files enable, fill, layer, ccsc and background are
+not carried; the datapath is driven by the KMS master only. What follows on
+configs/a733_defconfig, scripts/ and the checkpatch line count describes the
+development tree this patch was written in.]
+
+The block that reads pixels out of memory. `drm-a733-tcon-tv1-timing-generator-and-video-source` gave this SoC a raster and
+`drm-a733-dp-the-main-video-stream` gave it a DisplayPort stream, and the picture on the monitor today comes
+out of TCON_TV1's own VDBIST pattern generator with no framebuffer anywhere in
+the path. TV_SRC_CTL_REG bit 0 has exactly two settings --
+the DE provides the data source (0), or the VDBIST test-pattern generator
+does (1) -- so this patch writes the other source.
+
+WHAT IT DOES, AND WHAT IT LEAVES AT RESET
+------------------------------------------
+
+One display pipe, one VI channel, one layer, XRGB8888, the 1920x1200 mode in
+sun60i-display.h that the TCON and the transmitter already share. The driver
+allocates its own DMA-coherent framebuffer and paints it, so the fetch path is
+provable with no KMS device above it -- the same shape `drm-a733-tcon-tv1-timing-generator-and-video-source` used to prove a
+TCON before there was a CRTC to hang it on. Enable, fill, background and a
+register dump are debugfs files; nothing happens at bind.
+
+Left at reset DELIBERATELY, and named so nobody wonders whether they were
+overlooked: scaling (beyond bypass), colour management, the 17x17x17 LUT,
+HDR/cdc tone mapping, smart backlight, dynamic gamma and de-banding, AFBC/TFBD
+compressed sources, write-back, offline composition, online rotation, 10-bit
+and YUV paths, the other six channels, the other three layers of this channel,
+and the second display output. The capture measures why that is cheap: of
+29 233 non-zero words on a live link, 26 315 (90 %) sit on 31 pages that are
+essentially solid coefficient and LUT data. ELEVEN REGISTERS CARRY THE
+FRAMEBUFFER -- six on the channel, five on the blender -- and ten of the eleven
+are computed from the mode. Same shape as the TCON result: fifteen registers
+behind a working link.
+
+THE MANUAL DOES NOT DOCUMENT THIS BLOCK
+----------------------------------------
+
+A733 UM V0.92 chapter 14.3 "Display Engine" is two pages of prose.
+No register list, no offset table, no field table.
+Measured over the whole 2.7 MB UM extract and re-counted independently:
+
+  GLB_CTL   0 hits      blender / Blender   0 hits
+  BLD_      0 hits      RCQ                 0 hits (the queue appears as ONE
+  OVL_      0 hits                            feature bullet)
+  mixer     1 hit, and it is in 14.5 describing G2D's input geometry
+
+Compare TCON_TV, which gets its own register chapter with per-bit field tables
+(15.2.10), or eDP (15.4.7). The DE gets neither, which is a known gap in the
+manual.
+
+SO NO DE REGISTER IN THIS PATCH CARRIES A MANUAL REFERENCE, and asking for one is asking
+for a fabrication. The evidence floor here is one level lower than anywhere
+else in this tree: a live capture, plus mainline's own model of this DE
+generation. Every value says which of three things it is.
+
+WHAT IS COMPUTED, WHAT IS CARRIED, WHAT IS INFERRED
+----------------------------------------------------
+
+  COMPUTED  derived from the mode or the framebuffer -- arithmetic, and the
+            live link agrees with the result
+  CARRIED   copied off a working link and NOT understood
+  INFERRED  the name and meaning come from code (mainline's DE33 model, or the
+            out-of-tree A523/T527 v35x series) and the live A733 capture then
+            confirms the value at that offset
+
+| register                  | value      | tag      | evidence                 |
+|---------------------------|------------|----------|--------------------------|
+| de_top VERSION (read)     | 0x03520100 | -        | SILICON the 8 GiB board 08-18+08-19 |
+| de_top DE2TCON_MUX        | 0x0000fff5 | CARRIED  | SILICON; nibble 5 has no |
+|                           |            |          | known meaning -- below   |
+| mixer0 GLOBAL_CTL         | BIT(0)     | INFERRED | mainline RT_EN; silicon  |
+| mixer0 GLOBAL_SIZE        | 0x04af077f | COMPUTED | ((h-1)<<16)|(w-1)        |
+| mixer0 GLOBAL_CLK         | 1          | INFERRED | mainline DE33-only reg   |
+| mixer0 RCQ_HEAD_LEN/ADDR  | 0          | COMPUTED | we are the only writer   |
+| vi0 LAY0_ATTCTL           | 0xff008403 | COMPUTED | every field from the fmt |
+| vi0 LAY0_MBSIZE           | 0x04af077f | COMPUTED | the mode                 |
+| vi0 LAY0_MBCOOR           | 0          | COMPUTED | origin                   |
+| vi0 LAY0_PITCH0           | 0x00001e00 | COMPUTED | 1920 x 4 = 7680          |
+| vi0 LAY0_PITCH1/2, LADDR1/2| 0         | COMPUTED | packed RGB has one plane |
+| vi0 LAY0_TOP_LADDR0       | allocation | COMPUTED | the framebuffer          |
+| vi0 OVL_SIZE              | 0x04af077f | COMPUTED | the mode                 |
+| bld PIPE_CTL              | 0x00000101 | COMPUTED | EN(0) | FC_EN(0)         |
+| bld FCOLOR0               | 0xff000000 | COMPUTED | AARRGGBB opaque black    |
+| bld INSIZE0 / COORD0      | mode / 0   | COMPUTED | full screen at origin    |
+| bld ROUTE                 | 0          | COMPUTED | pipe 0 <- channel 0      |
+| bld PREMULTIPLY           | 0          | COMPUTED | XRGB has no alpha        |
+| bld BKCOLOR               | 0xff000000 | COMPUTED | mainline's init value    |
+| bld OUTSIZE               | 0x04af077f | COMPUTED | the mode                 |
+| bld BLEND_MODE0           | 0x03010301 | CARRIED  | mainline's own comment   |
+|                           |            |          | is "some still unknown   |
+|                           |            |          | magic numbers"           |
+| vi0 CCSC_CTL x8           | 1          | CARRIED  | SILICON -- see the traps |
+| vi0 VSU_CTL, OUT_SIZE     | 0          | CARRIED  | SILICON -- see the traps |
+| vi0 TFBD                  | NOT WRITTEN| -        | read and reported        |
+
+The four blender instances at a 0x400 stride are ALL written identically, and
+that is CARRIED: the UM lists two display outputs, so "one per lit
+output" is not what four register files are, and the live link holds all four
+identical on a board with exactly one pipe up. A working link's demonstrated
+state, not a theory about what the other three are for.
+
+THE ONE THING NOT UNDERSTOOD IN THE CONTROL PLANE. DE2TCON_MUX's disp0 nibble
+is 5. This SoC has four TCONs (LCD0, LCD1, TV0, TV1), so a
+plain index would make TCON_TV1 = 3. Two readings survive: a global index in a
+numbering space wider than this part populates, or an enable bit plus an index
+([3:1] = 2 with bit 0 set). This patch writes the word a working link carries
+and says it does not know why it is that word. Falsified by: writing 0x0000fff3
+or 0x0000ffff on a live link and watching the screen -- one command, and it
+settles the encoding.
+
+ON THE BOARD: THE GATE FIX WORKS, AND THE SCREEN IS BLACK FOR A DIFFERENT REASON
+------------------------------------------------------------------------------
+
+✅ ONE `echo 1 > enable`, NOTHING TYPED AFTER IT, and the whole datapath is
+programmed by the driver: the three de_top enables read 0x00010001 / 0x00010001
+/ 0x00000011, the layer reads ATTCTL 0xff008403, MBSIZE and OVL_SIZE 0x04af077f,
+PITCH 0x00001e00, LADDR0 0xfe400000, and the blender reads PIPE_CTL 0x00000101,
+FCOLOR0 0xff000000, INSIZE0 and OUTSIZE 0x04af077f. No "NOT OPEN" error. The
+aperture fix and sun60i_de_verify() both did their job.
+
+🔴 AND THE SCREEN IS BLACK. TCON source handed over (TV_SRC_CTL = 0x00000000),
+TCON SCANNING to 1234 of VTOTAL 1235, underflow AND lostwarn both clear during
+the window, framebuffer verified red by reading DRAM back
+(0xFE400000 = 0x00FF0000), scanout address unchanged, monitor receiving signal
+and not in standby. `bld0 ROUTE` written by hand to 0x00543210: no change.
+`layer` toggled: no change. Module clock moved DEPLL3X 696 MHz -> PERI0_480M
+480 MHz: no change. And all ~21 registers logged from the run that DID produce a
+picture are bit-identical -- so the difference is outside what that log covered.
+
+🔴 THE DERIVED CANDIDATE, AND THIS PATCH IMPLEMENTS IT: THE CCSC MATRIX
+------------------------------------------------------------------------
+
+A systematic diff against the vendor's live link -- 74 registers read at exactly
+the addresses its capture holds non-zero in the pixel-path blocks --
+shows the vendor setting
+24 words we leave at zero: three per CCSC instance, at +0x10, +0x24 and +0x38,
+all reading 0x00020000, in all eight instances.
+
+THOSE THREE OFFSETS ARE THE DIAGONAL OF A 3x3 MATRIX. Under a 3-row x 4-word
+row-major layout -- three coefficients and one constant per row, rows on a 0x10
+stride from +0x10 -- they are exactly c00, c11 and c22:
+
+    c00 = 0x10 + 0*0x10 + 0*4 = +0x10   ✓ non-zero in the capture
+    c11 = 0x10 + 1*0x10 + 1*4 = +0x24   ✓ non-zero in the capture
+    c22 = 0x10 + 2*0x10 + 2*4 = +0x38   ✓ non-zero in the capture
+
+...and the NINE off-diagonal words that layout predicts are all zero in the same
+capture. Three hits out of three with nine matching zeros, on a block whose name
+says a 3x3 matrix is what it holds. That is a UNITY MATRIX and 0x00020000 is its
+"1". The page's word count agrees independently: 32 non-zero words on 0x100000 =
+8 x (1 control + 3 diagonal).
+
+WHY IT EXPLAINS THIS BLACK SCREEN AND THE OTHER CANDIDATES DO NOT. This driver
+wrote CCSC_CTL = 1 -- ENABLING the block -- and left the matrix at its cold
+reset value, which is zero. AN ENABLED COLOUR-SPACE CONVERTER WITH AN ALL-ZERO
+MATRIX OUTPUTS ZERO FOR EVERY PIXEL. Every symptom follows: data still flows, so
+the TCON never underflows and never sets lostwarn; the layer, blender, sizes and
+scanout address all read back correct; the framebuffer really does contain red;
+and no clock change can help, because the pixels are being multiplied by zero.
+
+⚠ AND IT RETIRES THE ARGUMENT THAT PUT THE 1 THERE. This patch reasoned that
+eight instances reading 1 on the vendor's link made 1 the RESET DEFAULT. The
+vendor also writes 24 coefficient words, so it CONFIGURES this block rather than
+leaving it alone -- which makes 1 the vendor's value, not the reset, and makes
+the A523/T527 series' ctl = 0 the more likely of the two readings after all.
+
+SO BOTH ARE REACHABLE FROM debugfs `ccsc`, and one board session separates them
+instead of two: 1 (the default) writes the vendor's configuration, enabled with
+the unity matrix; 0 disables the block the way the prior art does. The three
+coefficients are in `state`. HYPOTHESIS, NOT PROOF -- nothing here has been on a
+board.
+
+⬜ AND THE REST OF THE DIFF IS ANALYSED, NOT GUESSED AT, AS FOLLOWS: one entry
+struck (0x05008104 is mainline's read-only GLOBAL_STATUS -- a symptom, never a
+cause, and not writable), two entries needing a read-twice test before they are
+compared once (0x05008098 looks like a counter, not a configuration), and the
+remaining four ranked into a bisect order. ⚠ NOTHING IN THAT LIST IS PROVEN TO
+MATTER: all 30 deltas were applied in one batch, the board wedged, and the
+attribution was lost. This patch therefore changes exactly ONE thing, so the
+next run is a single-variable test.
+
+✅ EARLIER THE SAME DAY, THIS PUT PIXELS FROM DRAM ON THE SCREEN
+----------------------------------------------------------------
+
+Run on the 8 GiB board in ONE kernel with `clk-sunxi-ng-a733-display-engine-clock-gate-reset` and `arm64-dts-a733-display-engine-node-and-de-to-tcon-edge`, test build dp567, 2026-08-19,
+with the three de_top enables supplied BY HAND -- which is what the run above
+then automated, and what makes the black screen there a different fault rather
+than a regression.
+
+WHAT WAS PROVEN, in the order this header asks for it. The observer first: the
+TCON's own VDBIST colour bars confirmed on the monitor by eye. Then the DE made
+the source, and the screen showed this driver's framebuffer. Then the test that
+separates "a picture" from "OUR picture":
+
+    echo 0x0000FF00 > fill    ->  THE SCREEN TURNED GREEN
+                                  with LAY0_TOP_LADDR0 UNCHANGED at 0xFE400000
+                                  and NO register touched at all
+
+Only DRAM content changed. That is the strongest form available: the DE is
+fetching this driver's buffer, at this driver's address, in this driver's
+format. Final state, both sticky TCON latches clean, verdict SCANNING -- swept
+to 1233 of VTOTAL 1235 over 4 wraps, underflow 0 before and during, lostwarn 0
+before and during.
+
+FOUR THINGS THIS SETTLES THAT WERE OPEN IN THIS FILE THIS MORNING:
+
+  - the DIRECT-MMIO COMMIT PATH WORKS ON A COLD DE, which is the limit the
+    warm-vendor measurement could not reach. `layer` is what settled it. The RCQ
+    stays unnecessary, and the commit indirection stays only for the narrower
+    reason that one register is not every register.
+  - THE IOMMU RISK DID NOT MATERIALISE. LAY0_TOP_LADDR0 = 0xFE400000 is a plain
+    physical address from dma_alloc_coherent() and the DE fetched it. On our
+    kernel the IOMMU is not translating for this master. The vendor's 0xFC000000
+    is still an IOVA and still not comparable -- that section stands.
+  - THE CLOCK POSTURE IS RIGHT. de0 came up at 480000000 Hz from pll-peri0-480m
+    (`arm64-dts-a733-display-engine-node-and-de-to-tcon-edge`'s pinning), bus-de0 at 200000000 Hz, both enabled; the floor check
+    passed and the DE supplied 1920x1200 at 154 MHz with ZERO underflows. Being
+    written for neither parent was the correct call.
+  - THE MODE, THE FORMAT AND THE BLENDER CONSTANTS ARE RIGHT AS WRITTEN:
+    ATTCTL 0xFF008403, MBSIZE/OVL_SIZE/INSIZE0/OUTSIZE 0x04AF077F, PITCH
+    0x00001E00, PIPE_CTL 0x101, FCOLOR0 0xFF000000, BLEND_MODE0 0x03010301,
+    DE2TCON_MUX 0x0000FFF5, VERSION 0x03520100, RCQ_HEAD_LEN 0x00000000.
+
+🔴 THE DEFECT: THREE de_top WORDS OPEN THE APERTURE, AND THIS DRIVER LEFT THEM
+------------------------------------------------------------------------------
+
+    0x05008000 = 0x00010001     first cut wrote nothing -- left 0x00000000
+    0x05008004 = 0x00010001     first cut wrote nothing -- left 0x00000000
+    0x05008008 = 0x00000011     first cut wrote nothing -- left 0x00000000
+
+Without them the channel window at 0x0510xxxx and the blender at 0x0528xxxx DO
+NOT ACCEPT A WRITE AT ALL. Not "fail to latch" -- they read back zero exactly
+like unmapped space, while de_top at 0x05008xxx answers normally. Proven
+causally at the register level with this driver out of the picture entirely,
+by raw devmem:
+
+    before:  devmem 0x05101000 32 0xFF008403 ; devmem 0x05101000 -> 0x00000000
+             (0x05200000, genuinely unmapped, also reads 0x00000000)
+    after the three writes:
+             devmem 0x05101000 32 0xFF008403 ; devmem 0x05101000 -> 0xFF008403
+             devmem 0x05281000 32 0x00000101 ; devmem 0x05281000 -> 0x00000101
+
+HOW THIS PATCH GOT IT WRONG, because the shape of the mistake is the reusable
+part. An earlier analysis of the vendor capture listed all three as UNKNOWN,
+and this driver read UNKNOWN as "leave at reset". But that same analysis shows them
+NON-ZERO ON A WORKING LINK -- which is exactly the evidence that somebody writes
+them. A word a live link holds and a cold block does not is a WRITE, not a
+mystery, and "not understood" is not a reason to omit it; it is a reason to
+carry it and say so. All three are now written and tagged CARRIED, with the bit
+shape (0x00010001 is this SoC's de-assert-reset + gate pattern) as the only
+INFERRED part.
+
+⚠ AND THE SECOND, ORDERING HALF OF THE SAME DEFECT -- STATED AS AN INVARIANT,
+because the next person to touch this driver's reset needs the rule and not the
+anecdote:
+
+    RE-APPLY AFTER EVERY reset_control_deassert(), BEFORE ANY DATAPATH WRITE.
+
+Two of the three are the DE's INNER reset+gate registers, and RST_BUS_DE0
+(DE0_BGR bit 16, this node's own reset) CLEARS THEM along with everything else
+inside the block. Measured: after an `enable 0` / `enable 1` cycle they read
+0x00000000 again, because sun60i_de_clocks_off() asserts exactly that reset. So
+they are not a probe-time one-shot and sun60i_de_top_open() MUST NOT be moved to
+probe or to anywhere else that runs once. Anything that touches this driver's
+reset owns re-running it afterwards.
+
+Supplied by hand AFTER enable on the board they let `layer` program the channel
+while the blender stayed at zero, because enable had already written it into a
+closed window -- which is the same rule seen from the failing side.
+
+⚠ THE FAILURE WAS SILENT, AND THAT IS NOW FIXED SEPARATELY FROM THE CAUSE. The
+first cut printed "scanning 1920x1200 XRGB8888 from ..." beside a `state` dump
+that was an honest column of zeros: a statement of intent next to the evidence
+against it. Two changes, and both outlive this bug:
+
+  - sun60i_de_verify() reads back ONE register per datapath window after the
+    commit and REFUSES rather than announcing success. Its two outcomes are
+    different faults and it says which: reading zero means the window is not
+    open, and it prints 0x05008000 / 0x05008004 / 0x05008008 with their expected
+    values; reading something else means the window is open but did not take the
+    write, which is the shadow the RCQ exists for and is not a content problem.
+  - `state` now lists the three ENABLE words FIRST, with their wanted values, so
+    a zero is visible next to everything it explains.
+
+⬜ ONE OBSERVATION NOT TURNED INTO A CHANGE. The board's final state carries
+bld0 ROUTE = 0x00543210 where this driver writes 0. Whether that is the cold
+reset value or one of the hand writes that completed the blender is NOT
+established, so nothing is concluded from it. Both encode pipe 0 <- channel 0 in
+the only nibble that is read while one pipe is enabled, and 0 is what the
+vendor's live link carries. Falsified by: a picture that needs the identity
+value.
+
+THE QUESTION THAT SHAPED THIS DRIVER -- MEASURED, AND THE METHOD IS THE FINDING
+-------------------------------------------------------------------------------
+
+The v35x DE has a register command queue: a DMA engine that walks 16-byte
+descriptors in DRAM and copies register blocks into the DE on each frame-start
+pulse from the bound TCON. The vendor's live link has one ARMED -- head array
+at DRAM 0xffff3fc0, RCQ_HEAD_LEN 0x760 = 118 x 16 exactly, and that the length
+divides by the descriptor size to an integer is what turns "a plausible pointer
+and a plausible length" into a structure. The A523/T527 series for this same DE
+version states flatly that the datapath latches ONLY through that queue and
+that plain CPU stores land in a shadow which never latches. If that held here,
+every datapath register above would be the right CONTENT delivered the wrong
+WAY, and this patch would be a DMA pool and a descriptor discipline instead.
+
+IT DOES NOT HOLD. Measured on the 8 GiB board on 2026-08-19, on a fresh vendor boot with
+the vendor's driver resident and its DE live -- IN THIS ORDER:
+
+  0. THE OBSERVER PROVEN FIRST: the monitor confirmed BY EYE to be showing the
+     console shell. Not assumed, established before any write.
+  1. devmem 0x05101018 32 0xFC400000   (+4 MiB) -- the register holds, and the
+     SCREEN GOES BLACK, monitor still on and NOT in standby.
+  2. devmem 0x05101018 32 0xFC000000   -- THE SHELL COMES BACK.
+
+Three states on one register, the return leg included, with the observer's
+state established up front. A PLAIN MMIO WRITE TO THE VI LAYER'S SCANOUT
+ADDRESS REACHES THE DATAPATH, and the RCQ is not mandatory for it.
+
+⚠ STEP 0 IS NOT CEREMONY -- IT IS THE ENTIRE DIFFERENCE BETWEEN A RESULT AND A
+COINCIDENCE, AND THIS PROJECT PAID FOR THAT LESSON. A first run of exactly
+this sequence produced exactly this outcome and was WITHDRAWN, because nobody
+had established that the person watching had the monitor switched on. A black
+screen from a monitor that is off is indistinguishable from a black screen the
+write caused. Same commands, same answer, and only the second run is evidence.
+Nothing was salvaged from the first; it was deleted and redone.
+
+That discipline is carried into the acceptance sequence below rather than left
+as a moral: step 6 (`fill`) writes a colour into the framebuffer and touches NO
+register, so it proves the observer AND the fetch path in one command -- and it
+runs BEFORE step 7 moves a register. The two must never be done in the other
+order.
+
+TWO LIMITS SURVIVE THE RESULT, and they are why the commit path stays an
+indirection rather than being inlined:
+
+  1. it proves the VI LAYER'S SCANOUT ADDRESS latches. It does not prove every
+     DE register does. If some other block's write appears not to take effect,
+     the RCQ is back on the table FOR THAT BLOCK.
+  2. the write was made while the VENDOR DRIVER held the device -- queue armed,
+     datapath already loaded. A COLD-PROGRAMMED DE, whose queue was never armed,
+     is what this patch produces and it is untested. ⬜ ITS FALSIFIER, and it is
+     step 7 of the acceptance run: all eleven registers written, every one
+     reading back correctly, screen black.
+
+THE COMMIT ABSTRACTION, AND WHAT THE OTHER IMPLEMENTATION WOULD COST
+---------------------------------------------------------------------
+
+struct sun60i_de_commit is three ops -- begin, stage, arm -- and direct MMIO is
+the REAL implementation, not a placeholder. The split it draws is not this
+driver's invention: de_top and the mixer top latch directly under every reading
+of this hardware, and the blender and the channel are the ones the queue exists
+for. So the control plane is plain writel() and only the datapath goes through
+the ops. An RCQ backend would stage (offset, value) pairs into a coherent block,
+build a head array, and arm the queue in arm() -- and not one register value in
+this file would move.
+
+WHAT THAT WOULD COST, from the prior art's own history rather than a guess: its
+first cut of sun55i_de.c is ~39 KB and is followed by roughly 200 KB of patches
+whose titles are almost entirely RCQ failure modes -- page-flip tearing with
+the queue armed, full reload after modeset, a pool out of low CMA, holding old
+framebuffers until the arm, block retry with two arms per stage, closing the
+races with the arm, channel quiesce before stopping, fixing wedge. The register
+content is the easy half; the commit machinery is where the difficulty is.
+This patch pays none of it, because MMIO is measured to reach the datapath --
+and it stays built so that if some block turns out to need the queue after all,
+that costs one backend and no register value.
+
+The driver also DISARMS the queue before touching the datapath -- length to
+zero first, so no walk can start from a valid length and a half-written
+pointer. On a cold DE those are four no-op stores. They are there for the path
+that is not intended: an RCQ left armed by a bootloader or a previous kernel
+would reload the datapath from stale DRAM once per frame, silently.
+
+🔴 THE VENDOR RUNS THIS PATH THROUGH AN IOMMU, AND WE DO NOT
+-------------------------------------------------------------
+
+The second way this driver can produce a black screen with every register
+reading back perfectly, and it has nothing to do with the register set.
+
+MEASURED on the 8 GiB board on 2026-08-19 with the DE live: 5000000.de sits in
+iommu_group 0 alongside the VE and the deinterlacer; sunxi-iommu-v2 at
+3900000.iommu comes up with "Default domain type: Translated" and a strict TLB
+invalidation policy; and the vendor DT gives de@5000000
+`iommus = <&iommu 8 1>` -- MASTER ID 8.
+
+THE PROOF THAT IT IS A TRANSLATION AND NOT AN IDENTITY MAP is direct, and it is
+the reason this section exists rather than being a note: 0x05101018 reads
+0xFC000000 with a picture on the screen, and a PHYSICAL read at 0xFC000000
+returns 0x005E0001 / 0xFE40FB00 / 0x005E0001 at +0/+4/+0x1000 -- structured
+data, not pixels. System RAM is 0x40000000-0x23FFFFFFF, so the address is in
+range; it simply is not where the framebuffer physically lives.
+
+THREE CONSEQUENCES.
+
+  1. ⛔ SCANOUT ADDRESSES IN A VENDOR CAPTURE ARE NOT COMPARABLE TO OURS. Every
+     other register in this patch can be diffed against that capture. This one
+     cannot: 0xFC000000 there is an IOVA, and whatever this driver programs is
+     not. Anyone "fixing" a mismatch in SRC_DMA_ADDR against the capture is
+     chasing a difference that is supposed to be there.
+
+  2. ⚠ OUR TREE HAS NO IOMMU SUPPORT AT ALL. No patch mentions one, no DT node
+     exists, no `iommus` property is anywhere in it -- so on our kernel the DE's
+     address reaches the bus UNTRANSLATED. THAT IS CORRECT IF AND ONLY IF THE
+     IOMMU IS GENUINELY IN BYPASS OR OFF FOR US, AND NOTHING HAS VERIFIED THAT.
+     It is named here as the risk it is, not assumed away. If the IOMMU comes up
+     translating with no mapping for master 8, the DE fetches from nowhere.
+     Mainline 6.18.36 does ship drivers/iommu/sun50i-iommu.c; whether it matches
+     this SoC's sunxi-iommu-v2 is UNVERIFIED and this patch assumes neither way.
+
+  3. ✅ THE DRIVER IS ALREADY WRITTEN FOR EITHER WORLD, and that is why it uses
+     the DMA API rather than a hand-computed address. dma_alloc_coherent() hands
+     back a dma_addr_t, which is a physical address today and becomes an IOVA
+     automatically on the day an IOMMU node and an `iommus` property exist --
+     with NO change in this file. A hand-rolled physical address would be
+     silently wrong on that day.
+
+     And it does not merely assume which world it is in: it asks
+     device_iommu_mapped() and SAYS, at enable and in `state`:
+
+       scanout buffer at 0x........ -- a physical address, no IOMMU is attached
+       scanout buffer at 0x........ -- an IOVA, this device is behind an IOMMU
+
+     One line, and it turns "we think the IOMMU is off" into a recorded fact of
+     the board session.
+
+⛔ WHAT THIS PATCH DOES **NOT** ASK THE DEVICE TREE FOR: an `iommus` property.
+Adding one speculatively is worse than leaving it out -- a phandle to an IOMMU
+node with no driver bound leaves this device deferring forever, and the symptom
+is a driver that never probes. It arrives together with a VERIFIED IOMMU driver
+for this SoC or not at all. If that day comes, this driver needs no change; the
+DMA API does it.
+
+Mainline 6.18.36 already models this display-engine generation:
+SUN8I_MIXER_DE33 in drivers/gpu/drm/sun4i/sun8i_mixer.h:157-161, compatible
+"allwinner,sun50i-h616-de33-mixer-0" at sun8i_mixer.c:859, with the channel
+formula map[channel] * 0x20000 + 0x1000. Our silicon decodes under it register
+for register, including mainline's own unexplained 0x03010301. What this patch
+takes from it is the DECODING KEY -- field layouts, bit positions, the size
+macro, the format number -- re-derived against our capture and credited above,
+value by value. Not one line of code is copied and no mainline file is touched.
+
+The intended direction is for the DE to eventually
+join sun4i-drm as a sunxi_engine backend, and that stands. This
+patch does not do it yet, for reasons that are about testability rather than
+taste:
+
+  - sun4i_drv.c is a component master driven by a display-engine node with
+    allwinner,pipelines, and sun4i_tcon_bind() returns -EPROBE_DEFER without a
+    matching mixer AND display-engine (sun4i_tcon.c:1121-1125). So the smallest
+    working unit there is the whole KMS stack: CRTC, encoder, connector, DP
+    bridge and fbdev at once. If it did not light up, nothing would say whether
+    the eleven registers were wrong or the plumbing was.
+  - sun4i_crtc_init() takes a struct sun4i_tcon *, so reusing that CRTC means
+    either folding `drm-a733-tcon-tv1-timing-generator-and-video-source` into sun4i_tcon.c -- throwing away a HW proof to win a
+    quirk fight over TV_BASIC1, BASIC0, a second reg window and a closed schema
+    -- or refactoring shared mainline code that seven other SoCs use, where we
+    cannot see a regression.
+  - sun8i_mixer_cfg.map[] is sized 6 and a full A733 needs 7.
+  - the device tree for any of that belongs to a separate patch.
+
+So: prove the register set first, in isolation, with a driver shaped like the
+one that proved the TCON. The move into sun4i-drm is then a change of frame
+around a known-good register set, not a change of frame AND an unknown register
+set at the same time. ⓘ Revisit as soon as this is HW-proven -- that is the
+right moment for that move.
+
+THE TWO TRAPS THE REGISTER MAP RECORDS, AND WHAT THIS DRIVER DOES WITH THEM
+----------------------------------------------------------------------------
+
+Neither is ignored and neither is guessed at. All three words are READ on a
+cold DE before anything is written and reported by debugfs `state`, which is
+also the first instalment of the DE reset-state dump this tree does not have.
+
+1. THE PER-CHANNEL SCALER (VSU, slot + 0x4000) is not a "leave it" item. The
+   prior art reports the v35x channel datapath as ALWAYS overlay -> VSU ->
+   blender with no bypass, and that after power-gating and re-ungating the DE
+   the filter-coefficient SRAM powers up holding RANDOM data; its stated reason
+   the vendor never hits this is that Android never power-gates the DE. Our
+   capture cannot settle it, because the vendor stack never power-gated it
+   either -- and this driver does, on every enable.
+   WHAT IT DOES: writes VSU_CTL = 0, which is what a working link carries, and
+   does NOT invent a unity coefficient table. The VSU register map is prior art
+   only, unconfirmed at this offset on this part, and writing dozens of
+   unverified words into a block in the fetch path is the guess this tree does
+   not make.
+   FALSIFIED BY: a picture that is present but visibly corrupt -- the series
+   describes it collapsing to a repeated column. That reading turns a
+   six-register channel setup into one that also loads coefficients.
+
+2. THE CHANNEL CSC (slot + 0x800) reads 0x00000001 -- enabled -- in eight
+   instances at a 0x100 stride, on a board where exactly ONE layer of ONE
+   channel was fetching. That eight-of-eight pattern is the argument that 1 is
+   this block's reset default rather than a vendor configuration.
+   WHAT IT DOES: writes 1, the value a link with correct colour carries. The
+   A523 series writes 0 here for a linear-RGB layer; that is code, on a
+   different part, and it disagrees with our own silicon on this part. Silicon
+   beats code.
+   FALSIFIED BY: wrong colour -- channels swapped or washed out -- and `state`'s
+   cold CCSC line then says which way to go. The fix is one line.
+
+3. THE TILED-FRAMEBUFFER DECODER (TFBD, slot + 0x5400) reads 0x00002103 in four
+   instances at a 0x100 stride -- and it reads that on SLOT 6, a channel that
+   was fetching nothing, which is the argument that it is an idle value and not
+   a configuration.
+   WHAT IT DOES: reads and reports it, and does not write it. The series warns
+   that a stale TFBD "mangles the fetch" and clears it, but its register map is
+   unconfirmed here and our framebuffer is linear -- and zeroing an unknown
+   block in the fetch path to satisfy a comment about another part is exactly
+   the defect class of trusting another SoC's register map.
+   FALSIFIED BY: a fetch that produces tiled or garbage output while every
+   register reads back correctly.
+
+TWO REGISTERS ARE WRITTEN THAT THE LIVE LINK LEAVES AT ZERO, and both are
+departures this patch owns rather than discovers later. PREMULTIPLY = 0 is the
+value either way and is written so a bootloader cannot leave it set for a
+format with no alpha. BKCOLOR = opaque black is what mainline initialises and
+the vendor does not; it is invisible behind a full-screen opaque layer, which
+is exactly why the vendor can do without writing it, and it is the first thing
+that shows the moment a plane is smaller than the screen -- the out-of-tree
+series added a patch titled "black blender background" for that reason.
+
+ONE REGISTER IS DELIBERATELY NOT WRITTEN where mainline would. BLD_OUTCTL, at
++0xfc, is mainline's interlace bit -- but the A523 block map puts +0xa0..+0xff
+in the colour-key region, not the control region, so the two candidate names
+conflict and our capture cannot choose: it reads zero, which is correct under
+both. This mode is progressive, so nothing needs it, and a write into a
+register whose identity is contested is not made.
+
+WHERE THE PRIOR ART DIFFERS, AND WHAT THIS DRIVER DOES INSTEAD
+-------------------------------------------------------------
+
+Two bodies of code are in scope and neither is ported --
+both are decoding keys -- so this is what would have come across had they been.
+
+| the A523/T527 v35x series | ours |
+|---|---|
+| reuses mainline's H616 channel map {0, 6, 7, 8} unchanged for a part it does not describe | slots {0,1,2,6,7,8,9} measured on OUR silicon: seven scaler pages on an exact 0x20000 stride, against the UM's own seven blending channels. Three VI, four UI |
+| puts the layer address at +0x10, because it drives a UI channel | +0x18, because slot 0 is a VI channel with three plane pitches and three plane addresses. Mixing the two silently points the scanout at what is a FILL COLOUR register in the other layout -- both maps are internally consistent, which is what makes it dangerous |
+| writes the channel CSC control to 0 for a linear-RGB layer | 1, which is what A733 silicon carries while producing correct colour, with the cold value reported so the first run says whether 1 was even a change |
+| clears TFBD unconditionally on a register map it hardcodes for another SoC | read and reported; the block is not written on evidence we do not have |
+| its first cut is followed by ~200 KB of RCQ failure-mode fixes | not paid, because MMIO is measured to reach the datapath here -- with the observer proven first, which is why that measurement stands. The seam that would let us pay it for one block is three function pointers |
+
+| the vendor DRM (191 026 LOC, ~21 % hardware-essential) | ours |
+|---|---|
+| DRM_SUNXI_PQ_PROC: a custom tuning ioctl | no custom ioctl. Tuning is a property, a debugfs file, or it does not exist |
+| cdc (HDR tone mapping, 55 617 LOC), smbl (smart backlight, 25 083) and an unbuilt panic screen with a bitmap font (17 560): 98 260 lines, 51 % of the tree, none of which this driver needs | none of it |
+| 757 KB of PQ tuning tables in .data against 487 KB of .text for all executable code | no tables |
+| needs .atomic_precheck, a drm_plane_helper_funcs hook that does not exist upstream | no core patch; the same checks fit in the existing atomic_check callback |
+| its port notes claim DRM_OBJECT_MAX_PROPERTY must go 24 -> 64 | already 64 in 6.18.36 (drm_mode_object.h:63). Nothing to port |
+
+AND WHERE THE COMPARISON IS NOT EARNED, PLAINLY: the A523 series has a page
+flip, vblank, plane state, scaler coefficients, format conversion and a working
+KMS device. This patch has none of those. It is one static layer brought up
+from debugfs. Its advantage over that series is the evidence per value and the
+measurement that removes the RCQ from the critical path -- not coverage.
+
+THE DEVICE TREE THIS CONSUMES -- AND IT IS ANOTHER PATCH'S NODE, UNCHANGED
+---------------------------------------------------------------------------
+
+The DE clocks and the DE node come from separate patches in this series (``clk-sunxi-ng-a733-display-engine-clock-gate-reset``/``arm64-dts-a733-display-engine-node-and-de-to-tcon-edge``), so
+this patch contains no DTS and no CCU. It consumes what those patches describe,
+byte for byte:
+
+    mixer0: mixer@5100000 {
+            compatible = "allwinner,sun60i-a733-de-mixer-0";
+            reg = <0x0 0x05100000 0x0 0x00180000>,
+                  <0x0 0x05008100 0x0 0x00000040>,
+                  <0x0 0x05280000 0x0 0x00020000>,
+                  <0x0 0x05008000 0x0 0x00000100>;
+            reg-names = "layers", "top", "display", "de-top";
+            interrupts = <GIC_SPI 50 IRQ_TYPE_LEVEL_HIGH>;
+            clocks = <&ccu CLK_BUS_DE0>, <&ccu CLK_DE0>;
+            clock-names = "bus", "mod";
+            resets = <&ccu RST_BUS_DE0>;
+            assigned-clocks = <&ccu CLK_DE0>;
+            assigned-clock-parents = <&ccu CLK_PLL_PERI0_480M>;
+            ports { ... port@1 -> tcon_tv1 ... };
+    };
+
+An earlier cut of this patch asked for a node of its own -- one window over the
+whole 4 MiB aperture and a compatible of its own. THAT WAS THE WRONG SHAPE and
+it is deleted rather than argued for. Two nodes for one block is a worse device
+tree, and the node above is already the shape a sun8i_mixer backend will want:
+mainline's three window names, plus "de-top" for the DE-global page mainline's
+model has no window for and this SoC needs, because DE2TCON_MUX lives there.
+
+SO THE COMPATIBLE IS CLAIMED DELIBERATELY. This driver is a stand-in for a
+sun8i_mixer entry, not a rival to one. When that entry lands, ONE patch moves
+the string from this driver's of_match_table into sun8i_mixer_of_table and the
+device tree does not move at all. A compatible of our own would have made the
+handover a DT change as well.
+
+⚠ AND THE WINDOW SPLIT IS CHECKED AT PROBE, WITH THE ADDRESS IN THE MESSAGE.
+Every offset in the driver counts from the DE aperture base (0x05000000), which
+is what the capture, the register map and the RCQ's own `reg_offset` word all
+use; sun60i_de_map() is the single place the four windows exist. Probe requires
+each named window to land on the offset the driver expects and to be at least
+as long as the driver reaches -- every minimum computed from the code, not
+picked. That check is not ceremony: a window at the wrong address on this SoC
+does not fault and does not fail to map, it reads zeros or somebody else's
+registers, so without it a DT mistake costs a board session instead of a line
+in dmesg.
+
+What it looks up and NOTHING else: the four reg windows by name, "bus" and
+"mod", and one reset UNNAMED (index 0, so the node may carry reset-names or
+not). Three properties in that node are deliberately not read here and are
+correct to have: `interrupts` (INTID 82 = GIC_SPI 50 per the A733 user manual; nothing
+here services one, and an enabled interrupt with no handler is a latch nobody
+clears, the same call `drm-a733-tcon-tv1-timing-generator-and-video-source` made for TV_GINT0), `ports` (the mixer binding's
+required output edge, which sun8i_mixer_of_get_id() derives the mixer index
+from), and `assigned-clock-parents`, which the clock core applies before probe.
+
+⚠ TWO CONSTRAINTS ON THE CLOCK, AND THE FIRST ONE CAN MOVE THE WHOLE SoC.
+
+  1. THIS DRIVER DOES NOT CALL clk_set_rate() ON THE MODULE CLOCK, on purpose.
+     DE0_CLK's source mux is DEPLL3X / DEPLL4X / PERI0_480M /
+     PERI0_400M / PERI0_300M / VIDEO0PLL4X / VIDEO2PLL4X, and UM 4.1.4.3
+     (A733 user manual) advises against changing DEPLL3X, because it also
+     feeds NSI, the SoC interconnect, at 700 MHz. A
+     set_rate here that propagated to that parent would move the fabric clock
+     under every other block on the chip to suit a display mode. ``clk-sunxi-ng-a733-display-engine-clock-gate-reset`` reaches
+     the same conclusion from the CCU side and gives de0 CLK_SET_RATE_NO_REPARENT
+     with no CLK_SET_RATE_PARENT anywhere in the chain, so the two halves agree
+     without either having to trust the other.
+     The reset value closes on the UM's own number, which is the cross-check on
+     the field decode: PLL_DE_CTRL_REG reset 0x40125600 gives N=87, M1=1, P1=3
+     over the 24 MHz PLL_REF, so DEPLL3X = 24 x 87 / 3 = 696 MHz -- "696MHz by
+     default", verbatim.
+     ⚠ VIDEO1PLL4X is ABSENT from that mux, and VIDEO1PLL4X is the net `clk-sunxi-ng-a733-video-plls-and-edp-tv-pixel-clock`
+     retunes to 308 MHz for the 154 MHz pixel clock. The DE and the eDP pixel
+     path cannot contend for the same PLL.
+  2. The driver READS the rate back, refuses below the rate this mode fetches
+     at (154 MHz), and logs what it got. It assumes NOTHING about which parent
+     it is given -- see the next block, which is why.
+
+⚠ WHICH PARENT THE DE ACTUALLY RUNS FROM, MEASURED -- AND A CLAIM THIS HEADER
+USED TO MAKE AND NO LONGER DOES.
+
+Read on the 8 GiB board on 2026-08-19 with the vendor's display engine GENUINELY LIVE (DE
+version 0x03520100, VI scanout 0x05101018 = 0xFC000000, picture on the monitor):
+
+    PLL_DE_CTRL   0x020022E0 = 0xFD124A00   bit31 SET -- PLL_DE is ON
+    DE0_CLK       0x02002A00 = 0x80000000   gate on, mux [26:24] = 000 =
+                                            DEPLL3X, FACTOR_M [4:0] = 0 -> M = 1
+    DEPLL gates   0x02003928 = 0x00030000   bits 17:16, the DE PLL tap gates
+
+So the vendor's working DE runs from DEPLL3X -- the RESET DEFAULT of that mux --
+not from a PERI0 tap. Decoding 0x??124A00 with the field map below: N field
+0x4A -> N = 75, M1 = 1, P1 = 3, so the VCO is 24 x 75 = 1800 MHz and DEPLL3X is
+600 MHz. Worth noticing twice: 600 MHz is also exactly the mod_rate mainline's
+DE33 config carries for the H616, reached from the other direction.
+
+That field map is cross-checked against the UM's own statement rather than
+assumed: PLL_DE_CTRL_REG's RESET value 0x40125600 decodes under it as N = 87,
+M1 = 1, P1 = 3, i.e. DEPLL3X = 24 x 87 / 3 = 696 MHz -- "696MHz by default",
+verbatim. One map, two values, each landing on its own documented or measured
+number.
+
+⛔ DELETED, NOT QUALIFIED: an earlier version of this header said PLL_DE is off
+on this board and that leaving the mux alone yields a stopped clock. It rested
+on a 2026-07-18 reading taken on a board whose DE was DOWN, where the PLL was
+naturally down with it. A reading of an idle block is not evidence about a
+running one, and the corrected reading is above.
+
+WHAT THAT CHANGES FOR THIS DRIVER: nothing in its register set, and one thing in
+its posture. `arm64-dts-a733-display-engine-node-and-de-to-tcon-edge` pins PERI0_480M; the vendor uses DEPLL3X at 600 MHz; both
+clear this mode's 154 MHz floor. THIS DRIVER IS WRITTEN FOR NEITHER. It never
+sets a rate, reads back what it was given, refuses loudly below the floor, and
+prints the rate at enable so a board session RECORDS which parent was in effect
+rather than inheriting an assumption about it.
+
+⚠ AND THE FAILURE PATH NAMES ADDRESSES, BECAUSE FOUR FAULTS READ ALIKE. A gated
+block on this SoC answers 0x00000000 without faulting, so a zero cannot tell a
+wrong base from a reset still asserted from a shut gate from a source clock that
+is not running -- and clk_get_rate() cannot settle it either, since a sunxi PLL
+recalc computes from its register fields whether or not PLL_EN is set, so a
+stopped PLL still reports a plausible rate. So the rate is printed as evidence,
+never as a verdict, and sun60i_de_check_alive() prints all four addresses with
+the values a live vendor DE carries:
+
+    DE0_BGR      0x02002A04   expect 0x00010001
+    DE0_CLK      0x02002A00   bit31 gate, [26:24] mux, [4:0] M   (live 0x80000000)
+    PLL_DE_CTRL  0x020022E0   bit31 PLL_EN                       (live 0xFD124A00)
+    DE tap gates 0x02003928   bits 17:16                         (live 0x00030000)
+
+The last two matter only when the mux selects a DE PLL tap -- which is what the
+vendor's own live DE does -- so they are named either way rather than omitted on
+the assumption that the device tree pinned a PERI0 parent.
+
+This is the practice that earned its keep on 2026-08-19: `drm-a733-tcon-tv1-timing-generator-and-video-source` was correct and
+still produced a dead raster because `arm64-dts-a733-tcon-tv1-and-the-dp-phy-pad-window` withheld a reg window and a clock, and
+it was diagnosed in ten minutes only because the driver announced the gap WITH
+THE ADDRESSES. Every reg window, clock and reset this driver expects is named
+the same way -- the windows at probe, the clocks here.
+
+Nothing else is owed to the CCU: DE_SYS_BGR (0x0A74), the AHB matrix gate
+(0x05C0 bit 5), the MBUS matrix gate (0x05E0 bit 11 -- the path both the
+scanout fetch and any RCQ descriptor fetch use) and CM_DESYS_CFG (0x1B04) are
+all in their working state at power-on and the vendor leaves all four alone.
+
+NUMBERING
+---------
+
+configs/a733_defconfig gains CONFIG_DRM_SUN60I_DE=m. That file IS the build's
+input, and scripts/check-defconfig.sh requires it to
+round-trip through savedefconfig -- so the line sits exactly where Kbuild puts
+it, and the round-trip was re-run locally until clean rather than pushed and
+watched. scripts/build.sh gains DRM_SUN60I_DE in A733_MODULES, the =m assertion
+in the compile gate, and sun60i-de.ko in A733_MODULE_FILES. That last one is the list
+that has been short three times; `nm -u` over the built object lists 42
+undefined symbols and not one is from drm.ko, so it adds nothing to the
+closure -- a statement about its symbol table, not depmod's opinion.
+
+WHAT IT OWES -- THE ACCEPTANCE SEQUENCE
+----------------------------------------
+
+⚠ STEPS 1-7 ALL PASSED ON 2026-08-19 (ON THE BOARD) WITH THE THREE de_top ENABLES
+SUPPLIED BY HAND. What the re-run has to show is that the driver now supplies
+them itself: the same sequence, with NOTHING typed between `enable` and the
+picture. Concretely, step 4 must show the three ENABLE words non-zero and every
+datapath line non-zero WITHOUT intervention, and step 3 must not print the
+"window is NOT OPEN" error.
+
+⬜ AND STEP 5 STILL OWES ITS OWN OBSERVABLE. The 08-19 run filled flat colours,
+which proved fetch but CANNOT show a geometry error -- a flat colour looks
+identical under a wrong pitch, a wrong size and a wrong origin. The gradient
+inside a one-pixel white border, which is what `enable` paints before anything
+is typed, is the test that discriminates, and it has not been looked at yet.
+
+Needs the DE node above, a sink on J4, the port in a DP pin assignment, and the
+link trained. Run in this order; each step
+is a gate on the next.
+
+1. THE BASELINE -- the TCON scans its own pattern.
+
+     echo 1 > /sys/kernel/debug/5731000.lcd-controller/enable
+     cat     /sys/kernel/debug/5731000.lcd-controller/scanout
+
+   PASS: verdict SCANNING, maximum 1235, at least one wrap, underflow and
+   lostwarn 0 -- and COLOUR BARS ON THE SCREEN.
+   FALSIFIER: no bars. Stop. That is `drm-a733-tcon-tv1-timing-generator-and-video-source` and `drm-a733-dp-the-main-video-stream`/link training and nothing below
+   means anything.
+
+2. THE DRIVER BOUND AT ALL. Before anything else, because a driver that did
+   not probe has no debugfs directory and every step below would fail for the
+   wrong reason:
+
+     ls -d /sys/kernel/debug/5100000.mixer
+
+   FALSIFIER: absent, with dmesg carrying `reg "<name>" is at 0x........,
+     expected 0x........` or `reg "<name>" is N bytes, this driver reaches M`.
+     That is the device tree's window decomposition disagreeing with this
+     driver's, named at probe rather than read as zeros at runtime.
+
+3. THE DE COMES UP COLD.
+
+     echo 1 > /sys/kernel/debug/5100000.mixer/enable
+     dmesg | tail -5
+
+   PASS: "module clock <N> Hz (floor 154000000)" and "scanning 1920x1200
+   XRGB8888 from 0x........, pitch 7680, commit by direct MMIO".
+   FALSIFIER A: "DE version reads 0x00000000, expected 0x03520100 -- the block
+     is not answering", followed by four lines naming the rate and the four
+     addresses. On this SoC a gated block answers zero without faulting, so this
+     is the reset/gate ORDER (UM 4.1.4.4), the DE0_BGR bit
+     assignment, or a source clock that is not running -- and the reported rate
+     cannot tell them apart. Read what the driver printed, in that order:
+
+       0x02002A04 DE0_BGR      expect 0x00010001
+       0x02002A00 DE0_CLK      expect bit31 set   (a live vendor DE: 0x80000000)
+       0x020022E0 PLL_DE_CTRL  bit31 PLL_EN       (live 0xFD124A00) -- only if
+       0x02003928 DE tap gates bits 17:16         (live 0x00030000)    the mux
+                                                  selects a DE PLL tap
+       cat /sys/kernel/debug/clk/de0/clk_parent
+
+     The eDP block measured the reset/gate half of this symptom for the same
+     cause. The base is the LAST thing to doubt.
+   FALSIFIER B: "module clock is <N> Hz, below the 154000000 Hz this mode
+     fetches at" -- the DT's parent for CLK_DE0.
+   FALSIFIER C: "no 9216000-byte coherent framebuffer" -- the CMA area is too
+     small or too fragmented, not a DE fault.
+
+4. THE REGISTER STATE.  cat .../5100000.mixer/state
+
+   Expected, exactly:
+     de_top VERSION        0x03520100     vi0 OVL_SIZE       0x04af077f
+     de_top DE2TCON_MUX    0x0000fff5     bld0 PIPE_CTL      0x00000101
+     mixer0 GLOBAL_CTL     0x00000001     bld0 FCOLOR0       0xff000000
+     mixer0 GLOBAL_SIZE    0x04af077f     bld0 INSIZE0       0x04af077f
+     mixer0 GLOBAL_CLK     0x00000001     bld0 ROUTE         0x00000000
+     mixer0 RCQ_HEAD_LEN   0x00000000     bld0 BKCOLOR       0xff000000
+     vi0 LAY0_ATTCTL       0xff008403     bld0 OUTSIZE       0x04af077f
+     vi0 LAY0_MBSIZE       0x04af077f     bld0 BLEND_MODE0   0x03010301
+     vi0 LAY0_MBCOOR       0x00000000
+     vi0 LAY0_PITCH0       0x00001e00
+     vi0 LAY0_TOP_LADDR0   = the address the "scanning" line printed
+
+   ⚠ THESE READ-BACKS ARE NOT THE PROOF. Step 5 is. What they can falsify:
+   FALSIFIER: a DATAPATH register reading back something other than what was
+     written while the CONTROL PLANE reads back correctly. That is the shadow
+     the 2026-08-19 measurement said does not exist on this path -- and since
+     that measurement was taken on a WARM DE, this is the outcome that puts an
+     RCQ backend behind the commit ops. Record which registers, because the
+     answer may be per-block.
+   Also record, whatever happens: the "read on a COLD DE" line. Four words this
+     tree has never had -- the version, the CCSC, the VSU and the TFBD reset
+     values -- and they decide the two traps above.
+
+5. THE PROOF, AND IT IS BY EYE.
+
+     echo 0 > /sys/kernel/debug/5731000.lcd-controller/source
+
+   WHAT A PERSON LOOKING AT THE SCREEN MUST SEE: the colour bars are replaced
+   by a smooth gradient -- dark at the top-left, red increasing to the right,
+   green increasing downward, a constant low blue -- inside a ONE-PIXEL WHITE
+   BORDER on all four edges. Nothing VDBIST can produce looks like that.
+
+   FALSIFIER, black screen: the DE is not reaching the TCON. Re-read `scanout`:
+     a line counter still sweeping to 1235 means the TCON is fine and the DE is
+     supplying nothing, which points at DE2TCON_MUX or the blender route; a
+     stopped counter means the TCON stopped when its source changed.
+   FALSIFIER, bars persist: TV_SRC_CTL bit 0 did not move. Read it back.
+   FALSIFIER, the white border is a DIAGONAL, or the picture repeats
+     horizontally: the pitch. LAY0_PITCH0 must be 0x1e00.
+   FALSIFIER, the border is off the edge of the screen, or the image is doubled
+     vertically: MBSIZE / OVL_SIZE / the blender sizes against the TCON's
+     active area -- both come from the same struct, so a mismatch here means
+     one of them is not being written.
+   FALSIFIER, a picture collapsed to a repeated column: VSU_CTL = 0 does NOT
+     bypass on a cold DE, and unity coefficients are owed.
+   FALSIFIER, the gradient runs in the wrong channel (blue varying, or a
+     coloured border): the format field or the channel CSC. The cold CCSC value
+     from step 4 says which.
+   FALSIFIER, tiled blocks or noise: TFBD is stale after all.
+   ⚠ FALSIFIER, BLACK SCREEN WITH EVERY REGISTER READING BACK CORRECT: before
+     doubting the register sequence, ask whether the address the DE was given is
+     one it can actually REACH. Read the driver's own line from step 3 --
+     "a physical address, no IOMMU is attached" vs "an IOVA" -- and check
+     0x03900000 / 0x03910000 for an IOMMU that came up translating with no
+     mapping for master 8. The vendor runs this path through one; we do not, and
+     that assumption is unverified. This failure shape is indistinguishable from
+     a wrong register sequence from the register side alone, which is exactly
+     why it is listed here.
+   FALSIFIER, `scanout` now reports underflow DURING the window: the DE is not
+     delivering pixels fast enough -- the module clock or the MBUS path, not
+     the register set.
+
+6. CAUSALITY, AND IT PROVES THE OBSERVER -- run this BEFORE step 7, always.
+
+     echo 0xff0000ff > /sys/kernel/debug/5100000.mixer/fill   # blue
+     echo 0xff00ff00 > /sys/kernel/debug/5100000.mixer/fill   # green
+
+   PASS: the screen follows each write, and NO REGISTER IS WRITTEN AT ALL --
+   this only touches the framebuffer. It retires two confounds in one command:
+   the DE is fetching THIS memory rather than showing something that merely
+   looks right, AND a human is watching a monitor that is switched on.
+   FALSIFIER: the screen does not change. Then whatever is on it is not coming
+   from this allocation, and step 5 proved nothing about the fetch path.
+   ⚠ THIS STEP EXISTS BECAUSE ITS ABSENCE ALREADY COST A RESULT. The withdrawn
+   MMIO measurement moved a register and read the screen without ever having
+   established that the screen could be read. Never do the second without the
+   first.
+
+7. ⬜ THE COLD DE -- does a CPU store reach ITS datapath too?
+
+   The vendor-side measurement covered a WARM DE with its queue armed. This is
+   the same question asked of the engine THIS driver programmed from reset.
+
+   ONLY VALID IF STEP 6 PASSED, and that is the whole point of the ordering.
+
+     echo 0 > /sys/kernel/debug/5100000.mixer/layer    # one datapath register
+     cat   /sys/kernel/debug/5100000.mixer/state       # what it reads back
+     echo 1 > /sys/kernel/debug/5100000.mixer/layer    # and back again
+
+   RESULT A -- the picture disappears and returns: MMIO latches the datapath of
+     a cold DE too. The commit backend in this patch is correct and complete,
+     and the RCQ is not needed for this driver's job. Record it; together with
+     the vendor-side measurement it closes the question.
+   RESULT B -- the picture does NOT change, while `state` shows
+     `vi0 LAY0_ATTCTL` reading back exactly what was written (0x00000000 then
+     0xff008403): that is the shadow the A523/T527 series describes. THE RCQ IS
+     MANDATORY. Nothing in the register set is wrong -- the register values are
+     the right content -- and the work is one backend behind begin/stage/arm, plus
+     the flip/retire/quiesce discipline whose cost is estimated above.
+   Either result is a finding. Neither is a defeat, and this patch is written so
+   that B costs no register value.
+
+8. 🔴 THE BLACK SCREEN, IF IT IS STILL BLACK -- one write, two readings.
+
+     cat   /sys/kernel/debug/5100000.mixer/state    # the three CCSC lines
+     echo 0 > /sys/kernel/debug/5100000.mixer/ccsc  # disable the block instead
+
+   PASS (either way): the picture appears. If it appears with ccsc = 1 and the
+   coefficients reading 0x00020000, the vendor's configuration is right and this
+   patch is complete. If it takes ccsc = 0, the A523/T527 reading is right for
+   this SoC and the default flips in a one-line follow-up.
+   FALSIFIER: black under BOTH. Then the CCSC is not on the path, this patch's
+   leading hypothesis is wrong, and the bisect moves to
+   the capture-diff entry at 0x05008030 --
+   ⚠ ONE GROUP AT A TIME. Thirty deltas in one batch is what lost the
+   attribution on 2026-08-19 and wedged the board.
+
+9. THE NEGATIVE CONTROL.
+
+     echo 0 > /sys/kernel/debug/5100000.mixer/enable   # picture goes
+     echo 1 > /sys/kernel/debug/5100000.mixer/enable   # picture back
+
+   PASS: the screen loses the picture and gets it back. A second enable landing
+   correctly also exercises the disarm and the stop-before-programming path,
+   which a first enable off a fresh reset cannot.
+
+PARTLY HARDWARE-PROVEN, and the parts are separated on purpose.
+HW-PROVEN (the 8 GiB board, 2026-08-19): the register set, the mode, the
+format, the direct-MMIO commit path on a cold DE, the fetch of this driver's own
+buffer at its own physical address, and zero data-supply errors.
+HW-PROVEN: sun60i_de_top_open() and sun60i_de_verify() -- one
+`enable`, nothing typed after it, whole datapath programmed, no error.
+NOT PROVEN: the CCSC unity matrix in this revision, which is a derivation from
+the capture and has not been on a board; and the gradient/border geometry test,
+which has still never been looked at. Applies at --fuzz=0 on the full series;
+drivers/gpu/drm/sun60i/ builds W=1 warning-free with CONFIG_DRM_SUN60I_DE=m
+cross-compiled for arm64; checkpatch --strict reports 0 errors, 0 warnings,
+0 checks over 1823 lines.
+
+CORRECTED 2026-09-22, comments only. Two comments said the layer
+address register is 32 bits wide and no VI high-address register exists. It
+exists: VI +0x0d0..+0x0e4 (TOP_HADDR0-2, BOT_HADDR0-2) carry one byte per
+layer, and a 1 in layer 1's byte moved that layer's fetch 4 GiB up (DP sink
+CRC with a control, 8 GB board).
+The search that found nothing read 0x05101080, which is layer
+2's plane-2 address. So probe()'s 32-bit DMA mask is this driver's choice --
+it writes no high-address byte -- not a hardware limit. No code changed: the
+refusal string "... the layer address register is 32 bits" still gives the old
+reason and is corrected with the next code change of this file.
+
+Assisted-by: Claude
+
+diff --git a/drivers/gpu/drm/sun60i/Kconfig b/drivers/gpu/drm/sun60i/Kconfig
+--- a/drivers/gpu/drm/sun60i/Kconfig
++++ b/drivers/gpu/drm/sun60i/Kconfig
+@@ -32,3 +32,21 @@ config DRM_SUN60I_TCON_TV
+ 
+ 	  Say M here if you want the DisplayPort output of this SoC to be able
+ 	  to scan a mode.
++
++config DRM_SUN60I_DE
++	tristate "Allwinner A733 (sun60iw2) display engine"
++	depends on DRM && OF
++	depends on ARCH_SUNXI || COMPILE_TEST
++	help
++	  Enable this for the display engine of the Allwinner A733 (sun60iw2),
++	  the only block on this SoC that reads pixels out of DRAM and into the
++	  TCON. TCON_TV1 can raster its own built-in test pattern without it,
++	  which is why this part had a picture before it had a framebuffer --
++	  and why that picture could never become a console.
++
++	  It programs one display pipe, one video channel and one XRGB8888
++	  layer, allocates and paints its own framebuffer, and leaves scaling,
++	  colour management, compressed sources and the second display output at
++	  reset. It is not a KMS driver and registers no CRTC yet.
++
++	  Say M here if you want this SoC to be able to scan a framebuffer.
+diff --git a/drivers/gpu/drm/sun60i/Makefile b/drivers/gpu/drm/sun60i/Makefile
+--- a/drivers/gpu/drm/sun60i/Makefile
++++ b/drivers/gpu/drm/sun60i/Makefile
+@@ -1,3 +1,4 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ obj-$(CONFIG_DRM_SUN60I_DP) += sun60i-dp.o
+ obj-$(CONFIG_DRM_SUN60I_TCON_TV) += sun60i-tcon-tv.o
++obj-$(CONFIG_DRM_SUN60I_DE) += sun60i-de.o
+diff --git a/drivers/gpu/drm/sun60i/sun60i-de.c b/drivers/gpu/drm/sun60i/sun60i-de.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/gpu/drm/sun60i/sun60i-de.c
+@@ -0,0 +1,1435 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Allwinner A733 (sun60iw2) display engine -- the block that scans DRAM.
++ *
++ * TCON_TV1 (sun60i-tcon-tv.c, `drm-a733-tcon-tv1-timing-generator-and-video-source`) turns a pixel clock into a raster and can
++ * source that raster from its own VDBIST pattern generator. That is why this
++ * SoC had a picture before it had a framebuffer -- and it is also why that
++ * picture could never be a console. TV_SRC_CTL_REG bit 0 has
++ * exactly two settings, the DE providing the data source (0) or the VDBIST
++ * test-pattern generator providing it (1); there is no third source. So every
++ * path from DRAM to the screen on this part runs through the display engine,
++ * and this file is that engine.
++ *
++ * WHAT IT DOES, AND DELIBERATELY NOTHING MORE. One display pipe, one VI
++ * channel, one layer, XRGB8888, the one mode this path has ever driven. The
++ * framebuffer is DMA-coherent memory this driver allocates and paints, so the
++ * fetch path is provable end to end with no KMS device above it -- the shape
++ * `drm-a733-tcon-tv1-timing-generator-and-video-source` used to prove the TCON before there was a CRTC to hang it on.
++ *
++ * WHERE THE VALUES COME FROM, AND WHY NOT ONE OF THEM CARRIES A MANUAL REFERENCE.
++ * A733 UM V0.92 chapter 14.3 "Display Engine" is two pages of prose
++ * (A733 user manual): no register list, no offset table, no field table.
++ * Searched over the whole 2.7 MB UM extract, `GLB_CTL`, `BLD_`, `OVL_`,
++ * `blender` and `RCQ` return zero hits each; the one `mixer` hit is in 14.5 and
++ * describes G2D. Compare TCON_TV, which gets a register chapter with per-bit
++ * tables (15.2.10), or eDP (15.4.7). The DE gets neither.
++ *
++ * So the evidence floor here is one level lower than anywhere else in this
++ * tree, and every value below says which of three things it is:
++ *
++ *   COMPUTED  derived from the mode or from the framebuffer -- arithmetic, and
++ *             the live vendor link agrees with the result;
++ *   CARRIED   copied off a working link and NOT understood;
++ *   INFERRED  the field name and meaning come from code -- mainline's DE33
++ *             model, or the out-of-tree A523/T527 v35x series -- and the live
++ *             A733 capture then confirms the value at that offset.
++ *
++ * A value with none of those tags does not appear in this file.
++ *
++ * THE SILICON THIS RESTS ON. the 8 GiB board, vendor stack, live 1920x1200 four-lane
++ * DisplayPort link, read-only through /dev/mem
++ * (an earlier capture, plus a second reading on
++ * 2026-08-19). Its DE identifies itself at 0x05008014 = 0x03520100, i.e. DE
++ * version 0x352 -- the same three digits the vendor DT string
++ * "allwinner,display-engine-v352" and the out-of-tree series' "de352" carry.
++ *
++ * THE DELIVERY QUESTION, AND IT IS MEASURED -- BUT THE METHOD IS THE FINDING.
++ * The v35x DE has a register command queue (RCQ): a DMA engine that walks
++ * 16-byte descriptors in DRAM and copies register blocks into the DE on each
++ * frame-start pulse from the bound TCON. The vendor's live link has one ARMED
++ * -- 118 heads at DRAM 0xffff3fc0, length 0x760 = 118 x 16 exactly -- and the
++ * A523/T527 series states that on this DE generation the datapath latches ONLY
++ * through it, with plain CPU stores landing in a shadow that never takes
++ * effect. If that held here, every datapath register in this file would be the
++ * right CONTENT delivered the wrong WAY, and this driver would be a DMA pool
++ * and a descriptor discipline instead.
++ *
++ * IT DOES NOT HOLD. On the 8 GiB board on 2026-08-19, on a fresh vendor boot with the
++ * vendor's driver resident and its DE live, in this order:
++ *
++ *   0. THE OBSERVER PROVEN FIRST -- monitor confirmed by eye to be showing the
++ *      console shell, not assumed, before any write was made;
++ *   1. devmem 0x05101018 32 0xFC400000  (+4 MiB) -- register holds, and THE
++ *      SCREEN GOES BLACK with the monitor still on and not in standby;
++ *   2. devmem 0x05101018 32 0xFC000000  -- THE SHELL COMES BACK.
++ *
++ * Three states on one register, the return leg included, with the observer's
++ * state established up front. A PLAIN MMIO WRITE TO THE VI LAYER'S SCANOUT
++ * ADDRESS REACHES THE DATAPATH.
++ *
++ * ⚠ STEP 0 IS NOT CEREMONY, IT IS THE WHOLE DIFFERENCE. A first run of this
++ * same sequence was WITHDRAWN because nobody had established that the person
++ * watching had the monitor switched on, and a black screen from a monitor that
++ * is off is indistinguishable from one the write caused. Same commands, same
++ * result, and only the second run is evidence. That discipline is carried into
++ * this driver's acceptance sequence: `fill` writes a colour into the
++ * framebuffer and touches NO register, so it proves the observer and the fetch
++ * path in one command -- and it is run BEFORE `layer` moves anything.
++ *
++ * TWO LIMITS THAT SURVIVE THE RESULT, and they are why the commit path is still
++ * an indirection rather than inlined:
++ *   1. it proves the VI LAYER'S SCANOUT ADDRESS latches. It does not prove
++ *      every DE register does. If some other block's write appears not to take
++ *      effect, the RCQ is back on the table FOR THAT BLOCK.
++ *   2. the write was made while the VENDOR DRIVER held the device, with the
++ *      queue already armed and the datapath already loaded. A cold-programmed
++ *      DE, whose queue was never armed, is what THIS driver produces and is
++ *      untested. Its falsifier: all eleven registers written, every one reading
++ *      back, screen black.
++ *
++ * So direct MMIO is the REAL implementation, not a placeholder -- and an RCQ
++ * backend still slots in behind the same three calls (begin, stage, arm)
++ * without moving one register value in this file, for whichever block might
++ * turn out to need it.
++ *
++ * THE OBSERVABLE THIS DRIVER OWES IS NOT "THE REGISTERS READ BACK". It is a
++ * framebuffer this driver painted, on the screen, changing when the pixels
++ * change -- and every register of the eleven-register datapath is reported next
++ * to it by debugfs `state`, together with the three blocks whose live state is
++ * a known trap.
++ *
++ * Copyright (c) 2026 DockSeed
++ */
++
++#include <linux/bitfield.h>
++#include <linux/clk.h>
++#include <linux/debugfs.h>
++#include <linux/delay.h>
++#include <linux/device.h>
++#include <linux/dma-mapping.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/reset.h>
++#include <linux/seq_file.h>
++
++#include <drm/drm_modes.h>
++
++#include "sun60i-display.h"
++
++/*
++ * The block map inside the DE0 aperture (0x05000000, 4 MiB,
++ * per the A733 user manual -- the aperture is the only DOC
++ * fact in this file). Every sub-block base below is INFERRED from the A523/T527
++ * v35x header's arithmetic and then confirmed by our capture landing on it:
++ * DE_CHN_OFFSET(phy) = 0x100000 + 0x20000*phy, CHN_OVL_OFFSET = 0x1000,
++ * CHN_SCALER_OFFSET = 0x4000, DE_DISP_OFFSET(0) = 0x280000.
++ *
++ * The capture confirms the channel arithmetic independently of the code that
++ * suggested it: seven scaler pages at an exact 0x20000 stride, at slots
++ * {0,1,2,6,7,8,9}, against the UM's feature list of seven blending channels and two
++ * display outputs. Three VI low, four UI from 6.
++ *
++ * EVERY OFFSET IN THIS FILE IS RELATIVE TO THE DE APERTURE BASE, not to one of
++ * the four windows the device tree splits it into. Two reasons, and the second
++ * is the one that matters: the capture, the register map and the vendor's own
++ * addressing all count from 0x05000000, so an offset here can be compared with
++ * a log line by eye -- and the RCQ's descriptor carries exactly this number in
++ * its `reg_offset` word, so an RCQ backend behind the commit ops needs it and a
++ * raw __iomem pointer would have thrown it away. sun60i_de_map() is the one
++ * place the window split exists.
++ */
++#define DE_APERTURE			0x05000000
++#define DE_TOP				0x008000
++/*
++ * 🔴 THE THREE WORDS THAT OPEN THE REST OF THE APERTURE. Without them the
++ * channel window at 0x0510xxxx and the blender at 0x0528xxxx DO NOT ACCEPT A
++ * WRITE AT ALL -- they are not merely un-latched, they read back zero exactly
++ * like unmapped address space, while de_top at 0x05008xxx answers normally.
++ *
++ * PROVEN CAUSALLY ON SILICON, the 8 GiB board, 2026-08-19, by raw devmem with
++ * no driver involved:
++ *
++ *   before:  devmem 0x05101000 32 0xFF008403 ; devmem 0x05101000 -> 0x00000000
++ *            (0x05200000, genuinely unmapped, reads 0x00000000 too)
++ *   after writing these three:
++ *            devmem 0x05101000 32 0xFF008403 ; devmem 0x05101000 -> 0xFF008403
++ *            devmem 0x05281000 32 0x00000101 ; devmem 0x05281000 -> 0x00000101
++ *
++ * ⚠ THE FIRST CUT OF THIS DRIVER DID NOT WRITE THEM, and that is the defect the
++ * board found. An earlier analysis of the vendor capture listed all three as
++ * UNKNOWN, and this driver read "UNKNOWN" as "leave at reset" -- but the same
++ * analysis shows them NON-ZERO on a working link, which was the standing evidence
++ * that they are written by somebody. A word that a live link holds and a cold
++ * block does not is a write, not a mystery.
++ *
++ * VALUES: CARRIED, from the vendor capture.
++ * MEANING: INFERRED, and only as far as the bit shape allows -- 0x00010001 is
++ * the de-assert-reset-plus-gate pattern every sunxi BGR register in this SoC
++ * uses (bit 16 reset, bit 0 gate), and 0x00000011 sets two adjacent gate-shaped
++ * bits. Which sub-blocks each bit covers is NOT known and is not guessed at
++ * here; what IS known is that all three together open the datapath, measured.
++ */
++#define  DE_TOP_ENABLE0			0x0000
++#define   DE_TOP_ENABLE0_VALUE		0x00010001
++#define  DE_TOP_ENABLE1			0x0004
++#define   DE_TOP_ENABLE1_VALUE		0x00010001
++#define  DE_TOP_ENABLE2			0x0008
++#define   DE_TOP_ENABLE2_VALUE		0x00000011
++#define  DE_TOP_DE2TCON_MUX		0x0010
++#define  DE_TOP_VERSION			0x0014
++
++#define DE_MIXER0_TOP			0x008100
++#define  MIXER_GLOBAL_CTL		0x0000
++#define   MIXER_GLOBAL_CTL_RT_EN	BIT(0)
++#define  MIXER_GLOBAL_SIZE		0x0008
++#define  MIXER_GLOBAL_CLK		0x000c
++#define  MIXER_RCQ_CTL			0x0010
++#define  MIXER_RCQ_HEAD_LADDR		0x0014
++#define  MIXER_RCQ_HEAD_HADDR		0x0018
++#define  MIXER_RCQ_HEAD_LEN		0x001c
++
++#define DE_CHN_BASE			0x100000
++#define DE_CHN_STRIDE			0x020000
++#define  DE_CHN_CCSC			0x0800
++#define  DE_CHN_OVL			0x1000
++#define  DE_CHN_VSU			0x4000
++#define  DE_CHN_TFBD			0x5400
++
++#define DE_DISP0			0x280000
++#define  DE_DISP_BLD			0x1000
++
++/*
++ * The VI channel this driver uses, and it is the one the capture proves. Slot 0
++ * decodes as a VI channel under both candidate field maps, and only one of them
++ * explains every non-zero AND every zero word: plane-1/2 pitches clear at
++ * +0x10/+0x14 where a UI layer would carry the framebuffer address, the address
++ * at +0x18 where a UI layer has a fill colour, +0x88 clear where UI_OVL_SIZE
++ * would be, and the size at +0xe8, which is a VI-only register.
++ *
++ * The UI channels' layout is witnessed nowhere in that capture -- slots 6-9
++ * have no layer block programmed -- so this driver does not use one.
++ */
++#define DE_VI0_SLOT			0
++#define DE_BLD_PIPE			0
++
++/*
++ * Four blender register files at a 0x400 stride, all four programmed
++ * identically on the live link, on a board with exactly one display pipe up.
++ * The UM lists two display outputs, so "one per lit output" is not
++ * what these are; the prior art's de_top +0x24 UCH2CORE_MUX ("phys UI chn ->
++ * core/disp mux") suggests a core concept between channels and pipes, which
++ * would fit four. That is INFERRED and this driver does not rely on it: it
++ * writes all four identically, because that is the state a working link
++ * demonstrably holds.
++ */
++#define DE_BLD_STRIDE			0x0400
++#define DE_BLD_INSTANCES		4
++#define  BLD_PIPE_CTL			0x0000
++#define   BLD_PIPE_CTL_EN(p)		BIT(8 + (p))
++#define   BLD_PIPE_CTL_FC_EN(p)		BIT(p)
++#define  BLD_ATTR_FCOLOR(p)		(0x0004 + 0x10 * (p))
++#define  BLD_ATTR_INSIZE(p)		(0x0008 + 0x10 * (p))
++#define  BLD_ATTR_COORD(p)		(0x000c + 0x10 * (p))
++#define  BLD_ROUTE			0x0080
++#define  BLD_PREMULTIPLY		0x0084
++#define  BLD_BKCOLOR			0x0088
++#define  BLD_OUTSIZE			0x008c
++#define  BLD_MODE(p)			(0x0090 + 0x04 * (p))
++
++/* The overlay layer block, layers at a 0x30 stride. Layer 0 only here. */
++#define DE_OVL_LAYER			0
++#define  OVL_LAY_ATTCTL(l)		(0x30 * (l) + 0x0000)
++#define   OVL_ATTCTL_ALPHA		GENMASK(31, 24)
++#define   OVL_ATTCTL_RGB_MODE		BIT(15)
++#define   OVL_ATTCTL_FBFMT		GENMASK(12, 8)
++#define   OVL_ATTCTL_ALPHA_MODE		GENMASK(2, 1)
++#define   OVL_ATTCTL_EN			BIT(0)
++#define  OVL_LAY_MBSIZE(l)		(0x30 * (l) + 0x0004)
++#define  OVL_LAY_MBCOOR(l)		(0x30 * (l) + 0x0008)
++#define  OVL_LAY_PITCH(l, p)		(0x30 * (l) + 0x000c + 4 * (p))
++#define  OVL_LAY_TOP_LADDR(l, p)	(0x30 * (l) + 0x0018 + 4 * (p))
++#define  OVL_VI_OVL_SIZE		0x00e8
++#define OVL_VI_PLANES			3
++
++/*
++ * The three blocks whose live state is a trap rather than a value. Offsets are
++ * INFERRED from the prior art; the words are what our own capture reads.
++ */
++#define DE_CCSC_INSTANCES		8
++#define DE_CCSC_STRIDE			0x0100
++#define  CCSC_CTL			0x0000
++#define  CCSC_CTL_LIVE			0x00000001
++/*
++ * 🔴 THE COEFFICIENT MATRIX, AND LEAVING IT AT RESET IS HOW THIS DRIVER PAINTED
++ * A BLACK SCREEN WITH EVERY OTHER REGISTER CORRECT (the 8 GiB board).
++ *
++ * The vendor's capture holds THREE non-zero words per CCSC instance besides the
++ * control word, at +0x10, +0x24 and +0x38, all reading 0x00020000. Those three
++ * offsets are not an arbitrary pattern: under a 3-row x 4-word row-major layout
++ * (three coefficients and one constant per row, rows on a 0x10 stride from
++ * +0x10) they are EXACTLY the diagonal --
++ *
++ *     c00 = 0x10 + 0*0x10 + 0*4 = +0x10   ✓ observed non-zero
++ *     c11 = 0x10 + 1*0x10 + 1*4 = +0x24   ✓ observed non-zero
++ *     c22 = 0x10 + 2*0x10 + 2*4 = +0x38   ✓ observed non-zero
++ *
++ * -- and the nine off-diagonal words the same layout predicts are all zero in
++ * that capture. Three hits out of three, with nine matching zeros, on a block
++ * whose name (channel colour-space conversion) says a 3x3 matrix is what it
++ * should contain. THAT IS A UNITY MATRIX, and 0x00020000 is its "1".
++ *
++ * WHY THAT EXPLAINS A BLACK SCREEN AND NOTHING ELSE DID. This driver wrote
++ * CCSC_CTL = 1 -- enabling the block -- and left the matrix at its COLD RESET
++ * value, which is zero. An enabled colour-space converter with an all-zero
++ * matrix outputs zero for every input pixel. Every other symptom follows: data
++ * still flows, so the TCON never underflows and never sets lostwarn; the layer,
++ * the blender, the sizes and the scanout address all read back correct; the
++ * framebuffer really does contain red; and no clock change can help, because
++ * the pixels are being multiplied by zero.
++ *
++ * ⚠ AND IT MEANS THE ARGUMENT FOR WRITING 1 WAS WRONG. This driver reasoned
++ * that eight instances reading 1 on the vendor's link made 1 the reset default.
++ * The vendor also writes 24 coefficient words, so it CONFIGURES this block
++ * rather than leaving it alone -- which is evidence that 1 is the vendor's
++ * value, not the reset. The A523/T527 series writes ctl = 0 for a linear-RGB
++ * layer, and that reading is now the more likely of the two.
++ *
++ * SO BOTH ARE REACHABLE FROM debugfs `ccsc`, and the board settles it in one
++ * session instead of two: 1 (default) writes the vendor's configuration --
++ * enabled with a unity matrix -- and 0 disables the block the way the prior art
++ * does. HYPOTHESIS, not proof: nothing here has been on a board.
++ */
++#define  CCSC_COEFF_ROW0		0x0010
++#define  CCSC_COEFF_ROW_STRIDE		0x0010
++#define  CCSC_COEFF_UNITY		0x00020000
++#define  CCSC_MATRIX_ROWS		3
++#define  VSU_CTL			0x0000
++#define  VSU_ATTR_OUT_SIZE		0x0040
++#define  TFBD_STATE_WORD		0x0030
++
++/* Values. */
++#define DE_VERSION_A733			0x03520100
++#define DE_SIZE(w, h)			((((h) - 1) << 16) | ((w) - 1))
++#define DE2TCON_MUX_LIVE		0x0000fff5
++#define BLD_COLOR_BLACK			0xff000000
++#define BLD_MODE_SRCOVER		0x03010301
++#define OVL_FBFMT_XRGB8888		4
++#define OVL_ALPHA_MODE_LAYER		1
++#define DE_ALPHA_OPAQUE			0xff
++#define DE_BYTES_PER_PIXEL		4
++
++/*
++ * How long the DE is given to retire what it has in flight, between the layer
++ * being switched off and its clocks being gated with its reset asserted. Two
++ * frame times, computed from the mode rather than picked.
++ *
++ * This is not caution for its own sake. Asserting a bus master's reset in the
++ * middle of an AXI burst is the classic way to wedge an interconnect, and the
++ * memory the layer was reading goes straight back to CMA immediately
++ * afterwards -- so the failure mode without it is a DE still fetching from
++ * pages that now belong to somebody else. The A523/T527 series pays for this
++ * lesson with a patch of its own titled "channel quiesce before stopping".
++ */
++#define DE_QUIESCE_FRAMES		2
++
++struct sun60i_de;
++
++/**
++ * struct sun60i_de_commit - how datapath register values reach the hardware
++ * @name:  what `state` prints, so a result says which path produced it
++ * @begin: start a batch (a no-op for MMIO; an RCQ backend resets its staging)
++ * @stage: deliver one register
++ * @arm:   make the batch take effect, and report whether it did
++ *
++ * The split between "control plane" and "datapath" is not this driver's
++ * invention and it is not cosmetic. The de_top and mixer-top registers latch
++ * directly under every reading of this hardware -- the prior art says so, and
++ * our capture holds live, sensible values in them. The blender and the channel
++ * are the ones the RCQ exists for. So the control plane is written with plain
++ * writel() below and only the datapath goes through this struct: if a block
++ * ever turns out to need the queue, one backend appears here and not one
++ * register value in this file moves.
++ *
++ * MMIO is measured to reach the datapath for the VI layer's scanout address
++ * (see the RCQ block at the top of this file), so this is the real
++ * implementation. The indirection stays for the two limits recorded there: one
++ * register is not every register, and a COLD DE is not the warm one that was
++ * measured. debugfs `layer` is the probe that confirms it on our own path.
++ */
++struct sun60i_de_commit {
++	const char	*name;
++	void		(*begin)(struct sun60i_de *de);
++	void		(*stage)(struct sun60i_de *de, u32 off, u32 val);
++	int		(*arm)(struct sun60i_de *de);
++};
++
++/**
++ * struct sun60i_de_window - one of the four reg windows the DT splits the
++ *                           aperture into
++ * @base: where it is mapped
++ * @off:  its offset from the DE aperture base, derived from the resource
++ * @size: its length
++ */
++struct sun60i_de_window {
++	void __iomem	*base;
++	u32		off;
++	u32		size;
++};
++
++/*
++ * The four windows, in the order and under the names mainline's DE33 mixer
++ * binding uses -- "layers", "top", "display" -- plus "de-top" for the
++ * DE-global page that mainline's model has no window for and this SoC needs,
++ * because DE2TCON_MUX lives there. Each carries the offset it MUST land on, so
++ * a device tree that describes a different decomposition is refused at probe
++ * with the address in the message rather than reading zeros at runtime.
++ *
++ * The minimum sizes are computed from what this driver touches, not picked:
++ * de-top up to the version word, top up to the last RCQ register, layers a
++ * whole channel slot, display the blender's four instances.
++ */
++enum {
++	SUN60I_DE_WIN_DE_TOP,
++	SUN60I_DE_WIN_TOP,
++	SUN60I_DE_WIN_LAYERS,
++	SUN60I_DE_WIN_DISPLAY,
++	SUN60I_DE_WINDOWS,
++};
++
++struct sun60i_de {
++	struct device			*dev;
++	struct sun60i_de_window		win[SUN60I_DE_WINDOWS];
++	struct clk			*bus_clk;
++	struct clk			*mod_clk;
++	struct reset_control		*reset;
++	struct dentry			*dbg;
++	struct mutex			lock;		/* serialises enable/disable */
++	const struct sun60i_de_commit	*commit;
++	bool				enabled;
++	bool				layer_on;
++	bool				ccsc_on;
++	struct drm_display_mode		mode;
++
++	dma_addr_t			fb_dma;
++	u32				fb_pitch;
++	u32				background;
++
++	/*
++	 * What the three trap blocks and the version register read on a COLD DE,
++	 * before this driver wrote anything. No DE reset-state dump exists in
++	 * this tree, so these four words are the first ones taken -- and they
++	 * are what separates "reset default" from "the vendor wrote this" for
++	 * the blocks that decide whether the picture is correct. Reported by
++	 * `state`.
++	 */
++	u32				cold_version;
++	u32				cold_ccsc;
++	u32				cold_vsu;
++	u32				cold_tfbd;
++};
++
++static u32 sun60i_de_chn(unsigned int slot)
++{
++	return DE_CHN_BASE + slot * DE_CHN_STRIDE;
++}
++
++static u32 sun60i_de_bld(unsigned int instance)
++{
++	return DE_DISP0 + DE_DISP_BLD + instance * DE_BLD_STRIDE;
++}
++
++/*
++ * The one place the device tree's window split exists. Every other offset in
++ * this file counts from the DE aperture base, which is what the capture, the
++ * register map and the RCQ descriptor all use.
++ *
++ * A NULL return can only mean a device tree whose windows do not cover an
++ * offset this driver was built to reach, and probe already refuses those -- so
++ * it is a should-not-happen that is still worth naming rather than faulting on.
++ */
++static void __iomem *sun60i_de_map(struct sun60i_de *de, u32 off)
++{
++	unsigned int i;
++
++	for (i = 0; i < SUN60I_DE_WINDOWS; i++) {
++		const struct sun60i_de_window *w = &de->win[i];
++
++		if (off >= w->off && off - w->off < w->size)
++			return w->base + (off - w->off);
++	}
++
++	dev_err_once(de->dev, "DE offset 0x%06x is in no mapped window\n", off);
++
++	return NULL;
++}
++
++/* The control plane. Plain MMIO, never through the commit path -- see above. */
++static void sun60i_de_write(struct sun60i_de *de, u32 off, u32 val)
++{
++	void __iomem *reg = sun60i_de_map(de, off);
++
++	if (reg)
++		writel(val, reg);
++}
++
++static u32 sun60i_de_read(struct sun60i_de *de, u32 off)
++{
++	void __iomem *reg = sun60i_de_map(de, off);
++
++	return reg ? readl(reg) : 0;
++}
++
++static void sun60i_de_mmio_begin(struct sun60i_de *de)
++{
++}
++
++static void sun60i_de_mmio_stage(struct sun60i_de *de, u32 off, u32 val)
++{
++	sun60i_de_write(de, off, val);
++}
++
++static int sun60i_de_mmio_arm(struct sun60i_de *de)
++{
++	/*
++	 * A read from the aperture, to order every store above against the
++	 * TCON's next frame-start. There is nothing to trigger: the writes are
++	 * the commit.
++	 */
++	sun60i_de_read(de, DE_TOP + DE_TOP_VERSION);
++
++	return 0;
++}
++
++static const struct sun60i_de_commit sun60i_de_commit_mmio = {
++	.name	= "direct MMIO",
++	.begin	= sun60i_de_mmio_begin,
++	.stage	= sun60i_de_mmio_stage,
++	.arm	= sun60i_de_mmio_arm,
++};
++
++static void sun60i_de_stage(struct sun60i_de *de, u32 off, u32 val)
++{
++	de->commit->stage(de, off, val);
++}
++
++/*
++ * Reset de-assert first, then the gate -- the order UM 4.1.4.4 prescribes:
++ * release the reset, then enable the gating clock.
++ * The eDP block measured what skipping it costs on this SoC: with the gate set
++ * and the reset still asserted the whole window reads 0x00000000, which is
++ * indistinguishable from a dead block
++ *.
++ *
++ * THE MODULE CLOCK RATE IS NOT SET HERE, AND THAT IS DELIBERATE. DE0_CLK's
++ * source mux offers DEPLL3X/DEPLL4X first, and UM 4.1.4.3
++ * (A733 user manual) advises against changing DEPLL3X, because it also
++ * feeds NSI, the SoC interconnect, at 700 MHz. A
++ * clk_set_rate() here that propagated to that parent would move the fabric
++ * clock under every other block on the chip to suit a display mode.
++ *
++ * THIS DRIVER IS PARENT-AGNOSTIC, AND SAYS SO BECAUSE THE TWO CANDIDATES ARE
++ * BOTH REAL. Measured on the 8 GiB board on 2026-08-19 with the vendor's display engine
++ * genuinely live and a picture on the monitor:
++ *
++ *   PLL_DE_CTRL 0x020022E0 = 0xFD124A00   bit31 SET -- PLL_DE is ON
++ *   DE0_CLK     0x02002A00 = 0x80000000   gate on, mux [26:24] = 000 = DEPLL3X,
++ *                                         FACTOR_M [4:0] = 0 -> M = 1
++ *   DEPLL gates 0x02003928 = 0x00030000   bits 17:16, the DE PLL tap gates
++ *
++ * So the vendor runs the DE from DEPLL3X -- the reset default of that mux --
++ * and not from a PERI0 tap. Decoding 0x??124A00 with the same field map the UM
++ * cross-check below uses: N field 0x4A -> N = 75, M1 = 1, P1 = 3, so over the
++ * 24 MHz PLL_REF the VCO is 1800 MHz and DEPLL3X is 600 MHz. That number is
++ * worth noticing twice: it is also exactly the mod_rate mainline's DE33 config
++ * carries for the H616 (sun8i_mixer.c, sun50i_h616_mixer0_cfg), reached from
++ * the other direction.
++ *
++ * The field map is cross-checked against the UM's own statement rather than
++ * assumed: PLL_DE_CTRL_REG's RESET value 0x40125600 decodes under it as N = 87,
++ * M1 = 1, P1 = 3, i.e. DEPLL3X = 24 x 87 / 3 = 696 MHz -- "696MHz by default",
++ * the UM's words. Same map, two values, both landing on their own documented
++ * or measured number.
++ *
++ * ⛔ AN EARLIER VERSION OF THIS COMMENT SAID PLL_DE IS OFF ON THIS BOARD AND
++ * THAT LEAVING THE MUX ALONE GIVES A STOPPED CLOCK. That is deleted, not
++ * qualified: it rested on a 2026-07-18 reading taken on a board whose DE was
++ * DOWN, where of course the PLL was too. On a live DE the same register reads
++ * enabled. A reading of an idle block is not evidence about a running one.
++ *
++ * So the rate is the device tree's decision -- `arm64-dts-a733-display-engine-node-and-de-to-tcon-edge` pins PERI0_480M, the vendor
++ * uses DEPLL3X at 600 MHz, and both clear this mode's floor -- and this driver
++ * assumes NEITHER. It reads the rate back, refuses below the rate the mode
++ * fetches at, and logs what it got, so a board session records which parent was
++ * actually in effect instead of inheriting an assumption.
++ */
++static int sun60i_de_clocks_on(struct sun60i_de *de)
++{
++	unsigned long floor = de->mode.clock * 1000L;
++	unsigned long rate;
++	int ret;
++
++	ret = reset_control_deassert(de->reset);
++	if (ret)
++		return ret;
++
++	ret = clk_prepare_enable(de->bus_clk);
++	if (ret)
++		goto err_reset;
++
++	ret = clk_prepare_enable(de->mod_clk);
++	if (ret)
++		goto err_bus;
++
++	rate = clk_get_rate(de->mod_clk);
++	if (rate < floor) {
++		dev_err(de->dev,
++			"module clock is %lu Hz, below the %lu Hz this mode fetches at\n",
++			rate, floor);
++		ret = -EINVAL;
++		goto err_mod;
++	}
++
++	dev_info(de->dev, "module clock %lu Hz (floor %lu Hz)\n", rate, floor);
++
++	return 0;
++
++err_mod:
++	clk_disable_unprepare(de->mod_clk);
++err_bus:
++	clk_disable_unprepare(de->bus_clk);
++err_reset:
++	reset_control_assert(de->reset);
++
++	return ret;
++}
++
++static void sun60i_de_clocks_off(struct sun60i_de *de)
++{
++	clk_disable_unprepare(de->mod_clk);
++	clk_disable_unprepare(de->bus_clk);
++	reset_control_assert(de->reset);
++}
++
++/*
++ * The one cheap liveness check this block offers, and the only register in it
++ * whose expected value is known independently of a capture: three sources agree
++ * that this DE is version 0x352 -- the version word itself, the vendor DT
++ * string "allwinner,display-engine-v352", and the out-of-tree series' own name
++ * for the same IP.
++ *
++ * ⚠ FOUR DIFFERENT FAULTS READ ALIKE HERE, AND THE DRIVER CAN DISTINGUISH NONE
++ * OF THEM -- so it names all four with their addresses instead of guessing. A
++ * gated block on this SoC answers 0x00000000 without faulting, so a zero is
++ * indistinguishable from a wrong base, from a reset still asserted, and from a
++ * source clock that is not running.
++ *
++ * AND clk_get_rate() CANNOT SETTLE IT: a sunxi PLL's recalc computes from its
++ * register fields whether or not PLL_EN is set, so a stopped PLL still reports
++ * a plausible rate and the floor check in sun60i_de_clocks_on() passes. The
++ * rate is therefore printed as evidence, never as a verdict.
++ *
++ * The four addresses below are what a board session needs, and printing them is
++ * the whole lesson of 2026-08-19: `drm-a733-tcon-tv1-timing-generator-and-video-source` was correct and still produced a dead
++ * raster because its device tree withheld a reg window and a clock, and it was
++ * diagnosed in ten minutes only because the driver announced the gap WITH THE
++ * ADDRESSES. Two of the four matter only when the parent is a DE PLL tap, which
++ * is what the vendor's own live DE uses -- so they are named either way rather
++ * than omitted on the assumption that the device tree pinned a PERI0 parent.
++ */
++static int sun60i_de_check_alive(struct sun60i_de *de)
++{
++	de->cold_version = sun60i_de_read(de, DE_TOP + DE_TOP_VERSION);
++	if (de->cold_version == DE_VERSION_A733)
++		return 0;
++
++	dev_err(de->dev,
++		"DE version reads 0x%08x, expected 0x%08x -- the block is not answering\n",
++		de->cold_version, DE_VERSION_A733);
++	dev_err(de->dev,
++		"module clock reports %lu Hz, which does NOT prove it is running -- a stopped PLL still reports its programmed rate\n",
++		clk_get_rate(de->mod_clk));
++	dev_err(de->dev,
++		"read these four: DE0_BGR 0x02002A04 (expect 0x00010001), DE0_CLK 0x02002A00 (bit31 gate, [26:24] mux, [4:0] M)\n");
++	dev_err(de->dev,
++		"and, if that mux selects a DE PLL tap: PLL_DE_CTRL 0x020022E0 (bit31 PLL_EN) and the DE tap gates 0x02003928 (bits 17:16)\n");
++	dev_err(de->dev,
++		"a live vendor DE carries 0x00010001 / 0x80000000 / 0xFD124A00 / 0x00030000; see also /sys/kernel/debug/clk/de0/clk_parent\n");
++
++	return -ENODEV;
++}
++
++/*
++ * The layer's attribute word, in ONE place: sun60i_de_layer() writes it and
++ * sun60i_de_verify() reads it back to prove the window took it, so spelling it
++ * twice would let a fix to one drift silently past the other.
++ *
++ * 0xff008403 on a live vendor link, and it decodes completely with no residue:
++ * global alpha 0xff, RGB_MODE set, FBFMT 4 = XRGB8888, alpha mode 01 = layer,
++ * EN. COMPUTED -- every field comes from the format and full opacity.
++ */
++static u32 sun60i_de_attctl(void)
++{
++	return FIELD_PREP(OVL_ATTCTL_ALPHA, DE_ALPHA_OPAQUE) |
++	       OVL_ATTCTL_RGB_MODE |
++	       FIELD_PREP(OVL_ATTCTL_FBFMT, OVL_FBFMT_XRGB8888) |
++	       FIELD_PREP(OVL_ATTCTL_ALPHA_MODE, OVL_ALPHA_MODE_LAYER) |
++	       OVL_ATTCTL_EN;
++}
++
++/*
++ * Open the datapath aperture.
++ *
++ * ⚠ THE INVARIANT, AND IT IS A RULE RATHER THAN A STEP IN A SEQUENCE:
++ *
++ *     RE-APPLY AFTER EVERY reset_control_deassert(), BEFORE ANY DATAPATH WRITE.
++ *
++ * Two of these three are the DE's own INNER reset+gate registers -- 0x00010001
++ * is this SoC's de-assert-reset-plus-gate pattern, bit 16 reset and bit 0 gate.
++ * RST_BUS_DE0, which is DE0_BGR bit 16 and this node's own reset, clears them
++ * along with everything else inside the block. Measured: after an
++ * `enable 0` / `enable 1` cycle they read 0x00000000 again, because
++ * sun60i_de_clocks_off() asserts exactly that reset.
++ *
++ * So this is NOT a probe-time one-shot and must never be moved to probe, or to
++ * any other place that runs once. Anything that touches this driver's reset
++ * owns re-running this function afterwards; anything that writes a channel or
++ * blender register without it having run writes into a window that does not
++ * accept writes at all.
++ */
++static void sun60i_de_top_open(struct sun60i_de *de)
++{
++	sun60i_de_write(de, DE_TOP + DE_TOP_ENABLE0, DE_TOP_ENABLE0_VALUE);
++	sun60i_de_write(de, DE_TOP + DE_TOP_ENABLE1, DE_TOP_ENABLE1_VALUE);
++	sun60i_de_write(de, DE_TOP + DE_TOP_ENABLE2, DE_TOP_ENABLE2_VALUE);
++}
++
++/*
++ * Read back two registers this driver has just written, one per datapath
++ * window, and refuse rather than announce success it cannot support.
++ *
++ * THIS EXISTS BECAUSE OF THE EXACT FAILURE IT CATCHES. The first cut printed
++ * "scanning 1920x1200 XRGB8888 from ..." next to a `state` dump that was an
++ * honest column of zeros -- a statement of intent beside the evidence
++ * contradicting it, which is the pairing that misleads a board session. A
++ * driver may say it is scanning only after something it wrote reads back.
++ *
++ * The two outcomes are different faults and are reported as such:
++ *   zero          -- the window is not open. The three de_top enables above are
++ *                    the first thing to look at, and their addresses are in the
++ *                    message.
++ *   something else -- the window is open but did not take the value, which is
++ *                    the shadow the RCQ exists for. Nothing about the register
++ *                    CONTENT is wrong in that case; the delivery is.
++ */
++static int sun60i_de_verify(struct sun60i_de *de)
++{
++	u32 ovl = sun60i_de_chn(DE_VI0_SLOT) + DE_CHN_OVL + OVL_LAY_ATTCTL(DE_OVL_LAYER);
++	u32 bld = sun60i_de_bld(0) + BLD_PIPE_CTL;
++	u32 want_bld = BLD_PIPE_CTL_EN(DE_BLD_PIPE) | BLD_PIPE_CTL_FC_EN(DE_BLD_PIPE);
++	u32 want_ovl = sun60i_de_attctl();
++	unsigned int i;
++	const struct {
++		const char	*what;
++		u32		off;
++		u32		want;
++	} check[] = {
++		{ "channel VI0 LAY0_ATTCTL", ovl, want_ovl },
++		{ "blender 0 PIPE_CTL",	     bld, want_bld },
++	};
++
++	for (i = 0; i < ARRAY_SIZE(check); i++) {
++		u32 got = sun60i_de_read(de, check[i].off);
++
++		if (got == check[i].want)
++			continue;
++
++		if (!got) {
++			dev_err(de->dev,
++				"%s at 0x%08x reads 0x00000000 -- this window is NOT OPEN\n",
++				check[i].what, DE_APERTURE + check[i].off);
++			dev_err(de->dev,
++				"the three de_top enables are what open it: 0x05008000, 0x05008004, 0x05008008 (expect 0x00010001, 0x00010001, 0x00000011)\n");
++		} else {
++			dev_err(de->dev,
++				"%s at 0x%08x: wrote 0x%08x, reads 0x%08x -- the window is open but did not take the write\n",
++				check[i].what, DE_APERTURE + check[i].off,
++				check[i].want, got);
++			dev_err(de->dev,
++				"that is the shadow the RCQ exists for; the register CONTENT is not what is wrong\n");
++		}
++
++		return -EIO;
++	}
++
++	return 0;
++}
++
++/*
++ * Disarm the register command queue before anything else touches the datapath.
++ *
++ * This driver commits by CPU store. An RCQ left armed -- by a bootloader, by a
++ * previous kernel, by this driver's own future self -- would walk a descriptor
++ * array in DRAM on every frame-start pulse from the TCON and overwrite the
++ * datapath with whatever that memory now holds, silently, once per frame. The
++ * length goes to zero FIRST, so there is no window in which a walk begins from
++ * a valid length and a half-written pointer.
++ *
++ * On a cold DE all four of these read zero already, so on the intended path
++ * this is four no-op stores. It is here for the path that is not intended.
++ */
++static void sun60i_de_disarm_rcq(struct sun60i_de *de)
++{
++	sun60i_de_write(de, DE_MIXER0_TOP + MIXER_RCQ_HEAD_LEN, 0);
++	sun60i_de_write(de, DE_MIXER0_TOP + MIXER_RCQ_HEAD_LADDR, 0);
++	sun60i_de_write(de, DE_MIXER0_TOP + MIXER_RCQ_HEAD_HADDR, 0);
++	sun60i_de_write(de, DE_MIXER0_TOP + MIXER_RCQ_CTL, 0);
++}
++
++/*
++ * de_top and the mixer-0 top block -- the control plane, four registers.
++ *
++ *   DE2TCON_MUX  0x0000fff5   CARRIED. One nibble per display pipe; disp0 = 5
++ *                             and the other three = 0xf on a board with exactly
++ *                             one pipe up, which is what "route disp0, disable
++ *                             the rest" looks like. WHAT 5 MEANS IS NOT KNOWN:
++ *                             this SoC has four TCONs, so a plain index would
++ *                             make TCON_TV1 = 3. Two readings survive -- a
++ *                             global index in a numbering space wider than this
++ *                             part populates, or an enable bit plus an index
++ *                             ([3:1] = 2 with bit 0 set). This driver writes
++ *                             the word a working link carries and does not
++ *                             pretend to know why it is that word.
++ *   GLOBAL_CTL   BIT(0)       INFERRED -- mainline's SUN8I_MIXER_GLOBAL_CTL
++ *                             RT_EN, the single bit sun8i_mixer_init() writes.
++ *                             Silicon carries exactly 0x00000001.
++ *   GLOBAL_SIZE  from mode    COMPUTED -- ((h-1) << 16) | (w-1), mainline's
++ *                             SUN8I_MIXER_SIZE(). 1920x1200 gives 0x04af077f,
++ *                             which is what silicon carries.
++ *   GLOBAL_CLK   1            INFERRED -- SUN50I_MIXER_GLOBAL_CLK, a DE33-only
++ *                             register mainline writes 1 to. Silicon agrees.
++ *
++ * The negative control that makes the mixer-top identification an
++ * identification rather than a coincidence belongs next to the base: mainline's
++ * DE33 top block is 0x40 bytes, so mixer 1's would begin at 0x05008140 -- and
++ * on a board with one pipe up that entire 0x40 reads zero. The layout predicts
++ * a second block at a specific address and the silicon has it empty for the
++ * right reason.
++ */
++static void sun60i_de_top_setup(struct sun60i_de *de)
++{
++	const struct drm_display_mode *mode = &de->mode;
++	u32 size = DE_SIZE(mode->hdisplay, mode->vdisplay);
++
++	sun60i_de_write(de, DE_TOP + DE_TOP_DE2TCON_MUX, DE2TCON_MUX_LIVE);
++	sun60i_de_write(de, DE_MIXER0_TOP + MIXER_GLOBAL_SIZE, size);
++	sun60i_de_write(de, DE_MIXER0_TOP + MIXER_GLOBAL_CLK, 1);
++	sun60i_de_write(de, DE_MIXER0_TOP + MIXER_GLOBAL_CTL,
++			MIXER_GLOBAL_CTL_RT_EN);
++}
++
++/*
++ * One CCSC instance: the control word, and -- when it is enabled -- the unity
++ * matrix that the control word without it makes lethal. Writing the diagonal
++ * before the enable is deliberate: it means the block is never enabled with a
++ * zero matrix, not even for the width of one frame.
++ *
++ * When disabled, the matrix is written as zeros anyway rather than left alone.
++ * A bypassed block's coefficients do not matter, and a driver that leaves half
++ * a configuration behind when it turns something off is how the next enable
++ * inherits a state nobody chose.
++ */
++static void sun60i_de_ccsc_one(struct sun60i_de *de, u32 base)
++{
++	u32 coeff = de->ccsc_on ? CCSC_COEFF_UNITY : 0;
++	unsigned int row;
++
++	for (row = 0; row < CCSC_MATRIX_ROWS; row++)
++		sun60i_de_stage(de,
++				base + CCSC_COEFF_ROW0 +
++				row * CCSC_COEFF_ROW_STRIDE + row * sizeof(u32),
++				coeff);
++
++	sun60i_de_stage(de, base + CCSC_CTL,
++			de->ccsc_on ? CCSC_CTL_LIVE : 0);
++}
++
++/*
++ * The two per-channel blocks that are non-zero on a live link and sit in the
++ * fetch path, plus the scaler. None of the three can be "left at reset",
++ * because on a cold DE nobody in this tree has ever read what their reset is --
++ * which is why the values are captured into cold_* here before anything is
++ * written, and printed by `state`.
++ *
++ * CCSC (channel colour-space conversion), slot + 0x800, eight instances at a
++ * 0x100 stride. Live: every one of the eight reads 0x00000001, on a board where
++ * exactly ONE layer of ONE channel was fetching -- which is the argument that 1
++ * is this block's reset default rather than something the vendor configured.
++ * The A523 series writes 0 here for a linear-RGB layer; that is code, on a
++ * different part, and our own silicon says 1 while producing correct colour on
++ * this part. Silicon beats code, so this driver writes 1.
++ *   FALSIFIED BY: wrong colour -- channels swapped, or washed out -- which
++ *   would mean the block is on the path with non-unity coefficients and the
++ *   answer is 0. One line, and cold_ccsc in `state` says which way to go.
++ *
++ * VSU (the per-channel scaler), slot + 0x4000. Live: VSU_CTL and
++ * ATTR_OUT_SIZE both read zero and there is a picture, so a 1:1 unscaled path
++ * costs nothing on a warm DE. The A523 series reports the v35x channel datapath
++ * as ALWAYS overlay -> VSU -> blender with no bypass, and that after
++ * power-gating the DE the filter-coefficient SRAM powers up holding RANDOM
++ * data; its stated reason the vendor never hits this is that Android never
++ * power-gates the DE. Our capture cannot settle it -- the vendor stack never
++ * power-gated it either -- and what it does show is suggestive: slot 0's
++ * coefficient area holds varying unstructured values and slot 6 holds one value
++ * repeated 32 times, and neither looks like a FIR set.
++ *   This driver writes VSU_CTL = 0, the value a working link carries, and does
++ *   NOT invent a unity coefficient table: the VSU register map is prior art
++ *   only, unconfirmed at this offset on this part, and writing dozens of
++ *   unverified words into a block in the fetch path is the guess this tree does
++ *   not make.
++ *   FALSIFIED BY: a picture that is present but visibly corrupt -- the series
++ *   describes it collapsing to a repeated column. That is the reading which
++ *   turns a six-register channel setup into one that also loads coefficients.
++ *
++ * TFBD (the tiled-framebuffer decoder), slot + 0x5400. Live: 0x00002103 in four
++ * instances at a 0x100 stride -- and it reads that on slot 6, a channel that
++ * was fetching NOTHING, which is the argument that it is an idle value and not
++ * a configuration. This driver does not write it, and the reason is
++ * provenance: the A523 series warns that a stale TFBD "mangles the fetch" and
++ * clears it, but its register map is unconfirmed here, our framebuffer is
++ * linear, and zeroing an unknown block to satisfy a comment about another part
++ * is exactly the defect class of trusting another SoC's register map. It is READ and reported
++ * instead, so the first run says what a cold TFBD holds.
++ *   FALSIFIED BY: a fetch that produces tiled or garbage output while every
++ *   register above reads back correctly.
++ */
++static void sun60i_de_channel_quiesce(struct sun60i_de *de)
++{
++	u32 chn = sun60i_de_chn(DE_VI0_SLOT);
++	unsigned int i;
++
++	de->cold_ccsc = sun60i_de_read(de, chn + DE_CHN_CCSC + CCSC_CTL);
++	de->cold_vsu = sun60i_de_read(de, chn + DE_CHN_VSU + VSU_CTL);
++	de->cold_tfbd = sun60i_de_read(de, chn + DE_CHN_TFBD + TFBD_STATE_WORD);
++
++	for (i = 0; i < DE_CCSC_INSTANCES; i++)
++		sun60i_de_ccsc_one(de, chn + DE_CHN_CCSC + i * DE_CCSC_STRIDE);
++
++	sun60i_de_stage(de, chn + DE_CHN_VSU + VSU_CTL, 0);
++	sun60i_de_stage(de, chn + DE_CHN_VSU + VSU_ATTR_OUT_SIZE, 0);
++}
++
++/*
++ * The blender, nine registers per instance times four instances.
++ *
++ *   PIPE_CTL     0x101       COMPUTED -- PIPE_CTL_EN(0) or-ed with FC_EN(0),
++ *                            mainline's two macros and the prior art's
++ *                            SUN55I_BLD_PIPE_EN(0) producing the same word from
++ *                            two directions. Silicon carries 0x00000101.
++ *   FCOLOR(0)                COMPUTED -- AARRGGBB. Opaque black by default,
++ *                            which is mainline's BLEND_COLOR_BLACK and what
++ *                            silicon carries.
++ *   INSIZE(0), COORD(0)      COMPUTED from the mode -- full screen at the
++ *                            origin.
++ *   ROUTE        0           COMPUTED -- four bits per pipe, pipe 0 <- channel
++ *                            0. The zero is the right answer here, not merely
++ *                            an untouched register.
++ *   OUTSIZE                  COMPUTED from the mode.
++ *   BLEND_MODE(0) 0x03010301 CARRIED, and honestly so: mainline's own comment
++ *                            on this constant is "some still unknown magic
++ *                            numbers", and the prior art calls it SRCOVER
++ *                            without explaining it either. The A733 carries the
++ *                            same word verbatim.
++ *
++ * TWO REGISTERS ARE WRITTEN THAT THE LIVE LINK LEAVES AT ZERO, and both are
++ * departures this driver owns rather than discovers later. PREMULTIPLY = 0 is
++ * the value either way, and is written so that a bootloader cannot leave it set
++ * for an XRGB8888 layer that has no alpha to premultiply. BKCOLOR = opaque
++ * black is what mainline initialises and the vendor does not; it is invisible
++ * behind a full-screen opaque layer, which is exactly why the vendor can do
++ * without writing it, and it is the first thing that shows the moment a plane is
++ * smaller than the screen. The out-of-tree series later added a patch titled
++ * "black blender background" for that reason.
++ *
++ * BLD_OUTCTL, which mainline places at +0xfc and uses for the interlace bit, is
++ * NOT written -- and that is a disagreement rather than an oversight. The A523
++ * block map puts +0xa0..+0xff in the colour-key region, not in the control
++ * region, so the two candidate names for +0xfc conflict and our capture cannot
++ * choose between them: it reads zero, which is correct under both. This mode is
++ * progressive, so nothing needs it.
++ */
++static void sun60i_de_blender(struct sun60i_de *de)
++{
++	const struct drm_display_mode *mode = &de->mode;
++	u32 size = DE_SIZE(mode->hdisplay, mode->vdisplay);
++	unsigned int i;
++
++	for (i = 0; i < DE_BLD_INSTANCES; i++) {
++		u32 bld = sun60i_de_bld(i);
++
++		sun60i_de_stage(de, bld + BLD_ATTR_FCOLOR(DE_BLD_PIPE),
++				de->background);
++		sun60i_de_stage(de, bld + BLD_ATTR_INSIZE(DE_BLD_PIPE), size);
++		sun60i_de_stage(de, bld + BLD_ATTR_COORD(DE_BLD_PIPE), 0);
++		sun60i_de_stage(de, bld + BLD_ROUTE, 0);
++		sun60i_de_stage(de, bld + BLD_PREMULTIPLY, 0);
++		sun60i_de_stage(de, bld + BLD_BKCOLOR, BLD_COLOR_BLACK);
++		sun60i_de_stage(de, bld + BLD_OUTSIZE, size);
++		sun60i_de_stage(de, bld + BLD_MODE(DE_BLD_PIPE),
++				BLD_MODE_SRCOVER);
++		sun60i_de_stage(de, bld + BLD_PIPE_CTL,
++				BLD_PIPE_CTL_EN(DE_BLD_PIPE) |
++				BLD_PIPE_CTL_FC_EN(DE_BLD_PIPE));
++	}
++}
++
++/*
++ * The layer -- six registers that matter, every one COMPUTED from the mode and
++ * the framebuffer, and the live link's ATTCTL word decodes completely under
++ * them with no residue: 0xff008403 is global alpha 0xff, RGB_MODE set, FBFMT
++ * 4 = XRGB8888, alpha mode 01 = layer, EN.
++ *
++ * The plane-1 and plane-2 pitches and addresses are written as zero rather than
++ * left alone. They are unused for a packed RGB format and the live link has
++ * them clear -- but they are also the four words that tell a VI channel apart
++ * from a UI one, so writing them is what makes "this is a single-plane RGB
++ * layer" a statement the hardware was given rather than one it was assumed to
++ * have kept.
++ *
++ * THE LAYER HAS HIGH-ADDRESS BYTES, and this driver leaves them at 0.
++ * VI +0xd0..+0xe4 (TOP/BOT_HADDR) carry one byte per layer; a 1 in layer 1's
++ * byte made the DE fetch 4 GiB above its address (sink CRC, 8 GB board,
++ * 2026-09-22). The search that found none read 0x05101080, layer 2's plane-2
++ * address. So probe()'s 32-bit DMA mask is this driver's choice, not the
++ * hardware's: a buffer above 4 GiB is refused, never truncated.
++ *
++ * ⚠ AND WHAT THAT ADDRESS *MEANS* IS NOT THE SAME ON THE VENDOR'S SYSTEM AND ON
++ * OURS. THE VENDOR RUNS THIS PATH THROUGH AN IOMMU.
++ *
++ * Measured on the 8 GiB board on 2026-08-19 with the DE live: 5000000.de sits in
++ * iommu_group 0 with the VE and the deinterlacer, sunxi-iommu-v2 at 3900000
++ * comes up with "Default domain type: Translated", and the vendor DT gives
++ * de@5000000 `iommus = <&iommu 8 1>` -- master id 8. The proof that it is a
++ * translation and not an identity map is direct: 0x05101018 reads 0xFC000000
++ * with a picture on the screen, and a PHYSICAL read at 0xFC000000 returns
++ * 0x005E0001 / 0xFE40FB00 / 0x005E0001 at +0/+4/+0x1000 -- structured data, not
++ * pixels, at an address that is inside system RAM (0x40000000-0x23FFFFFFF).
++ *
++ * TWO CONSEQUENCES, AND THE SECOND IS THIS DRIVER'S RISK, NOT ITS BUG:
++ *
++ *  1. SCANOUT ADDRESSES IN A VENDOR CAPTURE ARE NOT COMPARABLE TO OURS. Every
++ *     other register in this file can be diffed against that capture; this one
++ *     cannot, because 0xFC000000 there is an IOVA and whatever this driver
++ *     programs here is not. Do not "fix" a mismatch in this register against
++ *     the capture.
++ *  2. OUR TREE HAS NO IOMMU SUPPORT AT ALL -- no patch mentions one, no DT node
++ *     exists, no `iommus` property is anywhere in it -- so on our kernel the
++ *     DE's address reaches the bus UNTRANSLATED. That is correct if and only if
++ *     the IOMMU is genuinely in bypass or off for us, and NOTHING HAS VERIFIED
++ *     THAT. If it comes up translating with no mapping for master 8, the DE
++ *     fetches from nowhere and the symptom is a black screen with every
++ *     register reading back perfectly -- the exact failure shape that cost this
++ *     project a session on 2026-08-19. So the driver does not assume it: it
++ *     asks device_iommu_mapped() and SAYS which of the two it got, at enable
++ *     and in `state`.
++ *
++ * WHY THE DMA API RATHER THAN A HAND-ROLLED ADDRESS, and it is this exact case:
++ * dma_alloc_coherent() hands back a dma_addr_t, which is a physical address
++ * today and becomes an IOVA automatically on the day an IOMMU node and an
++ * `iommus` property exist -- with no change in this file. A hand-computed
++ * physical address would be silently wrong on that day.
++ *
++ * ⛔ AND THE `iommus` PROPERTY MUST NOT BE ADDED SPECULATIVELY. A phandle to an
++ * IOMMU node with no driver bound leaves this device deferring forever, so it
++ * arrives with a verified IOMMU driver or not at all. Mainline 6.18.36 does
++ * ship drivers/iommu/sun50i-iommu.c; whether it matches this SoC's
++ * sunxi-iommu-v2 is UNVERIFIED and this file assumes neither way.
++ */
++static void sun60i_de_layer(struct sun60i_de *de)
++{
++	const struct drm_display_mode *mode = &de->mode;
++	u32 ovl = sun60i_de_chn(DE_VI0_SLOT) + DE_CHN_OVL;
++	u32 size = DE_SIZE(mode->hdisplay, mode->vdisplay);
++	unsigned int plane;
++
++	for (plane = 1; plane < OVL_VI_PLANES; plane++) {
++		sun60i_de_stage(de, ovl + OVL_LAY_PITCH(DE_OVL_LAYER, plane), 0);
++		sun60i_de_stage(de, ovl + OVL_LAY_TOP_LADDR(DE_OVL_LAYER, plane), 0);
++	}
++
++	sun60i_de_stage(de, ovl + OVL_LAY_MBSIZE(DE_OVL_LAYER), size);
++	sun60i_de_stage(de, ovl + OVL_LAY_MBCOOR(DE_OVL_LAYER), 0);
++	sun60i_de_stage(de, ovl + OVL_LAY_PITCH(DE_OVL_LAYER, 0), de->fb_pitch);
++	sun60i_de_stage(de, ovl + OVL_LAY_TOP_LADDR(DE_OVL_LAYER, 0),
++			lower_32_bits(de->fb_dma));
++	sun60i_de_stage(de, ovl + OVL_VI_OVL_SIZE, size);
++
++	sun60i_de_stage(de, ovl + OVL_LAY_ATTCTL(DE_OVL_LAYER),
++			sun60i_de_attctl());
++}
++
++static void sun60i_de_layer_disable(struct sun60i_de *de)
++{
++	u32 ovl = sun60i_de_chn(DE_VI0_SLOT) + DE_CHN_OVL;
++
++	de->commit->begin(de);
++	sun60i_de_stage(de, ovl + OVL_LAY_ATTCTL(DE_OVL_LAYER), 0);
++	de->commit->arm(de);
++	de->layer_on = false;
++}
++
++/*
++ * Stage the layer on or off through the commit path, and nothing else.
++ *
++ * Reachable rather than internal because it is this driver's confirmation of
++ * the one thing the vendor-side measurement could not cover: that a CPU store
++ * reaches the datapath of a COLD DE, one this driver programmed itself, whose
++ * RCQ was never armed. With a picture already on the screen and the observer
++ * already proven by `fill` -- which writes no register at all -- a single
++ * datapath register is toggled and the screen either follows or does not.
++ * NOT following, while `state` shows LAY0_ATTCTL reading back exactly as
++ * written, is the shadow the A523/T527 series describes, and it is the result
++ * that puts an RCQ backend behind the three commit ops.
++ *
++ * ⚠ THE ORDER IS NOT OPTIONAL, and it is the correction to a measurement that
++ * had to be withdrawn and redone: prove the observer, THEN move a register. A
++ * screen nobody has confirmed is on cannot falsify anything.
++ */
++static void sun60i_de_layer_enable(struct sun60i_de *de)
++{
++	de->commit->begin(de);
++	sun60i_de_layer(de);
++	de->commit->arm(de);
++	de->layer_on = true;
++}
++
++/*
++ * mode->clock is in kHz, i.e. pixels per millisecond, so htotal x vtotal over
++ * it is the frame time in milliseconds directly -- 2080 x 1235 / 154000 = 17 ms
++ * rounded up for the one mode this path drives.
++ */
++static void sun60i_de_quiesce(struct sun60i_de *de)
++{
++	const struct drm_display_mode *mode = &de->mode;
++	u32 frame_ms = DIV_ROUND_UP(mode->htotal * mode->vtotal, mode->clock);
++
++	msleep(DE_QUIESCE_FRAMES * frame_ms);
++}
++
++static void sun60i_de_disable(struct sun60i_de *de)
++{
++	/*
++	 * Layer off, then quiesce, then the clocks, then the memory. The DE has
++	 * to stop fetching before the pages under it go back to CMA, or a buffer
++	 * that now belongs to somebody else is still being read at
++	 * 138 Mpixel/s -- and it has to be given time to finish what is in
++	 * flight before its reset is asserted underneath it.
++	 */
++	sun60i_de_layer_disable(de);
++	sun60i_de_quiesce(de);
++	sun60i_de_clocks_off(de);
++	de->enabled = false;
++}
++
++struct sun60i_de_reg {
++	const char	*name;
++	u32		off;
++};
++
++static void sun60i_de_dump(struct seq_file *s, struct sun60i_de *de,
++			   const struct sun60i_de_reg *regs, size_t n)
++{
++	size_t i;
++
++	for (i = 0; i < n; i++)
++		seq_printf(s, "  %-30s 0x%06x : 0x%08x\n", regs[i].name,
++			   regs[i].off, sun60i_de_read(de, regs[i].off));
++}
++
++static int sun60i_de_state_show(struct seq_file *s, void *unused)
++{
++	struct sun60i_de *de = s->private;
++	u32 chn = sun60i_de_chn(DE_VI0_SLOT);
++	u32 ovl = chn + DE_CHN_OVL;
++	u32 bld = sun60i_de_bld(0);
++	const struct sun60i_de_reg control[] = {
++		{ "de_top ENABLE0 (want 0x10001)", DE_TOP + DE_TOP_ENABLE0 },
++		{ "de_top ENABLE1 (want 0x10001)", DE_TOP + DE_TOP_ENABLE1 },
++		{ "de_top ENABLE2 (want 0x11)",	DE_TOP + DE_TOP_ENABLE2 },
++		{ "de_top VERSION",	DE_TOP + DE_TOP_VERSION },
++		{ "de_top DE2TCON_MUX",	DE_TOP + DE_TOP_DE2TCON_MUX },
++		{ "mixer0 GLOBAL_CTL",	DE_MIXER0_TOP + MIXER_GLOBAL_CTL },
++		{ "mixer0 GLOBAL_SIZE",	DE_MIXER0_TOP + MIXER_GLOBAL_SIZE },
++		{ "mixer0 GLOBAL_CLK",	DE_MIXER0_TOP + MIXER_GLOBAL_CLK },
++		{ "mixer0 RCQ_HEAD_LEN", DE_MIXER0_TOP + MIXER_RCQ_HEAD_LEN },
++	};
++	const struct sun60i_de_reg datapath[] = {
++		{ "vi0 LAY0_ATTCTL",	ovl + OVL_LAY_ATTCTL(DE_OVL_LAYER) },
++		{ "vi0 LAY0_MBSIZE",	ovl + OVL_LAY_MBSIZE(DE_OVL_LAYER) },
++		{ "vi0 LAY0_MBCOOR",	ovl + OVL_LAY_MBCOOR(DE_OVL_LAYER) },
++		{ "vi0 LAY0_PITCH0",	ovl + OVL_LAY_PITCH(DE_OVL_LAYER, 0) },
++		{ "vi0 LAY0_TOP_LADDR0", ovl + OVL_LAY_TOP_LADDR(DE_OVL_LAYER, 0) },
++		{ "vi0 OVL_SIZE",	ovl + OVL_VI_OVL_SIZE },
++		{ "bld0 PIPE_CTL",	bld + BLD_PIPE_CTL },
++		{ "bld0 FCOLOR0",	bld + BLD_ATTR_FCOLOR(DE_BLD_PIPE) },
++		{ "bld0 INSIZE0",	bld + BLD_ATTR_INSIZE(DE_BLD_PIPE) },
++		{ "bld0 ROUTE",		bld + BLD_ROUTE },
++		{ "bld0 BKCOLOR",	bld + BLD_BKCOLOR },
++		{ "bld0 OUTSIZE",	bld + BLD_OUTSIZE },
++		{ "bld0 BLEND_MODE0",	bld + BLD_MODE(DE_BLD_PIPE) },
++	};
++	const struct sun60i_de_reg traps[] = {
++		{ "vi0 CCSC_CTL",		chn + DE_CHN_CCSC + CCSC_CTL },
++		{ "vi0 CCSC c00 (want 0x20000)", chn + DE_CHN_CCSC + CCSC_COEFF_ROW0 },
++		{ "vi0 CCSC c11 (want 0x20000)", chn + DE_CHN_CCSC + CCSC_COEFF_ROW0 +
++						 CCSC_COEFF_ROW_STRIDE + 4 },
++		{ "vi0 CCSC c22 (want 0x20000)", chn + DE_CHN_CCSC + CCSC_COEFF_ROW0 +
++						 2 * CCSC_COEFF_ROW_STRIDE + 8 },
++		{ "vi0 VSU_CTL (written 0)",	chn + DE_CHN_VSU + VSU_CTL },
++		{ "vi0 VSU_OUT_SIZE (written 0)", chn + DE_CHN_VSU + VSU_ATTR_OUT_SIZE },
++		{ "vi0 TFBD (not written)",	chn + DE_CHN_TFBD + TFBD_STATE_WORD },
++	};
++
++	guard(mutex)(&de->lock);
++
++	if (!de->enabled)
++		return -ENODEV;
++
++	seq_printf(s, "mode           : %dx%d, %d kHz\n", de->mode.hdisplay,
++		   de->mode.vdisplay, de->mode.clock);
++	seq_printf(s, "module clock   : %lu Hz\n", clk_get_rate(de->mod_clk));
++	seq_printf(s, "scanout        : %pad, pitch %u, XRGB8888\n",
++		   &de->fb_dma, de->fb_pitch);
++	seq_printf(s, "address kind   : %s\n",
++		   device_iommu_mapped(de->dev) ?
++		   "IOVA (behind an IOMMU) -- NOT comparable with a vendor capture" :
++		   "physical (no IOMMU attached) -- a vendor capture's is an IOVA");
++	seq_printf(s, "commit         : %s\n", de->commit->name);
++
++	seq_puts(s, "\ncontrol plane (plain MMIO, latches directly):\n");
++	sun60i_de_dump(s, de, control, ARRAY_SIZE(control));
++	seq_printf(s, "\ndatapath (through the commit path -- %s):\n",
++		   de->commit->name);
++	sun60i_de_dump(s, de, datapath, ARRAY_SIZE(datapath));
++	seq_puts(s, "\nthe three trap blocks:\n");
++	sun60i_de_dump(s, de, traps, ARRAY_SIZE(traps));
++
++	/*
++	 * The cold values are a reading this tree does not otherwise have: no DE
++	 * reset-state dump exists, so until one is taken these four words are
++	 * the only evidence separating "reset default" from "the vendor wrote
++	 * this" for the blocks that decide whether the picture is correct.
++	 */
++	seq_puts(s, "\nread on a COLD DE, before this driver wrote anything:\n");
++	seq_printf(s, "  VERSION 0x%08x  CCSC 0x%08x  VSU_CTL 0x%08x  TFBD 0x%08x\n",
++		   de->cold_version, de->cold_ccsc, de->cold_vsu,
++		   de->cold_tfbd);
++
++	seq_puts(s, "\nRCQ_HEAD_LEN must read 0: this driver commits by CPU store, and an\n");
++	seq_puts(s, "armed queue would reload the datapath from DRAM on every frame-start.\n");
++	seq_puts(s, "\nThe three de_top ENABLE words open the channel and blender windows. With any\n");
++	seq_puts(s, "of them at zero those windows do not accept a write AT ALL and every datapath\n");
++	seq_puts(s, "line above reads 0x00000000 -- which is what unmapped space reads too.\n");
++	seq_printf(s, "\nCCSC is %s. An ENABLED CCSC with a ZERO matrix multiplies every pixel by\n",
++		   de->ccsc_on ? "ENABLED with a unity matrix" : "DISABLED");
++	seq_puts(s, "zero: a black screen with no underflow, no lostwarn, and every other register\n");
++	seq_puts(s, "correct. If the screen is black, read the three coefficients above first, then\n");
++	seq_puts(s, "try `echo 0 > ccsc` -- the two readings of this block are one write apart.\n");
++
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(sun60i_de_state);
++
++static void sun60i_de_teardown(void *data)
++{
++	struct sun60i_de *de = data;
++
++	debugfs_remove_recursive(de->dbg);
++
++	scoped_guard(mutex, &de->lock)
++		if (de->enabled)
++			sun60i_de_disable(de);
++}
++
++static int sun60i_de_resources(struct device *dev, struct sun60i_de *de)
++{
++	de->bus_clk = devm_clk_get(dev, "bus");
++	if (IS_ERR(de->bus_clk))
++		return dev_err_probe(dev, PTR_ERR(de->bus_clk), "bus clock\n");
++
++	de->mod_clk = devm_clk_get(dev, "mod");
++	if (IS_ERR(de->mod_clk))
++		return dev_err_probe(dev, PTR_ERR(de->mod_clk),
++				     "module clock\n");
++
++	/*
++	 * Unnamed, i.e. index 0 -- the node carries one reset (DE0_BGR bit 16)
++	 * and, if it carries no reset-names, a named lookup against it would
++	 * fail. This keeps working if reset-names is added later.
++	 */
++	de->reset = devm_reset_control_get_exclusive(dev, NULL);
++	if (IS_ERR(de->reset))
++		return dev_err_probe(dev, PTR_ERR(de->reset), "reset\n");
++
++	return 0;
++}
++
++/*
++ * The window table. Each entry names the reg-names string the device tree must
++ * carry, the offset from the DE aperture base that window MUST land on, and
++ * the minimum length this driver needs out of it -- every minimum computed from
++ * what the code below actually touches rather than picked.
++ *
++ * The check is the point. A window at the wrong address does not fault on this
++ * SoC and does not even fail to map; it reads zeros or, worse, someone else's
++ * registers. Refusing at probe with the address in the message turns a device
++ * tree mistake into a line in dmesg instead of a board session.
++ */
++static const struct {
++	const char	*name;
++	u32		off;
++	u32		min_size;
++} sun60i_de_window_map[SUN60I_DE_WINDOWS] = {
++	[SUN60I_DE_WIN_DE_TOP]	= { "de-top",  DE_TOP,
++				    DE_TOP_VERSION + sizeof(u32) },
++	[SUN60I_DE_WIN_TOP]	= { "top",     DE_MIXER0_TOP,
++				    MIXER_RCQ_HEAD_LEN + sizeof(u32) },
++	[SUN60I_DE_WIN_LAYERS]	= { "layers",  DE_CHN_BASE, DE_CHN_STRIDE },
++	[SUN60I_DE_WIN_DISPLAY]	= { "display", DE_DISP0,
++				    DE_DISP_BLD + DE_BLD_INSTANCES * DE_BLD_STRIDE },
++};
++
++static int sun60i_de_map_windows(struct platform_device *pdev,
++				 struct sun60i_de *de)
++{
++	struct device *dev = &pdev->dev;
++	unsigned int i;
++
++	for (i = 0; i < SUN60I_DE_WINDOWS; i++) {
++		const char *name = sun60i_de_window_map[i].name;
++		struct resource *res;
++		void __iomem *base;
++
++		base = devm_platform_ioremap_resource_byname(pdev, name);
++		if (IS_ERR(base))
++			return dev_err_probe(dev, PTR_ERR(base), "reg \"%s\"\n",
++					     name);
++
++		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, name);
++		if (res->start < DE_APERTURE ||
++		    res->start - DE_APERTURE != sun60i_de_window_map[i].off)
++			return dev_err_probe(dev, -EINVAL,
++					     "reg \"%s\" is at %pa, expected 0x%08x\n",
++					     name, &res->start,
++					     DE_APERTURE + sun60i_de_window_map[i].off);
++
++		if (resource_size(res) < sun60i_de_window_map[i].min_size)
++			return dev_err_probe(dev, -EINVAL,
++					     "reg \"%s\" is %llu bytes, this driver reaches %u\n",
++					     name, (u64)resource_size(res),
++					     sun60i_de_window_map[i].min_size);
++
++		de->win[i].base = base;
++		de->win[i].off = sun60i_de_window_map[i].off;
++		de->win[i].size = resource_size(res);
++	}
++
++	return 0;
++}
++
++static int sun60i_de_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct sun60i_de *de;
++	int ret;
++
++	de = devm_kzalloc(dev, sizeof(*de), GFP_KERNEL);
++	if (!de)
++		return -ENOMEM;
++
++	de->dev = dev;
++	de->mode = sun60i_display_mode_1920x1200;
++	de->background = BLD_COLOR_BLACK;
++	de->ccsc_on = true;
++	de->commit = &sun60i_de_commit_mmio;
++	platform_set_drvdata(pdev, de);
++
++	/*
++	 * A driver choice, not a hardware limit: the layer's high-address byte
++	 * (above sun60i_de_layer()) stays 0, so every buffer must sit
++	 * below 4 GiB. Mainline's sun8i mixer also runs with a 32-bit mask,
++	 * although its UI layers have a high-address register.
++	 */
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
++	if (ret)
++		return dev_err_probe(dev, ret, "32-bit DMA mask\n");
++
++	ret = devm_mutex_init(dev, &de->lock);
++	if (ret)
++		return ret;
++
++	ret = sun60i_de_map_windows(pdev, de);
++	if (ret)
++		return ret;
++
++	ret = sun60i_de_resources(dev, de);
++	if (ret)
++		return ret;
++
++	/*
++	 * Nothing above touched a register and nothing below does either. The DE
++	 * drives pixels into a TCON that may not be scanning, out of a Type-C
++	 * port that may be carrying SuperSpeed -- so it is started deliberately,
++	 * the rule `drm-allwinner-a733-displayport-aux` established for the AUX channel and `drm-a733-tcon-tv1-timing-generator-and-video-source` kept for the
++	 * TCON.
++	 */
++	de->dbg = debugfs_create_dir(dev_name(dev), NULL);
++	ret = devm_add_action_or_reset(dev, sun60i_de_teardown, de);
++	if (ret)
++		return ret;
++
++	debugfs_create_file("state", 0400, de->dbg, de, &sun60i_de_state_fops);
++
++	dev_info(dev, "A733 display engine on %s, idle until a KMS master binds\n",
++		 dev_name(dev));
++
++	return 0;
++}
++
++/*
++ * The compatible is mainline's DE33 mixer naming, and claiming it is
++ * deliberate: this is a stand-in for a sun8i_mixer entry, not a rival to one.
++ * The device tree describes the hardware in the shape that backend will want --
++ * four named windows, an output graph edge -- so when the mixer entry lands,
++ * one patch moves this string from here into sun8i_mixer_of_table and the DT
++ * does not move at all. A second compatible for the same block would have made
++ * that a device tree change as well.
++ *
++ * ⛔ AND IT IS THIS PART'S OWN STRING, NOT "allwinner,sun50i-h616-de33-mixer-0"
++ * AS A FALLBACK. That would bind this hardware to the H616 cfg, whose
++ * .map = {0, 6, 7, 8} computes the WRONG channel base for every channel above
++ * the first on a part whose slots are {0,1,2} + {6,7,8,9}. The DE33 *code*
++ * describes this silicon; the H616 *cfg* does not, and the difference is
++ * silent -- a fallback would probe happily and fetch from the wrong address.
++ * Reuse the code, never the cfg.
++ */
++static const struct of_device_id sun60i_de_of_match[] = {
++	{ .compatible = "allwinner,sun60i-a733-de-mixer-0" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, sun60i_de_of_match);
++
++static struct platform_driver sun60i_de_driver = {
++	.probe	= sun60i_de_probe,
++	.driver	= {
++		.name		= "sun60i-a733-de-mixer",
++		.of_match_table	= sun60i_de_of_match,
++	},
++};
++module_platform_driver(sun60i_de_driver);
++
++MODULE_DESCRIPTION("Allwinner A733 display engine");
++MODULE_LICENSE("GPL");

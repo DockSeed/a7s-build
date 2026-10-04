@@ -1,0 +1,125 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] drm/imagination: check the job's done fence, not the parent, on a timeout
+
+pvr_queue_timedout_job() starts with
+
+	if (dma_fence_is_signaled(s_job->s_fence->parent))
+		return DRM_GPU_SCHED_STAT_NO_HANG;
+
+(mainline ee7cb7425314, "drm/imagination: Don't timeout job if its fence
+has been signaled", carried here through
+drm-imagination-carry-the-mainline-driver). Stable has it since 6.18.53 as
+2d607646909a, without mainline 2224d6642136, so plain 6.18.53 and 6.18.54 run
+it with the old 500 ms timeout. The parent can be NULL at that point, and
+dma_fence_is_signaled() does not check for NULL.
+
+WHY THE PARENT CAN BE NULL -- read, 6.18.53 and mainline alike
+
+  drm_sched_run_job_work() calls drm_sched_job_begin() first
+  (sched_main.c:1254), which puts the job on pending_list and arms work_tdr
+  (sched_main.c:501-508); then run_job() (:1261); only then
+  drm_sched_fence_scheduled() stores the parent (:1263, sched_fence.c:65-75).
+  drm_sched_job_timedout() hands the first pending job to the driver
+  (sched_main.c:537-560). A job whose run_job() has not returned when the
+  timeout expires reaches the handler with parent == NULL. The scheduler
+  itself treats that as a normal state: drm_sched_stop() tests
+  `s_job->s_fence->parent &&` (:629), drm_sched_start() `if (!fence)` (:703).
+  Other drivers in the same place: amdgpu's soft recovery checks `!fence`;
+  etnaviv tests out_fence, the finished fence it takes at push
+  (etnaviv_sched.c:121); panfrost tests the done_fence that run_job() sets
+  before anything that can block (panfrost_job.c:401). lima tests
+  task->fence, which run_job() sets only after lima_pm_busy() has resumed the
+  GPU (lima_sched.c:220/226), so it carries the same class of defect (read,
+  not reported).
+
+WHAT WAS SEEN -- one oops, the 8 GiB board, 2026-09-13
+
+  Test kernel 6.18.36-wdtlock, CPU0 soft-locked by LKDTM:
+    Unable to handle kernel NULL pointer dereference at virtual address 0000000000000030
+    pc : pvr_queue_timedout_job+0x1c/0x238 [powervr]
+  Resolved against the powervr.ko of that kernel: +0x1c is
+  `ldr x0, [x20, #48]`, x20 = s_job->s_fence->parent (s_fence at +16 of the
+  job, parent at +136 of the fence), 48 = offsetof(struct dma_fence, flags).
+  A rebuild of that tree with the same compiler (Debian gcc 12.2.0-14) gives
+  the same 142 instruction words, and scripts/faddr2line puts +0x1c at
+  pvr_queue.c:873 through dma_fence_is_signaled(). drivers/gpu/drm/imagination/
+  and the scheduler are byte-identical between that tree and 6.18.53. The
+  handler ran at 76.9 s; with the 60 s timeout (mainline 2224d6642136) the
+  timer was last armed at or before 16.9 s, about 3 s after the LKDTM entry
+  at 13.8 s.
+
+HOW CPU0 CAN HOLD run_job() -- read, not observed on silicon
+
+  The GPU interrupt is threaded with IRQF_ONESHOT (pvr_device.c:308-310), and
+  the thread takes the IRQ's effective affinity (kernel/irq/manage.c:1011-1045).
+  If that is the soft-locked CPU, the thread never runs. A runtime suspend
+  then waits for it in disable_irq() -> synchronize_irq() (pvr_power.c:126,
+  manage.c:115), and the next run_job() waits for that suspend in
+  pm_runtime_resume_and_get() (drivers/base/power/runtime.c:826-850). The
+  fix does not depend on this chain: any
+  run_job() that takes longer than the timeout reaches line 873 with a NULL
+  parent.
+
+THE FIX
+
+Test job->done_fence instead. It is the fence run_job() returns as the
+parent, the one pvr_queue_timedout_job() and pvr_queue_start() re-assign as
+the parent, and pvr_queue_prepare_job() initialises it before the job can
+reach the pending list (its comment at pvr_queue.c:582). Where the parent is
+set, the two are the same fence and nothing changes. Where it is not, the job
+has not been submitted and is not done, so the handler goes on to its
+stop/start; drm_sched_stop() there waits for the pending run_job()
+(drm_sched_wqueue_stop() -> cancel_work_sync()). If run_job() never returns,
+the handler blocks there instead of oopsing, and the hung-task detector
+names it. If run_job() failed (an ERR_PTR, e.g. from pvr_job_get_pm_ref()),
+the parent stays NULL for good and the done fence unsignalled;
+drm_sched_stop() then finds the finished fence already signalled with the
+error, takes the job off the pending list and has it freed as the guilty job.
+
+UPSTREAM
+
+pvr_queue.c here is byte-identical to mainline master, linux-next,
+drm-misc-next and drm-misc-fixes (2026-09-27). No fix is posted: no
+dri-devel patchwork series since 2026-05-01 touches this line. So this is a
+mainline defect, not an import artefact, and one stable already ships.
+Upstream form: Fixes: ee7cb7425314.
+
+VERIFIED HERE (2026-09-27): applies with --fuzz=0 after the full series on a
+fresh 6.18.53; drivers/gpu/drm/imagination/ builds at W=1 with no warning
+(cross gcc 16.2.1). The object's handler now loads s_job+184
+(= done_fence, measured with offsetof) and tests bit 1 of +48. NOT
+hardware-proven.
+
+FALSIFIER, on a test kernel with
+a test-only patch (drm-imagination-shorten-the-scheduler-timeout-and-hold-run-job, not carried) and
+tdr_selftest_timeout_ms=2000, tdr_selftest_run_job_delay_ms=5000, one GL
+client: without this patch an oops in
+pvr_queue_timedout_job at address 0x30; with it "Job timeout" after the
+"holding" line, then "released", no oops, and the client finishes.
+
+For a comparison run, use a build without this patch.
+
+Assisted-by: Claude
+---
+--- a/drivers/gpu/drm/imagination/pvr_queue.c
++++ b/drivers/gpu/drm/imagination/pvr_queue.c
+@@ -867,10 +867,17 @@
+ 	struct drm_gpu_scheduler *sched = s_job->sched;
+ 	struct pvr_queue *queue = container_of(sched, struct pvr_queue, scheduler);
+ 	struct pvr_device *pvr_dev = queue->ctx->pvr_dev;
+-	struct pvr_job *job;
++	struct pvr_job *job = container_of(s_job, struct pvr_job, base);
+ 	u32 job_count = 0;
+ 
+-	if (dma_fence_is_signaled(s_job->s_fence->parent))
++	/*
++	 * Not s_fence->parent: drm_sched arms this timeout before it calls
++	 * run_job(), and sets the parent only when run_job() returns, so a job
++	 * whose run_job() has not returned yet arrives here with a NULL parent.
++	 * The done fence is what run_job() returns as the parent, and
++	 * prepare_job() initialises it before the job reaches the pending list.
++	 */
++	if (dma_fence_is_signaled(job->done_fence))
+ 		return DRM_GPU_SCHED_STAT_NO_HANG;
+ 
+ 	dev_err(sched->dev, "Job timeout\n");

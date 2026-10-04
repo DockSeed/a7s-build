@@ -1,0 +1,102 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] aic8800_fdrv: do not advertise monitor mode, which this build cannot run
+
+Measured on the board, 2026-09-16:
+- Stock image, NetworkManager managing wl0 (so its P2P device exists),
+  wl0 down: `iw dev wl0 set type monitor` fails with -EIO and "Monitor+Data interface
+  support (MON_DATA) disabled". The vendor guard in
+  rwnx_cfg80211_change_iface() tests RWNX_VIF_TYPE(vif) where the loop
+  variable vif_el is meant, so any second vif refuses monitor mode.
+- Same image with wl0 out of NetworkManager and a second managed vif wl1: the
+  same refusal; with wl1 deleted (one vif):, the command succeeds.
+- A test kernel whose guard counted only vifs the firmware has (not merged): with wl0 running and associated, `iw dev wl0 set type monitor`
+  succeeded and within 155 ms rwnx_rxdataind_aicwf oopsed on a NULL pointer
+  (rwnx_rx.c, skb_reset_tail_pointer(skb_monitor)); the rx thread
+  aicwf_busrx_thr was gone afterwards and wl0 stayed at 4 received packets.
+
+Code says (aic8800_fdrv/, compiled with CONFIG_RWNX_MON_DATA, _MON_XMIT and
+_MON_RXFILTER all n):
+- rwnx_rxdataind_aicwf: a frame with RX_STAT_MONITOR plus another status bit
+  takes a branch that copies only under CONFIG_RWNX_MON_DATA, so skb_monitor
+  stays NULL and is dereferenced. A failed skb_copy_expand() in the other
+  branch ends the same way. That is the oops above.
+- rwnx_netdev_monitor_ops sets ndo_start_xmit only under
+  CONFIG_RWNX_MON_XMIT; the core calls it unchecked, so any packet still
+  queued on a netdev switched to monitor jumps to address 0.
+- rwnx_rx_sm_disconnect_ind reads rwnx_vif->drv_conn_state before its NULL
+  check, and change_iface clears vif_table[] between remove_if and add_if
+  while a disconnect indication for the old station can still arrive.
+- Radiotap building hits BUG_ON for legacy rate indexes 4-7.
+These are read from the code, not each reproduced; the oops is the one that
+was measured. Fixing them is a series of its own, each needing its own proof.
+- Advertised anyway: wiphy->interface_modes includes NL80211_IFTYPE_MONITOR,
+  and the custchan module parameter, with custregd, narrows it to monitor only
+  (rwnx_set_wiphy_params). The firmware's own MON_DATA capability is never
+  read: rwnx_check_fw_hw_feature() is only called from inside #if 0.
+
+What changes:
+- NL80211_IFTYPE_MONITOR leaves interface_modes. cfg80211 then refuses a
+  change to monitor (cfg80211_change_iface) and a new monitor interface
+  (nl80211 new_interface, cfg80211_iftype_allowed) with -EOPNOTSUPP before
+  the driver is called, so none of the paths above is reachable, in any vif
+  combination, whether NetworkManager manages wl0 or not.
+- custchan=1 is refused at wiphy setup with an error line. It sets
+  rwnx_limits[0].types to MONITOR unconditionally, which with monitor gone from
+  interface_modes makes wiphy_register() fail (wiphy_verify_combinations), and
+  with custregd=1 it would also set interface_modes to monitor only.
+
+Left as the vendor has it: the monitor code itself, the guard with the wrong
+variable (now unreachable through cfg80211), and rwnx_interface_add()'s
+monitor checks. Nothing calls rwnx_interface_add() with a monitor type in
+this build (the initial monitor vif is under CONFIG_RWNX_MON_DATA).
+
+Falsifier, on the board (set type monitor on wl0), NetworkManager
+running:
+0. Image without this patch, wl0 unmanaged (one vif), wl0 down:
+   `iw dev wl0 set type monitor` -> succeeds. Proves the path this closes.
+   iw reports errors as "command failed: ... (-95)"; its exit code is not the
+   errno (161 for -95, 251 for -5).
+1. With this patch, NetworkManager managing wl0: `iw list` shows no monitor
+   under "Supported interface modes"; `iw dev wl0 set type monitor` with wl0
+   down and with wl0 up -> -EOPNOTSUPP (-95), no MON_DATA line, no oops.
+2. With this patch, wl0 unmanaged (one vif), the arm that succeeded in 0:
+   -> -EOPNOTSUPP.
+3. `iw phy phy0 interface add mon0 type monitor` -> -EOPNOTSUPP, no mon0.
+4. wl0 managed and up afterwards: associated, scan finds BSSes, traffic
+   passes; dmesg has no oops and the rx thread aicwf_busrx_thr exists.
+
+Assisted-by: Claude
+
+--- a/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/rwnx_main.c
++++ b/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/rwnx_main.c
+@@ -8998,6 +8998,15 @@
+ 		}
+ 	}
+ 
++    /*
++     * NL80211_IFTYPE_MONITOR is not advertised. This build has neither
++     * CONFIG_RWNX_MON_DATA nor CONFIG_RWNX_MON_XMIT, and its monitor paths
++     * crash: the monitor netdev has no ndo_start_xmit, and a monitor frame
++     * that also carries another rx status dereferences a NULL skb in
++     * rwnx_rxdataind_aicwf. cfg80211 refuses a type the wiphy does not
++     * advertise before the driver is called (cfg80211_change_iface,
++     * nl80211 new_interface).
++     */
+     wiphy->interface_modes =
+     BIT(NL80211_IFTYPE_STATION)     |
+     BIT(NL80211_IFTYPE_AP)          |
+@@ -9009,7 +9018,13 @@
+     BIT(NL80211_IFTYPE_P2P_DEVICE)  |
+     #endif
+     #endif
+-    BIT(NL80211_IFTYPE_MONITOR);
++    0;
++
++    /* custchan switches the wiphy to monitor-only, see above */
++    if (rwnx_mod_params.custchan) {
++        wiphy_err(wiphy, "custchan needs monitor mode, which this build does not support; ignored\n");
++        rwnx_mod_params.custchan = false;
++    }
+ 
+ #if defined CONFIG_GPIO_WAKEUP || defined CONFIG_WOWLAN
+ 		/* Set WoWLAN flags */

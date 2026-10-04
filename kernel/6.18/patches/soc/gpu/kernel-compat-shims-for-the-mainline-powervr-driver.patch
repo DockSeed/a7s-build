@@ -1,0 +1,133 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] kernel: compat shims for carrying the mainline drm/imagination driver
+
+This tree carries drivers/gpu/drm/imagination/ at mainline level rather than at
+the level the 6.18 stable tree ships (see the patch that follows). Two things
+mainline's driver uses do not exist here in the form it expects. Both shims live
+in this ONE patch, deliberately, so the compatibility surface is a single file
+to read and a single patch to delete the day the kernel is bumped.
+
+⚠ EACH IS SMALLER THAN "MISSING API" SUGGESTS, and that is the whole reason
+this is viable. The first claim made about them in this session was "core
+kernel surgery in three subsystems". That was wrong, and measuring it is what
+corrected it:
+
+1. pwrseq -- a RENAME. pwrseq_power_on/off() are present in
+   include/linux/pwrseq/consumer.h; mainline calls them pwrseq_enable/disable().
+   Aliased rather than editing the driver's two call sites, so the driver stays
+   byte-identical to upstream.
+
+2. drm_gpuvm_bo_obtain_locked() -- 26 lines, and every primitive it uses is
+   already here: drm_gpuvm_bo_find(), drm_gpuvm_bo_create(),
+   drm_gpuvm_immediate_mode(), drm_gem_gpuva_assert_lock_held(). The whole of
+   drm_gpuvm.c is 190 lines apart between the two trees (3016 vs 3206).
+
+A third shim, for include/linux/slab.h, left with the bump to 6.18.53.
+Mainline's driver calls kmalloc_obj()/kzalloc_obj() and their _objs forms with
+the GFP argument left out at 23 of its 24 call sites; on 6.18.36 that argument
+was mandatory, so this patch redefined the four macros with an optional one.
+Stable 6.18.39 backported the upstream form (2dca62902eb3, "slab: Introduce
+kmalloc_flex() and family"; the optional argument goes through default_gfp() in
+include/linux/gfp.h), so the stock header takes the short form and a
+redefinition would only shadow it. The rest of this patch was regenerated
+against 6.18.53 by a 3-way rebase; its hunks are unchanged.
+
+WHAT THIS COSTS US, said plainly: include/linux/pwrseq/consumer.h and
+drm_gpuvm.{c,h} differ from pristine 6.18.53. All three hunks are additive and
+guarded, and the driver exercises them -- but "additive" is not "harmless". The
+widest-reaching part, the slab.h shim included by essentially everything, is
+the part that is gone.
+
+VERIFIED: compile-check green with drivers/gpu/drm/imagination/ in the gate.
+⚠ NOT hardware-proven.
+
+Assisted-by: Claude
+---
+diff --git a/drivers/gpu/drm/drm_gpuvm.c b/drivers/gpu/drm/drm_gpuvm.c
+index 61c3df0..05cba32 100644
+--- a/drivers/gpu/drm/drm_gpuvm.c
++++ b/drivers/gpu/drm/drm_gpuvm.c
+@@ -1699,6 +1699,49 @@ drm_gpuvm_bo_obtain(struct drm_gpuvm *gpuvm,
+ }
+ EXPORT_SYMBOL_GPL(drm_gpuvm_bo_obtain);
+ 
++/**
++ * drm_gpuvm_bo_obtain_locked() - obtains an instance of the &drm_gpuvm_bo for
++ * the given &drm_gpuvm and &drm_gem_object, with the GEM's gpuva lock held
++ * @gpuvm: The &drm_gpuvm the @obj is mapped in.
++ * @obj: The &drm_gem_object being mapped in the @gpuvm.
++ *
++ * COMPAT for the mainline drm/imagination driver this tree carries; the
++ * function is upstream and not in 6.18.36. Reproduced from mainline: every
++ * primitive it needs -- drm_gpuvm_bo_find(), drm_gpuvm_bo_create(),
++ * drm_gpuvm_immediate_mode(), drm_gem_gpuva_assert_lock_held() -- is already
++ * present here, which is why this is 26 lines and not a subsystem port.
++ *
++ * Returns: a pointer to the &drm_gpuvm_bo on success, an ERR_PTR on failure
++ */
++struct drm_gpuvm_bo *
++drm_gpuvm_bo_obtain_locked(struct drm_gpuvm *gpuvm,
++			   struct drm_gem_object *obj)
++{
++	struct drm_gpuvm_bo *vm_bo;
++
++	/*
++	 * In immediate mode this would require the caller to hold the GEMs
++	 * gpuva mutex, but it's not okay to allocate while holding that lock,
++	 * and this method allocates. Immediate mode drivers should use
++	 * drm_gpuvm_bo_obtain_prealloc() instead.
++	 */
++	drm_WARN_ON(gpuvm->drm, drm_gpuvm_immediate_mode(gpuvm));
++
++	vm_bo = drm_gpuvm_bo_find(gpuvm, obj);
++	if (vm_bo)
++		return vm_bo;
++
++	vm_bo = drm_gpuvm_bo_create(gpuvm, obj);
++	if (!vm_bo)
++		return ERR_PTR(-ENOMEM);
++
++	drm_gem_gpuva_assert_lock_held(gpuvm, obj);
++	list_add_tail(&vm_bo->list.entry.gem, &obj->gpuva.list);
++
++	return vm_bo;
++}
++EXPORT_SYMBOL_GPL(drm_gpuvm_bo_obtain_locked);
++
+ /**
+  * drm_gpuvm_bo_obtain_prealloc() - obtains an instance of the &drm_gpuvm_bo
+  * for the given &drm_gpuvm and &drm_gem_object
+diff --git a/include/drm/drm_gpuvm.h b/include/drm/drm_gpuvm.h
+index 476990e..39e07e1 100644
+--- a/include/drm/drm_gpuvm.h
++++ b/include/drm/drm_gpuvm.h
+@@ -726,6 +726,9 @@ struct drm_gpuvm_bo *
+ drm_gpuvm_bo_obtain(struct drm_gpuvm *gpuvm,
+ 		    struct drm_gem_object *obj);
+ struct drm_gpuvm_bo *
++drm_gpuvm_bo_obtain_locked(struct drm_gpuvm *gpuvm,
++			   struct drm_gem_object *obj);
++struct drm_gpuvm_bo *
+ drm_gpuvm_bo_obtain_prealloc(struct drm_gpuvm_bo *vm_bo);
+ 
+ /**
+diff --git a/include/linux/pwrseq/consumer.h b/include/linux/pwrseq/consumer.h
+index 7d583b4..03d9012 100644
+--- a/include/linux/pwrseq/consumer.h
++++ b/include/linux/pwrseq/consumer.h
+@@ -53,4 +53,15 @@ static inline int pwrseq_power_off(struct pwrseq_desc *desc)
+ 
+ #endif /* CONFIG_POWER_SEQUENCING */
+ 
++/*
++ * COMPAT: mainline renamed pwrseq_power_on/off() to pwrseq_enable/disable()
++ * after 6.18, and the drm/imagination driver this tree carries uses the new
++ * names at two call sites. Aliases rather than editing the driver, so it stays
++ * byte-identical to upstream and the difference sits in one obvious shim.
++ */
++#ifndef pwrseq_enable
++#define pwrseq_enable(desc)	pwrseq_power_on(desc)
++#define pwrseq_disable(desc)	pwrseq_power_off(desc)
++#endif
++
+ #endif /* __POWER_SEQUENCING_CONSUMER_H__ */

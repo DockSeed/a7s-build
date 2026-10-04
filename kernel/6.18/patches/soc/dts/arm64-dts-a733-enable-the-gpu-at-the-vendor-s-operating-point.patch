@@ -1,0 +1,192 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: a733: enable the GPU, at the operating point the vendor uses
+
+`arm64-dts-a733-add-the-gpu-node-disabled` described the GPU and left it disabled, because two facts it depends on had
+not been read on our own silicon. Both have been, on the 8 GiB board on 2026-08-27, and
+from a stack that shares no code with ours -- so this flips the node on and pins
+the one thing that must not be left to chance.
+
+WHAT SETTLED THE TWO RESERVATIONS
+--------------------------------------------------------------------------------
+1. The BVNC is no longer borrowed. The vendor DDK on this board's eMMC prints
+   "PVR_K: Read BVNC 36.56.104.183 from HW device registers" at module init --
+   a ROGUE_CR_CORE_ID read on this silicon, not a device-tree string. That closes
+   the open BVNC question. The matching firmware
+   image is Imagination's own open-stack file (freedesktop project 22015, branch
+   powervr, WHENCE version 1.1.OS@6976702, LICENSE.powervr = Redistributable),
+   pinned and hashed by the fetch-gpu-firmware stage (scripts/stages/gpu-firmware.sh);
+   it is NOT the DDK blob, which is a different artefact of a different size and hash.
+2. The two PCK-600 domain indices are corroborated twice: the vendor device tree
+   on this board names pd_gpu_top_test -> 5 and pd_gpu_core_test -> 6, and the
+   status registers (base + N * 0x1000 + 8) read 5 = 0x8 and 6 = 0x8 while the
+   vendor driver holds the GPU, against 4 (the NPU) = 0x0 with the NPU idle and
+   8 (USB2, the header's confirmed anchor) = 0x8.
+
+THE ONE LINE THAT IS A SAFETY PROPERTY
+--------------------------------------------------------------------------------
+assigned-clock-parents pins GPU0_CLK's mux to PERI0_600M, and that is not a
+preference.
+
+Left alone, this clock comes out of reset on SEL=000 (GPUPLL) with the divider at
+M=0, and PLL_GPU0's own reset value is N=70, P0=2 -- 840 MHz. VDD-GPU meanwhile
+is whatever the boot chain left it at, and that was **measured**, not assumed:
+DCDC4 reads 800 mV on this board (regulator_summary, 2026-08-27), and U-Boot does
+not touch it -- the five rails it writes are swout1, swout2, bldo1, bldo2 and
+dcdc2. The vendor's own OPP
+table pairs 400 and 600 MHz with 800 mV, 800 MHz with 840 mV and 1008 MHz with
+960 mV (allwinner-bsp configs/linux-6.6/sun60iw2p1.dtsi, gpu-opp-table). So
+enabling this node without pinning the source would run the block at 840 MHz on
+the 800 mV rail -- above the vendor's curve, with nothing in the tree to notice.
+
+PERI0_600M with the divider left at reset is not a guess either: it is exactly
+what the vendor stack runs on this silicon. Measured on 2026-08-27 under a real
+GL load, GPU0_CLK read 0x82000000 -- gate on, SEL=010, M=0 -- with DCDC4 at
+800 mV and the DDK reporting 600 MHz. 600 MHz at 800 mV is a row of the vendor
+table, not an extrapolation from one.
+
+WHAT IS DELIBERATELY ABSENT
+--------------------------------------------------------------------------------
+- No assigned-clock-rates. gpu0 carries CLK_SET_RATE_PARENT and its parent here
+  is a fixed factor off PLL_PERI0 -- the PLL that feeds the whole SoC. A rate
+  request on gpu0 would propagate straight into it. Rate control belongs on the
+  GPU's own PLL with an OPP consumer, which is the next milestone.
+- No gpu-supply and no OPP table, therefore no regulator window on dcdc4 either.
+  The tree's rule is that a window may only land together with the driver that
+  consumes the rail; nothing here consumes it, so nothing here describes it.
+- GPUPLL is not used, and could not serve this point anyway: the VCO window is
+  1.26-2.52 GHz (UM Table 4-2), and 600 MHz would need
+  24 MHz x 50 / 2, i.e. a 1200 MHz VCO, below the floor.
+- ⚠ mainline's drm/powervr sets no rate of its own: pvr_power.c only calls
+  clk_prepare_enable() on core, sys and mem (pvr_power.c:262-270), and "core" is
+  the only mandatory one (pvr_device.c:103-115). So with no OPP table in the
+  node, nothing in the kernel will move this clock.
+
+The image side of this milestone is separate and in the same series: the module
+set gains powervr.ko and the three DRM libraries it links against, and the
+compose step installs the firmware together with LICENSE.powervr, because the
+licence's one condition is that the notice travels with the binary.
+
+VERIFICATION
+--------------------------------------------------------------------------------
+- applies: patch -p1 --fuzz=0 in the full ordered series (local, 2026-08-27).
+- builds: DTC 0 warnings.
+- read back from the artefact: dtc -I dtb shows assigned-clocks <ccu 82> =
+  CLK_GPU0, assigned-clock-parents <ccu 5> = CLK_PLL_PERI0_600M, status "okay".
+- ✅ **HW-PROVEN 2026-09-07 on the 8 GiB board** -- all four falsifiers this
+  patch fixed in advance were measured on the running board, none of them
+  smoothed:
+    GPU0_CLK 0x02002b20 = 0x82000000 -> SEL = 010, the pinned PERI0_600M parent
+    clk framework: gpu0 enable=1 rate=600000000, pll-peri0-600m rate=600000000
+    regulator_summary: dcdc4 = 800 mV
+    the driver binds and loads its firmware: "Initialized powervr 1.0.0"
+  Acceptance: a GPU test run, 7 passed / 0 failed.
+
+Assisted-by: Claude
+---
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -2731,39 +2731,28 @@
+ 		 * (pvr_drv.c dt_match[]); no SoC-specific string is needed and
+ 		 * none is invented here.
+ 		 *
+-		 * ⚠ THE NODE IS DISABLED ON PURPOSE, and the two reasons are
+-		 * named rather than left to be discovered:
++		 * ⚠ IT LANDED DISABLED AND IS ENABLED HERE, because both
++		 * reasons it waited on were settled on this board:
+ 		 *
+-		 *   1. The firmware. drm/imagination loads a BVNC-named blob,
+-		 *      and the BVNC this SoC needs is not established on our
+-		 *      own silicon -- 36.56.104.183 comes from this project's
+-		 *      earlier Armbian-based port, not from a ROGUE_CR_CORE_ID__PBVNC read here.
+-		 *      Debian's
+-		 *      firmware-misc-nonfree carries 36.53.104.796 and
+-		 *      33.15.11.3, neither of which is that.
+-		 *   2. The power domains below are UNVERIFIED indices. The
+-		 *      PCK-600 header says so itself: only PD_USB2 = 8 is
+-		 *      silicon-confirmed, the rest "follow the A733 hardware
+-		 *      domain map". Attaching a live block to the wrong
+-		 *      domain index power-manages a different block, so this
+-		 *      node stays inert until both are read on a board.
+-		 *
+-		 * Falsifiers, both cheap once a board is in front of someone:
+-		 * the domain status registers at 0x07060000 + N * 0x1000 + 0x8
+-		 * (so 0x07065008 for TOP and 0x07066008 for CORE) must track
+-		 * the GPU, and ROGUE_CR_CORE_ID__PBVNC must read the BVNC the
+-		 * firmware file is named for.
+-		 *
+-		 * ⚠ power-domains IS EFFECTIVELY MANDATORY for this driver,
+-		 * which the binding does not say. pvr_probe() calls
+-		 * pvr_power_domains_init() before anything else, and that
+-		 * function opens with of_count_phandle_with_args(...,
+-		 * "power-domains", ...) and returns the count on a negative
+-		 * value -- so a node WITHOUT the property fails probe with
+-		 * -ENOENT. With exactly one domain it returns 0 early and the
+-		 * platform core attaches it; with two it attaches them by the
+-		 * names "a" and "b", which is what this SoC's TOP/CORE split
+-		 * needs (pvr_power.c:607-660).
++		 *   1. The firmware. The BVNC is no longer a borrowed number:
++		 *      the vendor DDK on this board's eMMC prints "Read BVNC
++		 *      36.56.104.183 from HW device registers", i.e. a
++		 *      ROGUE_CR_CORE_ID read on this silicon, closing the
++		 *      open BVNC question. The matching
++		 *      file is Imagination's own open-stack image, pinned and
++		 *      hashed by the fetch-gpu-firmware build stage and installed
++		 *      into the image with its licence text.
++		 *   2. The power domains. The indices are corroborated twice:
++		 *      the vendor device tree names pd_gpu_top_test -> 5 and
++		 *      pd_gpu_core_test -> 6, and the PCK-600 status registers
++		 *      read 5 = 0x8 and 6 = 0x8 while the vendor driver holds
++		 *      the GPU, against 4 (the NPU) = 0x0 with the NPU idle.
++		 *
++		 * ⚠ What is deliberately NOT here yet is any rate control:
++		 * no OPP table, no gpu-supply, no devfreq. This node brings the
++		 * block up at one fixed, vendor-sanctioned operating point and
++		 * nothing more. Frequency and voltage move together or not at
++		 * all, and making them move is its own milestone.
+ 		 *
+ 		 * WHERE THE VALUES COME FROM
+ 		 *
+@@ -2799,7 +2788,42 @@
+ 			power-domains = <&pck600 PD_GPU_TOP>,
+ 					<&pck600 PD_GPU_CORE>;
+ 			power-domain-names = "a", "b";
+-			status = "disabled";
++			/*
++			 * ⚠ THE PARENT IS PINNED AND THAT IS A SAFETY
++			 * PROPERTY, NOT A PREFERENCE. Left alone, GPU0_CLK
++			 * comes out of reset on SEL=000 (GPUPLL) with M=0,
++			 * and PLL_GPU0's own reset value is N=70 P0=2 --
++			 * 840 MHz. Meanwhile VDD-GPU is whatever the boot
++			 * chain left, measured 800 mV on this board, and the
++			 * vendor's own OPP table pairs 800 MHz with 840 mV
++			 * and 1008 MHz with 960 mV. Enabling this node
++			 * without pinning the source therefore runs the GPU
++			 * ABOVE the voltage curve, which is the one failure
++			 * mode that does not announce itself.
++			 *
++			 * PERI0_600M with the divider at its reset value is
++			 * exactly the operating point the vendor stack runs
++			 * on this silicon: measured 2026-08-27 under GL load,
++			 * GPU0_CLK = 0x82000000 (SEL=010, M=0) with DCDC4 at
++			 * 800 mV -- and 600 MHz at 800 mV is a row of the
++			 * vendor OPP table, not an extrapolation.
++			 *
++			 * ⚠ NO assigned-clock-rates, deliberately. gpu0
++			 * carries CLK_SET_RATE_PARENT, and its parent here is
++			 * a fixed factor off PLL_PERI0 -- the PLL that feeds
++			 * the whole SoC. A rate request on gpu0 would
++			 * propagate straight into it. Rate control belongs to
++			 * an OPP consumer on the GPU's own PLL, which is the
++			 * next milestone, not to this line.
++			 *
++			 * ⚠ And GPUPLL cannot serve 600 MHz cleanly anyway:
++			 * the VCO window is 1.26-2.52 GHz (UM Table 4-2,
++			 * A733 user manual), so 24 MHz x 50 / 2 = 600 needs
++			 * a 1200 MHz VCO, below the floor.
++			 */
++			assigned-clocks = <&ccu CLK_GPU0>;
++			assigned-clock-parents = <&ccu CLK_PLL_PERI0_600M>;
++			status = "okay";
+ 		};
+ 	};
+ };

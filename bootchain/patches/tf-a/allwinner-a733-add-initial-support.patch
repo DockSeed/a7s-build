@@ -1,0 +1,340 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Sun, 4 Oct 2026 12:00:00 +0200
+Subject: [PATCH] feat(allwinner): A733: add initial support
+
+Based on Yixun Lan's commit f4c0b0dba78a "feat(allwinner): A733: Add
+initial support" in his TF-A tree (Link below), whose message reads
+"tested only with power on/off.". The platform files keep that commit's
+content where it is unchanged; the comment on SUNXI_SPC_NUM_PORTS now
+says where the value comes from.
+
+Changes against that commit: A733 only; CCMU_SEC_SWITCH_REG at CCU +
+0x1F00; no SUNXI_DSP_PRCM_BASE; sunxi_cpucfg_ncat3.h reduced to
+CLU0_CPUn_CTRL_REG and CLU0_RVBARADDRn_L/H; SUNXI_GICR_BASE instead of
+SUNXI_GICC_BASE; CPU files and GIC-600 options in the platform's
+platform.mk; SUNXI_PSCI_USE_SCPI := 0; rebased onto TF-A master.
+
+The A733 (sun60iw2) has two Cortex-A76 and six Cortex-A55 cores in one
+DynamIQ cluster, eight cores in all, and a GIC-600. Its MPIDR_EL1 has
+the DynamIQ layout (SUNXI_NEW_MPIDR_FMT), its cores are powered through
+Arm PPUs, and its GIC is driven by the generic GICv3 driver
+(USE_GIC_DRIVER := 3). The SCPI PSCI path is built out, as on A133, H616
+and R329: it expects an OpenRISC SCP behind the A31 msgbox, while the
+A733's SCP is a RISC-V E902 (UM V1.00 5.2) behind a different msgbox (UM
+6.1.6), and its SCP release would write bit 0 at SUNXI_R_CPUCFG_BASE, a
+register of the CPUIDLE block that no A733 document describes. Register
+locations follow the A733 User Manual V1.00: CCMU_SEC_SWITCH_REG is CCU
++ 0x1F00 (4.1.6.278; CCU + 0x0F00 is SPI0_CLK_REG on this SoC,
+4.1.6.160), the per-core AArch64 reset-state bit is CLU0_CPUn_CTRL_REG
+bit 0 and the reset vector CLU0_RVBARADDRn_L/H (5.1.6.6-5.1.6.9).
+Allwinner's public SPL source agrees on both CCU offsets
+(gitlab.com/tina5.0_aiot/lichee/brandy-2.0/spl-pub, commit 8f30b7df8531,
+include/arch/sun60iw2p1/clock_autogen.h: CCMU_SEC_SWITCH_REG 0x1f00,
+SPI0_CLK_REG 0x0f00). There is no DSP PRCM and no GICv2 CPU interface;
+the GIC-600 redistributors start at SUNXI_GICR_BASE.
+GICV3_IMPL_GIC600_MULTICHIP is not set: the A733 has one GIC-600, and
+without multichip data the option changes nothing.
+
+Link: https://github.com/dlan17/trusted-firmware-a/commit/f4c0b0dba78a2d9916154c130979992caa3f3156
+Assisted-by: Claude
+---
+ docs/plat/allwinner.rst                       |  2 +
+ .../common/include/sunxi_cpucfg_ncat3.h       | 32 +++++++++++++
+ plat/allwinner/common/include/sunxi_def.h     |  1 +
+ plat/allwinner/common/sunxi_bl31_setup.c      |  3 ++
+ .../allwinner/sun60i_a733/include/sunxi_ccu.h | 16 +++++++
+ .../sun60i_a733/include/sunxi_cpucfg.h        |  1 +
+ .../sun60i_a733/include/sunxi_mmap.h          | 46 ++++++++++++++++++
+ .../allwinner/sun60i_a733/include/sunxi_spc.h | 15 ++++++
+ plat/allwinner/sun60i_a733/platform.mk        | 47 +++++++++++++++++++
+ .../allwinner/sun60i_a733/sunxi_idle_states.c |  9 ++++
+ plat/allwinner/sun60i_a733/sunxi_power.c      | 25 ++++++++++
+ 11 files changed, 197 insertions(+)
+ create mode 100644 plat/allwinner/common/include/sunxi_cpucfg_ncat3.h
+ create mode 100644 plat/allwinner/sun60i_a733/include/sunxi_ccu.h
+ create mode 100644 plat/allwinner/sun60i_a733/include/sunxi_cpucfg.h
+ create mode 100644 plat/allwinner/sun60i_a733/include/sunxi_mmap.h
+ create mode 100644 plat/allwinner/sun60i_a733/include/sunxi_spc.h
+ create mode 100644 plat/allwinner/sun60i_a733/platform.mk
+ create mode 100644 plat/allwinner/sun60i_a733/sunxi_idle_states.c
+ create mode 100644 plat/allwinner/sun60i_a733/sunxi_power.c
+
+diff --git a/docs/plat/allwinner.rst b/docs/plat/allwinner.rst
+index 59b2075c0..d68dda84d 100644
+--- a/docs/plat/allwinner.rst
++++ b/docs/plat/allwinner.rst
+@@ -23,6 +23,8 @@ There is one build target per supported SoC:
+ +-------------------+-------------------------------+
+ | sun50i_r329       | R329                          |
+ +-------------------+-------------------------------+
++| sun60i_a733       | A733                          |
+++-------------------+-------------------------------+
+ 
+ To build with the default settings for a particular SoC:
+ 
+diff --git a/plat/allwinner/common/include/sunxi_cpucfg_ncat3.h b/plat/allwinner/common/include/sunxi_cpucfg_ncat3.h
+new file mode 100644
+index 000000000..7c60009fe
+--- /dev/null
++++ b/plat/allwinner/common/include/sunxi_cpucfg_ncat3.h
+@@ -0,0 +1,32 @@
++/*
++ * SPDX-License-Identifier: BSD-3-Clause
++ */
++
++#ifndef SUNXI_CPUCFG_H
++#define SUNXI_CPUCFG_H
++
++#include <stdbool.h>
++
++#include <lib/utils_def.h>
++
++#include <sunxi_mmap.h>
++
++/*
++ * One block of registers per core at SUNXI_CPUCFG_BASE + (n + 1) * 0x1000
++ * (A733 UM V1.00 5.1.6.6-5.1.6.9, CLU0_CPUn_CTRL_REG and
++ * CLU0_RVBARADDRn_L/H). RVBARADDR is the reset vector for AArch64
++ * execution only. CLU0_CPUn_CTRL_REG bit 0 AA64NAA32 (0: AArch32,
++ * 1: AArch64, reset value 0) is read by the core only when it comes
++ * out of reset: a core whose bit is 0 resets into AArch32 at the BROM.
++ */
++#define SUNXI_CPUCFG_CPU_CTRL_REG(n)	(SUNXI_CPUCFG_BASE + ((n) + 1) * 0x1000)
++#define SUNXI_CPUCFG_CPU_CTRL_AA64	BIT(0)
++#define SUNXI_CPUCFG_RVBAR_LO_REG(n)	(SUNXI_CPUCFG_BASE + 0x4 + ((n) + 1) * 0x1000)
++#define SUNXI_CPUCFG_RVBAR_HI_REG(n)	(SUNXI_CPUCFG_BASE + 0x8 + ((n) + 1) * 0x1000)
++
++static inline bool sunxi_cpucfg_has_per_cluster_regs(void)
++{
++	return true;
++}
++
++#endif /* SUNXI_CPUCFG_H */
+diff --git a/plat/allwinner/common/include/sunxi_def.h b/plat/allwinner/common/include/sunxi_def.h
+index d166aebff..b26f3ba94 100644
+--- a/plat/allwinner/common/include/sunxi_def.h
++++ b/plat/allwinner/common/include/sunxi_def.h
+@@ -20,6 +20,7 @@
+ #define SUNXI_SOC_H6			0x1728
+ #define SUNXI_SOC_H616			0x1823
+ #define SUNXI_SOC_R329			0x1851
++#define SUNXI_SOC_A733			0x1903
+ 
+ #define SUNXI_VER_BITS_MASK		0xffU
+ #define JEDEC_ALLWINNER_BKID		9U
+diff --git a/plat/allwinner/common/sunxi_bl31_setup.c b/plat/allwinner/common/sunxi_bl31_setup.c
+index f6f029e32..3306f67c8 100644
+--- a/plat/allwinner/common/sunxi_bl31_setup.c
++++ b/plat/allwinner/common/sunxi_bl31_setup.c
+@@ -156,6 +156,9 @@ void bl31_platform_setup(void)
+ 	case SUNXI_SOC_R329:
+ 		soc_name = "R329";
+ 		break;
++	case SUNXI_SOC_A733:
++		soc_name = "A733";
++		break;
+ 	default:
+ 		soc_name = "unknown";
+ 		break;
+diff --git a/plat/allwinner/sun60i_a733/include/sunxi_ccu.h b/plat/allwinner/sun60i_a733/include/sunxi_ccu.h
+new file mode 100644
+index 000000000..8c7e4d134
+--- /dev/null
++++ b/plat/allwinner/sun60i_a733/include/sunxi_ccu.h
+@@ -0,0 +1,16 @@
++/*
++ * SPDX-License-Identifier: BSD-3-Clause
++ */
++
++#ifndef SUNXI_CCU_H
++#define SUNXI_CCU_H
++
++/*
++ * CCMU_SEC_SWITCH_REG, A733 UM V1.00 4.1.6.278. Not at 0x0f00 as on the
++ * H6/H616: on the A733 that is SPI0_CLK_REG (4.1.6.160).
++ */
++#define SUNXI_CCU_SEC_SWITCH_REG	(SUNXI_CCU_BASE + 0x1f00)
++
++#define SUNXI_R_PRCM_SEC_SWITCH_REG	(SUNXI_R_PRCM_BASE + 0x0290)
++
++#endif /* SUNXI_CCU_H */
+diff --git a/plat/allwinner/sun60i_a733/include/sunxi_cpucfg.h b/plat/allwinner/sun60i_a733/include/sunxi_cpucfg.h
+new file mode 100644
+index 000000000..688eeb047
+--- /dev/null
++++ b/plat/allwinner/sun60i_a733/include/sunxi_cpucfg.h
+@@ -0,0 +1 @@
++#include <sunxi_cpucfg_ncat3.h>
+diff --git a/plat/allwinner/sun60i_a733/include/sunxi_mmap.h b/plat/allwinner/sun60i_a733/include/sunxi_mmap.h
+new file mode 100644
+index 000000000..481bef870
+--- /dev/null
++++ b/plat/allwinner/sun60i_a733/include/sunxi_mmap.h
+@@ -0,0 +1,46 @@
++/*
++ * SPDX-License-Identifier: BSD-3-Clause
++ */
++
++#ifndef SUNXI_MMAP_H
++#define SUNXI_MMAP_H
++
++/* Memory regions */
++#define SUNXI_ROM_BASE			0x00000000
++#define SUNXI_ROM_SIZE			0x00011000
++#define SUNXI_SRAM_BASE			0x00044000
++#define SUNXI_SRAM_SIZE			0x00030000
++#define SUNXI_SRAM_A1_BASE		0x00044000
++#define SUNXI_SRAM_A1_SIZE		0x0000C000
++#define SUNXI_SRAM_A2_BASE		0x00050000
++#define SUNXI_SRAM_A2_BL31_OFFSET	0x00012000
++#define SUNXI_SRAM_A2_SIZE		0x00024000
++#define SUNXI_DEV_BASE			0x01000000
++#define SUNXI_DEV_SIZE			0x09000000
++#define SUNXI_DRAM_BASE			0x40000000
++#define SUNXI_DRAM_VIRT_BASE		0x0a000000
++
++/* Memory-mapped devices */
++#define SUNXI_PIO_BASE			0x02000000
++#define SUNXI_SPC_BASE			0x02054000
++#define SUNXI_CCU_BASE			0x02002000
++#define SUNXI_WDOG_BASE			0x02050000
++#define SUNXI_UART0_BASE		0x02500000
++#define SUNXI_SYSCON_BASE		0x03000000
++#define SUNXI_DMA_BASE			0x04024000
++#define SUNXI_SID_BASE			0x03006000
++#define SUNXI_GICD_BASE			0x03400000
++#define SUNXI_GICR_BASE			0x03460000
++#define SUNXI_SPI0_BASE			0x02540000
++#define SUNXI_R_SPC_BASE		0x07002000
++#define SUNXI_R_TZMA_BASE		0x07003000
++#define SUNXI_R_PRCM_BASE		0x07010000
++#define SUNXI_R_WDOG_BASE		0x07021000
++#define SUNXI_R_PIO_BASE		0x07025000
++#define SUNXI_R_CPUCFG_BASE		0x07050000
++#define SUNXI_R_UART_BASE		0x07080000
++#define SUNXI_R_I2C_BASE		0x07083000
++#define SUNXI_CPUCFG_BASE		0x08000000
++#define SUNXI_CLUSTERCFG_BASE		0x08860000
++
++#endif /* SUNXI_MMAP_H */
+diff --git a/plat/allwinner/sun60i_a733/include/sunxi_spc.h b/plat/allwinner/sun60i_a733/include/sunxi_spc.h
+new file mode 100644
+index 000000000..93d51d93e
+--- /dev/null
++++ b/plat/allwinner/sun60i_a733/include/sunxi_spc.h
+@@ -0,0 +1,15 @@
++/*
++ * SPDX-License-Identifier: BSD-3-Clause
++ */
++
++#ifndef SUNXI_SPC_H
++#define SUNXI_SPC_H
++
++/* Port count as in Yixun Lan's TF-A tree; H6 and H616 also use 14 */
++#define SUNXI_SPC_NUM_PORTS		14
++
++#define SUNXI_SPC_DECPORT_STA_REG(p)	(SUNXI_SPC_BASE + 0x0000 + 0x10 * (p))
++#define SUNXI_SPC_DECPORT_SET_REG(p)	(SUNXI_SPC_BASE + 0x0004 + 0x10 * (p))
++#define SUNXI_SPC_DECPORT_CLR_REG(p)	(SUNXI_SPC_BASE + 0x0008 + 0x10 * (p))
++
++#endif /* SUNXI_SPC_H */
+diff --git a/plat/allwinner/sun60i_a733/platform.mk b/plat/allwinner/sun60i_a733/platform.mk
+new file mode 100644
+index 000000000..dc0b2097d
+--- /dev/null
++++ b/plat/allwinner/sun60i_a733/platform.mk
+@@ -0,0 +1,47 @@
++#
++# SPDX-License-Identifier: BSD-3-Clause
++#
++
++# Allwinner A733: two Cortex-A76 and six Cortex-A55 cores in one DynamIQ
++# cluster, and a GIC-600. Armv8.2.
++ARM_ARCH_MAJOR := 8
++ARM_ARCH_MINOR := 2
++
++# There are 8 cores in 1 cluster
++PLATFORM_MAX_CPUS_PER_CLUSTER := 8
++
++# DynamIQ MPIDR layout; the cores are powered through Arm PPUs
++# (sunxi_cpu_new_ops.c).
++SUNXI_NEW_MPIDR_FMT := 1
++
++# PSCI ops: native only, as on A133, H616 and R329. Mainline's SCPI path
++# is built for an OpenRISC SCP behind the A31 msgbox and matches nothing on
++# the A733: the SCP is a RISC-V E902 (UM V1.00 5.2), the msgbox is the split
++# one-way pair with a different register map (UM 6.1.6), and the write that
++# would release the SCP, bit 0 at SUNXI_R_CPUCFG_BASE, lands in the CPUIDLE
++# block below the DSU PPU, on a register no A733 document describes.
++SUNXI_PSCI_USE_SCPI := 0
++SUNXI_PSCI_USE_NATIVE := 1
++
++# GIC-600, driven by the generic GICv3 driver.
++USE_GIC_DRIVER := 3
++GICV3_SUPPORT_GIC600 := 1
++
++# The differences between the platforms are covered by the include files.
++include plat/allwinner/common/allwinner-common.mk
++
++BL31_SOURCES		+=	lib/cpus/${ARCH}/cortex_a55.S		\
++				lib/cpus/${ARCH}/cortex_a76.S
++
++# Cortex-A55 r2p0
++ERRATA_A55_1530923	:=	1
++
++USE_COHERENT_MEM		:=	0
++WARMBOOT_ENABLE_DCACHE_EARLY	:=	1
++HW_ASSISTED_COHERENCY		:=	1
++
++# The A76 is AArch64 only at EL1 and above
++CTX_INCLUDE_AARCH32_REGS	:=	0
++
++# Put NOBITS memory in SRAM A1, overwriting U-Boot's SPL.
++SEPARATE_NOBITS_REGION	:=	1
+diff --git a/plat/allwinner/sun60i_a733/sunxi_idle_states.c b/plat/allwinner/sun60i_a733/sunxi_idle_states.c
+new file mode 100644
+index 000000000..2894b38f7
+--- /dev/null
++++ b/plat/allwinner/sun60i_a733/sunxi_idle_states.c
+@@ -0,0 +1,9 @@
++/*
++ * SPDX-License-Identifier: BSD-3-Clause
++ */
++
++#include <sunxi_private.h>
++
++const struct psci_cpu_idle_state sunxi_idle_states[] = {
++	{}
++};
+diff --git a/plat/allwinner/sun60i_a733/sunxi_power.c b/plat/allwinner/sun60i_a733/sunxi_power.c
+new file mode 100644
+index 000000000..f7755a746
+--- /dev/null
++++ b/plat/allwinner/sun60i_a733/sunxi_power.c
+@@ -0,0 +1,25 @@
++/*
++ * SPDX-License-Identifier: BSD-3-Clause
++ */
++
++#include <platform_def.h>
++
++#include <arch_helpers.h>
++
++#include <sunxi_mmap.h>
++#include <sunxi_cpucfg.h>
++#include <sunxi_private.h>
++
++int sunxi_pmic_setup(uint16_t socid, const void *fdt)
++{
++	return 0;
++}
++
++void sunxi_power_down(void)
++{
++}
++
++void sunxi_cpu_power_off_self(void)
++{
++	sunxi_cpu_off(read_mpidr());
++}

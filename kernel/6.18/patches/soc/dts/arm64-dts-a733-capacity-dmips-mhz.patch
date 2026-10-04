@@ -1,0 +1,157 @@
+From 3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Tue, 21 Jul 2026 15:10:00 +0200
+Subject: [PATCH] arm64: dts: a733: add measured capacity-dmips-mhz
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Set capacity-dmips-mhz on all eight cpu@N so the scheduler sees this SoC
+as the asymmetric machine it is: 454 on the six Cortex-A55, 1024 on the
+two Cortex-A76.
+
+WHY IT MATTERS. Without the property anywhere, every CPU keeps the
+default capacity of 1024 (`cpu_scale`, drivers/base/topology.c).
+`asym_cpu_capacity_scan()` then finds a single capacity value and drops
+the list again, `asym_cpu_capacity_classify()` returns no flags because
+`count < 2`, and `SD_ASYM_CPUCAPACITY` is never set. The kernel runs fine
+— it simply treats an A55 and an A76 as interchangeable, so misfit
+migration never fires and EAS cannot be enabled at all
+(`sched_is_eas_possible()`: "CPUs do not have asymmetric capacities").
+The property is also all-or-nothing per the binding: specify it on one
+cpu node and you must specify it on all, or every CPU falls back to the
+default.
+
+WHERE THE NUMBER COMES FROM. It is measured on this silicon, not copied.
+The binding defines the value as a benchmark score divided by the
+frequency it ran at, normalised to the fastest core type — so no
+datasheet can supply it, and the A733 UM does not.
+
+Measured on our chain, 2026-07-21, with
+a benchmark from the test initramfs — a fixed integer
+workload, pinned with sched_setaffinity and confirmed with getcpu(),
+timed with CLOCK_MONOTONIC, with a CLOCK_THREAD_CPUTIME_ID guard that
+discards any run that lost the CPU, and a checksum that must be identical
+on every core (a differing checksum would mean the cores did not do the
+same work, making the ratio meaningless):
+
+  A55 (cpu0)   67 435 180 iters/s   best of 3
+  A76 (cpu6)  152 221 250 iters/s   best of 3
+  checksum 429933922257178114 identical across all 6 clean runs
+
+Both clusters ran at 1014 MHz, read out of CPU_L_PLL and CPU_B_PLL
+(N=39, 26 MHz DCXO) — our kernel has no
+cpufreq driver, so the registers are the only source and there is nothing
+to divide out. The ratio is therefore already per-MHz:
+
+  152221250 / 67435180 = 2.257   ->   1024 / 2.257 = 453.7  ->  454
+
+CROSS-CHECK AT A DIFFERENT OPERATING POINT. The same binary on the 6 GiB board
+(vendor BSP kernel) ran the clusters at 1794 and 2002 MHz: 119 278 792 and
+300 599 997 iters/s, i.e. 66 488 and 150 150 per MHz, ratio 2.258 -> 453.
+Two boards, two kernels, frequencies differing by a factor of two, and the
+normalised result agrees to 0.05 %. That is the invariance the property is
+supposed to have, and it is the main reason to trust the figure.
+
+WHAT THIS NUMBER IS NOT. It is not Dhrystone. Dhrystone is dominated by
+string and record copies, pointer chasing and enum compares against a
+libc, none of which a freestanding binary has. What was measured is a
+mixed integer workload — multiply, xorshift ALU, rotate-and-fold, an
+L1-resident load-modify-store and a predictable branch — chosen so that
+independent work is available for a wide out-of-order core to find, since
+that ability is exactly what separates an A76 from an in-order A55. A
+different op-mix would move the ratio; there is no neutral mix. So this is
+"our measured mixed-ALU ratio", and it should be read that way rather than
+as a DMIPS claim.
+
+FOR COMPARISON, deliberately not adopted: the Allwinner BSP ships 430 for
+the A55 (a value that appears nowhere in mainline), and the in-flight
+mainline A733 dtsi carries 530, which is the rk3588 figure for the same
+core pair. Mainline A55 values range from 250 to 1024 across vendors and
+A76 from 620 to 1740, so there is no convention to follow — only vendor
+measurements of varying provenance. 454 sits between the two candidates
+and is the only one that was measured on this SoC.
+
+NOT INCLUDED: dynamic-power-coefficient. It is an absolute quantity
+(uW/MHz/V^2) rather than a ratio, it needs OPP voltages to be useful, and
+we have neither the power measurements nor a cpufreq driver. Without it
+the Energy Model is not registered and EAS stays off even with asymmetric
+capacities, so this patch improves misfit handling and capacity-aware
+placement, not EAS.
+
+Depends on `arm64-dts-a733-cpu-topology`. DT-only.
+
+Assisted-by: Claude
+---
+ .../sun60i-a733-cubie-a7s-minimal.dts         | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -54,6 +54,7 @@
+ 			compatible = "arm,cortex-a55";
+ 			reg = <0x000>;
+ 			enable-method = "psci";
++			capacity-dmips-mhz = <454>;
+ 			d-cache-size = <32768>;
+ 			d-cache-line-size = <64>;
+ 			d-cache-sets = <128>;
+@@ -69,6 +70,7 @@
+ 			compatible = "arm,cortex-a55";
+ 			reg = <0x100>;
+ 			enable-method = "psci";
++			capacity-dmips-mhz = <454>;
+ 			d-cache-size = <32768>;
+ 			d-cache-line-size = <64>;
+ 			d-cache-sets = <128>;
+@@ -84,6 +86,7 @@
+ 			compatible = "arm,cortex-a55";
+ 			reg = <0x200>;
+ 			enable-method = "psci";
++			capacity-dmips-mhz = <454>;
+ 			d-cache-size = <32768>;
+ 			d-cache-line-size = <64>;
+ 			d-cache-sets = <128>;
+@@ -99,6 +102,7 @@
+ 			compatible = "arm,cortex-a55";
+ 			reg = <0x300>;
+ 			enable-method = "psci";
++			capacity-dmips-mhz = <454>;
+ 			d-cache-size = <32768>;
+ 			d-cache-line-size = <64>;
+ 			d-cache-sets = <128>;
+@@ -114,6 +118,7 @@
+ 			compatible = "arm,cortex-a55";
+ 			reg = <0x400>;
+ 			enable-method = "psci";
++			capacity-dmips-mhz = <454>;
+ 			d-cache-size = <32768>;
+ 			d-cache-line-size = <64>;
+ 			d-cache-sets = <128>;
+@@ -129,6 +134,7 @@
+ 			compatible = "arm,cortex-a55";
+ 			reg = <0x500>;
+ 			enable-method = "psci";
++			capacity-dmips-mhz = <454>;
+ 			d-cache-size = <32768>;
+ 			d-cache-line-size = <64>;
+ 			d-cache-sets = <128>;
+@@ -155,6 +161,7 @@
+ 			compatible = "arm,cortex-a76";
+ 			reg = <0x600>;
+ 			enable-method = "psci";
++			capacity-dmips-mhz = <1024>;
+ 			d-cache-size = <65536>;
+ 			d-cache-line-size = <64>;
+ 			d-cache-sets = <256>;
+@@ -170,6 +177,7 @@
+ 			compatible = "arm,cortex-a76";
+ 			reg = <0x700>;
+ 			enable-method = "psci";
++			capacity-dmips-mhz = <1024>;
+ 			d-cache-size = <65536>;
+ 			d-cache-line-size = <64>;
+ 			d-cache-sets = <256>;
+-- 
+2.45.0

@@ -1,0 +1,125 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Sat, 3 Oct 2026 17:13:49 +0200
+Subject: [PATCH] feat(allwinner): A733: let EL2 reach the DSU cluster PMU
+
+The DSU's cluster PMU (L3, snoop-filter and bus event counters, DSU TRM
+100453 chapter B3) is reached through IMPLEMENTATION DEFINED system
+registers. Their access rule, stated for each one under "Traps and
+enables" (B3.4 CLUSTERPMCR and on): write access below EL3 needs
+ACTLR_EL3[12], and a denied access traps to the lowest Exception level
+that denied it. Linux runs at EL2 (VHE) on the A733 boards, and nothing
+in BL31 sets the bit, so the in-tree arm_dsu_pmu driver traps into EL3
+on its first counter access.
+
+Every core sets ACTLR_EL3[12] in plat_reset_handler. ACTLR_EL3 is a
+per-core register that resets with the core, and the core-level power
+states of this BL31 come back through reset; plat_reset_handler runs on
+the cold and the warm entry path (el3_entrypoint_common ->
+call_reset_handler), so the bit is back every time a core is. TF-A's TC
+platform sets the same bit (tc_helpers.S, CPUACTLR_CLUSTERPMUEN).
+
+The boot core prints ACTLR_EL3 once at cold boot:
+  NOTICE:  BL31: ACTLR_EL3 0x..., CLUSTERPMUEN 1 (EL2 access to the DSU PMU)
+
+What is deliberately not done:
+- ACTLR_EL2[12] belongs to the hypervisor. It stays whatever Linux
+  leaves it (0), so a KVM guest at EL1 keeps trapping.
+- CLUSTERPMMDCR_EL3.SPME resets to 0 and is not written, so the
+  counters do not count Secure transactions (B3.5).
+
+The vendor BL31 for this SoC ships as a blob; whether it sets the bit
+is not known, and the vendor device tree carries no DSU PMU node.
+
+Assisted-by: Claude
+---
+ plat/allwinner/common/sunxi_bl31_setup.c      | 10 ++++-
+ plat/allwinner/sun60i_a733/platform.mk        |  4 ++
+ .../allwinner/sun60i_a733/sunxi_cluster_pmu.S | 41 +++++++++++++++++++
+ 3 files changed, 54 insertions(+), 1 deletion(-)
+ create mode 100644 plat/allwinner/sun60i_a733/sunxi_cluster_pmu.S
+
+diff --git a/plat/allwinner/common/sunxi_bl31_setup.c b/plat/allwinner/common/sunxi_bl31_setup.c
+index c8ea7d1c3..caf0d2446 100644
+--- a/plat/allwinner/common/sunxi_bl31_setup.c
++++ b/plat/allwinner/common/sunxi_bl31_setup.c
+@@ -222,8 +222,16 @@ void bl31_platform_setup(void)
+ 	 * (initialised above); runs once, before BL33 and so before anything
+ 	 * can switch a cluster onto it.
+ 	 */
+-	if (soc_id == SUNXI_SOC_A733)
++	if (soc_id == SUNXI_SOC_A733) {
+ 		sunxi_cpu_back_pll_setup();
++		/*
++		 * Readback of what plat_reset_handler set on this core
++		 * (sun60i_a733/sunxi_cluster_pmu.S).
++		 */
++		NOTICE("BL31: ACTLR_EL3 0x%llx, CLUSTERPMUEN %u (EL2 access to the DSU PMU)\n",
++		       (unsigned long long)read_actlr_el3(),
++		       (unsigned int)((read_actlr_el3() >> 12) & 1U));
++	}
+ 
+ 	sunxi_pmic_setup(soc_id, fdt);
+ 
+diff --git a/plat/allwinner/sun60i_a733/platform.mk b/plat/allwinner/sun60i_a733/platform.mk
+index bb7627ba5..5cc65ee6d 100644
+--- a/plat/allwinner/sun60i_a733/platform.mk
++++ b/plat/allwinner/sun60i_a733/platform.mk
+@@ -58,6 +58,10 @@ BL31_SOURCES		+=	lib/cpus/${ARCH}/cortex_a55.S		\
+ # clusters' parking target during a PLL relock (sunxi_cpu_back_pll.c).
+ BL31_SOURCES		+=	${AW_PLAT}/${PLAT}/sunxi_cpu_back_pll.c
+ 
++# EL2 access to the DSU cluster PMU (ACTLR_EL3[12]), set by every core on
++# every reset (sunxi_cluster_pmu.S).
++BL31_SOURCES		+=	${AW_PLAT}/${PLAT}/sunxi_cluster_pmu.S
++
+ # Cortex-A55 r2p0
+ ERRATA_A55_1530923	:=	1
+ 
+diff --git a/plat/allwinner/sun60i_a733/sunxi_cluster_pmu.S b/plat/allwinner/sun60i_a733/sunxi_cluster_pmu.S
+new file mode 100644
+index 000000000..a2bc13b80
+--- /dev/null
++++ b/plat/allwinner/sun60i_a733/sunxi_cluster_pmu.S
+@@ -0,0 +1,41 @@
++/*
++ * Copyright (c) 2026, DockSeed. All rights reserved.
++ *
++ * SPDX-License-Identifier: BSD-3-Clause
++ */
++
++#include <asm_macros.S>
++
++/*
++ * ACTLR_EL3[12] lets EL2 reach the DSU cluster PMU registers
++ * (CLUSTERPMCR_EL1 and the rest of DSU TRM 100453 chapter B3). With the
++ * bit clear, the DSU TRM gives, for every one of them ("Traps and
++ * enables", e.g. B3.4 CLUSTERPMCR): "write accessible in EL1 if
++ * ACTLR_EL3[12] is 1 and ACTLR_EL2[12] is 1 [...] If write access not
++ * possible, then Trap to the lowest Exception level that denied access".
++ * Linux runs at EL2 (VHE) here, so without this bit the in-tree
++ * arm_dsu_pmu driver traps into EL3 on its first counter access.
++ *
++ * Only bit 12 is set. ACTLR_EL2[12] is left to the hypervisor, so a guest
++ * at EL1 keeps trapping. CLUSTERPMMDCR_EL3.SPME is not touched and resets
++ * to 0, so the counters stay blind to Secure transactions (B3.5).
++ *
++ * ACTLR_EL3 is a per-core register that resets with the core, and a core
++ * comes back from CPU_OFF and from core-level CPU_SUSPEND through reset.
++ * plat_reset_handler runs on the cold and on the warm entry path
++ * (el3_entrypoint_common -> call_reset_handler), so every core sets it
++ * every time it comes up. TF-A's TC platform sets the same bit
++ * (plat/arm/board/tc/include/tc_helpers.S, CPUACTLR_CLUSTERPMUEN).
++ */
++#define ACTLR_EL3_CLUSTERPMUEN_BIT	(1 << 12)
++
++	.globl	plat_reset_handler
++
++	/* May clobber x0 - x18, x30 (asm_macros.S, call_reset_handler). */
++func plat_reset_handler
++	mrs	x0, actlr_el3
++	orr	x0, x0, #ACTLR_EL3_CLUSTERPMUEN_BIT
++	msr	actlr_el3, x0
++	isb
++	ret
++endfunc plat_reset_handler

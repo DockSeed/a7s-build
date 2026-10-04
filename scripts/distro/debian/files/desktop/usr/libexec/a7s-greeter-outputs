@@ -1,0 +1,41 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only OR MIT
+#
+# a7s-greeter-outputs -- light a display output that appeared while LightDM's
+# greeter is on screen. Installed by the image build (scripts/distro/debian) as
+# /usr/libexec/a7s-greeter-outputs and started by a7s-greeter-outputs.service,
+# which the udev rule 70-a7s-greeter-outputs.rules pulls in on every DRM
+# "change" uevent (a connector was plugged or unplugged).
+#
+# Why this exists: Xorg does not light an output that is hotplugged after the
+# server started. It sees the connector come up (xrandr: "DP-1 connected") but
+# assigns it no mode and no CRTC; that is left to whoever runs the session. In a
+# logged-in XFCE session xfsettingsd does it. LightDM's greeter does not, and no
+# X greeter in Debian does. So a board booted with no monitor, or with the
+# monitor plugged later, shows a dark screen until lightdm restarts.
+# Measured on the 6 GiB board: with this script the output
+# was lit about 1 s after the plug and the greeter redrew at 1920x1200.
+#
+# It acts only while the active session on seat0 is LightDM's X11 greeter.
+# Inside a user session it exits at the class test, so it never competes with
+# xfsettingsd or with a layout the user chose.
+set -eu
+
+session=$(loginctl show-seat seat0 --property=ActiveSession --value 2>/dev/null) || exit 0
+[ -n "${session}" ] || exit 0
+
+class=$(loginctl show-session "${session}" --property=Class --value 2>/dev/null) || exit 0
+type=$(loginctl show-session "${session}" --property=Type --value 2>/dev/null) || exit 0
+[ "${class}" = greeter ] && [ "${type}" = x11 ] || exit 0
+
+display=$(loginctl show-session "${session}" --property=Display --value 2>/dev/null) || exit 0
+case "${display}" in
+	:[0-9]*) ;;
+	*) exit 0 ;;
+esac
+
+# LightDM keeps the X server's authority for root here, one file per display.
+auth="/var/run/lightdm/root/${display}"
+[ -r "${auth}" ] || exit 0
+
+DISPLAY="${display}" XAUTHORITY="${auth}" exec xrandr --auto

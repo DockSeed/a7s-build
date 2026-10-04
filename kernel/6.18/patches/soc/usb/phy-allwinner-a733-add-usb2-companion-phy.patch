@@ -1,0 +1,269 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] phy: allwinner: A733 USB2 companion PHY — RESCAL + VBUSVLDEXT (fix dwc3 CSFTRST)
+
+The A733 USB3.1 DRD (dwc3 @0x06A00000) has an independent USB2.0 UTMI+ PHY
+@0x06B00000 (net USB2-U2). mainline dwc3 needs it up before its core soft-reset
+(DCTL.CSFTRST) completes: the reset FSM runs on the UTMI clock, which only
+appears once the PHY PLL locks.
+
+The first cut only cleared SIDDQ (analog power). That is not enough — the PLL
+never locked and dwc3 died with -ETIMEDOUT / -110. HW-proven on the 8 GiB board
+(2026-07-19, live devmem on our own kernel): with only SIDDQ cleared,
+DCTL.CSFTRST (bit30) stayed set; after also applying the Rext resistance
+calibration (SYSCFG res_base, rext_mode v2 — working the 8 GiB board RESCAL_CTRL=0x00c80532,
+RES200/RES1_CTRL=0xc8c80000) and setting VBUSVLDEXT|OTGDISABLE in PHYCTL
+(0x000e2410 -> 0x000e2430), CSFTRST cleared to 0.
+
+This completes the driver to match the vendor sunxi_phy_init
+(bsp/drivers/usb/dwc3/phy-sunxi-plat.c, the radxa/allwinner-bsp tree):
+- map the shared SYSCFG res_base (reg index 1) non-exclusively;
+- run the rext_mode-v2 RESCAL in phy_init/undo in phy_exit;
+- set VBUSVLDEXT|OTGDISABLE alongside clearing SIDDQ.
+
+The PHY's own reset-n is taken here as of 2026-07-29. It is bit4 of
+SUBSYS_USB3P1_BGR in the SERDES subsystem page (UM
+wording "USB3P1 USB2P0 PHY Resetn"), exported as a reset line by the provider in
+`clk-sunxi-ng-a733-add-serdes-subsystem-clocks`. It was previously written from the combo-PHY's phy_init -- another
+device's driver, and a layer up from where the line belongs.
+
+Two order changes come with that, both stated rather than glossed: dwc3 runs
+usb2 phy_init before usb3 phy_init (core.c:821-831), so the deassert now happens
+*before* the combo-PHY's bring-up instead of as its first statement -- still
+before the PMA sequence and before this driver's own PHYCTL writes, which is
+what it has to be. And phy_exit now asserts the bit, which no code did before;
+symmetric reset handling, but new behaviour on unbind and unproven on hardware.
+
+Requires the matching DT change (patch `arm64-dts-a733-add-usb3-dwc3-combophy`) adding the res_base reg region and
+the reset phandle.
+
+Assisted-by: Claude
+
+diff --git a/drivers/phy/allwinner/Kconfig b/drivers/phy/allwinner/Kconfig
+index 35e8e1d54..46a1c2b30 100644
+--- a/drivers/phy/allwinner/Kconfig
++++ b/drivers/phy/allwinner/Kconfig
+@@ -72,3 +72,12 @@ config PHY_SUN60I_A733_COMBO
+ 	  Enable this to bring up the COMB0 SERDES combo-PHY on the Allwinner
+ 	  A733 (sun60iw2) in USB3.1 SuperSpeed mode. DP-alt and PCIe modes of
+ 	  the same PHY are not handled by this driver.
++
++config PHY_SUN60I_A733_USB2
++	tristate "Allwinner A733 USB2 companion PHY (USB3 DRD)"
++	depends on ARCH_SUNXI || COMPILE_TEST
++	depends on HAS_IOMEM && OF
++	select GENERIC_PHY
++	help
++	  Enable this for the USB2.0 UTMI companion PHY of the A733 (sun60iw2)
++	  USB3.1 DRD controller. Required for the dwc3 core to leave reset.
+diff --git a/drivers/phy/allwinner/Makefile b/drivers/phy/allwinner/Makefile
+index 2a9ea32be..7b3c1d94e 100644
+--- a/drivers/phy/allwinner/Makefile
++++ b/drivers/phy/allwinner/Makefile
+@@ -4,3 +4,4 @@ obj-$(CONFIG_PHY_SUN6I_MIPI_DPHY)	+= phy-sun6i-mipi-dphy.o
+ obj-$(CONFIG_PHY_SUN9I_USB)		+= phy-sun9i-usb.o
+ obj-$(CONFIG_PHY_SUN50I_USB3)		+= phy-sun50i-usb3.o
+ obj-$(CONFIG_PHY_SUN60I_A733_COMBO)	+= phy-sun60i-a733-combophy.o
++obj-$(CONFIG_PHY_SUN60I_A733_USB2)	+= phy-sun60i-a733-usb2.o
+diff --git a/drivers/phy/allwinner/phy-sun60i-a733-usb2.c b/drivers/phy/allwinner/phy-sun60i-a733-usb2.c
+new file mode 100644
+--- a/drivers/phy/allwinner/phy-sun60i-a733-usb2.c
++++ b/drivers/phy/allwinner/phy-sun60i-a733-usb2.c
+@@ -0,0 +1,198 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Allwinner A733 (sun60iw2) USB2.0 companion UTMI+ PHY for the USB3.1 DRD.
++ *
++ * The USB3.1 DRD (dwc3 @0x06A00000) has its own independent USB2.0 UTMI PHY
++ * (block @0x06B00000, net USB2-U2) separate from USB0/USB1's sun4i-usb PHYs.
++ * mainline dwc3 needs this HS companion up before its core soft-reset
++ * (DCTL.CSFTRST) can complete: the reset FSM is clocked by the UTMI clock, and
++ * that clock only appears once the PHY PLL locks.
++ *
++ * PLL lock needs the Rext resistance calibration (SYSCFG res_base, rext_mode
++ * v2) which sets the PHY bias reference, plus VBUSVLDEXT/OTGDISABLE. Clearing
++ * SIDDQ alone (analog power) is NOT enough: without RESCAL + VBUSVLDEXT the
++ * UTMI PLL never locks and dwc3 hangs with -ETIMEDOUT / -110.
++ *
++ * The PHY's reset-n does not live in this block: it is bit4 of
++ * SUBSYS_USB3P1_BGR in the SERDES subsystem page, which the serdes-ccu exports
++ * as a reset line (UM wording
++ * "USB3P1 USB2P0 PHY Resetn"). It used to be written from the combo-PHY's
++ * phy_init, which is neither this PHY's device nor its layer; taking it here
++ * also means it is released before this driver touches PHYCTL rather than after.
++ *
++ * HW-proven on the 8 GiB board (2026-07-19, live devmem on our own kernel): with
++ * only SIDDQ cleared, DCTL.CSFTRST (bit30) stayed set; after replaying the
++ * working the 8 GiB board RESCAL state (RESCAL_CTRL=0x00c80532, RES200/RES1=0xc8c80000)
++ * and PHYCTL=0x000e2430 (VBUSVLDEXT set), CSFTRST cleared. Vendor reference:
++ * sunxi_phy_init (bsp/drivers/usb/dwc3/phy-sunxi-plat.c, the radxa/allwinner-bsp tree).
++ */
++
++#include <linux/bitops.h>
++#include <linux/clk.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/phy/phy.h>
++#include <linux/platform_device.h>
++#include <linux/reset.h>
++
++#define PHY_USB2_PHYCTL		0x10
++#define  PHY_USB2_OTGDISABLE	BIT(10)
++#define  PHY_USB2_VBUSVLDEXT	BIT(5)	/* force VBUS-valid to the controller */
++#define  PHY_USB2_SIDDQ		BIT(3)	/* 1 = power down, 0 = enable */
++#define PHY_USB2_PHYTUNE	0x18
++#define PHY_USB2_TUNE_DEFAULT	0x143338D6	/* vendor aw,phy_tune_param */
++
++/*
++ * SYSCFG res_base: USB2 HS Rext (200 ohm) resistance calibration, rext_mode v2.
++ * Selecting the trimmed reference sets the PHY bias current; the UTMI PLL will
++ * not lock without it (see file header). Shared block (USBPHY0/1/2 + PCIe), so
++ * mapped non-exclusively in probe.
++ */
++#define RESCAL_CTRL_REG		0x160
++#define  RESCAL_CAL_EN		BIT(0)
++#define  RESCAL_RES200_TRIM_SEL	BIT(10)
++#define RES1_CTRL_REG		0x168
++#define  RES200_TRIM		GENMASK(15, 8)
++
++struct a733_usb2phy {
++	void __iomem		*base;	/* u2_base   0x06b00000 */
++	void __iomem		*res;	/* SYSCFG res_base 0x03000000 (optional) */
++	struct clk		*clk;
++	struct reset_control	*reset;	/* SUBSYS_USB3P1_BGR bit4, serdes-ccu */
++};
++
++/* rext_mode v2: on = select the trimmed 200-ohm reference + clear raw trim. */
++static void a733_usb2phy_rescal(struct a733_usb2phy *p, bool on)
++{
++	u32 v;
++
++	if (!p->res)
++		return;
++
++	v = readl(p->res + RESCAL_CTRL_REG);
++	if (on)
++		v = (v & ~RESCAL_CAL_EN) | RESCAL_RES200_TRIM_SEL;
++	else
++		v = (v | RESCAL_CAL_EN) & ~RESCAL_RES200_TRIM_SEL;
++	writel(v, p->res + RESCAL_CTRL_REG);
++
++	v = readl(p->res + RES1_CTRL_REG);
++	if (on)
++		v &= ~RES200_TRIM;
++	writel(v, p->res + RES1_CTRL_REG);
++}
++
++static int a733_usb2phy_init(struct phy *phy)
++{
++	struct a733_usb2phy *p = phy_get_drvdata(phy);
++	u32 v;
++	int ret;
++
++	ret = clk_prepare_enable(p->clk);
++	if (ret)
++		return ret;
++
++	ret = reset_control_deassert(p->reset);
++	if (ret) {
++		clk_disable_unprepare(p->clk);
++		return ret;
++	}
++
++	a733_usb2phy_rescal(p, true);
++
++	v = readl(p->base + PHY_USB2_PHYCTL);
++	v |= PHY_USB2_OTGDISABLE | PHY_USB2_VBUSVLDEXT;
++	v &= ~PHY_USB2_SIDDQ;		/* power the PHY up */
++	writel(v, p->base + PHY_USB2_PHYCTL);
++
++	writel(PHY_USB2_TUNE_DEFAULT, p->base + PHY_USB2_PHYTUNE);
++
++	return 0;
++}
++
++static int a733_usb2phy_exit(struct phy *phy)
++{
++	struct a733_usb2phy *p = phy_get_drvdata(phy);
++	u32 v;
++
++	v = readl(p->base + PHY_USB2_PHYCTL);
++	v &= ~(PHY_USB2_OTGDISABLE | PHY_USB2_VBUSVLDEXT);
++	v |= PHY_USB2_SIDDQ;		/* power down */
++	writel(v, p->base + PHY_USB2_PHYCTL);
++
++	a733_usb2phy_rescal(p, false);
++
++	reset_control_assert(p->reset);
++	clk_disable_unprepare(p->clk);
++	return 0;
++}
++
++static const struct phy_ops a733_usb2phy_ops = {
++	.init	= a733_usb2phy_init,
++	.exit	= a733_usb2phy_exit,
++	.owner	= THIS_MODULE,
++};
++
++static int a733_usb2phy_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct a733_usb2phy *p;
++	struct phy_provider *provider;
++	struct phy *phy;
++	struct resource *res;
++
++	p = devm_kzalloc(dev, sizeof(*p), GFP_KERNEL);
++	if (!p)
++		return -ENOMEM;
++
++	p->base = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(p->base))
++		return PTR_ERR(p->base);
++
++	/*
++	 * res_base (SYSCFG) is shared with the other USB2 PHYs and PCIe, so map
++	 * it with a plain devm_ioremap rather than the exclusive *_resource
++	 * helper. Optional: a board without Rext calibration omits the region.
++	 */
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
++	if (res) {
++		p->res = devm_ioremap(dev, res->start, resource_size(res));
++		if (!p->res)
++			return -ENOMEM;
++	}
++
++	p->clk = devm_clk_get(dev, NULL);
++	if (IS_ERR(p->clk))
++		return dev_err_probe(dev, PTR_ERR(p->clk), "res-dcap clk\n");
++
++	p->reset = devm_reset_control_get_exclusive(dev, NULL);
++	if (IS_ERR(p->reset))
++		return dev_err_probe(dev, PTR_ERR(p->reset), "usb2 phy reset\n");
++
++	phy = devm_phy_create(dev, NULL, &a733_usb2phy_ops);
++	if (IS_ERR(phy))
++		return PTR_ERR(phy);
++	phy_set_drvdata(phy, p);
++
++	provider = devm_of_phy_provider_register(dev, of_phy_simple_xlate);
++	return PTR_ERR_OR_ZERO(provider);
++}
++
++static const struct of_device_id a733_usb2phy_of_match[] = {
++	{ .compatible = "allwinner,sun60i-a733-usb2-phy" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, a733_usb2phy_of_match);
++
++static struct platform_driver a733_usb2phy_driver = {
++	.probe	= a733_usb2phy_probe,
++	.driver	= {
++		.name		= "sun60i-a733-usb2-phy",
++		.of_match_table	= a733_usb2phy_of_match,
++	},
++};
++module_platform_driver(a733_usb2phy_driver);
++
++MODULE_DESCRIPTION("Allwinner A733 USB2 companion PHY (USB3 DRD)");
++MODULE_LICENSE("GPL");

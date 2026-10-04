@@ -1,0 +1,242 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Sat, 3 Oct 2026 17:03:26 +0200
+Subject: [PATCH] feat(allwinner): let a platform use the generic GIC driver
+
+The Allwinner common code drives a GICv2 itself: sunxi_bl31_setup.c
+initialises it and sunxi_native_pm.c disables and enables the CPU
+interface around CPU_OFF, CPU_ON, SYSTEM_OFF and SYSTEM_RESET. Newer
+Allwinner SoCs (the A733) have a GIC-600, a GICv3. Rather than adding a
+second hand-written GIC layer next to the GICv2 one, let such a platform
+set USE_GIC_DRIVER and leave the GIC to the generic driver, which the
+PSCI library and bl31_main() already call at the right points (cold
+boot, CPU_ON, CPU_OFF, CPU_SUSPEND, SYSTEM_OFF).
+
+With USE_GIC_DRIVER unset (every existing Allwinner platform) nothing
+changes. With USE_GIC_DRIVER=3:
+- the common code makes no GICv2 call;
+- bl31_early_platform_setup2() hands the redistributor frame
+  (SUNXI_GICR_BASE) to gic_set_gicr_frames(), before bl31_main() runs
+  gic_init() and gic_pcpu_init();
+- plat_arm_calc_core_pos(), which gicv3_base.c uses to map a
+  redistributor's affinity to a core, is plat_core_pos_by_mpidr();
+- PLAT_ARM_GICD_BASE is SUNXI_GICD_BASE;
+- plat_gic_pre_pcpu_init() is empty.
+The SCPI PSCI path drives the GICv2 itself and is refused with
+USE_GIC_DRIVER.
+
+This replaces the GIC abstraction layer of the dlan17 TF-A fork
+(fork commit 14b197fee, "refactor(allwinner): add gic abstraction
+layer", Jernej Skrabec) and its GICv3 half (sunxi_gicv3.c, fork commit
+57c92e467), which carried a copy of what the generic driver does.
+
+Assisted-by: Claude
+---
+ plat/allwinner/common/allwinner-common.mk    |  3 +++
+ plat/allwinner/common/include/plat_macros.S  |  3 +++
+ plat/allwinner/common/include/platform_def.h |  3 +++
+ plat/allwinner/common/sunxi_bl31_setup.c     | 26 ++++++++++++++++++++
+ plat/allwinner/common/sunxi_native_pm.c      | 10 ++++++++
+ plat/allwinner/common/sunxi_topology.c       | 15 +++++++++++
+ 6 files changed, 60 insertions(+)
+
+diff --git a/plat/allwinner/common/allwinner-common.mk b/plat/allwinner/common/allwinner-common.mk
+index 54c023efe..05c8c98a7 100644
+--- a/plat/allwinner/common/allwinner-common.mk
++++ b/plat/allwinner/common/allwinner-common.mk
+@@ -53,6 +53,9 @@ BL31_SOURCES		+=	${AW_PLAT}/common/sunxi_cpu_ops.c	\
+ endif
+ 
+ ifeq (${SUNXI_PSCI_USE_SCPI},1)
++ifneq (${USE_GIC_DRIVER},0)
++$(error "SUNXI_PSCI_USE_SCPI drives the GICv2 itself and cannot be used with USE_GIC_DRIVER")
++endif
+ BL31_SOURCES		+=	drivers/allwinner/sunxi_msgbox.c	\
+ 				drivers/arm/css/scpi/css_scpi.c		\
+ 				${AW_PLAT}/common/sunxi_scpi_pm.c
+diff --git a/plat/allwinner/common/include/plat_macros.S b/plat/allwinner/common/include/plat_macros.S
+index 77f183dd2..2d5004e69 100644
+--- a/plat/allwinner/common/include/plat_macros.S
++++ b/plat/allwinner/common/include/plat_macros.S
+@@ -19,7 +19,10 @@
+ 	 * ---------------------------------------------
+ 	 */
+ 	.macro plat_crash_print_regs
++#ifdef SUNXI_GICC_BASE
++	/* GICv2: arm_print_gic_regs reads the memory-mapped CPU interface. */
+ 	mov_imm	x17, SUNXI_GICC_BASE
++#endif
+ 	mov_imm	x16, SUNXI_GICD_BASE
+ 	arm_print_gic_regs
+ 	.endm
+diff --git a/plat/allwinner/common/include/platform_def.h b/plat/allwinner/common/include/platform_def.h
+index efa590460..156c06547 100644
+--- a/plat/allwinner/common/include/platform_def.h
++++ b/plat/allwinner/common/include/platform_def.h
+@@ -74,6 +74,9 @@
+ 					 PLATFORM_MAX_CPUS_PER_CLUSTER)
+ #define PLATFORM_STACK_SIZE		(0x1000 / PLATFORM_CORE_COUNT)
+ 
++/* For the generic GIC driver (USE_GIC_DRIVER). */
++#define PLAT_ARM_GICD_BASE		SUNXI_GICD_BASE
++
+ #ifndef SPD_none
+ #ifndef BL32_BASE
+ #define BL32_BASE			SUNXI_DRAM_BASE
+diff --git a/plat/allwinner/common/sunxi_bl31_setup.c b/plat/allwinner/common/sunxi_bl31_setup.c
+index 605ace5f8..f6f029e32 100644
+--- a/plat/allwinner/common/sunxi_bl31_setup.c
++++ b/plat/allwinner/common/sunxi_bl31_setup.c
+@@ -14,12 +14,19 @@
+ #include <arch_helpers.h>
+ #include <common/debug.h>
+ #include <common/fdt_fixup.h>
++#if USE_GIC_DRIVER
++#include <drivers/arm/gic.h>
++#else
+ #include <drivers/arm/gicv2.h>
++#endif
+ #include <drivers/console.h>
+ #include <drivers/generic_delay_timer.h>
+ #include <drivers/ti/uart/uart_16550.h>
+ #include <lib/mmio.h>
+ #include <plat/common/platform.h>
++#if USE_GIC_DRIVER == 3
++#include <plat/arm/common/plat_arm.h>
++#endif
+ 
+ #include <sunxi_def.h>
+ #include <sunxi_mmap.h>
+@@ -33,10 +40,22 @@ static console_t console;
+ 
+ static void *fdt;
+ 
++#if !USE_GIC_DRIVER
+ static const gicv2_driver_data_t sunxi_gic_data = {
+ 	.gicd_base = SUNXI_GICD_BASE,
+ 	.gicc_base = SUNXI_GICC_BASE,
+ };
++#elif USE_GIC_DRIVER == 3
++/* Where the generic GICv3 driver looks for this core's redistributor. */
++static const uintptr_t sunxi_gicr_frames[] = {
++	SUNXI_GICR_BASE,
++	0U,
++};
++
++void plat_gic_pre_pcpu_init(unsigned int cpu_idx)
++{
++}
++#endif
+ 
+ /*
+  * Try to find a DTB loaded in memory by previous stages.
+@@ -84,6 +103,11 @@ void bl31_early_platform_setup2(u_register_t arg0, u_register_t arg1,
+ 	console_16550_register(SUNXI_UART0_BASE, SUNXI_UART0_CLK_IN_HZ,
+ 			       SUNXI_UART0_BAUDRATE, &console);
+ 
++#if USE_GIC_DRIVER == 3
++	/* bl31_main() initialises the GIC before bl31_platform_setup(). */
++	gic_set_gicr_frames(sunxi_gicr_frames);
++#endif
++
+ #ifdef BL32_BASE
+ 	/* Populate entry point information for BL32 */
+ 	SET_PARAM_HEAD(&bl32_image_ep_info, PARAM_EP, VERSION_1, 0);
+@@ -152,11 +176,13 @@ void bl31_platform_setup(void)
+ 		NOTICE("BL31: No DTB found.\n");
+ 	}
+ 
++#if !USE_GIC_DRIVER
+ 	/* Configure the interrupt controller */
+ 	gicv2_driver_init(&sunxi_gic_data);
+ 	gicv2_distif_init();
+ 	gicv2_pcpu_distif_init();
+ 	gicv2_cpuif_enable();
++#endif
+ 
+ 	sunxi_security_setup();
+ 
+diff --git a/plat/allwinner/common/sunxi_native_pm.c b/plat/allwinner/common/sunxi_native_pm.c
+index 28abd3c67..4bc10366f 100644
+--- a/plat/allwinner/common/sunxi_native_pm.c
++++ b/plat/allwinner/common/sunxi_native_pm.c
+@@ -6,7 +6,9 @@
+ 
+ #include <arch_helpers.h>
+ #include <common/debug.h>
++#if !USE_GIC_DRIVER
+ #include <drivers/arm/gicv2.h>
++#endif
+ #include <drivers/delay_timer.h>
+ #include <lib/mmio.h>
+ #include <lib/psci/psci.h>
+@@ -27,20 +29,26 @@ static int sunxi_pwr_domain_on(u_register_t mpidr)
+ 
+ static void sunxi_pwr_domain_off(const psci_power_state_t *target_state)
+ {
++#if !USE_GIC_DRIVER
+ 	gicv2_cpuif_disable();
++#endif
+ 
+ 	sunxi_cpu_power_off_self();
+ }
+ 
+ static void sunxi_pwr_domain_on_finish(const psci_power_state_t *target_state)
+ {
++#if !USE_GIC_DRIVER
+ 	gicv2_pcpu_distif_init();
+ 	gicv2_cpuif_enable();
++#endif
+ }
+ 
+ static void sunxi_system_off(void)
+ {
++#if !USE_GIC_DRIVER
+ 	gicv2_cpuif_disable();
++#endif
+ 
+ 	/* Attempt to power down the board (may not return) */
+ 	sunxi_power_down();
+@@ -52,7 +60,9 @@ static void sunxi_system_off(void)
+ 
+ static void __dead2 sunxi_system_reset(void)
+ {
++#if !USE_GIC_DRIVER
+ 	gicv2_cpuif_disable();
++#endif
+ 
+ 	/* Reset the whole system when the watchdog times out */
+ 	mmio_write_32(SUNXI_WDOG0_CFG_REG, 1);
+diff --git a/plat/allwinner/common/sunxi_topology.c b/plat/allwinner/common/sunxi_topology.c
+index 45be1e03d..68a597531 100644
+--- a/plat/allwinner/common/sunxi_topology.c
++++ b/plat/allwinner/common/sunxi_topology.c
+@@ -9,6 +9,10 @@
+ #include <arch.h>
+ #include <plat/common/platform.h>
+ 
++#if USE_GIC_DRIVER == 3
++#include <plat/arm/common/plat_arm.h>
++#endif
++
+ static const unsigned char plat_power_domain_tree_desc[PLAT_MAX_PWR_LVL + 1] = {
+ 	/* One root node for the SoC */
+ 	1,
+@@ -33,6 +37,17 @@ int plat_core_pos_by_mpidr(u_register_t mpidr)
+ 	return cluster * PLATFORM_MAX_CPUS_PER_CLUSTER + core;
+ }
+ 
++#if USE_GIC_DRIVER == 3
++/*
++ * The generic GICv3 driver (drivers/arm/gic/v3/gicv3_base.c) maps the
++ * affinity of each redistributor to a core position through this.
++ */
++unsigned int plat_arm_calc_core_pos(u_register_t mpidr)
++{
++	return (unsigned int)plat_core_pos_by_mpidr(mpidr);
++}
++#endif
++
+ const unsigned char *plat_get_power_domain_tree_desc(void)
+ {
+ 	return plat_power_domain_tree_desc;

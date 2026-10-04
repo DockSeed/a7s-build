@@ -1,0 +1,113 @@
+From 9f1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Tue, 21 Jul 2026 14:00:00 +0200
+Subject: [PATCH] arm64: dts: a733: add heterogeneous PMU nodes (M8 follow-on)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add two arm-pmu nodes, one per core type, so the PMU driver binds a
+matching event map on each cluster and perf works on both.
+
+Everything below was measured on A733 silicon (the 6 GiB board) on 2026-07-21.
+The vendor DT is deliberately not cited as evidence: two BSP device trees
+agreeing is one source copied twice, not two witnesses.
+
+PPI 7 (INTID 23) -- proven by stimulus, not by reading a DT.
+A perf_event_open() cycle-counter event with sample_period=20000 was run
+pinned with taskset, first to cpu0 (A55), then to cpu6 (A76). The
+/proc/interrupts line
+
+  16:  ...  GICv3  23 Level  arm-pmu
+
+was 0 in every column before, went to 234986 in the cpu0 column after the
+first run, and to 276204 in the cpu6 column after the second -- each time
+only in the column of the stimulated PE. The counter-overflow interrupt
+therefore really is delivered as INTID 23, per PE, on both core types.
+Note this also shows what the vendor DT could not: before the stimulus
+every column read 0, so the interrupt was armed but never proven.
+
+Level, not edge -- proven read-only in silicon.
+GICR_ICFGR1 (redistributor base 0x03460000, per-PE stride 0x20000, SGI
+frame +0x10000, register +0x0c04) reads 0x00000000 on all eight PE
+frames, i.e. the INTID 23 field [15:14] = 0b00 = level. That alone would
+be circular -- the GICv3 driver programs ICFGR for PPIs, so the kernel
+could have written it from its own DT. It did not: writing 0b10 (edge)
+into that field does not stick (readback still 0x00000000), while the
+same interface writing GICD_ICFGR15 at 0x03400c3c does change it
+(wrote 0x00300000, read back 0x00200000; bit [20] is RES0). The PPI
+field is read-only, so level-high is a property of this silicon.
+
+Cross-read on the second A733 board (a second 6 GiB board, kernel 6.6.98): identical
+values in all eight frames.
+
+Two nodes rather than a single arm,armv8-pmuv3: the arm-pmu driver
+matches per compatible and each core type has its own event map. The
+silicon supports the split -- on the 6 GiB board /sys/bus/event_source/devices
+carries armv8_cortex_a55 and armv8_cortex_a76 side by side, and the
+per-PE delivery proof above covers both types separately.
+
+Side effect worth recording: GICR_TYPER[63:32] reads Aff1 = frame index,
+Aff0 = 0 across all eight frames (0x00000000, 0x00000100, ... 0x00000700)
+on both boards. Affinity_Value is hardware-derived from the PE's
+MPIDR_EL1, so this closes the item patch `arm64-dts-a733-cpu-topology` left open -- its reg=
+values with the 0x100 stride are MPIDR-true, not merely BSP convention.
+
+A note on the 6 GiB board: it runs a BSP kernel and is NOT a witness for this
+repo's boot chain. It is used
+here purely as A733 silicon, for register readback and interrupt
+delivery. No boot-chain, PSCI or firmware claim is drawn from it.
+
+Dropped from the earlier draft of this patch: the claim that the ARM PMU
+architecture mandates PPI 7. It does not -- the nPMUIRQ wiring is SoC
+integration (SBSA recommends INTID 23, which this SoC happens to follow).
+The delivery measurement above is what actually establishes it.
+
+Depends on patch `arm64-dts-a733-cpu-topology` (cpu topology, which establishes the A55/A76
+split). No driver code; arm-pmu is built into the arm64 defconfig.
+
+VERIFIED THIS PASS:
+  * patch -p1 clean, zero offset, against main post `clk-sunxi-ng-add-A733-sun60iw2-minimal-ccu` to `arm64-dts-a733-cpu-topology`
+  * dtc W=1: 0 warnings; both nodes present in the decompiled dtb
+  * silicon: IRQ delivery per PE, ICFGR1 read-only, TYPER affinity
+
+PENDING:
+  * Boot on our own chain (still single-cpu via `arm64-dts-allwinner-add-A733-minimal-boot-dt`'s stub until `arm64-dts-a733-cpu-topology`
+    boots). Proof there = the same stimulus, counters rising per PE on
+    our kernel.
+
+Assisted-by: Claude
+---
+ .../sun60i-a733-cubie-a7s-minimal.dts         | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -231,6 +231,24 @@
+ 			     <GIC_PPI 10 IRQ_TYPE_LEVEL_HIGH>;
+ 	};
+ 
++	/*
++	 * PMU, one node per core type. PPI 7 (INTID 23) and its level
++	 * trigger are silicon-verified on A733, not taken from a vendor DT:
++	 * the overflow IRQ is observed arriving per PE on both core types,
++	 * and the GICR_ICFGR1 field for INTID 23 is read-only at 0b00
++	 * (level). Evidence in the cover letter. Separate nodes because the
++	 * arm-pmu driver binds a per-core-type event map.
++	 */
++	pmu-a55 {
++		compatible = "arm,cortex-a55-pmu";
++		interrupts = <GIC_PPI 7 IRQ_TYPE_LEVEL_HIGH>;
++	};
++
++	pmu-a76 {
++		compatible = "arm,cortex-a76-pmu";
++		interrupts = <GIC_PPI 7 IRQ_TYPE_LEVEL_HIGH>;
++	};
++
+ 	osc24M: osc24M-clk {
+ 		#clock-cells = <0>;
+ 		compatible = "fixed-clock";
+-- 
+2.45.0

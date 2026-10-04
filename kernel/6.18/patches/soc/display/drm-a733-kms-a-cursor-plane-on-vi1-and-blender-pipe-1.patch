@@ -1,0 +1,497 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] drm/a733: kms: a cursor plane on VI channel 1 and blender pipe 1
+
+The KMS device has exactly one plane, the primary. Every compositor
+therefore draws the pointer into it and recomposites a full frame per
+pointer event; on the desktop image that is labwc through zink on the GPU. This adds a DRM_PLANE_TYPE_CURSOR plane that the
+display engine blends in hardware.
+
+WHERE IT LIVES
+
+VI channel slot 1, blender port 1, blender pipe 1 above pipe 0. VI rather
+than UI because the VI layer block is the one witnessed on silicon (slot 0,
+sun60i-de.c); a UI channel's layer layout is witnessed nowhere. Pipe = port
+= 1, and the vendor's own live map has VI1 on port 1 (de_top +0x30 =
+0x0000a810 on its link: port 0 VI0, port 1 VI1, port 2 UI0, port 3 UI2).
+
+THE WORD THAT WAS MISSING
+
+de_top +0x30, PORT2CHN_MUX (allwinner-bsp lowlevel_de/de_top.c, the V2
+offset the de352 descriptor selects; de_top_set_port2chn_mux()): 4 bits per
+blender port, VI 0..7, UI id + 8. Its reset value 0 names VI0 on every
+port, which serves the primary and nothing else. Measured by raw register
+stimulus before this patch:
+slot 1 and pipe 1 fully programmed, every word reading back, and the sink's
+frame CRC does not move; the same pipe enable with PORT2CHN = 0x10 toggles
+the CRC between two stable values twice, and a COORD write alone moves it.
+sun60i_de_top_setup() now writes port 0 = VI0, port 1 = VI1 on every
+start.
+
+THE LAYER WORD
+
+ATTCTL from the vendor's field map (lowlevel_de/ovl/de_ovl_type.h,
+ovl_v_attctl_reg) and its composition for a layer whose alpha is used
+(de_ovl.c, the lay[i].ctl word): alpha mode 2 = pixel alpha times global
+alpha 0xff, FBFMT 0 = ARGB8888 (MSB A-R-G-B LSB, DRM_FORMAT_ARGB8888),
+RGB_MODE, PREMUL [17:16] = 2 "has premul". The blender gets
+BLD_PREMULTIPLY bit 1 for pipe 1, as de_bld_set_premul() does for a
+premultiplied channel. Premultiplied is DRM's default blend mode for a
+plane without the property, and what cursor clients hand in.
+
+WHAT THE VENDOR DOES DIFFERENTLY
+
+  - It registers no cursor plane at all: drm_crtc_init_with_planes() gets
+    NULL for the cursor (sunxi_drm_crtc.c:2513) and every other channel
+    becomes an OVERLAY plane. The legacy cursor ioctl and a compositor's
+    cursor-plane path find nothing there either; here both land on pipe 1.
+  - It chooses ports through a per-mode channel table and rewrites the whole
+    port map per commit; here the map is fixed, because two channels are
+    all this driver drives.
+  - Its plane update writes crtc_x/y straight into the 16-bit coordinate
+    field (de_bld.c:246-250), so a pointer at the left or top edge becomes
+    a coordinate near 65535. Here drm_atomic_helper_check_plane_state()
+    clips, and the clipped source origin goes into the layer address, the
+    same path the primary already takes.
+
+WHAT IT DOES NOT DO
+
+  - One format, ARGB8888. XRGB8888 would be a different ATTCTL, and an
+    opaque square is not a cursor.
+  - No line-window guard, like every other write in this driver: a move
+    lands mid-frame, so for one frame the cursor can be split between two
+    heights. Because the writes take effect as they are made, slot 1 stops
+    reading the previous buffer once the update returns, which is what the
+    legacy cursor path's skipped vblank wait relies on.
+  - cursor_width/height = 64 is the size hint userspace reads through
+    DRM_CAP_CURSOR_WIDTH; the layer itself takes any size the primary does.
+
+The cursor is switched off before the primary on the way down
+(sun60i_de_stop()): slot 1 is a bus master reading a buffer the DRM core
+may free once the commit returns. A modeset starts the DE from reset, where
+slot 1 and pipe 1 are off; the cursor's atomic_update in the same commit
+turns it back on.
+
+FALSIFIERS
+
+  1. drm_info lists a second plane on the CRTC, type Cursor, format AR24;
+     DRM_CAP_CURSOR_WIDTH reads 64.
+  2. A cursor committed at (x, y) changes the sink CRC; the same commit
+     without the cursor restores the previous value; debugfs `state` shows
+     PORT2CHN_MUX0 0x10, vi1 LAY0_ATTCTL 0xff028005, bld0 PREMULTIPLY 0x2,
+     COORD1 = (y << 16) | x.
+  3. A cursor half off the left edge shows its right half at x = 0 (the
+     clipped source offset), not a wrapped coordinate.
+  4. Before/after under labwc with the pointer moving: flips per second and
+     labwc CPU; after, no full-frame composite per pointer event.
+
+Assisted-by: Claude
+---
+diff -u a/drivers/gpu/drm/sun60i/sun60i-de.c b/drivers/gpu/drm/sun60i/sun60i-de.c
+
+diff --git a/drivers/gpu/drm/sun60i/sun60i-de.c b/drivers/gpu/drm/sun60i/sun60i-de.c
+--- a/drivers/gpu/drm/sun60i/sun60i-de.c
++++ b/drivers/gpu/drm/sun60i/sun60i-de.c
+@@ -184,6 +184,17 @@
+ #define   DE_TOP_ENABLE2_VALUE		0x00000011
+ #define  DE_TOP_DE2TCON_MUX		0x0010
+ #define  DE_TOP_VERSION			0x0014
++/*
++ * Which channel feeds which blender port: one word per display, 4 bits per
++ * port, VI channels 0..7, UI channels id + 8. The name and the V2 offset are
++ * the vendor's (allwinner-bsp lowlevel_de/de_top.c, DE_PORT2CHN_MUX_OFFSET_V2,
++ * selected by the de352 descriptor; de_top_set_port2chn_mux()). Reset is 0,
++ * which names VI0 on every port -- enough for the primary on port 0, and the
++ * reason a second channel on pipe 1 showed nothing until port 1 was pointed
++ * at VI1.
++ */
++#define  DE_TOP_PORT2CHN_MUX0		0x0030
++#define   PORT2CHN_PORT(p, chn)		((chn) << (4 * (p)))
+ 
+ #define DE_MIXER0_TOP			0x008100
+ #define  MIXER_GLOBAL_CTL		0x0000
+@@ -219,6 +230,17 @@
+ #define DE_VI0_SLOT			0
+ #define DE_BLD_PIPE			0
+ 
++/*
++ * The cursor: VI slot 1 on blender port 1, blended by pipe 1 above pipe 0.
++ * VI and not UI because the VI layer layout is the one witnessed on silicon
++ * (slot 0 above); a UI channel's layer block is witnessed nowhere. Port 1 is
++ * the port the vendor's own live map gives VI1 (de_top +0x30 = 0xa810 on its
++ * link: port 0 VI0, port 1 VI1). Pipe = port = 1 keeps the route readable.
++ */
++#define DE_CURSOR_SLOT			1
++#define DE_CURSOR_PORT			1
++#define DE_CURSOR_PIPE			1
++
+ /*
+  * Four blender register files at a 0x400 stride, all four programmed
+  * identically on the live link, on a board with exactly one display pipe up.
+@@ -238,7 +260,9 @@
+ #define  BLD_ATTR_INSIZE(p)		(0x0008 + 0x10 * (p))
+ #define  BLD_ATTR_COORD(p)		(0x000c + 0x10 * (p))
+ #define  BLD_ROUTE			0x0080
++#define   BLD_ROUTE_PIPE(p, port)	((port) << (4 * (p)))
+ #define  BLD_PREMULTIPLY		0x0084
++#define   BLD_PREMULTIPLY_PIPE(p)	BIT(p)
+ #define  BLD_BKCOLOR			0x0088
+ #define  BLD_OUTSIZE			0x008c
+ #define  BLD_MODE(p)			(0x0090 + 0x04 * (p))
+@@ -247,6 +271,7 @@
+ #define DE_OVL_LAYER			0
+ #define  OVL_LAY_ATTCTL(l)		(0x30 * (l) + 0x0000)
+ #define   OVL_ATTCTL_ALPHA		GENMASK(31, 24)
++#define   OVL_ATTCTL_PREMUL		GENMASK(17, 16)
+ #define   OVL_ATTCTL_RGB_MODE		BIT(15)
+ #define   OVL_ATTCTL_FBFMT		GENMASK(12, 8)
+ #define   OVL_ATTCTL_ALPHA_MODE		GENMASK(2, 1)
+@@ -331,8 +356,11 @@
+ #define DE2TCON_MUX_LIVE		0x0000fff5
+ #define BLD_COLOR_BLACK			0xff000000
+ #define BLD_MODE_SRCOVER		0x03010301
++#define OVL_FBFMT_ARGB8888		0
+ #define OVL_FBFMT_XRGB8888		4
+ #define OVL_ALPHA_MODE_LAYER		1
++#define OVL_ALPHA_MODE_COMBINED		2
++#define OVL_PREMUL_HAS_PREMUL		2
+ #define DE_ALPHA_OPAQUE			0xff
+ #define DE_BYTES_PER_PIXEL		4
+ 
+@@ -425,6 +453,7 @@ struct sun60i_de {
+ 	const struct sun60i_de_commit	*commit;
+ 	bool				enabled;
+ 	bool				layer_on;
++	bool				cursor_on;
+ 	bool				ccsc_on;
+ 	/*
+ 	 * A KMS master is bound and owns the datapath. The debugfs verbs that
+@@ -883,6 +912,9 @@ static void sun60i_de_top_setup(struct sun60i_de *de)
+ 	u32 size = DE_SIZE(mode->hdisplay, mode->vdisplay);
+ 
+ 	sun60i_de_write(de, DE_TOP + DE_TOP_DE2TCON_MUX, DE2TCON_MUX_LIVE);
++	sun60i_de_write(de, DE_TOP + DE_TOP_PORT2CHN_MUX0,
++			PORT2CHN_PORT(DE_BLD_PIPE, DE_VI0_SLOT) |
++			PORT2CHN_PORT(DE_CURSOR_PORT, DE_CURSOR_SLOT));
+ 	sun60i_de_write(de, DE_MIXER0_TOP + MIXER_GLOBAL_SIZE, size);
+ 	sun60i_de_write(de, DE_MIXER0_TOP + MIXER_GLOBAL_CLK, 1);
+ 	sun60i_de_write(de, DE_MIXER0_TOP + MIXER_GLOBAL_CTL,
+@@ -1204,6 +1236,107 @@ static int sun60i_de_layer_disable(struct sun60i_de *de)
+ 	return ret;
+ }
+ 
++/*
++ * The cursor layer: VI slot 1, one layer, ARGB8888 with the pixel's own alpha,
++ * premultiplied -- DRM's default blend mode, and what cursor clients hand in.
++ *
++ * ATTCTL is built from the vendor's field map and its own composition for a
++ * layer whose alpha is not ignored (allwinner-bsp lowlevel_de/ovl/de_ovl.c,
++ * the lay[i].ctl word; de_channel.c, de_rtmx_chn_blend_attr()):
++ *   ALPHA_MODE [2:1] = 2  pixel alpha times global alpha, global = 0xff
++ *   FBFMT     [12:8] = 0  ARGB8888, MSB A-R-G-B LSB = DRM_FORMAT_ARGB8888
++ *   RGB_MODE     [15]     as for the primary
++ *   PREMUL   [17:16] = 2  the pixels are already premultiplied
++ * and the blender is told the same per pipe (BLD_PREMULTIPLY bit 1), which is
++ * what the vendor's de_bld_set_premul() does for a premultiplied channel.
++ *
++ * The high-address bytes (+0xd0..+0xe4) are not written: the DE comes out of
++ * reset with them at 0 on every slot, and nothing in this driver sets them
++ *.
++ *
++ * The blender words go to all four instances, like every other blender write
++ * in this file. PIPE_CTL is written whole, pipe 0's bits included, because
++ * the register holds both pipes and nothing else owns it.
++ */
++static u32 sun60i_de_cursor_attctl(void)
++{
++	return FIELD_PREP(OVL_ATTCTL_ALPHA, DE_ALPHA_OPAQUE) |
++	       FIELD_PREP(OVL_ATTCTL_PREMUL, OVL_PREMUL_HAS_PREMUL) |
++	       OVL_ATTCTL_RGB_MODE |
++	       FIELD_PREP(OVL_ATTCTL_FBFMT, OVL_FBFMT_ARGB8888) |
++	       FIELD_PREP(OVL_ATTCTL_ALPHA_MODE, OVL_ALPHA_MODE_COMBINED) |
++	       OVL_ATTCTL_EN;
++}
++
++static int sun60i_de_cursor_enable(struct sun60i_de *de,
++				   const struct drm_rect *dst,
++				   dma_addr_t addr, u32 pitch)
++{
++	u32 ovl = sun60i_de_chn(DE_CURSOR_SLOT) + DE_CHN_OVL;
++	u32 size = DE_SIZE(drm_rect_width(dst), drm_rect_height(dst));
++	u32 coord = DE_COORD(dst->x1, dst->y1);
++	unsigned int i;
++	int ret;
++
++	de->commit->begin(de);
++
++	sun60i_de_stage(de, ovl + OVL_LAY_MBSIZE(DE_OVL_LAYER), size);
++	sun60i_de_stage(de, ovl + OVL_LAY_MBCOOR(DE_OVL_LAYER), 0);
++	sun60i_de_stage(de, ovl + OVL_LAY_PITCH(DE_OVL_LAYER, 0), pitch);
++	sun60i_de_stage(de, ovl + OVL_LAY_TOP_LADDR(DE_OVL_LAYER, 0),
++			lower_32_bits(addr));
++	sun60i_de_stage(de, ovl + OVL_VI_OVL_SIZE, size);
++	sun60i_de_stage(de, ovl + OVL_LAY_ATTCTL(DE_OVL_LAYER),
++			sun60i_de_cursor_attctl());
++
++	for (i = 0; i < DE_BLD_INSTANCES; i++) {
++		u32 bld = sun60i_de_bld(i);
++
++		sun60i_de_stage(de, bld + BLD_ATTR_INSIZE(DE_CURSOR_PIPE), size);
++		sun60i_de_stage(de, bld + BLD_ATTR_COORD(DE_CURSOR_PIPE), coord);
++		sun60i_de_stage(de, bld + BLD_MODE(DE_CURSOR_PIPE),
++				BLD_MODE_SRCOVER);
++		sun60i_de_stage(de, bld + BLD_ROUTE,
++				BLD_ROUTE_PIPE(DE_BLD_PIPE, 0) |
++				BLD_ROUTE_PIPE(DE_CURSOR_PIPE, DE_CURSOR_PORT));
++		sun60i_de_stage(de, bld + BLD_PREMULTIPLY,
++				BLD_PREMULTIPLY_PIPE(DE_CURSOR_PIPE));
++		sun60i_de_stage(de, bld + BLD_PIPE_CTL,
++				BLD_PIPE_CTL_EN(DE_BLD_PIPE) |
++				BLD_PIPE_CTL_FC_EN(DE_BLD_PIPE) |
++				BLD_PIPE_CTL_EN(DE_CURSOR_PIPE));
++	}
++
++	ret = de->commit->arm(de);
++	de->cursor_on = true;
++
++	return ret;
++}
++
++/*
++ * Pipe first, then the layer, so no frame blends a half-disabled channel. On
++ * the way down (sun60i_de_stop()) this runs before the quiesce, for the same
++ * reason the primary layer does: slot 1 is a bus master reading a buffer the
++ * DRM core may free as soon as the commit returns.
++ */
++static int sun60i_de_cursor_disable(struct sun60i_de *de)
++{
++	u32 ovl = sun60i_de_chn(DE_CURSOR_SLOT) + DE_CHN_OVL;
++	unsigned int i;
++	int ret;
++
++	de->commit->begin(de);
++	for (i = 0; i < DE_BLD_INSTANCES; i++)
++		sun60i_de_stage(de, sun60i_de_bld(i) + BLD_PIPE_CTL,
++				BLD_PIPE_CTL_EN(DE_BLD_PIPE) |
++				BLD_PIPE_CTL_FC_EN(DE_BLD_PIPE));
++	sun60i_de_stage(de, ovl + OVL_LAY_ATTCTL(DE_OVL_LAYER), 0);
++	ret = de->commit->arm(de);
++	de->cursor_on = false;
++
++	return ret;
++}
++
+ /*
+  * Stage the layer on or off through the commit path, and nothing else.
+  *
+@@ -1375,6 +1508,8 @@ static void sun60i_de_stop(struct sun60i_de *de)
+ 	 * refuses to stop leaves the block fetching from pages that are about
+ 	 * to belong to somebody else.
+ 	 */
++	if (de->cursor_on)
++		sun60i_de_cursor_disable(de);
+ 	sun60i_de_layer_disable(de);
+ 	sun60i_de_quiesce(de);
+ 	sun60i_de_clocks_off(de);
+@@ -1433,6 +1568,16 @@ static int sun60i_de_state_show(struct seq_file *s, void *unused)
+ 		{ "bld0 BKCOLOR",	bld + BLD_BKCOLOR },
+ 		{ "bld0 OUTSIZE",	bld + BLD_OUTSIZE },
+ 		{ "bld0 BLEND_MODE0",	bld + BLD_MODE(DE_BLD_PIPE) },
++		{ "de_top PORT2CHN_MUX0", DE_TOP + DE_TOP_PORT2CHN_MUX0 },
++		{ "vi1 LAY0_ATTCTL (cursor)",
++		  sun60i_de_chn(DE_CURSOR_SLOT) + DE_CHN_OVL +
++		  OVL_LAY_ATTCTL(DE_OVL_LAYER) },
++		{ "vi1 LAY0_TOP_LADDR0 (cursor)",
++		  sun60i_de_chn(DE_CURSOR_SLOT) + DE_CHN_OVL +
++		  OVL_LAY_TOP_LADDR(DE_OVL_LAYER, 0) },
++		{ "bld0 INSIZE1 (cursor)", bld + BLD_ATTR_INSIZE(DE_CURSOR_PIPE) },
++		{ "bld0 COORD1 (cursor)", bld + BLD_ATTR_COORD(DE_CURSOR_PIPE) },
++		{ "bld0 PREMULTIPLY",	bld + BLD_PREMULTIPLY },
+ 	};
+ 	const struct sun60i_de_reg traps[] = {
+ 		{ "vi0 CCSC_CTL",		chn + DE_CHN_CCSC + CCSC_CTL },
+@@ -1616,6 +1761,40 @@ void sun60i_de_kms_layer_off(struct sun60i_de *de)
+ }
+ EXPORT_SYMBOL_GPL(sun60i_de_kms_layer_off);
+ 
++/*
++ * The cursor plane's two calls. Same commit path and the same missing
++ * line-window guard as sun60i_de_kms_scanout() -- a move lands mid-frame, so
++ * for one frame the cursor can sit at two heights. The writes take effect as
++ * they are made, so once this returns slot 1 no longer fetches the previous
++ * buffer, which is what the legacy cursor path's skipped vblank wait relies
++ * on.
++ */
++int sun60i_de_kms_cursor(struct sun60i_de *de, const struct drm_rect *dst,
++			 dma_addr_t addr, u32 pitch)
++{
++	guard(mutex)(&de->lock);
++
++	if (!de->enabled)
++		return -ENODEV;
++
++	if (!sun60i_de_dst_fits(&de->mode, dst))
++		return -EINVAL;
++
++	return sun60i_de_cursor_enable(de, dst, addr, pitch);
++}
++EXPORT_SYMBOL_GPL(sun60i_de_kms_cursor);
++
++void sun60i_de_kms_cursor_off(struct sun60i_de *de)
++{
++	guard(mutex)(&de->lock);
++
++	if (!de->enabled || !de->cursor_on)
++		return;
++
++	sun60i_de_cursor_disable(de);
++}
++EXPORT_SYMBOL_GPL(sun60i_de_kms_cursor_off);
++
+ /*
+  * The component hooks do no hardware work at all, and that is deliberate: this
+  * driver is started by a modeset, not by a bind, exactly as it is started by a
+diff --git a/drivers/gpu/drm/sun60i/sun60i-kms.c b/drivers/gpu/drm/sun60i/sun60i-kms.c
+--- a/drivers/gpu/drm/sun60i/sun60i-kms.c
++++ b/drivers/gpu/drm/sun60i/sun60i-kms.c
+@@ -529,6 +529,64 @@ static const struct drm_plane_helper_funcs sun60i_kms_plane_helper_funcs = {
+ 	.atomic_disable	= sun60i_kms_plane_atomic_disable,
+ };
+ 
++/*
++ * ---------------------------------------------------------------------------
++ * The cursor plane
++ * ---------------------------------------------------------------------------
++ *
++ * VI slot 1, blended by pipe 1 above the primary (sun60i-de.c, above
++ * sun60i_de_cursor_attctl()). Without it every compositor draws the pointer
++ * into the primary and recomposites a frame per pointer event.
++ *
++ * ARGB8888 only: the layer takes the pixel's alpha, premultiplied, which is
++ * DRM's default blend mode for a plane without a "pixel blend mode" property
++ * and what cursor clients hand in. XRGB8888 would need a different ATTCTL,
++ * and an opaque square is not what anyone wants as a cursor.
++ *
++ * The checks are the primary's, word for word (sun60i_kms_plane_atomic_check()):
++ * positioned but not scaled, whole-pixel source origin, a scanout address
++ * below 4 GiB. A cursor that hangs over an edge is clipped by the helper and
++ * its source offset goes into the address, as for the primary. What differs
++ * is that a cursor may be absent or wholly off the mode: both mean pipe 1 off.
++ */
++static const u32 sun60i_kms_cursor_formats[] = {
++	DRM_FORMAT_ARGB8888,
++};
++
++static void sun60i_kms_cursor_atomic_update(struct drm_plane *plane,
++					    struct drm_atomic_state *state)
++{
++	struct drm_plane_state *new_state =
++		drm_atomic_get_new_plane_state(state, plane);
++	struct sun60i_kms *kms = to_kms_plane(plane)->kms;
++	dma_addr_t addr;
++	int ret;
++
++	if (!new_state->visible) {
++		sun60i_de_kms_cursor_off(kms->de);
++		return;
++	}
++
++	addr = sun60i_kms_plane_scanout(new_state);
++
++	ret = sun60i_de_kms_cursor(kms->de, &new_state->dst, addr,
++				   new_state->fb->pitches[0]);
++	if (ret)
++		drm_err(plane->dev, "cursor from %pad: %d\n", &addr, ret);
++}
++
++static void sun60i_kms_cursor_atomic_disable(struct drm_plane *plane,
++					     struct drm_atomic_state *state)
++{
++	sun60i_de_kms_cursor_off(to_kms_plane(plane)->kms->de);
++}
++
++static const struct drm_plane_helper_funcs sun60i_kms_cursor_helper_funcs = {
++	.atomic_check	= sun60i_kms_plane_atomic_check,
++	.atomic_update	= sun60i_kms_cursor_atomic_update,
++	.atomic_disable	= sun60i_kms_cursor_atomic_disable,
++};
++
+ static const struct drm_plane_funcs sun60i_kms_plane_funcs = {
+ 	.update_plane		= drm_atomic_helper_update_plane,
+ 	.disable_plane		= drm_atomic_helper_disable_plane,
+@@ -911,6 +969,27 @@ static int sun60i_kms_plane_init(struct sun60i_kms *kms,
+ 	return 0;
+ }
+ 
++static int sun60i_kms_cursor_init(struct sun60i_kms *kms,
++				  struct drm_plane **out)
++{
++	struct sun60i_kms_plane *plane;
++
++	plane = drmm_universal_plane_alloc(kms->drm, struct sun60i_kms_plane,
++					   base, 0, &sun60i_kms_plane_funcs,
++					   sun60i_kms_cursor_formats,
++					   ARRAY_SIZE(sun60i_kms_cursor_formats),
++					   sun60i_kms_plane_modifiers,
++					   DRM_PLANE_TYPE_CURSOR, NULL);
++	if (IS_ERR(plane))
++		return PTR_ERR(plane);
++
++	plane->kms = kms;
++	drm_plane_helper_add(&plane->base, &sun60i_kms_cursor_helper_funcs);
++	*out = &plane->base;
++
++	return 0;
++}
++
+ /*
+  * The encoder, the bridge and the connector.
+  *
+@@ -978,6 +1057,13 @@ static int sun60i_kms_mode_config(struct sun60i_kms *kms)
+ 	drm->mode_config.min_height = 1;
+ 	drm->mode_config.max_width = SUN60I_KMS_MAX_FB_DIM;
+ 	drm->mode_config.max_height = SUN60I_KMS_MAX_FB_DIM;
++	/*
++	 * What DRM_CAP_CURSOR_WIDTH/HEIGHT report, and the buffer size a
++	 * compositor then allocates. A size hint, not a hardware bound: the
++	 * cursor layer takes any size the primary does.
++	 */
++	drm->mode_config.cursor_width = 64;
++	drm->mode_config.cursor_height = 64;
+ 	drm->mode_config.funcs = &sun60i_kms_mode_config_funcs;
+ 	drm->mode_config.helper_private = &sun60i_kms_mode_config_helpers;
+ 
+@@ -1124,7 +1210,7 @@ static int sun60i_kms_attach_components(struct sun60i_kms *kms,
+ static int sun60i_kms_bind(struct device *dev)
+ {
+ 	struct device_node *engine_np, *tcon_np;
+-	struct drm_plane *primary;
++	struct drm_plane *primary, *cursor;
+ 	struct sun60i_kms *kms;
+ 	struct drm_device *drm;
+ 	int ret;
+@@ -1178,7 +1264,11 @@ static int sun60i_kms_bind(struct device *dev)
+ 	if (ret)
+ 		goto unbind_all;
+ 
+-	ret = drmm_crtc_init_with_planes(drm, &kms->crtc, primary, NULL,
++	ret = sun60i_kms_cursor_init(kms, &cursor);
++	if (ret)
++		goto unbind_all;
++
++	ret = drmm_crtc_init_with_planes(drm, &kms->crtc, primary, cursor,
+ 					 &sun60i_kms_crtc_funcs, NULL);
+ 	if (ret)
+ 		goto unbind_all;
+diff --git a/drivers/gpu/drm/sun60i/sun60i-kms.h b/drivers/gpu/drm/sun60i/sun60i-kms.h
+--- a/drivers/gpu/drm/sun60i/sun60i-kms.h
++++ b/drivers/gpu/drm/sun60i/sun60i-kms.h
+@@ -65,6 +65,9 @@ void sun60i_de_kms_disable(struct sun60i_de *de);
+ int sun60i_de_kms_scanout(struct sun60i_de *de, const struct drm_rect *dst,
+ 			  dma_addr_t scanout, u32 pitch);
+ void sun60i_de_kms_layer_off(struct sun60i_de *de);
++int sun60i_de_kms_cursor(struct sun60i_de *de, const struct drm_rect *dst,
++			 dma_addr_t addr, u32 pitch);
++void sun60i_de_kms_cursor_off(struct sun60i_de *de);
+ 
+ /*
+  * TCON_TV1 -- implemented in sun60i-tcon-tv.c, same ownership rule.

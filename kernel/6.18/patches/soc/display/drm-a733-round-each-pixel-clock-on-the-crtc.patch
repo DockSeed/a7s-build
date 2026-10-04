@@ -1,0 +1,596 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] drm/a733: tcon-tv, kms, dp: round each mode's pixel clock on the CRTC instead of allowing one
+
+sun60i_dp_bridge_mode_valid() refused every mode whose clock was not
+exactly 154000 kHz (1920x1200 CVT-RB) with MODE_CLOCK_RANGE. A monitor
+without that mode gets an empty mode list and no picture: every EDID mode,
+the DP 640x480 fail-safe and the no-EDID 1024x768 fallback fail the same test
+(drm_probe_helper.c:651-689), and the shipped command line has no video=.
+The comment beside the test named the way out -- a clk_round_rate()
+tolerance check owned by TCON_TV1 once a CRTC exists -- and the CRTC exists
+since drm-a733-kms-drm-device-for-the-display-pipe.
+
+WHAT CHANGES
+
+  sun60i-tcon-tv.c  TCON_TV1 owns the pixel clock, so it answers for it:
+    sun60i_tcon_tv_kms_clock_valid()  clk_round_rate() on "tcon-tv"
+      (EDP_TV_CLK): MODE_OK within 0.5 %, MODE_CLOCK_LOW / _HIGH outside it,
+      MODE_CLOCK_HIGH above 154000 kHz, MODE_NOCLOCK without a rate. One
+      drm.debug KMS line per mode with the asked and the made rate in Hz and
+      the error in ppm.
+    sun60i_tcon_tv_kms_clock_fixup()  writes the rate the clock tree makes
+      into the adjusted mode, clock and crtc_clock, rounded UP to the kHz.
+    The enable line prints the asked rate beside the one it got.
+  sun60i-kms.c      the CRTC's .mode_valid adds the clock test after the
+                    field-width test; a new .mode_fixup calls the fixup.
+  sun60i-kms.h      the two prototypes; <drm/drm_modes.h> for the enum.
+  sun60i-dp.c       the equality test leaves .mode_valid (interlace and the
+                    link budget stay); the MVID check is documented against
+                    the adjusted clock; "video stream enabled" carries the
+                    kHz the core measures from MVID.
+
+No register write changes at 1920x1200: 154 MHz is exact, the adjusted
+clock stays 154000 and the dividers land where they did (N 77, P0 6, M 2).
+
+WHERE THE VALUES COME FROM
+
+Clock tree (A733 UM V1.00, printed pages; the CCU field tables):
+
+  PLL_VIDEO1_CTRL_REG 0x0140, reset 0x4012_6200 (p. 58-59; decimal offset
+    320, reset 1074946560): N = PLL_N + 1, PLL_N 0..254 and a minimum
+    PLL_N of 11; M1 = PLL_INPUT_DIV + 1, 0..1; P0 = PLL_OUTPUT0_DIV + 1,
+    0..7; VIDEO1PLL4X = InputFreq * N / M1 / P0.
+  Table 4-2 "PLL Specifications" (p. 20), PLL_VIDEO1 row: Fvco 1.26G..2.52G,
+    pre-divider 1/2, post-divider P0 1~8, reference clock 24MHz.
+  Table 4-3 (p. 21): VIDEO0~1_PLL, N 99, VCO 2376, 4x 1188.
+  EDP_TV_CLK_REG 0x1640 (p. 177-178): EDP_TV_CLK = Clock Source / M / N,
+    both FACTOR fields 0..31, CLK_SRC_SEL 001 = VIDEO1PLL4X.
+
+The model in clk-sunxi-ng-a733-video-plls-and-edp-tv-pixel-clock already
+matches every one of these (N 12..255, M1 1..2, P0 1..8, VCO 1272..2520 MHz,
+EDP N and M 1..32, rate propagation on), so the CCU is not touched.
+
+24, NOT 26 MHz, and silicon agrees: Table 4-2 gives PLL_VIDEO1's reference
+as 24 MHz, and with the fields at N 77, M1 1, P0 6, EDP M 2 the DisplayPort
+core measures 154.00 MHz from its own MVID -- 0x4902 over NVID 0x8000 at a
+270 MHz symbol clock (measured on
+the 8 GiB board, 2026-08-19). From 26 MHz those fields would make 166.8 MHz.
+
+THE TOLERANCE, FROM MAINLINE PRACTICE: 0.5 %. sun4i_rgb.c
+(SUN4I_RGB_DOTCLOCK_TOLERANCE_PER_MILLE 5: "VESA DMT defines a tolerance of
+0.5% on the pixel clock, while the CVT spec reuses that tolerance in its
+examples") and sun4i_hdmi_enc.c ("+-0.5% allowed by HDMI spec") ask the same
+question the same way, clk_round_rate() against the mode. Rounding the
+adjusted clock up to the kHz is rockchip_drm_vop.c's vop_crtc_mode_fixup():
+this tree, like Rockchip's, answers with the largest rate not above the
+request, so asking again for the rounded-up kHz lands on the same rate.
+
+WHAT THE TREE MAKES, walked through the three mainline routines
+(ccu_mp_find_best_with_parent_adj(), clk_divider_bestdiv(), ccu_nm_find_best())
+with a port of them, which reproduces the silicon words for 154 MHz exactly:
+
+  mode           asked      made          VCO   N  M1 P0 EDP N/M  PLL_VIDEO1_CTRL EDP_TV_CLK
+  1920x1200@60   154000 kHz 154000000 Hz  1848  77 1  6  1/2      0xF9524C00      0x81000001
+  1920x1080@60   148500     148500000     2376  99 1  8  1/2      0xF9726200      0x81000001
+  1280x1024@60   108000     108000000     1296  54 1  6  1/2      0xF9523500      0x81000001
+  1024x768@60     65000      65000000     1560  65 1  8  1/3      0xF9724000      0x81000002
+  640x480@60      25175      25173913     2316 193 2  4  1/23     0xF932C002      0x81000016
+  1920x1080@59.94 148352    148285714     2076 173 2  7  1/2      0xF962AC02      0x81000001
+
+(bit 24 reads 1 on silicon and is reserved; bit 26, the unused 3X gate, 0.)
+Of 32 common CEA/DMT clocks up to 154 MHz, 26 land exactly and six land low
+by at most 999 ppm (720x480@60, 27.027 -> 27.000 MHz), all inside 0.5 %.
+The same port shows the fixup's round trip lands on the same rate for every
+one of them, from three different starting states of the PLL.
+
+THE CEILING: 154000 kHz, the highest pixel clock this pipe has carried, at
+one pixel per clock. The UM names no single-pixel limit. Its one pixel-mode
+example is 1920x1080@60 at 148.5 MHz in single, 74.25 in dual and 37.125 MHz
+in quad pixel mode (15.4.4.1, p. 736) -- an example, not a threshold. A mode
+above the ceiling -- 1600x1200@60 at 162 MHz, 2560x1440@60 at 241.5 -- is
+refused by name and the connector offers the next mode the sink lists,
+instead of a raster at a rate this silicon has never been seen to run.
+Raising it is a measurement; above what that finds is PIXEL_MODE,
+which sun60i_tcon_tv_kms_check() already names. Only comments in the TCON and
+KMS files that said "a mode list wider than one entry" change for it: that
+list now exists, and the factor matters above this ceiling.
+
+WHO ELSE SITS ON PLL_VIDEO1. In this tree: nobody. Its one child is
+video1-pll4x, whose one child is edp-tv; the DE0 mux lists VIDEO0PLL4X and
+VIDEO2PLL4X but not VIDEO1 (ccu-sun60iw2.c), the 3X tap is not modelled, and
+the device tree names only CLK_EDP_TV with assigned-clock-parents
+CLK_VIDEO1_PLL4X (tcon_tv1). The UM's PLL distribution figure (Figure 4-2,
+p. 22) lists what could: EINK, TCONLCD0-1, COMBOPHY0/1, EDP, HDMI, CSI_MASTER,
+CSI, ISP, LPC. None has a driver here that selects it; a register readout on the
+board reads each one's gate and source field, so "nobody" is measured, not assumed.
+LPC is the exception: the figure hangs it on PLL_VIDEO1, but the CCU register
+list has no LPC clock register, so there is nothing to read for it.
+
+WHAT ASSUMED 154 MHz (grep of drivers/gpu/drm/sun60i, scripts, the dts):
+  - sun60i-dp.c .mode_valid's equality test -- the defect, removed here;
+  - sun60i-display.h's constant mode -- the debugfs verbs' default in the TCON,
+    the DE and the transmitter; KMS overwrites it with the adjusted mode, so
+    it stays for the instruments;
+  - worked examples in comments (sun60i-dp.c's TU and MVID arithmetic,
+    sun60i-de.c's frame time) and the board test scripts used for the
+    by-hand 1920x1200 bring-up; one of them judges PLL_VIDEO1 only
+    by enabled + locked;
+  - the first stage of a board test script took "PLL_VIDEO1 is not
+    0xF9524C00" as "not yet programmed", which a KMS boot in any other mode
+    passes falsely; it now judges PLL_EN. Its second stage keeps the 1920x1200
+    words, because the debugfs enable verb it drives rasters the built-in mode;
+  - no assigned-clock-rates in the dts, no video= on the command line.
+
+WHAT THE VENDOR DOES HERE, AND WHERE WE DIFFER (allwinner-bsp, read):
+
+  vendor                                     ours
+  -----------------------------------------  ---------------------------------
+  sunxi_edp_connector_mode_valid()           the CRTC asks clk_round_rate()
+  (sunxi_drm_edp.c:3056-3110) filters on     for every mode and refuses what
+  a blacklist, the DE's maximum clock, an    the dividers cannot make within
+  fps cap and lane capability -- and never   0.5 %
+  asks the clock tree whether the mode's
+  pixel clock can be made
+  -----------------------------------------  ---------------------------------
+  the TCON sets the rate and then compares:  the rate is settled before the
+  DRM_WARN on the HDMI path                  commit, carried in the adjusted
+  (sunxi_tcon.c:522-525), DRM_INFO on the    mode, and read back after
+  LCD path (:81-85), and carries on either   clk_set_rate(); a miss fails the
+  way                                        enable
+  -----------------------------------------  ---------------------------------
+  MVID read once and printed as the pixel    MVID compared with the rate the
+  clock, compared with nothing               dividers were set to
+  (trilinear_dp14.c:1638)
+  -----------------------------------------  ---------------------------------
+  pclk_limit = <200000> in its dtsi and a    one pixel per clock and a 154 MHz
+  doubled pixel mode above it                ceiling, named; the vendor number
+  (sunxi_drm_edp.c:652-667)                  is a hint for the measurement
+
+Where the vendor is right: it also filters modes on the display engine's
+clock (sunxi_drm_edp.c:3084-3089). Here the engine's own enable refuses a
+module clock below the mode's pixel clock (sun60i_de_clocks_on()), so that
+half is covered, at enable rather than in the mode list.
+
+Verified: applies at fuzz 0 as part of the full series against a freshly
+unpacked 6.18.53; compile-check green; drivers/gpu/drm/sun60i/ with W=1,
+no warning; the new symbols are in the objects. NOT hardware-proven.
+
+What would prove it, as one observable per mode, on a monitor with
+1920x1080: modetest sets 1920x1080@60 and a second mode; per mode the
+connector list holds it, PLL_VIDEO1_CTRL and EDP_TV_CLK read the words in
+the table above, the rate they decode to from 24 MHz equals the TCON's
+"pixel clock ... Hz" line, SRC0_MVID computes back to it within 1 % (the
+driver's own check) and in practice within one MVID step of 8.24 kHz, and
+SRC0_USER_FIFO_STATUS stays zero. Falsified by: a listed mode that is
+refused, MVID computing to something else than the decoded rate -- the
+clock model contradicting the core's measurement -- or a picture that does
+not come.
+
+Assisted-by: Claude
+---
+
+diff --git a/drivers/gpu/drm/sun60i/sun60i-dp.c b/drivers/gpu/drm/sun60i/sun60i-dp.c
+--- a/drivers/gpu/drm/sun60i/sun60i-dp.c
++++ b/drivers/gpu/drm/sun60i/sun60i-dp.c
+@@ -1005,6 +1005,15 @@ static int sun60i_dp_video_transfer_unit(struct sun60i_dp *dp,
+  * then reads MVID back in one place, scales it by 1000 and prints it in sysfs
+  * as the pixel clock (:1638, sunxi_drm_edp.c:1803) -- which on an async link
+  * reports 18 690 kHz for a 154 000 kHz mode. It never compares it to anything.
++ *
++ * WHAT IT IS COMPARED WITH. dp->mode is the CRTC's adjusted mode, whose clock
++ * sun60i_tcon_tv_kms_clock_fixup() has set to the rate the clock tree makes
++ * (rounded up to the kHz) -- not the nominal clock the sink listed, which may
++ * lie up to 0.5 % above it. So MVID is checked against the rate the dividers
++ * were actually set to, and the check is a falsifier of the clock model: the
++ * CCU's own claim against the core's measurement of what arrived. On the
++ * debugfs path dp->mode is the built-in 1920x1200, whose 154 MHz the dividers
++ * hit exactly.
+  */
+ static int sun60i_dp_video_pixel_khz(struct sun60i_dp *dp)
+ {
+@@ -1242,9 +1251,12 @@ static int sun60i_dp_video_stream_enable(struct sun60i_dp *dp)
+ 	if (ret)
+ 		return ret;
+ 
++	/* The measured clock rides along, so an ordinary boot log carries the
++	 * MVID reading for whichever mode was set, not only a debugfs read.
++	 */
+ 	dev_info(dp->dev,
+-		 "video stream enabled, %d kHz over %u lanes; the sink reports it in sync (DPCD 0x205)\n",
+-		 dp->mode.clock, dp->link_lanes);
++		 "video stream enabled, %d kHz over %u lanes (the core measures %d kHz); the sink reports it in sync (DPCD 0x205)\n",
++		 dp->mode.clock, dp->link_lanes, sun60i_dp_video_pixel_khz(dp));
+ 
+ 	return 0;
+ }
+@@ -2523,31 +2535,20 @@ sun60i_dp_bridge_mode_valid(struct drm_bridge *bridge,
+ 		return MODE_NO_INTERLACE;
+ 
+ 	/*
+-	 * ⚠ ONE PIXEL CLOCK, AND THE RESTRICTION IS HONEST RATHER THAN
+-	 * CONSERVATIVE. `clk-sunxi-ng-a733-video-plls-and-edp-tv-pixel-clock` models PLL_VIDEO1 as real clk_ops with rate
+-	 * propagation, and its own header names what it owes: "a SECOND mode.
+-	 * Nothing has ever asked this PLL for one" -- a mode whose pixel clock
+-	 * is not an integer divisor of a reachable VCO lands on the nearest
+-	 * lower rate, and the falsifier it names is SRC0_MVID not computing back
+-	 * to the requested clock. Until that measurement exists, a connector
+-	 * whose EDID offers a mode list would hand this driver clocks nothing
+-	 * has ever produced, and the only thing between that and a silently
+-	 * wrong raster is `drm-a733-tcon-tv1-timing-generator-and-video-source`'s readback -- one 1 % check, after the fact.
++	 * NO PIXEL-CLOCK TEST HERE, deliberately. The clock is TCON_TV1's, and
++	 * its CRTC answers for it -- sun60i_tcon_tv_kms_clock_valid(), a
++	 * clk_round_rate() tolerance check with the reasoning beside it. This
++	 * bridge used to refuse every clock but 154 MHz, because PLL_VIDEO1 had
++	 * never been asked for a second rate and no CRTC existed to ask it, and
++	 * said the test would move once one did; with it went the empty mode
++	 * list a monitor without a 1920x1200 mode got.
+ 	 *
+-	 * So the mode list is gated on the one clock this tree has driven, and
+-	 * the gate carries the observation that removes it. It sits here rather
+-	 * than in the CRTC only because the CRTC does not exist yet; it belongs
+-	 * to whoever owns clk_round_rate() on the pixel clock, which is
+-	 * TCON_TV1, and it moves there when that half lands.
+-	 *
+-	 * Closed by: asking PLL_VIDEO1 for a second mode -- 1280x1024 at
+-	 * 108 MHz is the one `clk-sunxi-ng-a733-video-plls-and-edp-tv-pixel-clock` names -- and reading SRC0_MVID back. If it
+-	 * computes to the requested clock, this test becomes a
+-	 * clk_round_rate() tolerance check instead.
++	 * What stays here is what the transmitter itself limits: interlace
++	 * above, and the link budget below. And what the transmitter measures,
++	 * it still measures: sun60i_dp_video_check_pixel_clk() compares SRC0_MVID
++	 * with the clock the adjusted mode carries, which is the rate the clock
++	 * tree makes, not the one the sink listed.
+ 	 */
+-	if (mode->clock != sun60i_display_mode_1920x1200.clock)
+-		return MODE_CLOCK_RANGE;
+-
+ 	budget = sun60i_dp_bridge_link_budget(dp);
+ 	if (!budget)
+ 		return MODE_OK;
+@@ -2706,16 +2707,16 @@ static void sun60i_dp_bridge_atomic_enable(struct drm_bridge *bridge,
+ 	guard(mutex)(&dp->lock);
+ 
+ 	/*
+-	 * ⚠ THE INVARIANT sun60i-display.h EXISTS FOR IS NOT CLOSED HERE.
++	 * THE INVARIANT sun60i-display.h EXISTS FOR, held by one source.
+ 	 * TCON_TV1 and this transmitter must describe the SAME mode; the
+ 	 * hardware reports a disagreement as SRC0_USER_FIFO_STATUS != 0,
+-	 * flagging a mismatch with the current video mode. From
+-	 * here the transmitter takes its mode from the atomic state, which is
+-	 * the retirement path that header names -- but the TCON still takes the
+-	 * constant until it gains a CRTC, which is the other half of Stage 2.
+-	 * Until both read the same atomic state, the invariant is held only by
+-	 * .mode_valid and by the constant, and the observable that would catch a
+-	 * mismatch is the one the driver already reads and prints.
++	 * flagging a mismatch with the mode in use. Both
++	 * take it from this CRTC state's adjusted_mode -- the TCON through
++	 * sun60i_kms_crtc_atomic_enable() -- and its clock is the rate the clock
++	 * tree makes (sun60i_tcon_tv_kms_clock_fixup()), so the transfer unit
++	 * below and the MVID check are computed from the clock that arrives.
++	 * The constant is left only for the debugfs verbs. The observable that
++	 * would catch a mismatch is the one the driver already reads and prints.
+ 	 */
+ 	drm_mode_copy(&dp->mode, &crtc_state->adjusted_mode);
+ 
+diff --git a/drivers/gpu/drm/sun60i/sun60i-kms.c b/drivers/gpu/drm/sun60i/sun60i-kms.c
+--- a/drivers/gpu/drm/sun60i/sun60i-kms.c
++++ b/drivers/gpu/drm/sun60i/sun60i-kms.c
+@@ -165,8 +165,8 @@
+  *      limit (edp_adjust_pixel_mode(), sunxi_drm_edp.c:708-721). ⇒ Both sides
+  *      of our pipe run one pixel per clock and both are at their reset value,
+  *      so the invariant holds today by neither half being touched. Recorded at
+- *      sun60i_tcon_tv_kms_check(), because a mode list wider than one entry has
+- *      to carry the factor through three places at once.
++ *      sun60i_tcon_tv_kms_check(), because a mode above TCON_PIXEL_CLK_MAX_KHZ
++ *      would have to carry the factor through three places at once.
+  *
+  * DIFFERENT ON PURPOSE -- where the vendor driver differs at exactly this
+  * layer, and what is done here instead. Reproducing the vendor's
+@@ -550,11 +550,18 @@ sun60i_kms_crtc_mode_valid(struct drm_crtc *crtc,
+ 	struct sun60i_kms *kms = crtc_to_kms(crtc);
+ 
+ 	/*
+-	 * The TCON's register field widths, and only those. The display engine
+-	 * is deliberately not consulted: its size fields are two 16-bit halves
+-	 * and its pitch register is a full word, so every mode the TCON accepts
+-	 * fits the engine by a wide margin. A second check that can never fire
+-	 * would be a check nobody can test.
++	 * The TCON's register field widths, then its pixel clock. The display
++	 * engine is deliberately not consulted: its size fields are two 16-bit
++	 * halves and its pitch register is a full word, so every mode the TCON
++	 * accepts fits the engine by a wide margin. A second check that can
++	 * never fire would be a check nobody can test.
++	 *
++	 * The pixel clock is asked HERE and not in the DisplayPort bridge,
++	 * because the clock is TCON_TV1's: the transmitter measures it
++	 * (SRC0_MVID) but does not make it. The bridge used to refuse every
++	 * clock but 154 MHz, the one rate PLL_VIDEO1 had then been asked for,
++	 * and said the test belonged here once a CRTC existed; the clock
++	 * tree now answers per mode, through clk_round_rate().
+ 	 *
+ 	 * The link's own limit is applied where it belongs, by the DRM core,
+ 	 * out of the bridge's .mode_valid and the sink's EDID.
+@@ -562,7 +569,33 @@ sun60i_kms_crtc_mode_valid(struct drm_crtc *crtc,
+ 	if (sun60i_tcon_tv_kms_check(kms->tcon, mode))
+ 		return MODE_BAD;
+ 
+-	return MODE_OK;
++	return sun60i_tcon_tv_kms_clock_valid(kms->tcon, mode);
++}
++
++/*
++ * The adjusted mode carries the pixel clock the clock tree will make, not the
++ * one the sink listed; sun60i_tcon_tv_kms_clock_fixup() says why and how. The
++ * atomic helpers call this after every bridge's and encoder's check
++ * (drm_atomic_helper.c, mode_fixup()), so nothing downstream rewrites the
++ * clock again, and each block's .atomic_enable reads adjusted_mode --
++ * sun60i_de_kms_enable() and sun60i_tcon_tv_kms_enable() below,
++ * sun60i_dp_bridge_atomic_enable() in the transmitter.
++ */
++static bool sun60i_kms_crtc_mode_fixup(struct drm_crtc *crtc,
++				       const struct drm_display_mode *mode,
++				       struct drm_display_mode *adjusted_mode)
++{
++	struct sun60i_kms *kms = crtc_to_kms(crtc);
++	int ret;
++
++	ret = sun60i_tcon_tv_kms_clock_fixup(kms->tcon, adjusted_mode);
++	if (ret) {
++		drm_dbg_kms(crtc->dev, "[CRTC:%d:%s] no pixel clock for %d kHz: %d\n",
++			    crtc->base.id, crtc->name, mode->clock, ret);
++		return false;
++	}
++
++	return true;
+ }
+ 
+ static int sun60i_kms_crtc_atomic_check(struct drm_crtc *crtc,
+@@ -775,6 +808,7 @@ static void sun60i_kms_crtc_atomic_flush(struct drm_crtc *crtc,
+ 
+ static const struct drm_crtc_helper_funcs sun60i_kms_crtc_helper_funcs = {
+ 	.mode_valid	= sun60i_kms_crtc_mode_valid,
++	.mode_fixup	= sun60i_kms_crtc_mode_fixup,
+ 	.atomic_check	= sun60i_kms_crtc_atomic_check,
+ 	.atomic_flush	= sun60i_kms_crtc_atomic_flush,
+ 	.atomic_enable	= sun60i_kms_crtc_atomic_enable,
+diff --git a/drivers/gpu/drm/sun60i/sun60i-kms.h b/drivers/gpu/drm/sun60i/sun60i-kms.h
+--- a/drivers/gpu/drm/sun60i/sun60i-kms.h
++++ b/drivers/gpu/drm/sun60i/sun60i-kms.h
+@@ -32,6 +32,8 @@
+ 
+ #include <linux/types.h>
+ 
++#include <drm/drm_modes.h>	/* enum drm_mode_status */
++
+ struct drm_crtc;
+ struct drm_display_mode;
+ struct drm_rect;
+@@ -72,9 +74,19 @@ void sun60i_de_kms_layer_off(struct sun60i_de *de);
+  * runs. That is a call into the DRM core, not into sun60i-kms.ko, so the
+  * dependency above still points one way. The two _vblank calls are the CRTC's
+  * .enable_vblank/.disable_vblank and are safe in atomic context.
++ *
++ * The TCON also owns the pixel clock, so it answers the two questions about
++ * it: whether a mode's clock can be made at all (_clock_valid, the CRTC's
++ * .mode_valid) and which rate the adjusted mode carries (_clock_fixup, the
++ * CRTC's .mode_fixup, which rewrites @mode's clock in place).
+  */
+ int sun60i_tcon_tv_kms_check(struct sun60i_tcon_tv *tcon,
+ 			     const struct drm_display_mode *mode);
++enum drm_mode_status
++sun60i_tcon_tv_kms_clock_valid(struct sun60i_tcon_tv *tcon,
++			       const struct drm_display_mode *mode);
++int sun60i_tcon_tv_kms_clock_fixup(struct sun60i_tcon_tv *tcon,
++				   struct drm_display_mode *mode);
+ int sun60i_tcon_tv_kms_enable(struct sun60i_tcon_tv *tcon,
+ 			      const struct drm_display_mode *mode, u8 bpc,
+ 			      struct drm_crtc *crtc);
+diff --git a/drivers/gpu/drm/sun60i/sun60i-tcon-tv.c b/drivers/gpu/drm/sun60i/sun60i-tcon-tv.c
+--- a/drivers/gpu/drm/sun60i/sun60i-tcon-tv.c
++++ b/drivers/gpu/drm/sun60i/sun60i-tcon-tv.c
+@@ -241,9 +241,64 @@
+  */
+ #define TV_START_DELAY_GUARD		5
+ 
+-/* The pixel clock must land on the mode, not near it. */
++/*
++ * The readback after clk_set_rate(). Under KMS the mode it checks has already
++ * been through sun60i_tcon_tv_kms_clock_fixup(), so it compares the rate the
++ * clock framework reports against the rate the same framework promised a
++ * moment earlier -- the two agree to under 1 kHz, and 1 % only catches a clock
++ * model that contradicts itself. The debugfs path asks for the built-in mode,
++ * which the dividers hit exactly.
++ */
+ #define TCON_PIXEL_CLK_TOLERANCE_PERCENT	1
+ 
++/*
++ * Which modes the pixel clock can serve, as TCON_TV1's CRTC answers it.
++ *
++ * TOLERANCE: 0.5 %, the figure mainline sunxi display drivers already apply
++ * for the same question -- sun4i_rgb.c (SUN4I_RGB_DOTCLOCK_TOLERANCE_PER_MILLE,
++ * "VESA DMT defines a tolerance of 0.5% on the pixel clock, while the CVT spec
++ * reuses that tolerance in its examples") and sun4i_hdmi_enc.c ("+-0.5%
++ * allowed by HDMI spec"). The comparison is clk_round_rate() against the mode,
++ * as both of those do. On this clock tree it can only err low: every stage of
++ * edp-tv -> video1-pll4x -> pll-video1 rounds to the largest rate that does
++ * not exceed the request (ccu_mp_find_best_with_parent_adj(),
++ * clk_divider_bestdiv(), ccu_nm_find_best()).
++ *
++ * WHAT THE TREE CAN MAKE. PLL_VIDEO1 counts from the 24 MHz REF_PLL, not the
++ * 26 MHz DCXO -- UM V1.00 Table 4-2 "PLL Specifications" lists PLL_VIDEO1's
++ * reference clock as 24MHz (printed page 20). VCO = 24 MHz * N / M1 with
++ * N = 12..255 (PLL_N has a minimum of 11, N = PLL_N + 1) and
++ * M1 = 1..2, inside 1.26..2.52 GHz (Table 4-2); then P0 = 1..8
++ * (PLL_VIDEO1_CTRL_REG 0x0140, printed pages 58-59); then EDP_TV_CLK's two
++ * linear dividers, N and M each 1..32 (EDP_TV_CLK_REG 0x1640, printed pages
++ * 177-178). Walking those three mainline routines for the CEA/DMT clocks a
++ * monitor commonly lists up to 154 MHz: most land exactly -- 148.5 on VCO
++ * 2376 = 24 * 99, 108 on 1296 = 24 * 54, 65 on 1560 = 24 * 65 -- and the rest
++ * land low by less than 0.1 %: 1920x1080@59.94 asks 148.352 MHz and gets
++ * 148.286 (-447 ppm), 640x480@60 asks 25.175 and gets 25.174 (-43 ppm),
++ * 720x480@60 asks 27.027 and gets 27.000 (-999 ppm).
++ * Silicon agrees about the reference: at N 77, P0 6, M 2 the DisplayPort core
++ * measures 154.00 MHz from its own MVID (0x4902 over NVID 0x8000 at a
++ * 270 MHz symbol clock, measured on the board);
++ * from 26 MHz the same fields would make 166.8 MHz.
++ *
++ * CEILING: 154 MHz, the highest pixel clock this pipe has carried. Every
++ * stage here runs one pixel per clock, and the TCON, the display engine and
++ * the transmitter have been driven at 154 MHz and nothing faster. The UM names
++ * no single-pixel limit. Its one pixel-mode example is 1920x1080@60 at
++ * 148.5 MHz in single, 74.25 in dual and 37.125 MHz in quad pixel mode
++ * (15.4.4.1, printed page 736) -- an example, not a threshold. The vendor
++ * device tree carries pclk_limit = <200000> and doubles the pixel mode above
++ * it -- a hint, not a number this driver uses. A mode above the ceiling is
++ * refused by name (MODE_CLOCK_HIGH), and the connector falls back to the next
++ * mode the sink lists instead of scanning at a rate nobody has seen this
++ * silicon run. Raising it is a board measurement, and above whatever
++ * that measurement finds it is PIXEL_MODE, which sun60i_tcon_tv_kms_check()
++ * already names.
++ */
++#define TCON_PIXEL_CLK_TOLERANCE_PER_MILLE	5
++#define TCON_PIXEL_CLK_MAX_KHZ			154000
++
+ struct sun60i_tcon_tv {
+ 	struct device		*dev;
+ 	void __iomem		*regs;		/* TCON_TV1  0x05731000 */
+@@ -598,7 +653,8 @@ static void sun60i_tcon_tv_program(struct sun60i_tcon_tv *tcon, bool vdbist)
+  * The pixel clock is asked for and then read back, because the clock model is
+  * the thing under test here: PLL_VIDEO1 and EDP_TV_CLK are new, and a driver
+  * that programs a raster on a rate it never checked produces a picture-shaped
+- * failure. 1 % is generous for a mode whose clock the divider hits exactly.
++ * failure. What the tolerance is measured against is at
++ * TCON_PIXEL_CLK_TOLERANCE_PERCENT.
+  */
+ static int sun60i_tcon_tv_set_pixel_clk(struct sun60i_tcon_tv *tcon,
+ 					const struct drm_display_mode *mode)
+@@ -628,7 +684,7 @@ static int sun60i_tcon_tv_set_pixel_clk(struct sun60i_tcon_tv *tcon,
+ 		return -EINVAL;
+ 	}
+ 
+-	dev_info(tcon->dev, "pixel clock %lu Hz\n", got);
++	dev_info(tcon->dev, "pixel clock %lu Hz (asked %lu Hz)\n", got, want);
+ 
+ 	return 0;
+ }
+@@ -885,9 +941,10 @@ static void sun60i_tcon_tv_disable(struct sun60i_tcon_tv *tcon)
+  * (clk_set_rate(mclk, pixel_clk / pixel_mode) in sunxi_tcon_edp_mode_init())
+  * and writes the same factor into GCTL. This tree runs one pixel per clock on
+  * both sides and both are at their reset value, so the invariant holds today
+- * by both halves being untouched -- but a mode list wider than one entry has to
+- * carry the factor through all three places or the raster is wrong by an
+- * integer ratio. Named here because that is where the next reader will look.
++ * by both halves being untouched -- but a mode above TCON_PIXEL_CLK_MAX_KHZ,
++ * the ceiling sun60i_tcon_tv_kms_clock_valid() enforces, would have to carry
++ * the factor through all three places or the raster is wrong by an integer
++ * ratio. Named here because that is where the next reader will look.
+  */
+ int sun60i_tcon_tv_kms_check(struct sun60i_tcon_tv *tcon,
+ 			     const struct drm_display_mode *mode)
+@@ -896,6 +953,106 @@ int sun60i_tcon_tv_kms_check(struct sun60i_tcon_tv *tcon,
+ }
+ EXPORT_SYMBOL_GPL(sun60i_tcon_tv_kms_check);
+ 
++/*
++ * Can the pixel clock serve this mode? The CRTC's .mode_valid, so the DRM core
++ * asks it for every mode a sink lists, before the mode reaches the connector's
++ * list, and again on every atomic check -- which is why a refusal is a debug
++ * line and not an error. The policy, the tolerance and the ceiling, with their
++ * sources, are at TCON_PIXEL_CLK_TOLERANCE_PER_MILLE.
++ *
++ * clk_round_rate() walks the same routines clk_set_rate() will and touches no
++ * register, so a mode this answers MODE_OK for is one the dividers were asked
++ * about, not one assumed to fit.
++ */
++enum drm_mode_status
++sun60i_tcon_tv_kms_clock_valid(struct sun60i_tcon_tv *tcon,
++			       const struct drm_display_mode *mode)
++{
++	unsigned long want, slack;
++	long got;
++
++	if (mode->clock <= 0)
++		return MODE_CLOCK_LOW;
++
++	if (mode->clock > TCON_PIXEL_CLK_MAX_KHZ) {
++		drm_dev_dbg(tcon->dev, DRM_UT_KMS,
++			    "%dx%d: pixel clock %d kHz is above the %d kHz this pipe has carried\n",
++			    mode->hdisplay, mode->vdisplay, mode->clock,
++			    TCON_PIXEL_CLK_MAX_KHZ);
++		return MODE_CLOCK_HIGH;
++	}
++
++	want = (unsigned long)mode->clock * 1000;
++	got = clk_round_rate(tcon->pixel_clk, want);
++	if (got <= 0) {
++		drm_dev_dbg(tcon->dev, DRM_UT_KMS,
++			    "%dx%d: the clock tree has no rate for %lu Hz: %ld\n",
++			    mode->hdisplay, mode->vdisplay, want, got);
++		return MODE_NOCLOCK;
++	}
++
++	drm_dev_dbg(tcon->dev, DRM_UT_KMS,
++		    "%dx%d: pixel clock %lu Hz asked, %ld Hz made (%+lld ppm)\n",
++		    mode->hdisplay, mode->vdisplay, want, got,
++		    div_s64(((s64)got - (s64)want) * 1000000, want));
++
++	slack = want / 1000 * TCON_PIXEL_CLK_TOLERANCE_PER_MILLE;
++	if ((unsigned long)got < want - slack)
++		return MODE_CLOCK_LOW;
++	if ((unsigned long)got > want + slack)
++		return MODE_CLOCK_HIGH;
++
++	return MODE_OK;
++}
++EXPORT_SYMBOL_GPL(sun60i_tcon_tv_kms_clock_valid);
++
++/*
++ * Carry the rate the clock tree will actually make in the adjusted mode, so
++ * every block downstream of the CRTC describes the same pixel clock: this TCON
++ * asks for it in sun60i_tcon_tv_set_pixel_clk(), and the DisplayPort
++ * transmitter computes its transfer unit from it and compares the pixel clock
++ * its core measures (SRC0_MVID) against it. Without this the transmitter would
++ * be told the nominal clock of a mode the dividers made 0.1 % slower, and the
++ * one register that measures the truth would be judged against a number
++ * nobody programmed.
++ *
++ * Rounded UP to the kHz, as rockchip_drm_vop.c's vop_crtc_mode_fixup() does
++ * for its dclk: every stage of this clock tree answers with the largest rate
++ * that does not exceed the request, so asking again for the rounded-up kHz
++ * lands on the same rate instead of on the next one below it -- and the
++ * readback in sun60i_tcon_tv_set_pixel_clk() would catch it if not.
++ *
++ * crtc_clock follows, because drm_mode_set_crtcinfo() copied the nominal clock
++ * into it before this ran and the vblank timestamp constants are computed
++ * from it (drm_calc_timestamping_constants()). It copies clock unchanged for
++ * every mode but frame-packed stereo, which this pipe does not offer.
++ */
++int sun60i_tcon_tv_kms_clock_fixup(struct sun60i_tcon_tv *tcon,
++				   struct drm_display_mode *mode)
++{
++	unsigned long want = (unsigned long)mode->clock * 1000;
++	unsigned long made, khz;
++	long got;
++
++	got = clk_round_rate(tcon->pixel_clk, want);
++	if (got <= 0)
++		return got ? (int)got : -EINVAL;
++
++	made = got;
++	khz = DIV_ROUND_UP(made, 1000);
++	if (made != want)
++		drm_dev_dbg(tcon->dev, DRM_UT_KMS,
++			    "%dx%d: pixel clock %d kHz carried as %lu kHz, the rate the clock tree makes (%lu Hz)\n",
++			    mode->hdisplay, mode->vdisplay, mode->clock, khz,
++			    made);
++
++	mode->clock = khz;
++	mode->crtc_clock = khz;
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(sun60i_tcon_tv_kms_clock_fixup);
++
+ /*
+  * The raster, taking its source from the display engine rather than from the
+  * TCON's own pattern generator. That single argument is the whole difference

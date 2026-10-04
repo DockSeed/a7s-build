@@ -1,0 +1,268 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] mmc: sunxi: A733 eMMC - program the card threshold and the FIFO watermark
+
+Every HS400 hypothesis so far has been a phase or a delay. This one is neither,
+and it is the first candidate in this series that touches a register the driver
+has never written at all.
+
+SMHC_THLD (0x100) resets to 0x5: CARD_WR_THLD_ENB and CARD_RD_THLD_ENB both SET,
+with a threshold size of 0. sunxi-mmc.c never writes that register, so we run
+with both gates armed and both trivially satisfied. What the UM
+says about the two enables makes that a defect rather than a default:
+
+    CARD_WR_THLD_ENB  a write transfer starts only once the transmit FIFO holds
+                      at least the card-threshold amount of data
+    CARD_RD_THLD_ENB  a read transfer starts only once the receive FIFO has at
+                      least CARD_RD_THLD of free space
+
+With the size at 0 both conditions hold before a single byte has moved. The
+protection is not disabled, it is vacuous - which is why nothing has ever
+reported it.
+
+SMHC_SFC (0x104) says what the mechanism is for: when the read threshold equals
+BLK_SZ (CARD_RD_THLD_ENB set), the controller may pause the card clock between
+blocks on a read. The block gap is where a stall is legal. Without a
+threshold the controller can only stall inside a block, and in HS400 - 8-bit DDR
+framed by the card's own strobe - an in-block stall is a framing error by
+construction. That is the error class we measure: cmd 25 WR DCE / WR DCE EBE and
+cmd 18 RD DCE SBE, CRC together with start- and end-bit errors, in both
+directions.
+
+The transmit trigger level is the other half of the same mechanism. We write
+SMHC_FIFOTH = 0x20070008 (burst 8, RX_TL 7, TX_TL 8), so transmission may start
+with 32 bytes buffered against a 512-byte block. The UM recommends burst 16,
+TX_TL 240, RX_TL 15 for this controller (11.3.8.17 - the only two occurrences of
+"recommend" in ch. 11.3 are about this register) and its single-block-write
+procedure (11.3.6.2) writes the literal value 0x300F00F0. Vendor silicon on the 8 GiB board
+reads exactly 0x300f00f0 while writing this eMMC at HS400.
+
+Measured on that board on 2026-07-25, in the vendor's working HS400 state, by
+writing 64 MiB and then reading it back and reading SMHC_THLD after each:
+
+    after the write:  0x02000004    size 512, write gate on,  read gate off
+    after the read:   0x02000001    size 512, write gate off, read gate on
+    SMHC_FIFOTH:      0x300f00f0    unchanged in both
+
+The per-transfer switching this patch implements is therefore measured on
+silicon in both directions, not inferred from vendor source.
+
+So the two are one setting, not two knobs: the write gate waits for a whole
+block in the FIFO, and only a transmit trigger level that can hold a whole block
+lets that condition ever come true. Enabling either alone does nothing - which is
+also why an earlier conclusion (2026-07-24), that FIFOTH is a real defect but not this bug, does not
+settle it. That conclusion rested on the absence of FIFO_RUN_ERROR, and FE is the
+controller reporting its own FIFO misuse, not the threshold mechanism; the UM
+treats them in separate paragraphs. The live FIFOTH test planned for that same
+boot ("set it via devmem and write again") has no recorded result - it never ran.
+SMHC_THLD was never examined at all.
+
+It also fits the asymmetry none of the timing hypotheses explained: HS200 at the
+same 150 MHz is error-free while HS400 fails. HS400 is DDR, so it moves twice the
+bytes per clock through the same FIFO with the same watermarks.
+
+Implementation:
+
+- fifoth becomes a cfg field. Unset means the historic 0x20070008, so no other
+  SoC changes behaviour; the A733 eMMC gets 0x300f00f0.
+- sunxi_mmc_set_thld() programs SMHC_THLD per transfer from data->blksz and
+  enables the gate for the direction in flight. The guards are the physical ones
+  (a threshold larger than the FIFO can never be reached), mirroring the vendor's
+  conditions.
+
+Not gated on HS400: the mechanism is a property of the data path, the vendor
+programs it in every mode, and the same guards keep it inert where a block does
+not fit. The SD controller keeps the old watermark and is unaffected in every
+mode by construction.
+
+HYPOTHESIS, NOT PROVEN. Compile-clean (aarch64, W=1) and mechanism-complete, but
+no board has run it. The measurement that decides it is the error-class
+histogram: it empties out or it does not.
+
+Assisted-by: Claude
+---
+--- a/drivers/mmc/host/sunxi-mmc.c
++++ b/drivers/mmc/host/sunxi-mmc.c
+@@ -71,12 +71,13 @@
+ #define SDXC_REG_A12A		0x058 /* SMC Auto Command 12 Register */
+ #define SDXC_REG_SD_NTSR	0x05C /* SMC New Timing Set Register */
+ #define SDXC_REG_DRV_DL		0x140 /* Drive Delay Control Register */
+ #define SDXC_REG_SAMP_DL_REG	0x144 /* SMC sample delay control */
+ #define SDXC_REG_DS_DL_REG	0x148 /* SMC data strobe delay control */
+ #define SDXC_REG_CSDC		0x054 /* CRC Status Detect Control (HS400) */
++#define SDXC_REG_THLD		0x100 /* Card Threshold Control */
+ #define SDXC_REG_EMMC_DSBD	0x10C /* eMMC DDR Start Bit Detect Control */
+ 
+ /* HS400 data-strobe fields (A733 UM 11.3, V5P3X controller) */
+ #define SDXC_HS400_MD_EN		BIT(31)	  /* EMMC_DSBD: HS400 mode enable */
+ #define SDXC_HALF_START_BIT		BIT(0)	  /* EMMC_DSBD: half start-bit (eMMC>=4.5) */
+ #define SDXC_HS400_NEW_SAM_EN		BIT(0)	  /* SD_NTSR: HS400 new sample */
+@@ -85,12 +86,26 @@
+ #define SDXC_NTSR_DAT_SAM_PH_HS400	(0x3 << 8) /* SD2 HS400: 0 degree */
+ #define SDXC_CSDC_CRC_DET_MASK		0xf
+ #define SDXC_CSDC_HS400			0x6	  /* CSDC: HS400 speed mode */
+ #define SDXC_CSDC_OTHER			0x3	  /* CSDC: non-HS400 speed mode */
+ #define SDXC_DS_DL_SW_MASK		0x3f	  /* DS_DL: 6-bit SW delay */
+ 
++/* SMHC_THLD (UM 11.3.8.29). Reset value is 0x5: both gates ENABLED with a
++ * threshold size of 0, i.e. armed and vacuous -- see sunxi_mmc_set_thld(). */
++#define SDXC_CARD_THLD_SIZE_MASK	GENMASK(28, 16)
++#define SDXC_CARD_THLD_SIZE_SHIFT	16
++#define SDXC_CARD_THLD_SIZE_MAX		0x1fff
++#define SDXC_CARD_WR_THLD_ENB		BIT(2)
++#define SDXC_CARD_RD_THLD_ENB		BIT(0)
++
++/* FIFO geometry, UM 11.3.8.17: FIFO_DEPTH = 256 words = 1 KiB. */
++#define SDXC_FIFO_BYTES			1024
++/* Burst 8, RX trigger level 7, TX trigger level 8 -- the value this driver has
++ * always written. Kept as the default so no existing SoC changes behaviour. */
++#define SDXC_FIFOTH_DEFAULT		0x20070008
++
+ #define mmc_readl(host, reg) \
+ 	readl((host)->reg_base + SDXC_##reg)
+ #define mmc_writel(host, reg, value) \
+ 	writel((value), (host)->reg_base + SDXC_##reg)
+ 
+ /* global control register bits */
+@@ -278,12 +293,15 @@ struct sunxi_mmc_cfg {
+ 
+ 	/* clock hardware can switch between old and new timing modes */
+ 	bool ccu_has_timings_switch;
+ 
+ 	/* controller carries the HS400 data-strobe delay path */
+ 	bool can_hs400;
++
++	/* SMHC_FIFOTH value; 0 selects SDXC_FIFOTH_DEFAULT */
++	u32 fifoth;
+ };
+ 
+ struct sunxi_mmc_host {
+ 	struct device *dev;
+ 	struct mmc_host	*mmc;
+ 	struct reset_control *reset;
+@@ -347,17 +365,25 @@ static int sunxi_mmc_init_host(struct sunxi_mmc_host *host)
+ 	u32 rval;
+ 
+ 	if (sunxi_mmc_reset_host(host))
+ 		return -EIO;
+ 
+ 	/*
+-	 * Burst 8 transfers, RX trigger level: 7, TX trigger level: 8
++	 * FIFO burst size and trigger levels. The historic value is burst 8,
++	 * RX trigger 7, TX trigger 8; a cfg may override it, because the
++	 * transmit trigger level is what decides how much of a block is
++	 * buffered before the controller starts driving data at the card, and
++	 * 8 words is 32 bytes against a 512-byte block. The A733 UM recommends
++	 * burst 16 / TX 240 / RX 15 for this controller and names the literal
++	 * value 0x300F00F0 in its own single-block-write procedure (11.3.8.17,
++	 * 11.3.6.2), which is also what the vendor stack runs on silicon.
+ 	 *
+ 	 * TODO: sun9i has a larger FIFO and supports higher trigger values
+ 	 */
+-	mmc_writel(host, REG_FTRGL, 0x20070008);
++	mmc_writel(host, REG_FTRGL,
++		   host->cfg->fifoth ? host->cfg->fifoth : SDXC_FIFOTH_DEFAULT);
+ 	/* Maximum timeout value */
+ 	mmc_writel(host, REG_TMOUT, 0xffffffff);
+ 	/* Unmask SDIO interrupt if needed */
+ 	mmc_writel(host, REG_IMASK, host->sdio_imask);
+ 	/* Clear all pending interrupts */
+ 	mmc_writel(host, REG_RINTR, 0xffffffff);
+@@ -1171,12 +1197,65 @@ static void sunxi_mmc_hw_reset(struct mmc_host *mmc)
+ 	mmc_writel(host, REG_HWRST, 0);
+ 	udelay(10);
+ 	mmc_writel(host, REG_HWRST, 1);
+ 	udelay(300);
+ }
+ 
++/*
++ * Card read/write threshold (SMHC_THLD, UM 11.3.8.29).
++ *
++ * The register resets to 0x5 -- CARD_WR_THLD_ENB and CARD_RD_THLD_ENB both set
++ * with a threshold size of 0. A driver that never writes it therefore runs with
++ * both gates armed and both trivially satisfied ("start the transfer once 0
++ * bytes are available"), which is not the same as having no flow control: it is
++ * flow control that never engages, and nothing reports it.
++ *
++ * What the gates are for, per the UM: a write transfer starts only once the
++ * transmit FIFO holds the card-threshold amount of data, and a read transfer
++ * only once the receive FIFO has CARD_RD_THLD of free space. SMHC_SFC adds
++ * the reason it matters here -- a read threshold equal to the block size
++ * lets the controller pause the card clock between blocks on a read.
++ * Block gap is where a stall is legal. Without the
++ * threshold the controller can only stall inside a block, and in HS400 (8-bit
++ * DDR framed by the card's strobe) an in-block stall is a framing error.
++ *
++ * So: program the size to the block size, and enable the gate for the direction
++ * actually in flight. The guards mirror the vendor's, whose conditions are the
++ * physical ones -- a threshold larger than the FIFO can never be reached.
++ */
++static void sunxi_mmc_set_thld(struct sunxi_mmc_host *host,
++			       struct mmc_data *data)
++{
++	u32 fifoth = host->cfg->fifoth ? host->cfg->fifoth : SDXC_FIFOTH_DEFAULT;
++	u32 tx_bytes = (fifoth & 0xff) * 4;
++	u32 rx_bytes = ((fifoth >> 16) & 0x7ff) * 4;
++	u32 rval;
++
++	rval = mmc_readl(host, REG_THLD);
++	rval &= ~(SDXC_CARD_THLD_SIZE_MASK | SDXC_CARD_WR_THLD_ENB |
++		  SDXC_CARD_RD_THLD_ENB);
++
++	if (data->blksz <= SDXC_CARD_THLD_SIZE_MAX) {
++		if (data->flags & MMC_DATA_WRITE) {
++			/*
++			 * The transmit trigger level must be able to hold a
++			 * whole block, or the gate would wait for data the
++			 * FIFO is never allowed to accumulate.
++			 */
++			if (data->blksz <= tx_bytes)
++				rval |= (data->blksz << SDXC_CARD_THLD_SIZE_SHIFT) |
++					SDXC_CARD_WR_THLD_ENB;
++		} else if (rx_bytes + data->blksz <= SDXC_FIFO_BYTES) {
++			rval |= (data->blksz << SDXC_CARD_THLD_SIZE_SHIFT) |
++				SDXC_CARD_RD_THLD_ENB;
++		}
++	}
++
++	mmc_writel(host, REG_THLD, rval);
++}
++
+ static void sunxi_mmc_request(struct mmc_host *mmc, struct mmc_request *mrq)
+ {
+ 	struct sunxi_mmc_host *host = mmc_priv(mmc);
+ 	struct mmc_command *cmd = mrq->cmd;
+ 	struct mmc_data *data = mrq->data;
+ 	unsigned long iflags;
+@@ -1255,12 +1334,13 @@ static void sunxi_mmc_request(struct mmc_host *mmc, struct mmc_request *mrq)
+ 		return;
+ 	}
+ 
+ 	if (data) {
+ 		mmc_writel(host, REG_BLKSZ, data->blksz);
+ 		mmc_writel(host, REG_BCNTR, data->blksz * data->blocks);
++		sunxi_mmc_set_thld(host, data);
+ 		sunxi_mmc_start_dma(host, data);
+ 	}
+ 
+ 	host->mrq = mrq;
+ 	host->wait_dma = wait_dma;
+ 	mmc_writel(host, REG_IMASK, host->sdio_imask | imask);
+@@ -1379,12 +1459,18 @@ static const struct sunxi_mmc_cfg sun60i_a733_emmc_cfg = {
+ 	.idma_des_size_bits = 13,
+ 	.idma_des_shift = 2,
+ 	.can_calibrate = true,
+ 	.mask_data0 = true,
+ 	.needs_new_timings = true,
+ 	.can_hs400 = true,
++	/* UM 11.3.8.17 recommends BSIZE_OF_TRANS = 3 (MSize 16), TX_TL = 240
++	 * and RX_TL = 15, and 11.3.6.2 writes 0x300F00F0 verbatim.
++	 * Vendor silicon on the 8 GiB board reads exactly this while writing this eMMC
++	 * at HS400.
++	 */
++	.fifoth = 0x300f00f0,
+ };
+ 
+ static const struct of_device_id sunxi_mmc_of_match[] = {
+ 	{ .compatible = "allwinner,sun4i-a10-mmc", .data = &sun4i_a10_cfg },
+ 	{ .compatible = "allwinner,sun5i-a13-mmc", .data = &sun5i_a13_cfg },
+ 	{ .compatible = "allwinner,sun7i-a20-mmc", .data = &sun7i_a20_cfg },

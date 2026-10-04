@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000008 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Mon, 21 Sep 2026 00:00:00 +0000
+Subject: [PATCH] sunxi: cubie-a7s: drop the SPI-NOR flash drivers
+
+sunxi-cubie-a7s-drop-dead-storage-paths removed the SATA and UFS paths and left these standing, because whether
+this board populates a SPI flash was not established and removing eight chip
+drivers on an assumption is how you find out the hard way.
+
+It is established now: no board in the A7S family carries a SPI flash.
+That makes the whole block dead text -- nine chip drivers, the MTD glue and
+the sf test command, for a chip that is not on the board.
+
+The firmware path is unchanged by this and was already settled: U-Boot is
+loaded from eMMC where present, otherwise from the card. The BROM would
+happily boot SPI NOR -- it sits in the try order between RAW NAND and SPI
+NAND -- but on a board with no such chip that branch can only ever fail.
+
+⚠ Removing the chip drivers is not enough on its own: CONFIG_SPI_FLASH and
+CONFIG_CMD_SF are not in this defconfig at all, they arrive from the defaults,
+and the built image still carried the whole sf sub-system with them. So both
+are explicitly unset here rather than left to be implied.
+
+Kept on purpose: CONFIG_SPI and CONFIG_CMD_SPI. The controller is not the
+flash. Something else on a header may want it, and nothing here says
+otherwise.
+
+Falsifier: a boot chain built without these, booting unchanged from the card,
+and still finding the drive.
+
+Assisted-by: Claude
+
+diff --git a/src/configs/radxa-cubie-a7s_defconfig b/src/configs/radxa-cubie-a7s_defconfig
+--- a/src/configs/radxa-cubie-a7s_defconfig
++++ b/src/configs/radxa-cubie-a7s_defconfig
+@@ -15,9 +15,8 @@
+ CONFIG_SPL_RAM_DEVICE=y
+ CONFIG_CMD_DFU=y
+ CONFIG_CMD_I2C=y
+-CONFIG_CMD_MTD=y
+-CONFIG_CMD_SF_TEST=y
+ CONFIG_CMD_SPI=y
++# CONFIG_CMD_SF is not set
+ CONFIG_NET_RANDOM_ETHADDR=y
+ CONFIG_ADC=y
+ CONFIG_SUNXI_GPADC=y
+@@ -29,18 +28,6 @@
+ CONFIG_SYS_I2C_EEPROM_ADDR=0x50
+ CONFIG_SYS_I2C_EEPROM_ADDR_OVERFLOW=0x7
+ CONFIG_SUPPORT_EMMC_BOOT=y
+-CONFIG_MTD=y
+-CONFIG_MTD_BLOCK=y
+-CONFIG_SPI_FLASH_SOFT_RESET=y
+-CONFIG_SPI_FLASH_SOFT_RESET_ON_BOOT=y
+-CONFIG_SPI_FLASH_MACRONIX=y
+-CONFIG_SPI_FLASH_SPANSION=y
+-CONFIG_SPI_FLASH_STMICRO=y
+-CONFIG_SPI_FLASH_SST=y
+-CONFIG_SPI_FLASH_WINBOND=y
+-CONFIG_SPI_FLASH_XMC=y
+-CONFIG_SPI_FLASH_DATAFLASH=y
+-CONFIG_SPI_FLASH_MTD=y
+ CONFIG_DM_MDIO=y
+ CONFIG_DM_ETH_PHY=y
+ CONFIG_DWC_ETH_QOS=y
+@@ -60,6 +47,8 @@
+ CONFIG_REGULATOR_AXP=y
+ CONFIG_CMD_PCI=y
+ CONFIG_SPI=y
++# CONFIG_SPI_FLASH is not set
++# CONFIG_DM_SPI_FLASH is not set
+ CONFIG_WDT=y
+ CONFIG_WDT_SUNXI=y
+ CONFIG_WATCHDOG=y

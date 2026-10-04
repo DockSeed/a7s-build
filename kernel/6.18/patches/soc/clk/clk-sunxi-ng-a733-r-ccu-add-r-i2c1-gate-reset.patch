@@ -1,0 +1,104 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] clk: sunxi-ng: a733 r-ccu: add R_I2C1 bus gate + reset
+
+The Type-C port controller on this board sits on S_TWI1, which the minimal R-CCU
+does not gate yet. Without it the bus never clocks, the TCPC never probes, and
+the USB-C port's CC lines stay floating -- so no device attaches even though the
+combo-PHY and xHCI are up (HW-proven 2026-07-21, LINK_STUS0 = 0x111 with nothing
+enumerating).
+
+Values are taken from the A733 user manual, not copied from another SoC:
+  - S_TWI_BGR at PRCM 0x19c, TWI1 gate = bit1, TWI1 reset = bit17
+    (TWI0/1/2_GATING bit0/1/2, TWI0/1/2_RST bit16/17/18).
+  - parent r-apb1: S_TWI is on the APBS1 bus, same as TWI0 in `clk-sunxi-ng-a733-r-ccu-add-r-i2c0-gate-reset`.
+
+That care is not ceremony here -- reading the A523 value for r_i2c0 would have
+pointed the controller at the A733's S_UART1 block, which is how the `clk-sunxi-ng-a733-r-ccu-add-r-i2c0-gate-reset` review
+caught it.
+
+When patches were numbered, one number had to carry both the subsystem and
+the apply order, and for this patch (a USB consumer that must apply after a misc
+consumer) they disagreed. Order won, because the alternative does not build.
+This is why the patch order is kept in a series file, where order is explicit
+and independent of the name.
+
+Assisted-by: Claude
+
+--- a/drivers/clk/sunxi-ng/ccu-sun60iw2-r.c
++++ b/drivers/clk/sunxi-ng/ccu-sun60iw2-r.c
+@@ -82,11 +82,23 @@
+ static SUNXI_CCU_GATE_HW(bus_r_i2c0_clk, "bus-r-i2c0",
+ 			 &r_apb1_clk.common.hw, 0x19c, BIT(0), 0);
+ 
++/*
++ * S_TWI_BGR (PRCM 0x19c): TWI1 gate = bit1, TWI1 reset = bit17 (A733 UM,
++ * S_TWI_BGR table -- TWI0/1/2_GATING bit0/1/2, TWI0/1/2_RST bit16/17/18).
++ * Same APBS1 bus as TWI0, so the parent is r-apb1 as well. This is the bus
++ * clock the HUSB311 Type-C port controller (S_TWI1 @ 0x07084000, U4 @ 0x4e)
++ * hangs off; without it the Type-C CC lines are never driven, so no device
++ * attaches on the USB-C port even with VBUS present.
++ */
++static SUNXI_CCU_GATE_HW(bus_r_i2c1_clk, "bus-r-i2c1",
++			 &r_apb1_clk.common.hw, 0x19c, BIT(1), 0);
++
+ static struct ccu_common *sun60iw2_r_ccu_clks[] = {
+ 	&r_ahb_clk.common,
+ 	&r_apb0_clk.common,
+ 	&r_apb1_clk.common,
+ 	&bus_r_i2c0_clk.common,
++	&bus_r_i2c1_clk.common,
+ };
+ 
+ static struct clk_hw_onecell_data sun60iw2_r_hw_clks = {
+@@ -96,11 +108,13 @@
+ 		[CLK_R_APB0]		= &r_apb0_clk.common.hw,
+ 		[CLK_R_APB1]		= &r_apb1_clk.common.hw,
+ 		[CLK_BUS_R_I2C0]	= &bus_r_i2c0_clk.common.hw,
++		[CLK_BUS_R_I2C1]	= &bus_r_i2c1_clk.common.hw,
+ 	},
+ };
+ 
+ static struct ccu_reset_map sun60iw2_r_ccu_resets[] = {
+ 	[RST_BUS_R_I2C0]	= { 0x19c, BIT(16) },
++	[RST_BUS_R_I2C1]	= { 0x19c, BIT(17) },
+ };
+ 
+ static const struct sunxi_ccu_desc sun60iw2_r_ccu_desc = {
+--- a/drivers/clk/sunxi-ng/ccu-sun60iw2-r.h
++++ b/drivers/clk/sunxi-ng/ccu-sun60iw2-r.h
+@@ -8,6 +8,6 @@
+ #include <dt-bindings/clock/sun60i-a733-r-ccu.h>
+ #include <dt-bindings/reset/sun60i-a733-r-ccu.h>
+ 
+-#define CLK_NUMBER	(CLK_BUS_R_I2C0 + 1)
++#define CLK_NUMBER	(CLK_BUS_R_I2C1 + 1)
+ 
+ #endif /* _CCU_SUN60IW2_R_H */
+--- a/include/dt-bindings/clock/sun60i-a733-r-ccu.h
++++ b/include/dt-bindings/clock/sun60i-a733-r-ccu.h
+@@ -4,7 +4,8 @@
+  *
+  * The PRCM at 0x07010000 is the AON/CPUS clock+reset block (A733 UM 4.2,
+  * A733 user manual). This minimal set exposes only the AON bus clocks the
+- * r_pio (S_GPIO) needs plus the r_i2c0 (S_TWI0) bus gate the PMIC hangs off;
++ * r_pio (S_GPIO) needs plus the r_i2c0 (S_TWI0) gate the PMIC hangs off and the
++ * r_i2c1 (S_TWI1) gate the Type-C port controller hangs off;
+  * more AON clocks (r_uart, ...) are added as consumers land.
+  */
+ #ifndef _DT_BINDINGS_CLK_SUN60I_A733_R_CCU_H_
+@@ -14,5 +15,6 @@
+ #define CLK_R_APB0		1
+ #define CLK_R_APB1		2
+ #define CLK_BUS_R_I2C0		3
++#define CLK_BUS_R_I2C1		4
+ 
+ #endif /* _DT_BINDINGS_CLK_SUN60I_A733_R_CCU_H_ */
+--- a/include/dt-bindings/reset/sun60i-a733-r-ccu.h
++++ b/include/dt-bindings/reset/sun60i-a733-r-ccu.h
+@@ -10,5 +10,6 @@
+ #define _DT_BINDINGS_RST_SUN60I_A733_R_CCU_H_
+ 
+ #define RST_BUS_R_I2C0		0
++#define RST_BUS_R_I2C1		1
+ 
+ #endif /* _DT_BINDINGS_RST_SUN60I_A733_R_CCU_H_ */

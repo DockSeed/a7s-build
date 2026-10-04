@@ -1,0 +1,94 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: allwinner: A733 minimal — power the on-board WiFi/BT module (PM0/PM1)
+
+The on-board WiFi/BT module never enumerates on our image. The hub in front of
+it does: the CH334F (U9) comes up on USB1/EHCI1, reports four ports, and every
+port is empty. A device that is not powered never asserts its D+ pull-up, so
+the hub has nothing to report — which is exactly the symptom.
+
+The module has its own rail and it is not the hub's VBUS. DCDC1 feeds a WPM2015
+load switch (Q8) whose output is WIFI_3V3, and the module sits on hub port 1 as
+a soldered device rather than behind a connector. Two AON pins gate it:
+
+  PM0 = USB_WIFI_PWR
+  PM1 = WL-REG-ON
+
+Silicon agrees with the spec: PM_CFG0 @0x07025030 reads 0x001ff111, so PM0 and
+PM1 are muxed to output.
+
+Before this patch the tree drove exactly two AON GPIOs — PL2 (`arm64-dts-a733-add-usb3-dwc3-combophy`, the Type-C
+J4 VBUS) and PM5 (`arm64-dts-a733-aon-pinctrl-usb-host-vbus`, the J8 downstream-port VBUS) — and neither reaches this
+module. The gap had been noticed but left open. `arm64-dts-a733-aon-pinctrl-usb-host-vbus`'s own note that PM5 also powers
+the WiFi/BT module is superseded: PM5
+switches the downstream port VBUS, not this rail.
+
+These are real load-switch outputs gated by a SoC pin, not the regulator-fixed
+placeholder trap — nothing here stands in for a switchable PMIC rail; the switch
+is physically there and its enable is the pin.
+
+PM0's node is placed before PM1's so the regulator core registers power before
+reset-release, the order the reference board's own device tree uses.
+
+Deliberately omitted: regulator-boot-on, which would assert a bootloader state
+nobody here has measured, and regulator-enable-ramp-delay, which has no documented
+value to base it on (no WPM2015 datasheet is in the tree) and is inert while
+nothing consumes the rails. regulator-always-on is what holds them, exactly as
+for usb-host-vbus in `arm64-dts-a733-aon-pinctrl-usb-host-vbus`.
+
+HW proof pending: the module must appear behind the hub in lsusb, and a PM0/PM1
+toggle must produce a disconnect/reconnect — the standard `arm64-dts-a733-aon-pinctrl-usb-host-vbus` met. This patch
+does NOT claim a working wlan0: that needs a wireless driver and is a separate
+change with its own proof.
+
+Assisted-by: Claude
+---
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -520,6 +520,47 @@
+ 	};
+ 
+ 	/*
++	 * WIFI_3V3 -- the on-board WiFi/BT module's own supply. It is NOT the hub
++	 * VBUS: DCDC1 feeds a WPM2015 load switch (Q8) whose output is WIFI_3V3,
++	 * and the module hangs off hub port 1 as a soldered device, not a
++	 * connector. PM5 above switches only the *downstream port*
++	 * VBUS for J8
++	 * and does not reach this module.
++	 *
++	 * Two pins gate it, both on the AON S_GPIO bank (r_pio, bank index 1 = PM):
++	 *   PM0 = USB_WIFI_PWR
++	 *   PM1 = WL-REG-ON
++	 * Silicon agrees: PM_CFG0 @0x07025030 reads 0x001ff111, i.e. PM0/PM1 are
++	 * muxed to output.
++	 *
++	 * Power first, then release reset -- so PM0's node comes before PM1's, the
++	 * order the regulator core registers them in.
++	 *
++	 * Neither node carries regulator-boot-on: that would assert a bootloader
++	 * state nobody here has measured. regulator-always-on alone is what holds
++	 * them, exactly as for usb-host-vbus above.
++	 */
++	reg_wifi_pwr: regulator-wifi-pwr {
++		compatible = "regulator-fixed";
++		regulator-name = "wifi-pwr";
++		regulator-min-microvolt = <3300000>;
++		regulator-max-microvolt = <3300000>;
++		gpio = <&r_pio 1 0 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		regulator-always-on;
++	};
++
++	reg_wifi_regon: regulator-wifi-regon {
++		compatible = "regulator-fixed";
++		regulator-name = "wifi-regon";
++		regulator-min-microvolt = <3300000>;
++		regulator-max-microvolt = <3300000>;
++		gpio = <&r_pio 1 1 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		regulator-always-on;
++	};
++
++	/*
+ 	 * VBUS for the Type-C J4 SuperSpeed port, switched by SGM2576 U2 whose
+ 	 * enable is USB0-DRVVBUS = PL2 (the "USB0" net name is a schematic label;
+ 	 * on page-12 it gates J4's VBUS switch).

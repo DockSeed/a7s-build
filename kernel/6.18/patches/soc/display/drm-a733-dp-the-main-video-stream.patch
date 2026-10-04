@@ -1,0 +1,976 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] drm: allwinner: A733 DP -- the main video stream, computed from the mode
+
+[Recipe cut: regenerated: context only, the removed debugfs knobs of earlier
+patches are not touched here.]
+
+The transmitter's half of the pixel path: the Main Stream Attributes, the
+transfer unit, the second register window's clock gates, and the two enables
+that start the stream. With `drm-a733-tcon-tv1-timing-generator-and-video-source`'s TCON feeding it and link training done by
+hand, this is what a monitor turns into a picture.
+
+THE MSA BLOCK IS COMPUTABLE, AND IS COMPUTED
+---------------------------------------------
+
+Until 2026-08-19 the transfer unit was carried from a vendor capture and
+SRC0_USER_DATA_CNT was a register found by diffing our window against that
+capture. Both are derivable: UM 15.4.5.3 states the
+equations, and re-deriving them reproduces what a live vendor link carries at
+1920x1200 over four lanes, to the digit:
+
+    LinkBW      = LINK_BW_SET * 27 * LANE_COUNT_SET    0x0A * 27 * 4 = 1080
+    Data Rate   = pixel clock * bpp / 8                154 * 24 / 8  =  462
+    TU symbols  = Data Rate / LinkBW * TU_SIZE         462/1080 * 64 = 27.3778
+                                                       -> 27 + 6/16 = 0x061B0040
+    SYMBOL_COUNT    = (HRES * bpp + 7) / 8             (1920*24+7)/8 = 5760
+    USER_DATA_COUNT = (SYMBOL_COUNT + lanes - 1)/lanes (5760+3)/4    = 1440
+
+⚠ AND THE POINT OF COMPUTING IS THE LANE COUNT. The by-hand script hardcodes
+the four-lane words, and they are wrong for two lanes -- which wants
+0x0C360040 and 0xB40 -- so two-lane runs that used those words and looked
+clean were running an under-programmed transfer unit. This driver never sees
+a constant, so it cannot make that mistake.
+
+The tidy explanation for why two lanes tolerated a four-lane TU is eliminated,
+not assumed: SRC0_USER_CONTROL bit 0 USER_SPARSE_MODE_ENABLE would make the core
+ignore SYMBOLS_PER_TU entirely, and it reads ZERO on the
+vendor's live link. Sparse is off and the symbol count is honoured. This driver
+does not turn it on and says why -- it would paper over exactly the arithmetic
+this patch exists to get right -- and its read-out warns if anything else has.
+
+⚠ Field decode, UM 15.4.7.56: [15:0] TU_SIZE, [23:16] SYMBOLS_PER_TU, [27:24]
+FRAC_SYMBOLS_PER_TU in sixteenths. The UM contradicts itself on the middle one --
+15.4.5.3's prose puts it at [22:16], the register table at
+[23:16] -- and it cannot matter, because the field's own maximum is 64. Both are
+cited; neither alone.
+
+TU_SIZE stays at the register's reset 64, the top of the 32..64 range the UM
+allows, and the manual mode is chosen deliberately: the automatic mode
+(SYMBOLS_PER_TU = 0) may not suit every sink, and the UM advises the manual
+mode for boxes that must work with a wide range of sinks. A monitor on a
+Type-C cable is exactly that.
+
+SRC0_USER_DATA_CNT IS NOT OPTIONAL, AND HERE IS WHY
+----------------------------------------------------
+
+🔴 Left at its reset zero, it is what stood between a fully trained link and
+a picture. The register is the per-lane symbol count of one line of active
+video; the framer sends that many from the user FIFO and then starts
+blanking (15.4.7.59) -- so at zero the blanking start comes after zero
+symbols of active video and every line is blank. What that looked like on
+2026-08-18: all four lanes CR and EQ and symbol-locked, interlane aligned,
+zero symbol errors on every lane, the sink reporting itself in sync,
+SRC0_USER_FIFO_STATUS clean -- and the monitor not even waking from standby.
+It was found by diffing this 4 KiB window against a vendor live-link
+capture, 70 non-zero words on each side, and it was the one register the
+vendor sets and we did not.
+
+That also half-answers a question that was still open: which of
+SRC0_USER_DATA_CNT and TV_PIXELDEPTH_MODE was load-bearing, given both were
+written in the same minute. USER_DATA_CNT is settled from the doc alone --
+at zero it cannot produce active video, whatever else is right.
+TV_PIXELDEPTH is not: at its reset value TCON_TV1 runs in 6-bit mode (the
+6-bit colorbar, if the colorbar is its source), into a framing configuration
+counting 24 bits per pixel, which is provably INCONSISTENT with MISC0 but
+not provably fatal. That half needs one write on a live link and is in the
+acceptance list below.
+
+SRC0_SECONDARY_DATA_WINDOW -- THE ONE DELIBERATE DEPARTURE
+-----------------------------------------------------------
+
+We write what the UM's equation gives, 252, where both our by-hand run and the
+vendor write 98. The decision, and the reasoning, because it is the only value
+in this patch that a working link disagrees with:
+
+  - The UM gives a hard rule and a recommendation. The rule is that the value
+    must stay below the horizontal blanking period, counted in main link
+    symbols; the recommendation is the formula Reg = HBLANK_PERIOD /
+    LINK_SYMBOL_CLOCK_PERIOD * 0.9 (15.4.7.40). For this mode the blanking
+    period is 280 link symbol clocks and the recommendation is 252. Both 98 and
+    252 satisfy the rule.
+  - 98 is not two independent sources agreeing. The vendor computes it as
+    HSTART * (link symbol rate / 2) / pixel clock (trilinear_dp14.c:889-903) --
+    112 * 135000 / 154000 = 98 -- from an undocumented formula over the wrong
+    quantity, HSTART rather than the blanking period, with a bare /2 that
+    hardcodes a symbols-per-link-clock ratio. Our by-hand value was copied off
+    that live link. One source, seen twice.
+  - This tree's rule is that a value comes from the reference docs and that
+    vendor code is a hint to verify. The doc has an equation, and 98 does not
+    satisfy it.
+
+Reverting costs one write on a live link and no rebuild: `devmem 0x05740808 32
+0x62`. Falsified by: SRC0_USER_FIFO_STATUS or SRC0_USER_FRAMING_STATUS going
+non-zero, or the picture going away.
+
+SRC0_DATA_CONTROL IS NOT WRITTEN, BUT IT IS CHECKED
+----------------------------------------------------
+
+The UM tells integrators to leave this register alone unless the vendor's
+support engineers direct otherwise (15.4.7.42), so it is left alone -- and
+its reset value 0x00002004 sits exactly on the one constraint the UM does
+impose: 15.4.5.4 requires DATA_ACCUMULATION_DELAY to be no smaller than half
+the TU size, and the reset is a delay of 32 against a TU size of 64.
+Anything that raises TU_SIZE or lowers the delay breaks it, and the symptom
+would be uneven spacing of the Blanking Start symbols, not an error. So the
+check takes the TU size as an argument and refuses, rather than trusting
+that nobody will ever change the constant.
+
+MVID AND NVID ARE READ, NEVER WRITTEN
+--------------------------------------
+
+MISC0 bit 0 is left at 0, asynchronous clock mode, deliberately -- and in that
+mode both registers are READ-ONLY: MVID returns what the core computes from
+the input video clock, and NVID returns 0x8000
+(15.4.7.55, 15.4.7.57). MVID is therefore one of the few numbers in this driver
+that cannot be a register echoing our own write: it is the core measuring what
+TCON_TV1 is actually feeding it. The driver converts it back to kHz and refuses
+to enable the stream if it is more than 1 % from the mode, and checks NVID
+against its constant on the way.
+
+⚠ That also corrects an earlier belief of this tree: that NVID silently
+drops a write when the eDP_REG_PAD gates are shut. NVID is read-only in this
+mode; the write was always a no-op, and what changed when the video clock
+started was the value the core returns. The observation was right and the
+explanation was not.
+
+THE TWO ENABLES WITH NO UM ROW
+-------------------------------
+
+0x0800 and 0x0804, bit 0 each, preceded by a video soft reset (0x0090 bit 0).
+The register list runs from CORE_ID at 0x00FC straight to 0x0808, so neither has
+a row. They are named twice elsewhere and the two names disagree: UM 15.4.5.3
+refers to the SOURCE_ENABLE and VIDEO_STREAM_ENABLE host registers as
+the main link enables, while the vendor calls them
+TR_VIDEO_STREAM_ENABLE and TR_SECOND_STREAM_ENABLE (trilinear_dp14.h:113-114),
+i.e. it reads the second as stream #2 of a multi-stream link.
+
+Their absence is why the first successful link training here dropped: with
+training cleared and the stream not enabled the core sends idle and the sink
+loses lock. Both are written, because both were set when this board produced a
+picture and neither has been tested alone. ⬜ If the vendor's reading is right,
+0x0804 has no business being set on a single-stream link -- and separating them
+costs one write: `devmem 0x05740804 32 0`.
+
+WHERE THE VENDOR DRIVER DIFFERS, AND WHAT WE DO INSTEAD
+-------------------------------------------------------
+
+Read from bsp/drivers/drm/sunxi_device/hardware/lowlevel_edp/trilinear_dp14/ and
+sunxi_drm_edp.c. (The other low-level driver in that directory, inno_edp13, is
+not built for this SoC: CONFIG_AW_DRM_TRILINEAR_EDP14=y, no INNO_EDP13 line in
+any defconfig, and no object file.)
+
+| vendor | ours |
+|---|---|
+| writes MVID and NVID unconditionally, as the FIRST thing it does, before it has computed the clocking mode -- with `// not sure divide 1000 or 100000, spec seems conflict` sitting above the MVID write (trilinear_dp14.c:1262-1266). In async mode both are read-only, so both writes have no effect | neither is written; MVID is read as a measurement and the stream is refused if it disagrees with the mode, NVID is checked against its constant |
+| reads MVID back in one place, scales it by 1000 and prints it in sysfs as the pixel clock (:1638, sunxi_drm_edp.c:1803) -- which on an async link reports 18690 kHz for a 154000 kHz mode. It is never compared with anything | the same register, converted with the link symbol rate the way the UM defines it, and compared |
+| leaves the clocking mode to the zeroed allocation: `edp_core->sync_clock` is declared, read twice and assigned nowhere, so kzalloc decides the clocking mode of every link it drives (sunxi_edp.h:444, :1274, :1320). Same for `interlace` -> 0x0860 always 0, and `colormetry` -> MISC0 bit 4 always BT601 | async chosen deliberately, with the consequence for MVID stated |
+| never reads SRC0_USER_FIFO_STATUS, SRC0_USER_FRAMING_STATUS or SRC0_INPUT_STATUS. The macros exist and the tree-wide grep for each returns only its own #define line | all three read out, and INPUT_STATUS sampled eight times because bit 2 is low during blanking |
+| never programs SRC0_DATA_CONTROL either -- also #define-only | not programmed, but checked against the TU-size constraint the UM states |
+| `edp_video_stream_enable()` sets 0x0804 and its disable line is commented out (:908, :914), so the second stream stays enabled for the lifetime of the driver after any modeset | both enables cleared on disable, in reverse order |
+| its eDP path does a video soft reset before enabling the stream and its DisplayPort path does not (sunxi_drm_edp.c:3750-3752 against :3994-3999) -- same IP, same MSA block, two sequences | one sequence |
+| `edp_hw_link_start()`'s return value discarded at both call sites (:3752, :3999) while every neighbouring call is checked | checked |
+| TU arithmetic truncates rather than rounds and hides the TU size in a bare literal: `data_per_tu = (pixel_clk * 8 * bpp) / bw` where the 8 is LS_PER_TU/8000*1000 (:1195). Change LS_PER_TU and :1199 follows, :1195 does not | one division into sixteenths, and TU_SIZE is a symbol wherever it appears |
+| `if (bw != 0)` with no else (:1194): a zero link bandwidth leaves TU_CONFIG at whatever it held and returns RET_OK, so the caller's error check is unreachable | a symbol count of zero, or one larger than the TU, refuses with the mode, rate, lane count and bpp in the message |
+| SECONDARY_DATA_WINDOW computed by reading HSTART back out of 0x083C (:897), an undocumented ordering dependency on set_video_timings that nothing enforces or comments; and no divide-by-zero guard on the pixel clock | computed from the mode that is being programmed, in one place |
+| maps eDP_REG_PAD, logs "Maybe there is no top addr for edp!" at DEBUG level when it is absent, and then dereferences NULL (sunxi_drm_edp.c:2835-2839 into trilinear_dp14.c:1215); never unmaps it (:2953). Its named macros for that window are 0x2000/0x2004 in the MAIN window, whose mapping is 0x1000 long -- dead defines that would write past the end (trilinear_dp14.h:183-185) | the window is optional and absent means a named refusal from `video`, not a NULL write; devm-managed |
+| its YUV420 branch writes `SET_BITS(shift=3, width=4, val=0xc0)` with a macro that does not mask val, so 0xc0 << 3 sets bits 9-10 outside the field -- and then falls through and programs MISC0 as RGB anyway (:1286-1292) | — |
+| `if ((lane_cnt < 0) || (lane_cnt > 4))` on a u32 (:868), so the first half can never be true; and when the check fires the function is void, so the caller cannot tell | — |
+| `trilinear_enable()`, `trilinear_irq_enable/disable()`, `trilinear_set_lane_sw_pre()` are empty bodies registered in the ops table; `edp_controller_soft_reset()` is 100 % commented out and still called | no such slots |
+
+AND WHAT IT GETS RIGHT, WHICH IS TAKEN
+
+  - The MISC0 encodings, and its own reader decodes the same fields the same way
+    (:1279-1307 against :1573-1630). Ported as-is.
+  - USER_DATA_COUNT: two correct ceilings, `ceil(hres*bpp/8)` then
+    `ceil(.../lanes)` (:1368-1369). The same expression is here.
+  - HSTART and VSTART as sync-leading-edge to first-active, which is what the
+    MSA fields mean (:1415, :1421).
+  - POLARITY as PVSYNC << 1 | PHSYNC << 0 (:1424-1425), and the SAME two flags
+    fed to TCON_TV1's TV_IO_POL -- so its two blocks cannot describe different
+    modes. That is the right architecture, and `drm-a733-tcon-tv1-timing-generator-and-video-source` and this patch keep it by
+    taking the mode from one place.
+  - Refusing an unachievable mode when the symbol count exceeds the TU rather
+    than failing the modeset (:1783-1826). Kept, minus its off-by-two: its own
+    message says the limit is 62 where its code tests 64.
+  - The enable ORDER: training, then MSA, then the transfer unit, then the video
+    reset, then the stream. The transfer unit is computed from the post-training
+    lane count, not the requested one. Kept, which is why `video` has two verbs.
+
+⚠ The register-table convention for POLARITY says the opposite of what silicon
+does -- it documents 0 as active high and 1 as active low (15.4.7.46) -- and then
+notes that this sense is inverted relative to the user input port polarities.
+Silicon settles it: a live link at a +HSync -VSync mode carries 0x1. ⬜ One
+mode; the VSYNC bit has never been exercised set.
+
+SRC0_USER_SYNC_POLARITY (0x0864) is left at its 0x0F reset and only verified.
+⬜ Its derivation is genuinely open: 0x0F says all four user inputs are active
+high, which does not follow from TCON_TV1's TV_IO_POL under any reading we can
+justify, and the same +HSync -VSync mode is the only one anyone has run. A mode
+with the other polarity moves TV_IO_POL and would say whether 0x0864 has to move
+with it.
+
+APPLY ORDER
+-----------
+
+This patch edits only drivers/gpu/drm/sun60i/sun60i-dp.c, which
+`drm-allwinner-a733-displayport-aux` created and
+`drm-a733-dp-configure-the-main-link-phy` extended, and it includes
+sun60i-display.h, which
+`drm-a733-tcon-tv1-timing-generator-and-video-source` adds -- so it must
+apply after both.
+
+The mode itself lives in sun60i-display.h rather than twice, and that is an
+invariant rather than tidiness: TCON_TV1 generates the raster and the MSA tells
+the sink what that raster is, and the hardware reports a disagreement between
+the two as SRC0_USER_FIFO_STATUS != 0, i.e. the user FIFO reporting that
+the programming does not fit the video mode. It is bring-up scaffolding with
+a defined end -- when a KMS driver exists the mode comes from the connector,
+which is why every function here already takes it as an argument.
+
+WHAT IT NEEDS FROM THE DEVICE TREE
+-----------------------------------
+
+A SECOND REG WINDOW on the DisplayPort node: eDP_REG_PAD at 0x05760000, index 1.
+`arm64-dts-a733-displayport-transmitter` deliberately has one window because the AUX path measurably never needs
+these gates; the patch that drives pixels adds the second, exactly as predicted.
+That DTS change is `arm64-dts-a733-tcon-tv1-and-the-dp-phy-pad-window`, later in the series with the pixel-clock patches, so it is not in this patch. Absent,
+this driver still probes, AUX still works, and `video` refuses by name.
+
+⚠ Their absence does not look like a missing clock gate: with them shut, fifteen
+of seventeen main-stream registers read back correctly and only MVID and NVID
+misbehave. They are opened FIRST here, before any MSA write, for that reason --
+the by-hand run opened them last and had to re-write NVID afterwards.
+
+⬜ One might expect both bit 0 and bit 4 of DP_VID_CLK_CFG to go to 1.
+Only bit 0 does. Bit 4 is VID1_CLK_GATING, the second video source's gate; the
+register reads 0x00000001 on the board once a picture is up and the vendor
+writes 0x1 (trilinear_dp14.c:1216).
+
+WHAT IT OWES
+-------------
+
+  1. THE STREAM, on a kernel with `drm-a733-tcon-tv1-timing-generator-and-video-source` and the pixel-clock DT present:
+
+       echo 1 > /sys/kernel/debug/5731000.lcd-controller/enable
+       echo 1 > /sys/kernel/debug/5740000.displayport/aux_enable
+       echo 0 > /sys/kernel/debug/5740000.displayport/link
+       echo configure > /sys/kernel/debug/5740000.displayport/video
+       (train the link by hand here: 4 lanes, 2700 Mb/s)
+       echo stream > /sys/kernel/debug/5740000.displayport/video
+       cat /sys/kernel/debug/5740000.displayport/video
+
+     PASS: transfer unit "size 64, 27 + 6/16", data count 1440, pixel clock
+     within a digit of 154000 kHz, fifo status 0 and DEN seen. Falsified by: a
+     non-zero fifo status (this mode is mis-programmed), a data count that is not
+     1440 at four lanes, or the measured pixel clock disagreeing with the mode.
+  2. AT TWO LANES, which is the case the hardcoded script got wrong: the same
+     sequence with `link` asked for 2 lanes must produce "54 + 12/16" and 2880,
+     not "27 + 6/16" and 1440.
+  3. A PICTURE, by eye. Nothing else proves it -- a register
+     read-back alone has been mistaken for that proof before.
+  4. THE 252 DECISION, checked rather than assumed: fifo and framing status zero
+     with the computed window, and the picture unchanged when
+     `devmem 0x05740808 32 0x62` puts the carried value back.
+
+Build-tested only -- not hardware-proven. Applies at fuzz 0 on the full
+series; builds W=1 warning-free; checkpatch --strict reports 0 errors,
+0 warnings, 0 checks.
+
+Assisted-by: Claude
+
+diff --git a/drivers/gpu/drm/sun60i/sun60i-dp.c b/drivers/gpu/drm/sun60i/sun60i-dp.c
+--- a/drivers/gpu/drm/sun60i/sun60i-dp.c
++++ b/drivers/gpu/drm/sun60i/sun60i-dp.c
+@@ -53,6 +53,7 @@
+ #include <linux/i2c.h>
+ #include <linux/io.h>
+ #include <linux/iopoll.h>
++#include <linux/math64.h>
+ #include <linux/minmax.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+@@ -67,6 +68,9 @@
+ #include <drm/display/drm_dp.h>
+ #include <drm/display/drm_dp_helper.h>
+ #include <drm/drm_edid.h>
++#include <drm/drm_modes.h>
++
++#include "sun60i-display.h"
+ 
+ /* A733 user manual 15.4.7 register descriptions. Only the AUX block and the core id
+  * are named here; the rest of the 4 KiB window belongs to link training and
+@@ -138,6 +142,136 @@ static const unsigned int sun60i_dp_link_rates[] = { 810000, 540000, 270000, 162
+ 
+ #define SUN60I_DP_RATE_TO_MBPS(r)	((unsigned int)(r) / 100)
+ 
++/*
++ * ---------------------------------------------------------------------------
++ * The main video stream, UM 15.4.5.3 and the register tables 15.4.7.14 to
++ * 15.4.7.64
++ * ---------------------------------------------------------------------------
++ */
++#define DP_TRANSMITTER_OUTPUT_ENABLE	0x0080		/* 15.4.7.14 */
++#define  TX_OUTPUT_ENABLE		BIT(0)
++#define DP_SOFT_RESET			0x0090		/* 15.4.7.15, write-only */
++#define  SOFT_RESET_VIDEO		BIT(0)
++#define  SOFT_RESET_LINK		BIT(4)
++#define DP_INPUT_SOURCE_ENABLE		0x0094		/* 15.4.7.16 */
++#define  INPUT_SOURCE_ENABLE_SST	BIT(0)		/* "only bit 0 is valid" */
++
++/*
++ * ⚠ 0x0800 and 0x0804 have NO ROW in the UM's register list: 15.4.6 runs from
++ * CORE_ID at 0x00FC straight to SRC0_SECONDARY_DATA_WINDOW at 0x0808. They are
++ * named twice elsewhere and the two names do not agree, so both are recorded:
++ * UM 15.4.5.3 refers to the SOURCE_ENABLE and VIDEO_STREAM_ENABLE host
++ * registers as the main link enables, while the vendor calls
++ * them TR_VIDEO_STREAM_ENABLE and TR_SECOND_STREAM_ENABLE
++ * (trilinear_dp14.h:113-114) -- i.e. it reads the second one as stream #2 of a
++ * multi-stream link.
++ *
++ * ⬜ If the vendor's reading is right, 0x0804 has no business being set on an
++ * SST link at all -- and it sets it unconditionally, then never clears it,
++ * because its own disable line is commented out (trilinear_dp14.c:908, :914).
++ * Both are written here because both were set when this board produced a
++ * picture and neither has been tested alone. Separating them costs one write on
++ * a live link: `devmem 0x05740804 32 0`.
++ */
++#define DP_SRC0_ENABLE			0x0800
++#define  SRC0_ENABLE			BIT(0)
++#define DP_SRC0_STREAM_ENABLE		0x0804
++#define  SRC0_STREAM_ENABLE		BIT(0)
++
++#define DP_SRC0_SECONDARY_DATA_WINDOW	0x0808		/* 15.4.7.40 */
++#define  SECONDARY_DATA_WINDOW		GENMASK(11, 0)
++#define DP_SRC0_INPUT_STATUS		0x080c		/* 15.4.7.41, read-only */
++#define  INPUT_STATUS_ODDEVEN		BIT(3)
++#define  INPUT_STATUS_DEN		BIT(2)
++#define  INPUT_STATUS_HSYNC		BIT(1)
++#define  INPUT_STATUS_VSYNC		BIT(0)
++#define DP_SRC0_DATA_CONTROL		0x0810		/* 15.4.7.42 */
++#define  DATA_CONTROL_ACCUM_DELAY	GENMASK(14, 8)
++#define  DATA_CONTROL_FIFO_DEPTH	GENMASK(5, 0)
++#define DP_SRC0_MAIN_STREAM_HTOTAL	0x0820		/* 15.4.7.44 */
++#define DP_SRC0_MAIN_STREAM_VTOTAL	0x0824		/* 15.4.7.45 */
++#define DP_SRC0_MAIN_STREAM_POLARITY	0x0828		/* 15.4.7.46 */
++#define  MAIN_STREAM_VSYNC_POLARITY	BIT(1)
++#define  MAIN_STREAM_HSYNC_POLARITY	BIT(0)
++#define DP_SRC0_MAIN_STREAM_HSWIDTH	0x082c		/* 15.4.7.47 */
++#define DP_SRC0_MAIN_STREAM_VSWIDTH	0x0830		/* 15.4.7.48 */
++#define DP_SRC0_MAIN_STREAM_HRES	0x0834		/* 15.4.7.49 */
++#define DP_SRC0_MAIN_STREAM_VRES	0x0838		/* 15.4.7.50 */
++#define DP_SRC0_MAIN_STREAM_HSTART	0x083c		/* 15.4.7.51 */
++#define DP_SRC0_MAIN_STREAM_VSTART	0x0840		/* 15.4.7.52 */
++#define DP_SRC0_MISC0			0x0844		/* 15.4.7.53 */
++#define  MISC0_BIT_DEPTH		GENMASK(7, 5)
++#define   MISC0_BPC_6			0
++#define   MISC0_BPC_8			1
++#define   MISC0_BPC_10			2
++#define   MISC0_BPC_12			3
++#define   MISC0_BPC_16			4
++#define  MISC0_COMPONENT_FORMAT		GENMASK(2, 1)
++#define   MISC0_FORMAT_RGB		0
++#define  MISC0_SYNCHRONOUS_CLOCK	BIT(0)
++#define DP_SRC0_MISC1			0x0848		/* 15.4.7.54 */
++#define DP_SRC0_MVID			0x084c		/* 15.4.7.55 */
++#define  MVID_MASK			GENMASK(23, 0)
++#define DP_SRC0_TU_CONFIG		0x0850		/* 15.4.7.56 */
++#define  TU_CONFIG_FRAC_SYMBOLS		GENMASK(27, 24)
++/*
++ * ⚠ The UM contradicts itself on the next field and neither statement can be
++ * cited alone: 15.4.5.3's prose puts SYMBOLS_PER_TU at [22:16],
++ * the register table 15.4.7.56 at [23:16]. It cannot matter at any legal
++ * setting -- the field's own maximum is 64, seven bits -- but a driver that
++ * quoted one and not the other would look settled where it is not.
++ */
++#define  TU_CONFIG_SYMBOLS		GENMASK(23, 16)
++#define  TU_CONFIG_SIZE			GENMASK(15, 0)
++#define DP_SRC0_NVID			0x0854		/* 15.4.7.57 */
++#define  NVID_ASYNC_CONSTANT		0x8000
++#define DP_SRC0_USER_PIXEL_COUNT	0x0858		/* 15.4.7.58 */
++#define DP_SRC0_USER_DATA_COUNT		0x085c		/* 15.4.7.59 */
++#define  USER_DATA_COUNT_MASK		GENMASK(17, 0)
++#define DP_SRC0_MAIN_STREAM_INTERLACED	0x0860		/* 15.4.7.60 */
++#define DP_SRC0_USER_SYNC_POLARITY	0x0864		/* 15.4.7.61 */
++#define  USER_SYNC_POLARITY_RESET	0x0f
++#define DP_SRC0_USER_CONTROL		0x0868		/* 15.4.7.62 */
++#define  USER_CONTROL_SPARSE_MODE	BIT(0)		/* the A733 user manual */
++#define DP_SRC0_USER_FIFO_STATUS	0x086c		/* 15.4.7.63, read-only */
++#define  USER_FIFO_UNDERFLOW		BIT(1)
++#define  USER_FIFO_OVERFLOW		BIT(0)
++#define DP_SRC0_USER_FRAMING_STATUS	0x0870		/* 15.4.7.64, clear-on-read */
++#define  FRAMING_VBI_TIMING_ERROR	BIT(1)
++#define  FRAMING_DATA_UNDERFLOW		BIT(0)
++
++/* eDP_REG_PAD, the second register window. UM 15.4.8. */
++#define PAD_DP_LNK_CLK_CFG		0x0000		/* the A733 user manual */
++#define  LNK_CLK_GATING			BIT(0)
++#define PAD_DP_VID_CLK_CFG		0x0004		/* the A733 user manual */
++#define  VID0_CLK_GATING		BIT(0)
++#define  VID1_CLK_GATING		BIT(4)
++
++/*
++ * The transfer unit. UM 15.4.5.3 offers an automatic mode (SYMBOLS_PER_TU = 0)
++ * and a manual one. The UM advises the manual mode for boxes that must work
++ * with a wide range of sinks, since the automatic mode may not suit all of
++ * them. A
++ * monitor on a Type-C cable is exactly that, so the count is computed.
++ *
++ * TU_SIZE 64 is the register's own reset value and the top of the range the UM
++ * allows (32..64). ⚠ Changing it means rechecking SRC0_DATA_CONTROL, which is
++ * why sun60i_dp_video_check_data_control() exists and takes the size as an
++ * argument rather than reading a constant.
++ */
++#define TU_SIZE				64
++#define TU_FRAC_UNITS			16
++
++/*
++ * 8b/10b: a lane at R Mb/s on the wire carries R/10 mega-symbols per second and
++ * one payload byte per symbol. Everything below counts bytes per second in kB/s
++ * so that a pixel clock in kHz can be used directly.
++ */
++#define LANE_KBPS_PER_MBPS		100
++
++/* MVID is a measurement, so it is compared with a tolerance, not for equality. */
++#define MVID_TOLERANCE_PERCENT		1
++
+ struct sun60i_dp {
+ 	struct device		*dev;
+ 	void __iomem		*base;
+@@ -162,6 +296,16 @@ struct sun60i_dp {
+ 	bool			dpcd_valid;
+ 	unsigned int		link_rate;
+ 	unsigned int		link_lanes;
++	/* The main video stream. The second reg window is eDP_REG_PAD at
++	 * 0x05760000, which the AUX path measurably never needs and video
++	 * cannot do without; a DT with one window still gets a working AUX
++	 * channel and a named refusal from `video`.
++	 */
++	void __iomem		*pad;
++	struct drm_display_mode	mode;
++	u8			bpc;
++	bool			video_configured;
++	bool			video_on;
+ };
+ 
+ static inline struct sun60i_dp *aux_to_dp(struct drm_dp_aux *aux)
+@@ -382,6 +526,451 @@ static int sun60i_dp_aux_enable(struct sun60i_dp *dp)
+ 	return ret;
+ }
+ 
++/*
++ * ---------------------------------------------------------------------------
++ * The main video stream
++ * ---------------------------------------------------------------------------
++ *
++ * What reaches the sink as a picture is the transfer-unit packetisation of
++ * pixels arriving from TCON_TV1, described to the sink by the Main Stream
++ * Attribute packet. Both halves are programmed here, and both are COMPUTED from
++ * the mode, the link rate and the lane count -- UM 15.4.5.3
++ * states the equations, and re-deriving them reproduces, to the digit, what a
++ * live vendor link carries at 1920x1200 over four lanes
++ *:
++ *
++ *   LinkBW      = LINK_BW_SET * 27 * LANE_COUNT_SET   0x0A * 27 * 4 = 1080
++ *   Data Rate   = pixel clock * bpp / 8               154 * 24 / 8  =  462
++ *   TU symbols  = Data Rate / LinkBW * TU_SIZE        462/1080 * 64 = 27.3778
++ *                                                     -> 27 + 6/16 = 0x061B0040
++ *   SYMBOL_COUNT    = (HRES * bpp + 7) / 8            (1920*24+7)/8 = 5760
++ *   USER_DATA_COUNT = (SYMBOL_COUNT + lanes - 1)/lanes  (5760+3)/4  = 1440
++ *
++ * ⚠ THE POINT OF COMPUTING RATHER THAN CARRYING is the lane count. The by-hand
++ * script this transcribes hardcodes the four-lane words, and they are wrong for
++ * two lanes -- which wants 0x0C360040 and 0xB40 -- so two-lane runs that used
++ * those words and looked clean were running an under-programmed transfer
++ * unit. This code cannot make that mistake, because it never sees a constant.
++ */
++
++static void sun60i_dp_video_gates(struct sun60i_dp *dp, bool on)
++{
++	/*
++	 * ⚠ Their absence does not look like a missing clock gate. With them
++	 * shut, fifteen of seventeen main-stream registers read back exactly
++	 * what was written and only MVID and NVID misbehave -- so a driver that
++	 * verifies its own read-backs passes on fifteen and then chases MVID.
++	 * They are opened FIRST here for that reason; the by-hand run opened
++	 * them last and had to re-write NVID afterwards.
++	 *
++	 * VID1_CLK_GATING (bit 4) stays shut: it belongs to the second video
++	 * source, and this is a single-stream link with INPUT_SOURCE_ENABLE at
++	 * bit 0. The vendor writes the same two words, 0x1 and 0x1
++	 * (trilinear_dp14.c:1215-1216).
++	 */
++	writel(on ? LNK_CLK_GATING : 0, dp->pad + PAD_DP_LNK_CLK_CFG);
++	writel(on ? VID0_CLK_GATING : 0, dp->pad + PAD_DP_VID_CLK_CFG);
++}
++
++static u32 sun60i_dp_video_bpc_code(u8 bpc)
++{
++	switch (bpc) {
++	case 6:
++		return MISC0_BPC_6;
++	case 10:
++		return MISC0_BPC_10;
++	case 12:
++		return MISC0_BPC_12;
++	case 16:
++		return MISC0_BPC_16;
++	default:
++		return MISC0_BPC_8;
++	}
++}
++
++/*
++ * The Main Stream Attributes. Every field is the DisplayPort quantity of the
++ * same name, so the mode goes in directly: HSTART and VSTART are measured from
++ * the LEADING EDGE OF SYNC to the first active pixel or line, which is
++ * htotal - hsync_start and vtotal - vsync_start.
++ *
++ * MISC0 bit 0 is left at 0, asynchronous clock mode, deliberately: it is what
++ * makes MVID a measurement of the incoming pixel clock rather than a number we
++ * assert (UM 15.4.5.2). ⚠ The vendor reaches the same setting
++ * only implicitly -- its edp_core->sync_clock is declared, read twice and assigned
++ * nowhere, so kzalloc decides the clocking mode of every link it drives
++ * (trilinear_dp14.c:1274, :1320; sunxi_edp.h:444).
++ *
++ * POLARITY is PVSYNC << 1 | PHSYNC << 0, i.e. a set bit means the mode's sync
++ * pulse is POSITIVE. ⚠ The register table says the opposite: it documents 0
++ * as active high and 1 as active low (15.4.7.46), and then notes that this
++ * sense is inverted relative to the user input port polarities. Silicon
++ * settles it: a live link at a +HSync -VSync mode carries 0x1.
++ * The vendor writes the same expression (trilinear_dp14.c:1424-1425 over
++ * sunxi_drm_intf.c:99,108) and feeds those same two flags to TCON_TV1's
++ * TV_IO_POL, which is why the two blocks cannot describe different modes.
++ * ⬜ One mode; the VSYNC bit has never been exercised set.
++ */
++static void sun60i_dp_video_msa(struct sun60i_dp *dp,
++				const struct drm_display_mode *mode, u8 bpc)
++{
++	u32 polarity = 0;
++
++	if (mode->flags & DRM_MODE_FLAG_PVSYNC)
++		polarity |= MAIN_STREAM_VSYNC_POLARITY;
++	if (mode->flags & DRM_MODE_FLAG_PHSYNC)
++		polarity |= MAIN_STREAM_HSYNC_POLARITY;
++
++	writel(mode->htotal, dp->base + DP_SRC0_MAIN_STREAM_HTOTAL);
++	writel(mode->vtotal, dp->base + DP_SRC0_MAIN_STREAM_VTOTAL);
++	writel(polarity, dp->base + DP_SRC0_MAIN_STREAM_POLARITY);
++	writel(mode->hsync_end - mode->hsync_start,
++	       dp->base + DP_SRC0_MAIN_STREAM_HSWIDTH);
++	writel(mode->vsync_end - mode->vsync_start,
++	       dp->base + DP_SRC0_MAIN_STREAM_VSWIDTH);
++	writel(mode->hdisplay, dp->base + DP_SRC0_MAIN_STREAM_HRES);
++	writel(mode->vdisplay, dp->base + DP_SRC0_MAIN_STREAM_VRES);
++	writel(mode->htotal - mode->hsync_start,
++	       dp->base + DP_SRC0_MAIN_STREAM_HSTART);
++	writel(mode->vtotal - mode->vsync_start,
++	       dp->base + DP_SRC0_MAIN_STREAM_VSTART);
++	writel(FIELD_PREP(MISC0_BIT_DEPTH, sun60i_dp_video_bpc_code(bpc)) |
++	       FIELD_PREP(MISC0_COMPONENT_FORMAT, MISC0_FORMAT_RGB),
++	       dp->base + DP_SRC0_MISC0);
++	writel(0, dp->base + DP_SRC0_MISC1);
++	writel(0, dp->base + DP_SRC0_MAIN_STREAM_INTERLACED);
++	/* One pixel per clock, which is what TV_GCTL_REG's PIXEL_MODE says. */
++	writel(1, dp->base + DP_SRC0_USER_PIXEL_COUNT);
++}
++
++/* Valid data symbols per transfer unit, in sixteenths. */
++static u32 sun60i_dp_video_symbols_x16(const struct drm_display_mode *mode,
++				       u32 bpp, unsigned int rate_mbps,
++				       unsigned int lanes)
++{
++	u64 src_kbps = (u64)mode->clock * bpp / 8;
++	u64 link_kbps = (u64)rate_mbps * lanes * LANE_KBPS_PER_MBPS;
++
++	return div64_u64(src_kbps * TU_SIZE * TU_FRAC_UNITS, link_kbps);
++}
++
++/*
++ * SRC0_DATA_CONTROL is NOT written -- the UM tells integrators to leave this
++ * register alone unless the vendor's support engineers direct otherwise
++ * (15.4.7.42) -- but it is CHECKED, because its reset value sits exactly on the
++ * one constraint the UM does impose: 15.4.5.4 requires DATA_ACCUMULATION_DELAY
++ * to be no smaller than half the TU size, and the reset 0x00002004 is a delay
++ * of 32 against a TU size of 64. Anything that lowers the delay or raises the
++ * TU size breaks it, and the failure would be uneven spacing of the
++ * Blanking Start symbols, not an error.
++ *
++ * The vendor never programs and never reads this register at all
++ * (trilinear_dp14.h:117 is its only occurrence in that tree).
++ */
++static int sun60i_dp_video_check_data_control(struct sun60i_dp *dp, u32 tu_size)
++{
++	u32 val = readl(dp->base + DP_SRC0_DATA_CONTROL);
++	u32 delay = FIELD_GET(DATA_CONTROL_ACCUM_DELAY, val);
++
++	if (delay < tu_size / 2) {
++		dev_err(dp->dev,
++			"DATA_ACCUMULATION_DELAY %u is below half of TU size %u (UM 15.4.5.4)\n",
++			delay, tu_size);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++/*
++ * The secondary-data window, in link symbol clocks. UM 15.4.7.40 gives both a
++ * hard rule -- the value must stay below the horizontal blanking period -- and
++ * a recommended value, the formula Reg = HBLANK_PERIOD /
++ * LINK_SYMBOL_CLOCK_PERIOD * 0.9. For this mode the blanking period is 280
++ * symbols and the recommendation is 252.
++ *
++ * ⚠ THIS IS A DELIBERATE DEPARTURE FROM WHAT A WORKING LINK CARRIES, and it is
++ * the only one in this patch. Both our by-hand run and the vendor write 98, and
++ * 98 is legal -- it satisfies the hard rule. But it is not a carried mystery
++ * either: the vendor computes it as HSTART * (link symbol rate / 2) / pixel
++ * clock (trilinear_dp14.c:889-903), which at this mode is 112 * 135000 / 154000
++ * = 98, from an undocumented formula over the wrong quantity -- HSTART rather
++ * than the blanking period -- with a bare /2. Our own by-hand value was copied
++ * from that live link, so the two agreeing sources are one source.
++ *
++ * This tree's rule is that a value comes from the reference docs, and the
++ * reference doc has an equation. It is computed. Falsified by:
++ * SRC0_USER_FIFO_STATUS or SRC0_USER_FRAMING_STATUS going non-zero, or the
++ * picture going away -- and reverting costs one write on a live link,
++ * `devmem 0x05740808 32 0x62`, with no rebuild.
++ */
++static u32 sun60i_dp_video_secondary_window(const struct drm_display_mode *mode,
++					    unsigned int rate_mbps)
++{
++	u32 hblank = mode->htotal - mode->hdisplay;
++	u64 blank_symbols = div_u64((u64)hblank * rate_mbps * LANE_KBPS_PER_MBPS,
++				    mode->clock);
++	u64 window;
++
++	if (blank_symbols < 2)
++		return 0;
++
++	window = min(div_u64(blank_symbols * 9, 10), blank_symbols - 1);
++
++	return min_t(u32, window, FIELD_MAX(SECONDARY_DATA_WINDOW));
++}
++
++static int sun60i_dp_video_transfer_unit(struct sun60i_dp *dp,
++					 const struct drm_display_mode *mode,
++					 u32 bpp)
++{
++	u32 sym16 = sun60i_dp_video_symbols_x16(mode, bpp, dp->link_rate,
++						dp->link_lanes);
++	u32 symbol_count, data_count;
++	int ret;
++
++	/*
++	 * More valid symbols than a transfer unit can hold means the link
++	 * cannot carry this mode. Refusing here is taken from the vendor driver,
++	 * which checks the same thing in its mode filter
++	 * (trilinear_dp14.c:1783-1826) rather than failing the modeset -- minus
++	 * its off-by-two: its own message says the limit is 62 where its code
++	 * tests 64.
++	 */
++	if (!sym16 || sym16 > TU_SIZE * TU_FRAC_UNITS) {
++		dev_err(dp->dev,
++			"%u.%02u symbols per TU of %u: %u Mb/s over %u lanes cannot carry %d kHz at %u bpp\n",
++			sym16 / TU_FRAC_UNITS,
++			(sym16 % TU_FRAC_UNITS) * 100 / TU_FRAC_UNITS, TU_SIZE,
++			dp->link_rate, dp->link_lanes, mode->clock, bpp);
++		return -EINVAL;
++	}
++
++	ret = sun60i_dp_video_check_data_control(dp, TU_SIZE);
++	if (ret)
++		return ret;
++
++	writel(FIELD_PREP(TU_CONFIG_SIZE, TU_SIZE) |
++	       FIELD_PREP(TU_CONFIG_SYMBOLS, sym16 / TU_FRAC_UNITS) |
++	       FIELD_PREP(TU_CONFIG_FRAC_SYMBOLS, sym16 % TU_FRAC_UNITS),
++	       dp->base + DP_SRC0_TU_CONFIG);
++
++	/*
++	 * 🔴 SRC0_USER_DATA_COUNT is the register that stood between a fully
++	 * trained link and a picture. At its reset value of zero the framing
++	 * logic sends a blanking-start symbol after zero symbols of active
++	 * video, so every line is blank -- and every link observable stays
++	 * perfect: all four lanes CR + EQ + symbol-locked, interlane aligned,
++	 * zero symbol errors, the sink reporting itself in sync, FIFO_STATUS
++	 * clean, and the monitor not even waking from standby. It was found on
++	 * 2026-08-18 by diffing this 4 KiB window against a live vendor link,
++	 * where it was the one register the vendor set and we did not.
++	 */
++	symbol_count = DIV_ROUND_UP(mode->hdisplay * bpp, 8);
++	data_count = DIV_ROUND_UP(symbol_count, dp->link_lanes);
++	if (data_count > (u32)USER_DATA_COUNT_MASK) {
++		dev_err(dp->dev,
++			"%u bytes per line per lane does not fit the 18-bit field\n",
++			data_count);
++		return -EINVAL;
++	}
++	writel(data_count, dp->base + DP_SRC0_USER_DATA_COUNT);
++
++	writel(sun60i_dp_video_secondary_window(mode, dp->link_rate),
++	       dp->base + DP_SRC0_SECONDARY_DATA_WINDOW);
++
++	return 0;
++}
++
++/*
++ * MVID, read and never written. In asynchronous clock mode the register is
++ * read-only and returns what the core itself computes from the input video
++ * clock (15.4.7.55) -- so it is the core measuring what
++ * TCON_TV1 is actually feeding it, one of the few numbers in this driver that
++ * cannot be a register echoing our own write. NVID is read-only in the same
++ * mode and returns the constant 0x8000, which is the scale.
++ *
++ * ⚠ The vendor writes both, unconditionally, before it has computed the
++ * clocking mode (trilinear_dp14.c:1263, :1266), with the comment "// not sure
++ * divide 1000 or 100000, spec seems conflict" sitting above the MVID write. It
++ * then reads MVID back in one place, scales it by 1000 and prints it in sysfs
++ * as the pixel clock (:1638, sunxi_drm_edp.c:1803) -- which on an async link
++ * reports 18 690 kHz for a 154 000 kHz mode. It never compares it to anything.
++ */
++static int sun60i_dp_video_pixel_khz(struct sun60i_dp *dp)
++{
++	u32 mvid = readl(dp->base + DP_SRC0_MVID) & (u32)MVID_MASK;
++
++	return div_u64((u64)mvid * dp->link_rate * LANE_KBPS_PER_MBPS,
++		       NVID_ASYNC_CONSTANT);
++}
++
++static int sun60i_dp_video_check_pixel_clk(struct sun60i_dp *dp)
++{
++	int measured = sun60i_dp_video_pixel_khz(dp);
++	int want = dp->mode.clock;
++	u32 nvid = readl(dp->base + DP_SRC0_NVID) & (u32)MVID_MASK;
++
++	if (nvid != NVID_ASYNC_CONSTANT) {
++		dev_err(dp->dev,
++			"NVID is 0x%x, not the 0x%x asynchronous mode returns\n",
++			nvid, NVID_ASYNC_CONSTANT);
++		return -EIO;
++	}
++
++	if (abs(measured - want) > want / 100 * MVID_TOLERANCE_PERCENT) {
++		dev_err(dp->dev,
++			"the core measures %d kHz on its video input, the mode is %d kHz\n",
++			measured, want);
++		return -EIO;
++	}
++
++	return 0;
++}
++
++/*
++ * Program the stream, but do not start it. Everything here is safe before link
++ * training and has to happen before it: the transfer unit depends on the lane
++ * count and the rate, which is why sun60i_dp_link_configure() has to have run.
++ *
++ * What this deliberately does NOT touch is LINK_BW_SET and LANE_COUNT_SET, for
++ * the reason `drm-a733-dp-configure-the-main-link-phy` gives: those belong with the training pattern sequence and
++ * the matching DPCD writes, and moving one end without the other is the failure
++ * that has already been seen once.
++ */
++static int sun60i_dp_video_configure(struct sun60i_dp *dp)
++{
++	const struct drm_display_mode *mode = &dp->mode;
++	u32 bpp = dp->bpc * 3;
++	int ret;
++
++	if (!dp->enabled) {
++		dev_err(dp->dev, "the AUX channel is down\n");
++		return -ENODEV;
++	}
++
++	if (!dp->pad) {
++		dev_err(dp->dev,
++			"no eDP_REG_PAD window: this node needs a second reg entry at 0x05760000\n");
++		return -ENODEV;
++	}
++
++	if (!dp->link_rate || !dp->link_lanes) {
++		dev_err(dp->dev,
++			"no link rate or lane count yet -- configure the PHY first (write to `link`)\n");
++		return -EINVAL;
++	}
++
++	/* Both are divisors below, and div_u64() by zero is an oops, not an
++	 * error return. The built-in mode cannot be zero today; the mode this
++	 * takes from a connector one day can be anything.
++	 */
++	if (mode->clock <= 0 || mode->htotal <= mode->hdisplay) {
++		dev_err(dp->dev, "mode %dx%d @ %d kHz is not a mode\n",
++			mode->hdisplay, mode->vdisplay, mode->clock);
++		return -EINVAL;
++	}
++
++	sun60i_dp_video_gates(dp, true);
++	sun60i_dp_video_msa(dp, mode, dp->bpc);
++
++	ret = sun60i_dp_video_transfer_unit(dp, mode, bpp);
++	if (ret)
++		goto err_gates;
++
++	/*
++	 * The transmitter output enable must wait until the link output is
++	 * configured, so that the controller does not disturb the PHY while
++	 * it powers up (15.4.7.14); the source enable then starts the
++	 * NO_VIDEO pattern while no video stream is enabled (15.4.7.16),
++	 * which is exactly the state to be in
++	 * while training runs.
++	 */
++	writel(TX_OUTPUT_ENABLE, dp->base + DP_TRANSMITTER_OUTPUT_ENABLE);
++	writel(INPUT_SOURCE_ENABLE_SST, dp->base + DP_INPUT_SOURCE_ENABLE);
++
++	dp->video_configured = true;
++
++	return 0;
++
++err_gates:
++	sun60i_dp_video_gates(dp, false);
++
++	return ret;
++}
++
++/*
++ * Start the stream. This runs AFTER link training: with training cleared and
++ * the stream not enabled the core sends idle and the sink loses the lock it
++ * just gained, which is what happened here on the first successful training,
++ * 2026-08-18.
++ *
++ * The video soft reset before it is the vendor's, and it is right -- but only
++ * on one of its two paths. Its eDP path resets and then enables
++ * (sunxi_drm_edp.c:3750-3752) while its DisplayPort path jumps straight to the
++ * enable with no reset at all (:3994-3999), same IP, same MSA block, two
++ * sequences. And its reset is write-only and never released, because nothing in
++ * that driver ever writes the bit back to zero. SOFT_RESET is documented
++ * write-only and self-clearing in effect (15.4.7.15); this driver writes the
++ * one bit it means and reads nothing back from a write-only register.
++ */
++static int sun60i_dp_video_stream_enable(struct sun60i_dp *dp)
++{
++	int ret;
++
++	if (!dp->enabled || !dp->video_configured) {
++		dev_err(dp->dev,
++			"the stream is not configured yet -- write \"configure\" first\n");
++		return -EINVAL;
++	}
++
++	ret = sun60i_dp_video_check_pixel_clk(dp);
++	if (ret)
++		return ret;
++
++	writel(SOFT_RESET_VIDEO, dp->base + DP_SOFT_RESET);
++	usleep_range(5000, 6000);
++
++	writel(SRC0_ENABLE, dp->base + DP_SRC0_ENABLE);
++	writel(SRC0_STREAM_ENABLE, dp->base + DP_SRC0_STREAM_ENABLE);
++
++	dp->video_on = true;
++	dev_info(dp->dev, "video stream enabled, %d kHz over %u lanes\n",
++		 dp->mode.clock, dp->link_lanes);
++
++	return 0;
++}
++
++static void sun60i_dp_video_disable(struct sun60i_dp *dp)
++{
++	/*
++	 * `enabled`, not just `pad`. Six writes into a block whose reset is
++	 * asserted and whose bus clock is off is what `echo off > video` would
++	 * otherwise do on a driver that was never enabled -- and this file's own
++	 * AUX path establishes the rule: both the gate and the reset are
++	 * required before a single register of this block is reachable,
++	 * measured, not assumed. The call from sun60i_dp_aux_disable() is
++	 * unaffected: it runs while `enabled` is still true.
++	 */
++	if (!dp->enabled || !dp->pad)
++		return;
++
++	/*
++	 * Cleared in the reverse order, including 0x0804 -- the vendor's line
++	 * for that one is commented out (trilinear_dp14.c:914), so its second
++	 * stream stays enabled for the lifetime of the driver once any modeset
++	 * has run.
++	 */
++	writel(0, dp->base + DP_SRC0_STREAM_ENABLE);
++	writel(0, dp->base + DP_SRC0_ENABLE);
++	writel(0, dp->base + DP_INPUT_SOURCE_ENABLE);
++	writel(0, dp->base + DP_TRANSMITTER_OUTPUT_ENABLE);
++	sun60i_dp_video_gates(dp, false);
++
++	dp->video_on = false;
++	dp->video_configured = false;
++}
++
+ static void sun60i_dp_link_release(struct sun60i_dp *dp)
+ {
+ 	if (!dp->link_phy_inited)
+@@ -399,6 +988,7 @@ static void sun60i_dp_link_release(struct sun60i_dp *dp)
+ 
+ static void sun60i_dp_aux_disable(struct sun60i_dp *dp)
+ {
++	sun60i_dp_video_disable(dp);
+ 	sun60i_dp_link_release(dp);
+ 	i2c_del_adapter(&dp->aux.ddc);
+ 	phy_power_off(dp->aux_phy);
+@@ -595,6 +1185,16 @@ static int sun60i_dp_link_configure(struct sun60i_dp *dp, unsigned int rate_mbps
+ 	dp->link_rate = rate_mbps;
+ 	dp->link_lanes = lanes;
+ 
++	/*
++	 * The transfer unit and the per-lane data count are computed FROM the
++	 * rate and the lane count, so a link that has just been reconfigured
++	 * invalidates them. Without this, "configure" at four lanes followed by
++	 * a two-lane `link` and then "stream" would start a stream on a
++	 * four-lane TU -- exactly the under-programmed transfer unit that
++	 * computing these values instead of carrying them exists to prevent.
++	 */
++	dp->video_configured = false;
++
+ 	dev_info(dp->dev, "main link configured: %u Mb/s, %u lanes\n",
+ 		 rate_mbps, lanes);
+ 
+@@ -613,6 +1213,7 @@ static void sun60i_dp_teardown(void *data)
+ static int sun60i_dp_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
++	struct resource *res;
+ 	struct sun60i_dp *dp;
+ 	int ret;
+ 
+@@ -621,6 +1222,8 @@ static int sun60i_dp_probe(struct platform_device *pdev)
+ 		return -ENOMEM;
+ 
+ 	dp->dev = dev;
++	dp->mode = sun60i_display_mode_1920x1200;
++	dp->bpc = 8;
+ 	platform_set_drvdata(pdev, dp);
+ 
+ 	ret = devm_mutex_init(dev, &dp->lock);
+@@ -666,6 +1269,26 @@ static int sun60i_dp_probe(struct platform_device *pdev)
+ 	if (IS_ERR(dp->link_phy))
+ 		return dev_err_probe(dev, PTR_ERR(dp->link_phy), "main-link phy\n");
+ 
++	/*
++	 * eDP_REG_PAD, the second reg window. Optional here in exactly the
++	 * sense `arm64-dts-a733-displayport-transmitter` predicted: the AUX channel never needs it, so a node that
++	 * carries one window keeps working, and the video path says what is
++	 * missing instead of writing into NULL. The vendor's driver maps the
++	 * same window, logs a DEBUG-level "Maybe there is no top addr for edp!"
++	 * when it is absent and then dereferences NULL anyway
++	 * (sunxi_drm_edp.c:2835-2839 into trilinear_dp14.c:1215) -- and never
++	 * unmaps it (:2953).
++	 */
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
++	if (res) {
++		dp->pad = devm_ioremap_resource(dev, res);
++		if (IS_ERR(dp->pad))
++			return dev_err_probe(dev, PTR_ERR(dp->pad),
++					     "eDP_REG_PAD window\n");
++	} else {
++		dev_info(dev, "no eDP_REG_PAD reg window: AUX only, no video\n");
++	}
++
+ 	dp->aux.name = dev_name(dev);
+ 	dp->aux.dev = dev;
+ 	dp->aux.transfer = sun60i_dp_aux_transfer;

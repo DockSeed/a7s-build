@@ -1,0 +1,67 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] pinctrl: sunxi: a733: drop the IRQ remux on read, the data register follows an EINT pin
+
+Both A733 pin controllers set irq_read_needs_mux, taken over from the A523
+drivers: sunxi_pinctrl_gpio_get() switches a pin that sits on its EINT
+selector to input for the read and back afterwards. Upstream removed the flag
+from the A523 family on measurement -- eaf84ff67340 "pinctrl: sunxi: a523:
+Remove unneeded IRQ remuxing flag" (Andre Przywara; stable 6.18.40 as
+0234e8fc296e): only the A10/H3 generation cannot read an IRQ-muxed line, and
+on the A523 "the GPIO data register reflects the true GPIO state even with a
+pin muxed to IRQ trigger". This does the same for the A733, on its own
+measurement.
+
+MEASURED (Cubie A7S, 6 GiB board, 2026-09-25)
+
+A free header pin, floating, its level set by the internal pull. The pull
+switched up and down twice with the pin as a GPIO input (control) and twice on
+its EINT selector (14 on every bank of both blocks), five data-register reads
+each, INT_CTL untouched:
+
+  PJ24 (main PIO, PJ_CFG3/PJ_DAT/PJ_PUL1)   input: 1 0 1 0   EINT: 1 0 1 0
+  PL6  (S_GPIO, PL_CFG0/PL_DAT/PL_PUL0)     input: 1 0 1 0   EINT: 1 0 1 0
+
+On both blocks the data bit follows the pin on the EINT selector exactly as
+it does on input. The UM note the remux was written against (on PF_DAT: the
+value is undefined when the port is a functional pin) does
+not describe the EINT function on this part.
+
+WHAT FOLLOWS
+
+With the flag gone, sunxi_pinctrl_gpio_get() reads the data register directly
+for every pin, and nothing on the A733 reaches the remux path any more. The
+series' pinctrl-sunxi-restore-the-pin-s-own-irq-mux-after-a-read, which made
+that path put the pin back on selector 14 instead of the A10's 6, has no A733
+user left and is retired with this change; every SoC that still sets the flag
+has its EINT function on 6.
+
+Verified: builds (W=1 clean); the series applies at fuzz 0 with it and
+without the retired patch. Pending on silicon, one line: on a test kernel,
+the SD card-detect PF6 reads "card present" through gpiolib while PF_CFG0
+keeps PF6 on selector 14 (0x0E... in bits 27:24), and a read of an EINT line
+no longer rewrites its CFG register.
+
+Assisted-by: Claude
+---
+diff -uNr a/drivers/pinctrl/sunxi/pinctrl-sun60iw2.c b/drivers/pinctrl/sunxi/pinctrl-sun60iw2.c
+--- a/drivers/pinctrl/sunxi/pinctrl-sun60iw2.c
++++ b/drivers/pinctrl/sunxi/pinctrl-sun60iw2.c
+@@ -96,7 +96,6 @@
+ 	.io_bias_field_shift = a733_io_bias_field_shift,
+ 	.irq_banks = ARRAY_SIZE(a733_irq_bank_map),
+ 	.irq_bank_map = a733_irq_bank_map,
+-	.irq_read_needs_mux = true,
+ 	.irq_cfg_reg = A733_IRQ_CFG_REG,
+ 	.irq_ctrl_reg = A733_IRQ_CTRL_REG,
+ 	.irq_status_reg = A733_IRQ_STATUS_REG,
+diff -uNr a/drivers/pinctrl/sunxi/pinctrl-sun60iw2-r.c b/drivers/pinctrl/sunxi/pinctrl-sun60iw2-r.c
+--- a/drivers/pinctrl/sunxi/pinctrl-sun60iw2-r.c
++++ b/drivers/pinctrl/sunxi/pinctrl-sun60iw2-r.c
+@@ -64,7 +64,6 @@
+ static struct sunxi_pinctrl_desc a733_r_pinctrl_data = {
+ 	.irq_banks = ARRAY_SIZE(a733_r_irq_bank_map),
+ 	.irq_bank_map = a733_r_irq_bank_map,
+-	.irq_read_needs_mux = true,
+ 	.io_bias_cfg_variant = BIAS_VOLTAGE_POW_MOD_SEL_2BIT,
+ 	.io_bias_field_shift = a733_r_io_bias_field_shift,
+ 	.pin_base = PL_BASE,

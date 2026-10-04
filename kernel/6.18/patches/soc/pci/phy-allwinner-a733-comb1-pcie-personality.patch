@@ -1,0 +1,548 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] phy: allwinner: add the A733 COMB1 combo-PHY in its PCIe personality
+
+The A733 has two combo PHYs. COMB0 carries USB3-SS and DisplayPort and is
+driven by `phy-allwinner-a733-add-serdes-combophy`. COMB1 carries either USB3-SS or PCIe, one lane, and on this
+board the protocol mux selects PCIe. This is the PCIe half of COMB1, and
+without it there is no link for a controller to train.
+
+A SEPARATE DRIVER, AND WHY
+
+`phy-allwinner-a733-add-serdes-combophy` is 2800 lines of Type-C orientation handling, DisplayPort rate
+negotiation and AUX/HPD, none of which exists on COMB1 -- and it drives
+hardware that works today. Threading a fourth mode through its init and reset
+paths buys a regression risk on a running subsystem for about forty lines of
+shared code (a 16-bit write helper and the shape of a table). `phy-allwinner-a733-add-serdes-combophy`'s own header
+says DP-alt and PCIe are out of its scope; this keeps that promise instead of
+quietly breaking it.
+
+WHERE THE VALUES COME FROM
+
+The wrapper registers are documented: A733 UM V1.00, SERDES chapter, gives
+LINK_CTRL0/1, LANE0_CTRL0 and LINK_STUS0 with their fields, and the protocol
+mux at 0x6C44 with 001 = PCIe0 lane 0.
+
+The PMA body at 0x06CA0000 is not in the UM at all. Its 84 words were extracted
+mechanically from the vendor driver -- not transcribed -- and then classified
+against the table `phy-allwinner-a733-add-serdes-combophy` already carries for COMB0:
+
+  49  same index AND same value as the COMB0 table
+  17  same index, different value
+  18  index not in the COMB0 table
+
+Each line in the table says which class it is in. The 49 are as understood as
+COMB0 is, and the same word carrying the same value on a different PHY instance
+in a different protocol is itself evidence that those offsets are
+protocol-independent. The other 35 are magic values and are marked as such
+rather than presented as derived; deriving them is open work, as are the two LINK_CTRL1
+fields where the vendor value uses encodings the UM calls reserved, and an
+addressing ambiguity in three of the accesses.
+
+WHAT THIS COVERS THAT THE VENDOR DOES NOT
+
+ - PMA_CMN_READY is polled with a timeout. The vendor spins in while(true) with
+   a 100 us delay and no way out: a PHY that never reports ready hangs the boot
+   instead of failing the probe.
+ - The PCIe controller's bus gates are NOT touched here. The vendor sets them
+   from its PHY path; they gate the controller's own AXI and AHB access, so they
+   belong to the controller's node, which claims them as clocks.
+ - The reference-clock gate is claimed as a clock, not poked in a register
+   window this driver does not own.
+ - The vendor's last fixup reads a word, computes a value from it and then
+   overwrites both with a constant. Only the constant survives here, with a note,
+   so nobody maintains arithmetic that never had an effect.
+
+ONE SHARP EDGE, AND IT IS IN THE MAPPING
+
+The middle register window (0x06C06000) holds the protocol mux of BOTH combo
+PHYs, and `phy-allwinner-a733-add-serdes-combophy` claims it as an exclusive region. So this driver maps it with
+devm_ioremap() instead of requesting it: requesting it twice fails with -EBUSY
+and would take PCIe down whenever USB3 probed first -- an ordering nobody
+controls. The AUX/HPD PHY solves the same overlap the same way.
+
+Verified: compile-check builds the object clean. No hardware effect on its own
+-- a PHY with no consumer is never initialised; the proof belongs to the patch
+that adds the controller node.
+
+Based on drivers/phy/sunxi-cadence-combophy.c from radxa/allwinner-bsp
+(commit b36af3872d4e, "aiot-linux-v1.4.6 release"; the file is unchanged on
+the branches cubie-aiot-v1.4.6 and cubie-aiot-v1.4.8), GPL-2.0,
+Copyright(c) 2020 - 2023 Allwinner Technology Co.,Ltd. and
+Copyright (C) 2024 Allwinner Electronics Co., Ltd. The 84 PMA words come
+from its sunxi_cadence_phy_pcie_phy_init():
+https://github.com/radxa/allwinner-bsp/blob/b36af3872d4e6e91da6e929f4ccf4822b3ea9d66/drivers/phy/sunxi-cadence-combophy.c
+
+Assisted-by: Claude
+
+diff --git a/drivers/phy/allwinner/phy-sun60i-a733-pcie-combophy.c b/drivers/phy/allwinner/phy-sun60i-a733-pcie-combophy.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/phy/allwinner/phy-sun60i-a733-pcie-combophy.c
+@@ -0,0 +1,430 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Allwinner A733 (sun60iw2) COMB1 combo-PHY, PCIe personality.
++ *
++ * The A733 has two combo PHYs in its SERDES subsystem. COMB0 carries USB3-SS
++ * and DisplayPort and is driven by phy-sun60i-a733-combophy.c. COMB1 carries
++ * either USB3-SS or PCIe, one lane, and on this board the protocol mux selects
++ * PCIe (SUBSYS_COMB1_PIPE at 0x06C06C44 reads 0x1 whenever something drives
++ * it). This driver is the PCIe half of COMB1.
++ *
++ * It is a separate driver rather than a third personality inside the COMB0 one
++ * for two reasons that are about risk, not taste: that driver is 2800 lines of
++ * Type-C orientation handling, DisplayPort rate negotiation and AUX/HPD, none
++ * of which exists on COMB1 -- and it runs working hardware today, so threading
++ * a fourth mode through its init and reset paths buys a regression risk for no
++ * shared code. What the two do share is the shape of a PMA table and a 16-bit
++ * write helper, about forty lines.
++ *
++ * WHAT THE REGISTERS ARE
++ *
++ * Three windows, all named by the UM (A733 UM V1.00, SERDES subsystem):
++ *
++ *   link  0x06C02000  COMB1_PHY_PINS_* -- the wrapper. Documented: LINK_CTRL0
++ *                     at 0x0000 (bit0 PHY reset), LINK_CTRL1 at 0x0004
++ *                     (bit28 EN_REFCLK, bit24/20 PLL refclk select, bit16
++ *                     termination, [13:12] refclk divider, [5:4] refclk mode),
++ *                     LANE0_CTRL0 at 0x0100 ([5:4] lane mode, bit0 lane reset),
++ *                     LINK_STUS0 at 0x0900 (bit0 PMA_CMN_READY).
++ *   top2  0x06C06000  the protocol mux at +0xC44: [3:0] 000 = USB3.1,
++ *                     001 = PCIe0 lane 0. Reset value is 0xF.
++ *   pma   0x06CA0000  the PMA/PCS body. NOT in the UM, at all. 128 KiB of
++ *                     16-bit words addressed by index.
++ *
++ * WHERE THE PMA VALUES COME FROM, AND WHAT IS STILL UNKNOWN
++ *
++ * The vendor BSP programs 84 words here (sunxi-cadence-combophy.c, Copyright(c) 2020 - 2023
++ * Allwinner Technology Co.,Ltd., (C) 2024 Allwinner Electronics Co., Ltd.). They were extracted
++ * mechanically from it, not transcribed, and classified against our COMB0 driver's table:
++ *
++ *   49  same index AND same value as the COMB0 USB3 table (`phy-allwinner-a733-add-serdes-combophy`)
++ *   17  same index, different value -- offset meaning transfers, value does not
++ *   18  index not in the COMB0 table at all
++ *
++ * The 49 are as understood as COMB0 is: the same word, the same value, on a
++ * different PHY instance in a different protocol -- which is itself evidence
++ * that those offsets carry protocol-independent common/bias configuration. The
++ * other 35 are magic values. They are marked as such per line below, not presented
++ * as derived, and deriving them is open work. Nothing in the UM covers this
++ * window, so no amount of reading closes that gap; it needs measurement.
++ *
++ * WHAT THIS DOES THAT THE VENDOR DRIVER DOES NOT
++ *
++ *  - PMA_CMN_READY is polled with a timeout. The vendor spins in while(true)
++ *    with a 100 us delay and no way out; a PHY that never reports ready hangs
++ *    the boot instead of failing the probe.
++ *  - The bus gates of the PCIe controller (SUBSYS_PCIE_BGR bits 18/17/16) are
++ *    NOT touched here. The vendor sets them from its PHY path; they gate the
++ *    controller's own AXI and AHB access, so they belong to the controller's
++ *    node, which claims them as clocks.
++ *  - The reference-clock gate (SUBSYS_DBG_CTRL bit29) is a clock and is claimed
++ *    as one, instead of being poked in a register window this driver does not
++ *    own.
++ *  - The vendor's fixup at the end reads a word, computes a value from it and
++ *    then discards both by assigning a constant. Only the constant is kept here,
++ *    with that noted, so nobody maintains arithmetic that never had an effect.
++ *
++ * Copyright (C) 2026 DockSeed
++ */
++
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/phy/phy.h>
++#include <linux/platform_device.h>
++#include <linux/reset.h>
++
++/* link window (0x06C02000) */
++#define A733_PCIE_LINK_CTRL0		0x0000
++#define  A733_PCIE_LINK_RESET_N		BIT(0)
++#define A733_PCIE_LINK_CTRL1		0x0004
++#define  A733_PCIE_LINK_EN_REFCLK	BIT(28)
++#define A733_PCIE_LANE0_CTRL0		0x0100
++#define  A733_PCIE_LANE0_MODE		GENMASK(5, 4)
++#define  A733_PCIE_LANE0_RESET_N_SW	BIT(0)
++#define A733_PCIE_LINK_STUS0		0x0900
++#define  A733_PCIE_PMA_CMN_READY	BIT(0)
++
++/* top2 window (0x06C06000) */
++#define A733_PCIE_PIPE_TXD_MAP		0x0C44
++#define  A733_PCIE_PIPE_TXD_MAP_PCIE0	0x1
++
++/*
++ * LINK_CTRL1 as the vendor writes it before touching the PMA: refclk taken
++ * from the internal path (bit24 PLL1 select, bit0 digital select), termination
++ * off, divider and mode left at 0. ⚠ The UM marks the internal-mode encoding
++ * 00 in [9:8] as reserved and recommends [13:12] = 10 for a 100 MHz reference,
++ * and this value uses neither -- it is what runs on this board, and nothing here settles
++ * the question.
++ */
++#define A733_PCIE_LINK_CTRL1_INIT	0x01100001
++
++/* PMA words are 16 bit, addressed by index */
++struct a733_pcie_pma_write {
++	u16 idx;
++	u16 val;
++};
++
++struct a733_pcie_combophy {
++	struct device		*dev;
++	void __iomem		*link;
++	void __iomem		*top2;
++	void __iomem		*pma;
++	struct clk		*serdes_clk;
++	struct clk		*refclk;
++	struct reset_control	*reset;
++	struct phy		*phy;
++};
++
++static void a733_pcie_pma_write(struct a733_pcie_combophy *cp, u16 idx, u16 val)
++{
++	writew(val, cp->pma + ((u32)idx << 1));
++}
++
++static void a733_pcie_pma_write_all(struct a733_pcie_combophy *cp,
++				    const struct a733_pcie_pma_write *tbl,
++				    size_t n)
++{
++	size_t i;
++
++	for (i = 0; i < n; i++)
++		a733_pcie_pma_write(cp, tbl[i].idx, tbl[i].val);
++}
++
++static void a733_pcie_rmw(void __iomem *reg, u32 clr, u32 set)
++{
++	u32 val = readl(reg);
++
++	val &= ~clr;
++	val |= set;
++	writel(val, reg);
++}
++
++/* PMA, first block: 25 writes before the lane is put into PCIe mode */
++static const struct a733_pcie_pma_write a733_pcie_pma_pre[] = {
++	{ 0x0022, 0x001A },	/* shared with COMB0 */
++	{ 0x002A, 0x0034 },	/* shared with COMB0 */
++	{ 0x002C, 0x00DA },	/* shared with COMB0 */
++	{ 0x0032, 0x0034 },	/* shared with COMB0 */
++	{ 0x0034, 0x00DA },	/* shared with COMB0 */
++	{ 0x0064, 0x0082 },	/* shared with COMB0 */
++	{ 0x0065, 0x0082 },	/* shared with COMB0 */
++	{ 0x0074, 0x001A },	/* shared with COMB0 */
++	{ 0x0104, 0x0020 },	/* shared with COMB0 */
++	{ 0x0105, 0x0007 },	/* shared with COMB0 */
++	{ 0x010C, 0x0020 },	/* shared with COMB0 */
++	{ 0x010D, 0x0007 },	/* shared with COMB0 */
++	{ 0x0114, 0x030C },	/* shared with COMB0 */
++	{ 0x0115, 0x0007 },	/* shared with COMB0 */
++	{ 0x0124, 0x0007 },	/* shared with COMB0 */
++	{ 0x0125, 0x0003 },	/* shared with COMB0 */
++	{ 0x0126, 0x000F },	/* shared with COMB0 */
++	{ 0x0128, 0x0132 },	/* shared with COMB0 */
++	{ 0x40C0, 0x0208 },	/* PCIe only */
++	{ 0x40C2, 0x009C },	/* PCIe only */
++	{ 0x8044, 0x001A },	/* shared with COMB0 */
++	{ 0x8045, 0x0082 },	/* shared with COMB0 */
++	{ 0x804C, 0x001A },	/* shared with COMB0 */
++	{ 0x804D, 0x0082 },	/* shared with COMB0 */
++	{ 0x4123, 0x0A28 },	/* shared with COMB0 */
++};
++
++/* PMA, second block: PLL, equalisation and lane tuning */
++static const struct a733_pcie_pma_write a733_pcie_pma_post[] = {
++	{ 0x0094, 0x0004 },	/* shared with COMB0 */
++	{ 0x00A4, 0x0004 },	/* PCIe only */
++	{ 0x00D4, 0x0004 },	/* shared with COMB0 */
++	{ 0x01A4, 0x0509 },	/* shared with COMB0 */
++	{ 0x01B4, 0x0509 },	/* PCIe only */
++	{ 0x01C4, 0x0509 },	/* shared with COMB0 */
++	{ 0x01A5, 0x0F00 },	/* shared with COMB0 */
++	{ 0x01B5, 0x0F00 },	/* PCIe only */
++	{ 0x01C5, 0x0F00 },	/* shared with COMB0 */
++	{ 0x01A6, 0x0F08 },	/* shared with COMB0 */
++	{ 0x01B6, 0x0F08 },	/* PCIe only */
++	{ 0x01C6, 0x0F08 },	/* shared with COMB0 */
++	{ 0x0090, 0x0180 },	/* shared with COMB0 */
++	{ 0x00A0, 0x0133 },	/* PCIe only */
++	{ 0x00D0, 0x0133 },	/* COMB0 offset, PCIe value */
++	{ 0x0091, 0x9D8A },	/* shared with COMB0 */
++	{ 0x00A1, 0xB13B },	/* PCIe only */
++	{ 0x00D1, 0xB13B },	/* COMB0 offset, PCIe value */
++	{ 0x0092, 0x0002 },	/* shared with COMB0 */
++	{ 0x00A2, 0x0002 },	/* PCIe only */
++	{ 0x00D2, 0x0002 },	/* shared with COMB0 */
++	{ 0x0093, 0x0102 },	/* shared with COMB0 */
++	{ 0x00A3, 0x00CE },	/* PCIe only */
++	{ 0x00D3, 0x00CE },	/* COMB0 offset, PCIe value */
++	{ 0x01A0, 0x0022 },	/* COMB0 offset, PCIe value */
++	{ 0x01B0, 0x0022 },	/* PCIe only */
++	{ 0x01C0, 0x0022 },	/* COMB0 offset, PCIe value */
++	{ 0x0098, 0x0001 },	/* shared with COMB0 */
++	{ 0x00A8, 0x0001 },	/* PCIe only */
++	{ 0x00D8, 0x0001 },	/* COMB0 offset, PCIe value */
++	{ 0x0099, 0x045F },	/* shared with COMB0 */
++	{ 0x00A9, 0x02F0 },	/* PCIe only */
++	{ 0x00D9, 0x0399 },	/* COMB0 offset, PCIe value */
++	{ 0x009A, 0x006B },	/* shared with COMB0 */
++	{ 0x00AA, 0x0068 },	/* PCIe only */
++	{ 0x00DA, 0x0068 },	/* COMB0 offset, PCIe value */
++	{ 0x009B, 0x0004 },	/* shared with COMB0 */
++	{ 0x00AB, 0x0004 },	/* PCIe only */
++	{ 0x00DB, 0x0004 },	/* shared with COMB0 */
++	{ 0x0084, 0x0104 },	/* shared with COMB0 */
++	{ 0x00C4, 0x0104 },	/* shared with COMB0 */
++	{ 0x0085, 0x0005 },	/* shared with COMB0 */
++	{ 0x00C5, 0x0005 },	/* shared with COMB0 */
++	{ 0x0086, 0x0337 },	/* shared with COMB0 */
++	{ 0x00C6, 0x0337 },	/* shared with COMB0 */
++	{ 0x0088, 0x3DBE },	/* COMB0 offset, PCIe value */
++	{ 0x00C8, 0x3DBE },	/* COMB0 offset, PCIe value */
++	{ 0x0082, 0x0003 },	/* shared with COMB0 */
++	{ 0x00C2, 0x0003 },	/* shared with COMB0 */
++	{ 0x009C, 0x0014 },	/* COMB0 offset, PCIe value */
++	{ 0x00DC, 0x0014 },	/* COMB0 offset, PCIe value */
++	{ 0x009E, 0x0192 },	/* COMB0 offset, PCIe value */
++	{ 0x00DE, 0x0192 },	/* COMB0 offset, PCIe value */
++	{ 0x009F, 0x0006 },	/* COMB0 offset, PCIe value */
++	{ 0x00DF, 0x0006 },	/* COMB0 offset, PCIe value */
++	{ 0x81E0, 0x0000 },	/* PCIe only */
++	{ 0x8171, 0x0019 },	/* PCIe only */
++	{ 0x8172, 0x0019 },	/* PCIe only */
++	{ 0x81FF, 0x0001 },	/* COMB0 offset, PCIe value */
++};
++
++/*
++ * Three 32-bit read-modify-writes the vendor does on byte offsets 0x98, 0xa8
++ * and 0xd8 of the PMA window, each clearing [1:0] and setting 0b10.
++ *
++ * ⚠ These are byte offsets on a window every other access treats as 16-bit
++ * words, so one 32-bit access covers two PMA words -- and byte 0x98 is word
++ * index 0x4C, not index 0x98. Reproduced exactly as the vendor issues them,
++ * because that is what the hardware saw in every boot that worked; whether the
++ * intent was the word pair at 0x4C/0x4D or the words at index 0x98 is unsettled.
++ */
++static const u32 a733_pcie_pma_sel_bytes[] = { 0x98, 0xa8, 0xd8 };
++
++static int a733_pcie_phy_init(struct phy *phy)
++{
++	struct a733_pcie_combophy *cp = phy_get_drvdata(phy);
++	u32 val;
++	int ret, i;
++
++	ret = clk_set_rate(cp->serdes_clk, 100000000);
++	if (ret)
++		return dev_err_probe(cp->dev, ret, "serdes clock to 100 MHz\n");
++
++	ret = clk_prepare_enable(cp->serdes_clk);
++	if (ret)
++		return ret;
++
++	ret = clk_prepare_enable(cp->refclk);
++	if (ret)
++		goto err_serdes;
++
++	/* COMB1 carries PCIe, not USB3. Reset value of this field is 0xF. */
++	writel(A733_PCIE_PIPE_TXD_MAP_PCIE0, cp->top2 + A733_PCIE_PIPE_TXD_MAP);
++
++	writel(A733_PCIE_LINK_CTRL1_INIT, cp->link + A733_PCIE_LINK_CTRL1);
++
++	a733_pcie_pma_write_all(cp, a733_pcie_pma_pre,
++				ARRAY_SIZE(a733_pcie_pma_pre));
++
++	/* lane mode 00 = PCIe across the PIPE interface (UM: L00_MODE) */
++	a733_pcie_rmw(cp->link + A733_PCIE_LANE0_CTRL0, A733_PCIE_LANE0_MODE, 0);
++
++	a733_pcie_pma_write_all(cp, a733_pcie_pma_post,
++				ARRAY_SIZE(a733_pcie_pma_post));
++
++	for (i = 0; i < ARRAY_SIZE(a733_pcie_pma_sel_bytes); i++)
++		a733_pcie_rmw(cp->pma + a733_pcie_pma_sel_bytes[i], 0x3, 0x2);
++
++	/* release the PHY, then the lane */
++	a733_pcie_rmw(cp->link + A733_PCIE_LINK_CTRL0, 0, A733_PCIE_LINK_RESET_N);
++	a733_pcie_rmw(cp->link + A733_PCIE_LANE0_CTRL0, 0,
++		      A733_PCIE_LANE0_RESET_N_SW);
++
++	/*
++	 * Wait for the PMA common block. The vendor spins here forever; a PHY
++	 * that never reports ready must fail the probe, not hang the boot. The
++	 * bound is generous on purpose -- the observed time is far below it and
++	 * this is not a place to be clever.
++	 */
++	ret = readl_poll_timeout(cp->link + A733_PCIE_LINK_STUS0, val,
++				 val & A733_PCIE_PMA_CMN_READY, 100, 100000);
++	if (ret) {
++		dev_err(cp->dev, "PMA common block not ready (STUS0 %#x)\n", val);
++		goto err_refclk;
++	}
++
++	/*
++	 * Post-ready fixups, in the vendor's order. The first one is a plain
++	 * constant: the vendor reads the word and computes 0x220 | ~0x2 from it
++	 * before overwriting the result with 0x270 unconditionally, so the read
++	 * and the arithmetic never had an effect and are not reproduced.
++	 */
++	writew(0x0270, cp->pma + 0xa0);
++	writew(readw(cp->pma + 0x98) | BIT(4), cp->pma + 0x98);
++	writew(readw(cp->pma + 0x18000) | BIT(0), cp->pma + 0x18000);
++
++	/* reference clock out to the slot, last, once the PHY is up */
++	a733_pcie_rmw(cp->link + A733_PCIE_LINK_CTRL1, 0,
++		      A733_PCIE_LINK_EN_REFCLK);
++
++	return 0;
++
++err_refclk:
++	clk_disable_unprepare(cp->refclk);
++err_serdes:
++	clk_disable_unprepare(cp->serdes_clk);
++	return ret;
++}
++
++static int a733_pcie_phy_exit(struct phy *phy)
++{
++	struct a733_pcie_combophy *cp = phy_get_drvdata(phy);
++
++	a733_pcie_rmw(cp->link + A733_PCIE_LANE0_CTRL0,
++		      A733_PCIE_LANE0_RESET_N_SW, 0);
++	a733_pcie_rmw(cp->link + A733_PCIE_LINK_CTRL0,
++		      A733_PCIE_LINK_RESET_N, 0);
++	clk_disable_unprepare(cp->refclk);
++	clk_disable_unprepare(cp->serdes_clk);
++
++	return 0;
++}
++
++static const struct phy_ops a733_pcie_phy_ops = {
++	.init	= a733_pcie_phy_init,
++	.exit	= a733_pcie_phy_exit,
++	.owner	= THIS_MODULE,
++};
++
++static int a733_pcie_combophy_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct a733_pcie_combophy *cp;
++	struct phy_provider *provider;
++	struct resource *res;
++	int ret;
++
++	cp = devm_kzalloc(dev, sizeof(*cp), GFP_KERNEL);
++	if (!cp)
++		return -ENOMEM;
++
++	cp->dev = dev;
++
++	cp->link = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(cp->link))
++		return PTR_ERR(cp->link);
++	/*
++	 * devm_ioremap(), not devm_platform_ioremap_resource(): the top-2
++	 * window at 0x06C06000 holds the protocol mux of BOTH combo PHYs, and
++	 * the COMB0 driver already claims it as an exclusive region. Requesting
++	 * it a second time fails with -EBUSY and takes PCIe down whenever USB3
++	 * probed first -- an ordering nobody controls. The AUX/HPD PHY solves
++	 * the same overlap the same way.
++	 */
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
++	if (!res)
++		return -EINVAL;
++	cp->top2 = devm_ioremap(dev, res->start, resource_size(res));
++	if (!cp->top2)
++		return -ENOMEM;
++	cp->pma = devm_platform_ioremap_resource(pdev, 2);
++	if (IS_ERR(cp->pma))
++		return PTR_ERR(cp->pma);
++
++	cp->serdes_clk = devm_clk_get(dev, "serdes");
++	if (IS_ERR(cp->serdes_clk))
++		return dev_err_probe(dev, PTR_ERR(cp->serdes_clk),
++				     "serdes clock\n");
++
++	cp->refclk = devm_clk_get(dev, "refclk");
++	if (IS_ERR(cp->refclk))
++		return dev_err_probe(dev, PTR_ERR(cp->refclk), "refclk gate\n");
++
++	/*
++	 * The SERDES reset is shared with the USB3 side of the subsystem, so it
++	 * is taken as a shared reference and deasserted here; devres balances
++	 * it. Asserting it on exit would take the other half down with us.
++	 */
++	cp->reset = devm_reset_control_get_shared(dev, NULL);
++	if (IS_ERR(cp->reset))
++		return dev_err_probe(dev, PTR_ERR(cp->reset), "serdes reset\n");
++
++	ret = reset_control_deassert(cp->reset);
++	if (ret)
++		return ret;
++
++	cp->phy = devm_phy_create(dev, NULL, &a733_pcie_phy_ops);
++	if (IS_ERR(cp->phy))
++		return dev_err_probe(dev, PTR_ERR(cp->phy), "phy_create\n");
++
++	phy_set_drvdata(cp->phy, cp);
++
++	provider = devm_of_phy_provider_register(dev, of_phy_simple_xlate);
++
++	return PTR_ERR_OR_ZERO(provider);
++}
++
++static const struct of_device_id a733_pcie_combophy_of_match[] = {
++	{ .compatible = "allwinner,sun60i-a733-pcie-combophy" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, a733_pcie_combophy_of_match);
++
++static struct platform_driver a733_pcie_combophy_driver = {
++	.probe	= a733_pcie_combophy_probe,
++	.driver	= {
++		.name		= "sun60i-a733-pcie-combophy",
++		.of_match_table	= a733_pcie_combophy_of_match,
++	},
++};
++module_platform_driver(a733_pcie_combophy_driver);
++
++MODULE_DESCRIPTION("Allwinner A733 COMB1 combo-PHY, PCIe personality");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/phy/allwinner/Kconfig b/drivers/phy/allwinner/Kconfig
+--- a/drivers/phy/allwinner/Kconfig
++++ b/drivers/phy/allwinner/Kconfig
+@@ -73,6 +73,23 @@
+ 	  A733 (sun60iw2) in USB3.1 SuperSpeed mode. DP-alt and PCIe modes of
+ 	  the same PHY are not handled by this driver.
+ 
++config PHY_SUN60I_A733_PCIE_COMBO
++	tristate "Allwinner A733 SERDES combo-PHY (COMB1, PCIe) driver"
++	depends on ARCH_SUNXI || COMPILE_TEST
++	depends on HAS_IOMEM && OF
++	depends on RESET_CONTROLLER
++	select GENERIC_PHY
++	help
++	  Enable this to bring up the COMB1 SERDES combo-PHY on the Allwinner
++	  A733 (sun60iw2) in PCIe mode. COMB1 carries either PCIe or a second
++	  USB3.1 SuperSpeed link; which one is a board property, selected by a
++	  protocol mux this driver writes. Say Y if the board routes PCIe out
++	  of COMB1 -- on the Cubie A7S that is the FPC connector J3.
++
++	  This is a separate driver from PHY_SUN60I_A733_COMBO, which drives
++	  COMB0 (USB3 and DisplayPort). The two PHYs share a subsystem and a
++	  reset, nothing else.
++
+ config PHY_SUN60I_A733_USB2
+ 	tristate "Allwinner A733 USB2 companion PHY (USB3 DRD)"
+ 	depends on ARCH_SUNXI || COMPILE_TEST
+diff --git a/drivers/phy/allwinner/Makefile b/drivers/phy/allwinner/Makefile
+--- a/drivers/phy/allwinner/Makefile
++++ b/drivers/phy/allwinner/Makefile
+@@ -4,5 +4,6 @@
+ obj-$(CONFIG_PHY_SUN9I_USB)		+= phy-sun9i-usb.o
+ obj-$(CONFIG_PHY_SUN50I_USB3)		+= phy-sun50i-usb3.o
+ obj-$(CONFIG_PHY_SUN60I_A733_COMBO)	+= phy-sun60i-a733-combophy.o
++obj-$(CONFIG_PHY_SUN60I_A733_PCIE_COMBO)	+= phy-sun60i-a733-pcie-combophy.o
+ obj-$(CONFIG_PHY_SUN60I_A733_USB2)	+= phy-sun60i-a733-usb2.o
+ obj-$(CONFIG_PHY_SUN60I_A733_AUX_HPD)	+= phy-sun60i-a733-aux-hpd.o

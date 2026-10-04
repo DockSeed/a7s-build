@@ -1,0 +1,12 @@
+# AIC8800D80 firmware, from radxa-pkg/aic8800 tag 5.0+git20260123.5f7be68d-8,
+# subtree src/USB/driver_fw/fw/aic8800D80/. Hashes taken by us, not from the
+# vendor manifest. In this tag the MD5 sums in src/firmware_version.md do match
+# the six files it lists; aic_userconfig_8800d80.txt is still not listed (see
+# README.md).
+a526cbd02fcdc495f049f3ad6b5933cb08cd984b16790c716a060d582fee1a56  fw_adid_8800d80_u02.bin
+f0e2f5bbc17bc327ca7f1574ff55370dfd863d931514347bb4abc18a74f6218f  fw_patch_8800d80_u02.bin
+ca738f5ea5aca6021c4f48b60ff35e835dfdaf072a8490e3ba8ba0a42440e3e5  fw_patch_8800d80_u02_ext0.bin
+9decb77435b7e9713e33e32da483d683b7329ed93b672b2d1b134031d7da5f67  fw_patch_table_8800d80_u02.bin
+23f2bed2ac0e8f7bda8f36df7defd30d9b928c97867f6f0f01f28d89dd78d670  fmacfw_8800d80_u02.bin
+c5c8c774dfae93aed71f8da7489e35159192135e4929591ea8a945b76deba6bd  fmacfw_8800d80_h_u02.bin
+56c039d10af63c888b18890f508968a143f034de279fd2c4ec7ee65133e3dbdb  aic_userconfig_8800d80.txt

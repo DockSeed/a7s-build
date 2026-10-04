@@ -1,0 +1,433 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: a733: add the thermal sensor, five zones, and CPU throttling
+
+Wires the THS the previous patches enable, and gives the board actual thermal
+protection rather than a readable number.
+
+The node: base and size from the memory map of the A733 user manual (UM V0.92),
+IRQ INTID 71 = GIC SPI 39 (UM interrupt list); the two
+clocks and the reset from `clk-sunxi-ng-a733-add-ths-and-gpadc-clocks`. No nvmem-cells and no allwinner,sram, for the
+reasons `thermal-sun8i-add-a733-support` records.
+
+Every sensor the part has gets a zone. A server image that watches one corner
+of the die and not the others is not protection, and the four non-CPU sensors
+cost nothing to read.
+
+The two CPU sensor indices are measured, and they contradict the UM. This is the
+only value in this patch whose source is silicon alone, and it was the only one
+that went in unquestioned -- because it was, for once, documented.
+
+The UM states the mapping outright (A733 user manual, 7.1.1): the die has five
+thermal sensors, sensor0 in the CPUB, sensor1 in the DDR, sensor2 in the NPU,
+sensor3 in the CPUL and sensor4 in the GPU.
+The datasheet says only that
+five sensors exist and where (datasheet V0.92 and V0.93, "A76 core, A56 core, GPU,
+NPU and DDR"), without indices. The UM's own environment diagram
+draws both CPU sensors as one block, "Tsensor0、3", and so cannot arbitrate. Every
+earlier revision of this patch and of `thermal-sun8i-add-a733-support`'s chip comment
+took that sentence at face value.
+
+A per-cluster stimulus refutes it for the two CPU entries. On the 8 GiB board, 2026-08-15,
+test image, phases idle 120 s / A76-only 900 s / settle 180 s / A55-only
+300 s: loading only cpu6+cpu7 raised ths 3 by +34.1 K against ths 0 +30.9 K;
+loading only cpu0..cpu5 reversed it, ths 0 +15.6 K against ths 3 +14.2 K. The
+ordering flips with the stimulus. Because each pair is a comparison between two
+sensors inside one run, no baseline error, ambient drift, differing run length or
+differing absolute power can produce the reversal -- only proximity to the heat
+source can. ths 3 sits at the A76 and ths 0 at the A55, the other way round from
+the UM. Re-reducing the same series over end-of-phase means rather than the
+recorded window shifts each absolute rise by 1-2 K and leaves the gaps at 3.0 K
+and 1.3 K, so the flip is a property of the data and not of the reduction.
+
+It had already been measured once, and dismissed. On 2026-08-14 the same
+stimulus ran for 120 s per cluster
+and produced the same reversal: under A55-only THS0 60.82 C against THS3 58.96 C
+(THS3-THS0 = -1.86 K), under A76-only THS0 74.81 C against THS3 78.17 C
+(THS3-THS0 = +3.36 K), with the two sensors within 0.9 K of each other at every
+idle point in between (+0.06, +0.87, +0.00 K). That is a 5.2 K stimulus-driven
+swing in the difference, on a different day, a different image and a different
+run length than the 08-15 series -- an independent replication, not a re-reading
+of the same data.
+
+It was set aside as inconclusive because the separations "1.9 K and 3.4 K" were
+judged to be "inside the sensors' own +-3 C error band".
+That reasoning does not hold, and it
+is worth writing down because it is an easy mistake to repeat. The +-3 C figure
+(UM 7.1.2) is an ABSOLUTE accuracy bound: how far one sensor's
+reported temperature may sit from the true temperature. The measurement here is a
+DIFFERENCE between two sensors compared across two stimuli, so any fixed
+per-sensor offset -- which is exactly what an accuracy bound describes -- cancels
+identically. An accuracy band cannot manufacture a sign reversal that tracks
+which cluster is loaded, and the idle points show the pair returning to within
+0.9 K each time. The one thing the +-3 C rating does bear on, absolute die
+temperature, is not what this claim rests on.
+
+So the sensors are swapped and the cooling maps are left alone: cpub-thermal
+takes <&ths 3>, cpul-thermal takes <&ths 0>, and each zone keeps the cluster its
+name promises. Swapping the cooling devices instead would have produced exactly
+the same throttling behaviour while leaving a zone called "cpub" reporting the
+little cluster's temperature -- correct behaviour resting on a false name, and
+the version that a later reader, or a glance at the vendor DT, "fixes" back.
+
+What the crossed mapping cost, and why it passed its own HW proof: under an
+all-core load it is invisible. Both sensors rise together, both zones cross their
+trip, both clusters throttle, and every acceptance run in this tree is an all-core
+run -- this patch's own proof included. It bites only on a single-cluster load, where
+the A76's sensor drove the A55's cpufreq policy and vice versa: the governor
+throttled the cores that were not producing the heat and left the cores that were
+at full clock. The lesson is the test, not the value: a sensor-to-block mapping is
+only exercised by a stimulus that can tell the zones apart.
+
+⚠ UNPROVEN, and deliberately not claimed here: why the UM disagrees. The stimulus
+establishes which sensor is near which cluster; it cannot say whether Allwinner
+transposed the sensors, the block names, or only that table. Nor is the shared
+scale's absolute accuracy involved -- the argument is differential and survives
+any common offset. The UM sentence is only flagged here, not rewritten:
+the measurements settle which index this DT uses, not what Allwinner
+got wrong.
+
+Throttling is wired for both clusters and it is the only cooling this tree can
+offer today. cpufreq-dt owns the CPU-little and CPU-big policies (`arm64-dts-a733-cpu-clocks-from-cpu-ccu` and `arm64-dts-a733-cpu-opp-tables-and-supply`), so
+#cooling-cells goes on cpu@0 and cpu@600 -- the two policy owners, for the same
+reason cpu-supply sits only there -- and each CPU zone maps its passive trip
+onto its own cluster. DDR, NPU and GPU have no devfreq in this tree, so they
+carry a critical trip and no cooling map: an emergency shutdown is real
+protection, while an unwired passive trip would only look like it.
+
+Trip temperatures now rest on the datasheet and on measurement, where an
+earlier revision of this patch had to guess. Two things changed on 2026-08-14.
+
+The limit is sourced. A733 Datasheet ch. 6 Table 6-2 gives a recommended
+operating junction temperature of 115 C and an absolute maximum of 125 C, and
+5.1.3 defines them apart: the first is continuous operation over the designed
+lifetime, the second is where damage occurs. Identical in V0.92 and V0.93, whose
+thermal chapters were diffed line by line. Design against 115, never 125.
+
+The scale is no longer provisional in the way this patch used to claim. `thermal-sun8i-add-a733-support`'s
+two-segment mapping was compared against the vendor driver's own input/output
+relation -- its THS_DATA register paired with the temperature it reports for the
+same sensor -- on three kernels including the untouched stock vendor ROM. The
+relation recovered from that data by regression is slope -62.000 mC/LSB at
+intercept 174964 below the breakpoint and -59.000 at 167265 above it: `thermal-sun8i-add-a733-support`'s own
+two lines and its own knee, to the millidegree, 393/420 and 298/313 samples
+exact. So the 4.6 C disagreement between the segments is the vendor's fit, not an
+artefact of ours, and reproducing it is the correct behaviour rather than a
+liability. What remains unproven is the absolute accuracy of that shared scale,
+for which a traceable thermometer would be needed.
+
+That leaves the sensor's own rating as the margin to carry: +-3 C from 60 to
+125 C. Critical therefore moves 95 -> 110 C, matching what Allwinner ships and
+what our own 6.6 track runs, and a reading of 110 C means at most 113 C true --
+still under the 115 C the datasheet allows continuously.
+
+Passive moves 80 -> 90 C, chosen fanless-first on purpose. Assume no board
+running this kernel has a fan -- most will not -- and pick the value that is
+right for that case. A fan then only keeps the part further away from the trip;
+it is a bonus, not a precondition, and no trip needs to be re-tuned when one
+exists.
+
+80 C was not unsafe, it was leaving performance on the table for no gain. Measured
+on the board with passive at 80 C: it settles at 82-83 C with the cooling states
+at 4 of 10 and 3 of 13, i.e. cpu0 held to 1404 MHz and cpu6 to 1794 MHz. At 90 C
+it settles near 92-93 C and gives those steps back, still 23 C inside the
+datasheet's 115 C continuous limit, with the sensor's own +-3 C inside that
+margin.
+
+⚠ Read those clock numbers with their condition attached: the boards here have
+their fans wired straight to +5 V and ground, bypassing the PWM connector, so a
+fan was running at full speed throughout that measurement. The settling
+temperature is set by the trip and is unaffected -- step_wise holds the die a few
+degrees above it either way -- but the FREQUENCIES are the best case. A board with
+no airflow at all reaches the same 82-83 C with more throttling and lower clocks.
+The trip choice does not change; the performance it buys does, and nobody should
+quote 1404/1794 MHz as a fanless figure. A genuinely fanless number has not been
+measured, because no board here is genuinely fanless.
+
+Verified in the decompiled dtb: five zones, #cooling-cells = 2 on both policy
+CPUs, and the two cooling-device phandles resolving to cpu@0 and cpu@600.
+
+HW proof pending: zones appear under /sys/class/thermal with plausible idle
+readings, and under an eight-core load the temperature rises and
+cooling_device*/cur_state leaves 0.
+
+The two CPU zones carry labels (`cpul_thermal:`, `cpub_thermal:`) even though
+nothing in this patch references them. That is deliberate: a board that adds an
+active stage has to reach these zones with `&cpub_thermal { ... }`, and the label
+belongs to the patch that defines the node rather than to whichever patch happens
+to need it first. Without that, the board fan patch had to add the labels itself,
+which silently made the idle-injection patch depend on the fan patch -- two
+changes with nothing to do with each other, coupled through one context line, and
+the coupling only showed up when the fan patch was held back for lacking hardware
+proof.
+
+Assisted-by: Claude
+---
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -21,6 +21,7 @@
+ #include <dt-bindings/clock/sun60i-a733-rtc-ccu.h>
+ #include <dt-bindings/clock/sun60i-a733-serdes-ccu.h>
+ #include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/thermal/thermal.h>
+ #include <dt-bindings/reset/sun60i-a733-ccu.h>
+ #include <dt-bindings/reset/sun60i-a733-r-ccu.h>
+ #include <dt-bindings/reset/sun60i-a733-serdes-ccu.h>
+@@ -1441,6 +1442,43 @@
+ 		 * unstable this is the first knob to turn.
+ 		 *
+ 		 */
++		/*
++		 * Thermal sensor controller. Base and size from the memory map of the A733 user manual
++		 * (UM V0.92); IRQ INTID 71 = GIC SPI 39 from
++		 * the interrupt list of the A733 user manual.
++		 *
++		 * Five sensors. The UM (7.1.1) assigns them
++		 * 0 = CPUB, 1 = DDR, 2 = NPU, 3 = CPUL, 4 = GPU. Three of those five
++		 * are used as written. The TWO CPU ENTRIES ARE MEASURED THE OTHER WAY
++		 * ROUND and this DT follows the measurement, not the UM: ths 0 is at
++		 * the A55 and ths 3 at the A76. Stimulus, deltas, and why the reversal
++		 * cannot be an artefact: the thermal-zones comment at the end of this
++		 * file.
++		 * Do not "restore" these two indices from the UM or from a vendor DT.
++		 *
++		 * Two clocks. "bus" is the THS0 gate; "mod" is the 24 MHz conversion
++		 * clock, whose CCU reset default is OFF -- without it the ADC has no
++		 * clock at all and the driver's 2 us / 20 us timing constants are
++		 * meaningless. It must be the 24 MHz SYS_CLK24M net, never the 26 MHz
++		 * DCXO.
++		 *
++		 * No nvmem-cells: the driver does not implement the fuse-to-CDATA
++		 * transform (known from the vendor driver, not from the UM; see
++		 * `thermal-sun8i-add-a733-support`), and shipping on the 0x800 reset default costs
++		 * -0.74..+0.43 C measured across five sensors on two dies -- well
++		 * inside the part's own +-3 C.
++		 * No allwinner,sram either; that is an H616 erratum, not this part.
++		 */
++		ths: thermal-sensor@2522000 {
++			compatible = "allwinner,sun60i-a733-ths";
++			reg = <0x0 0x02522000 0x0 0x400>;
++			interrupts = <GIC_SPI 39 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&ccu CLK_BUS_THS>, <&ccu CLK_GPADC0_24M>;
++			clock-names = "bus", "mod";
++			resets = <&ccu RST_BUS_THS>;
++			#thermal-sensor-cells = <1>;
++		};
++
+ 		gmac0: ethernet@4500000 {
+ 			compatible = "allwinner,sun60iw2-gmac200",
+ 				     "snps,dwmac-5.30a";
+@@ -2336,3 +2374,214 @@
+ &cpu7 {
+ 	operating-points-v2 = <&cluster1_opp>;
+ };
++
++
++/*
++ * Thermal zones. Every sensor the part has gets one, because a server image
++ * that watches one corner of the die and not the others is not protection.
++ *
++ * ⚠ THE TWO CPU SENSOR INDICES ARE MEASURED, AND THEY CONTRADICT THE UM. This
++ * is the one value in this patch whose only source is silicon, so it is spelled
++ * out here in full rather than cited.
++ *
++ * The UM is not silent here -- it is wrong here, which is worse, because a
++ * documented value does not get questioned. UM 7.1.1 states that the die
++ * carries five thermal sensors: sensor0 in the CPUB, sensor1 in the DDR,
++ * sensor2 in the NPU, sensor3 in the CPUL, sensor4 in the GPU. Its own
++ * environment diagram
++ * draws both CPU sensors as a
++ * single block, "Tsensor0、3", so it distinguishes nothing and cannot correct
++ * the sentence. Taken at face value that sentence put <&ths 0> on cpub-thermal
++ * and <&ths 3> on cpul-thermal.
++ *
++ * A per-cluster stimulus on the 8 GiB board, 2026-08-15, reverses it. Load ONLY cpu6+cpu7
++ * (A76) for 900 s: ths 3 rises +34.1 K, ths 0 +30.9 K. Then load ONLY cpu0..5
++ * (A55) for 300 s: ths 0 rises +15.6 K, ths 3 +14.2 K. The ordering flips with
++ * the stimulus. That is a comparison of two sensors inside one run, so no
++ * baseline error, ambient drift, run length or absolute power level can produce
++ * the reversal -- only proximity to the heat source can. ths 3 is therefore at
++ * the A76 and ths 0 at the A55. Re-reducing the same series over end-of-phase
++ * means instead of the recorded window moves each absolute rise by 1-2 K and
++ * leaves the gaps at 3.0 K and 1.3 K: the flip is in the data, not in how it was
++ * reduced.
++ *
++ * Replicated, and previously dismissed. The same stimulus on 2026-08-14
++ * (120 s per cluster, different
++ * image) gave the same reversal: THS3-THS0 = -1.86 K under A55-only and
++ * +3.36 K under A76-only, with the pair inside 0.9 K at every idle point
++ * between them -- a 5.2 K stimulus-driven swing in the difference. It was set
++ * aside as "inside the sensors' own +-3 C error band".
++ * That does not follow: +-3 C
++ * (UM 7.1.2) is an ABSOLUTE accuracy bound on one sensor
++ * against true temperature, and this is a DIFFERENCE between two sensors
++ * across two stimuli, in which any fixed per-sensor offset cancels. An
++ * accuracy band cannot produce a sign reversal that tracks which cluster is
++ * loaded.
++ *
++ * The fix swaps the SENSORS, not the cooling maps, so each zone keeps the
++ * cluster its name promises and cpub-thermal reads the sensor at the big
++ * cluster. Swapping the cooling devices instead would have produced identical
++ * throttling while leaving a zone called "cpub" reporting the little cluster --
++ * correct behaviour standing on a false name, which is the version a later
++ * reader "fixes" back.
++ *
++ * Why the crossed version survived its own HW proof, stated because it is the
++ * reusable lesson: under an all-core load it is INVISIBLE. Both sensors rise
++ * together, both zones cross their trip, both clusters throttle, and every
++ * acceptance run this tree has done is an all-core run. It bites only on a
++ * single-cluster load, where the A76's sensor drove the A55's cpufreq policy and
++ * vice versa -- the governor throttled cores that were not producing the heat
++ * and left the cores that were at full clock. A thermal mapping is only tested
++ * by a stimulus that can tell the two zones apart.
++ *
++ * ⚠ UNPROVEN, and deliberately not claimed: WHY the UM disagrees. The stimulus
++ * establishes which sensor sits near which cluster; it cannot say whether
++ * Allwinner transposed the sensors, the block names, or only that table. The UM
++ * sentence is only flagged here, not rewritten: the measurements settle
++ * which index this DT uses, not what Allwinner got wrong.
++ *
++ *
++ * ⚠ Trip temperatures come from the datasheet, not from a guess. A733 Datasheet
++ * Table 6-2: recommended operating junction temperature 115 C, absolute maximum
++ * 125 C; 5.1.3 defines the first as continuous operation over the designed
++ * lifetime and the second as the damage threshold. Design against 115.
++ * Critical 110 C leaves the sensor's own +-3 C rating inside that limit -- a
++ * reading of 110 is at most 113 true -- and is what both Allwinner and our 6.6
++ * track ship.
++ *
++ * Passive 90 C is chosen fanless-first: assume no board running this kernel has
++ * a fan, because most will not. Measured at 80 C the part settles at 82-83 C with
++ * cpu0 throttled to 1404 MHz and cpu6 to 1794 MHz; at 90 C it settles near
++ * 92-93 C and gives those steps back, still 23 C inside the datasheet's 115 C
++ * continuous limit. ⚠ Those clock figures were taken with a fan running flat out
++ * -- the boards here have theirs wired directly to +5 V, bypassing PWM -- so they
++ * are the best case. The settling temperature is set by the trip and does not
++ * change; a board with no airflow reaches it with more throttling. The vendor's 60 C works only because a fan
++ * runs from a 60 C active trip -- without one, step_wise parks at the bottom OPP
++ * (416 MHz on their table, 247 MHz on ours), which is a misconfiguration rather
++ * than caution.
++ *
++ * The scale itself was checked rather than trusted: `thermal-sun8i-add-a733-support`'s two segments were
++ * measured against the vendor driver's own register-to-reported-temperature
++ * relation on three kernels, including an untouched stock vendor ROM, and match
++ * it to the millidegree on both segments. The 4.6 C step between the segments is
++ * the vendor's, and reproducing it is correct. Absolute accuracy of that shared
++ * scale is still unproven and needs a traceable thermometer.
++ *
++ * ⚠ Throttling is still the only actuator between here and the critical trip.
++ * The 6.6 track has a second stage, idle injection at 100 C, and this tree gains
++ * it in `arm64-dts-a733-idle-injection-cooling`. Until that lands, the 20 C between 90 and 110 has nothing in it.
++ *
++ * Throttling is wired for both clusters and is the only cooling this tree can
++ * offer today: cpufreq-dt owns the CPU-big and CPU-little policies (`arm64-dts-a733-cpu-clocks-from-cpu-ccu` and `arm64-dts-a733-cpu-opp-tables-and-supply`),
++ * and there is no devfreq for DDR, NPU or GPU. Those three therefore carry a
++ * critical trip and no cooling map -- an emergency shutdown is real protection,
++ * an unwired passive trip would only look like it.
++ */
++&cpu0 {
++	#cooling-cells = <2>;
++};
++
++&cpu6 {
++	#cooling-cells = <2>;
++};
++
++/ {
++	thermal-zones {
++		cpul_thermal: cpul-thermal {
++			polling-delay-passive = <500>;
++			polling-delay = <1000>;
++			/* ths 0 = A55, measured; the UM says 3. See above. */
++			thermal-sensors = <&ths 0>;
++
++			trips {
++				cpul_passive: cpul-trip-0 {
++					temperature = <90000>;
++					type = "passive";
++					hysteresis = <2000>;
++				};
++				cpul_critical: cpul-trip-1 {
++					temperature = <110000>;
++					type = "critical";
++					hysteresis = <0>;
++				};
++			};
++
++			cooling-maps {
++				map0 {
++					trip = <&cpul_passive>;
++					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
++				};
++			};
++		};
++
++		cpub_thermal: cpub-thermal {
++			polling-delay-passive = <500>;
++			polling-delay = <1000>;
++			/* ths 3 = A76, measured; the UM says 0. See above. */
++			thermal-sensors = <&ths 3>;
++
++			trips {
++				cpub_passive: cpub-trip-0 {
++					temperature = <90000>;
++					type = "passive";
++					hysteresis = <2000>;
++				};
++				cpub_critical: cpub-trip-1 {
++					temperature = <110000>;
++					type = "critical";
++					hysteresis = <0>;
++				};
++			};
++
++			cooling-maps {
++				map0 {
++					trip = <&cpub_passive>;
++					cooling-device = <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
++				};
++			};
++		};
++
++		ddr-thermal {
++			polling-delay-passive = <500>;
++			polling-delay = <1000>;
++			thermal-sensors = <&ths 1>;
++
++			trips {
++				ddr_critical: ddr-trip-0 {
++					temperature = <110000>;
++					type = "critical";
++					hysteresis = <0>;
++				};
++			};
++		};
++
++		npu-thermal {
++			polling-delay-passive = <500>;
++			polling-delay = <1000>;
++			thermal-sensors = <&ths 2>;
++
++			trips {
++				npu_critical: npu-trip-0 {
++					temperature = <110000>;
++					type = "critical";
++					hysteresis = <0>;
++				};
++			};
++		};
++
++		gpu-thermal {
++			polling-delay-passive = <500>;
++			polling-delay = <1000>;
++			thermal-sensors = <&ths 4>;
++
++			trips {
++				gpu_critical: gpu-trip-0 {
++					temperature = <110000>;
++					type = "critical";
++					hysteresis = <0>;
++				};
++			};
++		};
++	};
++};

@@ -1,0 +1,60 @@
+From 65b21a7d4de48f5fede3c78495b4fdf61762005e Mon Sep 17 00:00:00 2001
+From: "Russell King (Oracle)" <rmk+kernel@armlinux.org.uk>
+Date: Thu, 8 Jan 2026 17:36:14 +0000
+Subject: net: stmmac: dwmac4: fix RX FIFO fill statistics
+
+[ Upstream commit 65b21a7d4de48f5fede3c78495b4fdf61762005e ]
+
+In dwmac4_debug(), the wrong shift is used with the RXFSTS mask:
+
+ #define MTL_DEBUG_RXFSTS_MASK          GENMASK(5, 4)
+ #define MTL_DEBUG_RXFSTS_SHIFT         4
+ #define MTL_DEBUG_RRCSTS_SHIFT         1
+
+                       u32 rxfsts = (value & MTL_DEBUG_RXFSTS_MASK)
+                                    >> MTL_DEBUG_RRCSTS_SHIFT;
+
+where rxfsts is tested against small integers 1 .. 3. This results in
+the tests always failing, causing the "mtl_rx_fifo__fill_level_empty"
+statistic counter to always be incremented no matter what the fill
+level actually is.
+
+Fix this by using FIELD_GET() and remove the unnecessary
+MTL_DEBUG_RXFSTS_SHIFT definition as FIELD_GET() will shift according
+to the least siginificant set bit in the supplied field mask.
+
+Reviewed-by: Maxime Chevallier <maxime.chevallier@bootlin.com>
+Signed-off-by: Russell King (Oracle) <rmk+kernel@armlinux.org.uk>
+Link: https://patch.msgid.link/E1vdtvi-00000002GtP-1Os1@rmk-PC.armlinux.org.uk
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+[ adapted: not picked up by 6.18.y (no Fixes:, no Cc: stable). The 6.18
+  dwmac4.h still holds the MTL debug defines twice; upstream dropped the
+  second copy in 1fd3b573713a ("net: stmmac: dwmac4: remove duplicated
+  definitions"), which is not carried here. The header hunk removes
+  MTL_DEBUG_RXFSTS_SHIFT from the first copy, as upstream does; the
+  second copy's define stays, unused. The dwmac4_core.c hunk is
+  unchanged; only hunk positions differ. ]
+Assisted-by: Claude
+---
+--- a/drivers/net/ethernet/stmicro/stmmac/dwmac4.h
++++ b/drivers/net/ethernet/stmicro/stmmac/dwmac4.h
+@@ -446,7 +446,6 @@
+ 
+ /* MAC debug: GMII or MII Transmit Protocol Engine Status */
+ #define MTL_DEBUG_RXFSTS_MASK		GENMASK(5, 4)
+-#define MTL_DEBUG_RXFSTS_SHIFT		4
+ #define MTL_DEBUG_RXFSTS_EMPTY		0
+ #define MTL_DEBUG_RXFSTS_BT		1
+ #define MTL_DEBUG_RXFSTS_AT		2
+--- a/drivers/net/ethernet/stmicro/stmmac/dwmac4_core.c
++++ b/drivers/net/ethernet/stmicro/stmmac/dwmac4_core.c
+@@ -710,8 +710,7 @@
+ 		value = readl(ioaddr + MTL_CHAN_RX_DEBUG(dwmac4_addrs, queue));
+ 
+ 		if (value & MTL_DEBUG_RXFSTS_MASK) {
+-			u32 rxfsts = (value & MTL_DEBUG_RXFSTS_MASK)
+-				     >> MTL_DEBUG_RRCSTS_SHIFT;
++			u32 rxfsts = FIELD_GET(MTL_DEBUG_RXFSTS_MASK, value);
+ 
+ 			if (rxfsts == MTL_DEBUG_RXFSTS_FULL)
+ 				x->mtl_rx_fifo_fill_level_full++;

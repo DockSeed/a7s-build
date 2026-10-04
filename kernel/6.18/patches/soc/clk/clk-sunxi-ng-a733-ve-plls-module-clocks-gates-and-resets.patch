@@ -1,0 +1,820 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] clk: sunxi-ng: a733: the video engine's PLLs, module clocks, gates and resets
+
+[Recipe cut: pll-ve0 and pll-ve1 are NOT CLK_IS_CRITICAL here: the flag only
+serves the vendor video-engine driver, which this recipe does not carry, so
+without it the VCOs stay in the state the boot chain leaves them in (see the
+comment in the diff).]
+
+The video engine is the last big block with nothing in our CCU. PLL_VE0,
+PLL_VE1, VE_ENC0_CLK, VE_DEC_CLK, VE_BGR and the engines' six bus-matrix bits
+keep whatever the boot chain left, and no consumer can claim them. This patch
+adds fourteen clocks and two resets for the two engines -- a decoder and an
+encoder, each with its own PLL -- and repoints NPU_CLK's two VE mux slots at
+the new PLL taps. Nothing in the tree references the new ids until the device
+tree in `arm64-dts-a733-ve-decoder-and-encoder-nodes` does.
+
+It is step 1 of 3 of the vendor video-engine path: the SoC glue. The driver is
+the vendor's cedar_ve (`soc-sunxi-cedar-ve-carry-the-vendor-video-engine-interface`),
+the userspace part is Allwinner's closed-source one.
+
+WHERE THE VALUES COME FROM
+------------------------------------------------------------------------------
+The CCU field tables of the A733 user manual (UM v0.92 4.1.6), every field
+re-read in the UM text, and every register again in UM V1.00 section 4.1 --
+same fields, same defaults. CCU base 0x02002000.
+
+  PLL_VE0_CTRL_REG    0x0220  reset 0x4030_5A00
+  PLL_VE1_CTRL_REG    0x0240  reset 0x4020_5600
+    31 PLL_EN  30 PLL_LDO_EN (reset 1)  29 LOCK_ENABLE (reset 0)  28 LOCK (R)
+    27 PLL_OUTPUT_GATE  22:20 PLL_OUTPUT_DIV, P0 = field + 1
+    15:8 PLL_N, N = field + 1, lower bound 11 on the field  1 PLL_INPUT_DIV, M1
+    VE0PLL = InputFreq*N/M1/P0; with a 26 MHz DCXO the register descriptions give
+    546 MHz (VE0PLL) and 696 MHz (VE1PLL) as defaults
+  Table 4-2, both rows: Fvco 1.26G~2.52G, 1/2, typical 1.872G, P0 1~8, lock
+    0.1 ms, reference 24MHz
+  Table 4-3: VE0 24 / N 91 / 2184 / 546, VE1 24 / N 87 / 2088 / 696
+  Figure 4-2: PLL_VE0 and PLL_VE1 feed "VE_DEC, VE_ENC0, NPU"
+  VE_ENC0_CLK_REG     0x0A80  31 gate, 26:24 mux (000 VE0PLL, 001 VE1PLL, ...),
+                              4:0 M
+  VE_DEC_CLK_REG      0x0A88  the same, but 000 VE1PLL, 001 VE0PLL
+  VE_BGR_REG          0x0A8C  18 VE_DEC_RST, 16 VE_ENC0_RST, 2 VE_DEC_GATING,
+                              0 VE_ENC0_GATING
+  AHB_MAT_CLK_GATING  0x05C0  1 VE_ENC_AHB, 0 VE_DEC_AHB, reset 1
+  MBUS_MAT_CLK_GATING 0x05E0  14 VE_DEC_MBUS, 12 VE_ENC0_MBUS, reset 1
+  MBUS_GATE_EN        0x05E4  18 VE_DEC_MCLK_EN, 1 VE_ENC0_MCLK_EN, reset 0
+
+The parent is pll-ref, 24.000000 MHz (the 26 MHz DCXO x 96 / 104, `arm64-dts-a733-model-the-26mhz-dcxo` and
+`clk-sunxi-ng-a733-feed-pll-ref-from-the-dcxo`). Table 4-2 gives 24MHz as the reference for both PLLs, and the
+register's own note is arithmetic that only 24 satisfies: 24 x 91 / 4 = 546,
+where 26 would give 591.5. So for the factors the board is found in, this
+model computes 546 MHz (VE0PLL) and 696 MHz (VE1PLL) from the UM and pll-ref;
+the vendor's clk debugfs prints the same 546, and that agreement is not the
+source.
+
+SILICON WITNESS
+------------------------------------------------------------------------------
+Measured: the 8 GiB board, vendor kernel
+6.6.98-4-aw2511, an engine requested through cedar_ve (IOCTL_ENGINE_REQ),
+read via /dev/mem, released, nothing written:
+
+  register        idle        decoder req.  encoder req.
+  PLL_VE0_CTRL    0x01305a00  0xf9305a00    as idle
+  PLL_VE1_CTRL    0x01205600  as idle       0xf9205600
+  AHB_MAT         0x11010390  0x11010391    0x11010392
+  MBUS_MAT        0xf0010003  0xf0014003    0xf0011003
+  MBUS_GATE_EN    0x00000805  0x00040805    0x00000807
+  VE_ENC0_CLK     0x01000000  as idle       0x81000000
+  VE_DEC_CLK      0x01000000  0x81000000    as idle
+  VE_BGR          0x00000000  0x00040004    0x00010001
+  VEPLL_GATE_EN   0x00030000  0x00030000    0x00030000
+
+Every bit this patch models moves exactly with its engine and nothing else in
+those registers does: the bit map above is witnessed, and each PLL has one
+consumer. Our own kernel, without this patch, on the same board: PLL_VE0
+0x41305a00, PLL_VE1 0x41205600, AHB_MAT 0x110103bf, MBUS_MAT 0xf1015803,
+MBUS_GATE_EN 0x00000804, both module clocks 0, VEPLL_GATE_EN 0x00030003.
+
+DECISIONS, each argued at its site in the code
+------------------------------------------------------------------------------
+  - PLL_VE0/PLL_VE1 are a ccu_nm VCO plus a P0 tap each (as PLL_NPU and
+    PLL_GPU0), parent pll-ref, VCO window 1272-2520 MHz (`clk-sunxi-ng-a733-npu-pll-module-clock-and-resets`'s floor).
+  - The two VCOs are CLK_IS_CRITICAL. Mainline's ccu_nm_enable() does not do
+    UM Method 2 (lock before output gate); the vendor driver toggles every VE
+    clock per engine request and per rate change, and `clk-sunxi-ng-a733-pll-gpu0-must-be-running-before-the-gpu-binds` measured what a
+    PLL transition under a clocked block does on this SoC. The VCOs run
+    locked from registration on; the taps follow the consumer. Cost: two
+    VCOs running while the engines sleep.
+  - The module clocks carry CLK_SET_RATE_PARENT | CLK_SET_RATE_NO_REPARENT |
+    CLK_SET_RATE_GATE: a rate moves the whole chain, never the mux, and only
+    while the engine's clock is unprepared.
+  - The module clocks are capped at 624 MHz (.common.max_rate, applied by
+    ccu_common with clk_hw_set_rate_range()). VDD-VE is DCDC2 at 800 mV,
+    shared with the DRAM; the vendor's VF table pairs every bin with 624 MHz
+    at 800 mV; Table 4-2's typical VCO 1.872G is 3 x 624. The vendor enforces
+    none of it -- see below.
+  - The eight bus gates carry flags 0: the vendor driver names all four per
+    engine in the device tree and enables them before use (`clk-sunxi-ng-a733-gpu-bus-matrix-gates-are-critical`'s GPU gates
+    had no consumer; these do).
+  - LDO_EN and LOCK_ENABLE are forced in probe() for both PLLs, before
+    registration enables them.
+  - NPU_CLK's slots 100/101 become .hw pointers to ve0pll/ve1pll. A name
+    lookup would have found "pll-ve0", the VCO, and handed the NPU mux the
+    wrong rate. The NPU comment that explained the placeholders is rewritten;
+    its encoding-111 warning stays.
+
+WHERE THE VENDOR DRIVER DIFFERS, AND WHAT THIS PATCH DOES (its ccu-sun60iw2.c, read from the
+BSP copy on a board on the vendor kernel, which matches a second copy line for line in the
+VE parts; a hint, never a source)
+------------------------------------------------------------------------------
+  - PLL_INPUT_DIV (M1) not modelled; P0 folded into the ccu_nm's ".m". A
+    boot that left M1 = 2 would be reported at twice its rate.
+  - no ceiling: cedar_ve accepts IOCTL_SET_VE_FREQ up to 900 MHz
+    (VE_CLK_HIGH_WATER) and passes it to clk_set_rate(), and an engine whose
+    rate nobody set runs at its PLL's reset factors -- measured above: the
+    requested encoder at 696 MHz, over the vendor's own 624 MHz table.
+  - its six matrix gates are CLK_IS_CRITICAL "key" gates that OR
+    0x10000FF / 0x41055800 / 0x40302 into every write of 0x05C0 / 0x05E0 /
+    0x05E4. The UM has no key field there; the constants are other gates,
+    re-opened by whoever writes. And the vendor kernel reads them clear at
+    idle, which that source cannot produce: the running vendor CCU is not the
+    BSP copy, so its flags are no evidence.
+  - CLK_IGNORE_UNUSED on both PLLs; a sigma-delta pattern model that 624 MHz
+    does not need (integer N; PAT0 reads 0).
+  What the vendor gets RIGHT and mainline lacks: its PLL enable helper does
+  Method 2. CLK_IS_CRITICAL on the VCO is the substitute here.
+
+A523: one pll-ve (0x058, a single ccu_nkmp) and one engine. Nothing carried
+over; no A523 offset, bit or bound is used.
+
+NOT MODELLED, on purpose
+------------------------------------------------------------------------------
+  - VEPLL_GATE_EN_REG 0x1918: software gates at reset 1 on
+    both stacks, auto-gating off on ours (0x00030003) and on in the vendor's
+    (0x00030000) in every state. Both pass; no write needed. `clk-sunxi-ng-a733-npu-pll-module-clock-and-resets`'s call for
+    NPUPLL_GATE_EN.
+  - PLL_VEn_LOCK_CTRL/PAT0/PAT1/BIAS (0x0224-0x0230, 0x0244-0x0250): lock
+    window and fractional pattern, unused at an integer N.
+
+WHAT THIS CHANGES ON A KERNEL WITH NO VE DRIVER BOUND
+------------------------------------------------------------------------------
+  - PLL_VE0/PLL_VE1: LDO_EN and LOCK_ENABLE set in probe, PLL_EN set at
+    registration (critical): both VCOs run at their reset factors, 2184 and
+    2088 MHz, locked, with their output gates closed.
+  - clk_disable_unused() clears AHB_MAT bits 0/1 and MBUS_MAT bits 12/14,
+    1 -> 0 -- VE-only fields, and the state the vendor leaves them in. The
+    other VE bits are 0 already.
+
+BINDING IDS
+------------------------------------------------------------------------------
+Allocated and counted in the applied tree:
+clocks 97-110 (CLK_PLL_VE0, CLK_VE0PLL, CLK_PLL_VE1, CLK_VE1PLL, CLK_VE_ENC0,
+CLK_VE_DEC, CLK_BUS_VE_ENC0, CLK_BUS_VE_DEC, CLK_AHB_VE_ENC0, CLK_AHB_VE_DEC,
+CLK_MBUS_VE_ENC0, CLK_MBUS_VE_DEC, CLK_MCLK_VE_ENC0, CLK_MCLK_VE_DEC), resets
+37-38 (RST_BUS_VE_ENC0, RST_BUS_VE_DEC). A binding-id consistency check passed
+over all eight headers.
+
+VERIFIED / NOT VERIFIED
+------------------------------------------------------------------------------
+  applies      full series, freshly unpacked 6.18.36, patch --fuzz=0.
+  builds       ccu-sun60iw2.o, native, W=1: no warning.
+  arrays       read out of the built object, sizes predicted first:
+                 sun60iw2_ccu_clks    784 B = 98 entries (was 84, +14)
+                 sun60iw2_hw_clks     896 B = 8 + 111 * 8, so
+                                      .num == CLK_MCLK_VE_DEC + 1
+                 sun60iw2_ccu_resets  312 B = 39 entries (was 37, +2)
+               Both resets are IN the map, not only in the header -- the
+               RST_BUS_GMAC0 silent-no-op trap.
+  HW-effect    NOT OBSERVED. The register reads above are input evidence,
+               not proof of this patch.
+
+PENDING OBSERVABLE (falsifier), on a kernel with this patch and `arm64-dts-a733-ve-decoder-and-encoder-nodes`:
+  - before any VE use: abs 0x02002220 and 0x02002240 read bits 31/30/29/28
+    set and bit 27 clear; abs 0x020025C0 bits 0/1 and 0x020025E0 bits 12/14
+    read 0.
+  - after the driver has probed: abs 0x02002220 N = 78 (0x4D), P0 = 3 (field
+    2), 0x02002A88 = 0x01000000 -- 624 MHz on VE0PLL, gate closed; likewise
+    0x02002240 / 0x02002A80 for the encoder.
+  - with an engine requested: exactly the bits of the witness table above
+    set for that engine, and /sys/kernel/debug/clk/ve-dec/clk_rate 624000000.
+  - a request of 900 MHz through IOCTL_SET_VE_FREQ ends at 624000000.
+
+Assisted-by: Claude
+---
+
+diff --git a/drivers/clk/sunxi-ng/ccu-sun60iw2.c b/drivers/clk/sunxi-ng/ccu-sun60iw2.c
+--- a/drivers/clk/sunxi-ng/ccu-sun60iw2.c
++++ b/drivers/clk/sunxi-ng/ccu-sun60iw2.c
+@@ -1147,6 +1147,203 @@ static SUNXI_CCU_M_DATA_WITH_MUX_GATE(de0_clk, "de0", de0_parents, 0x0A00,
+  */
+ static SUNXI_CCU_GATE_HWS(bus_de0_clk, "bus-de0", ahb_hws, 0x0A04, BIT(0), 0);
+ 
++/*
++ * The video engine's two PLLs. Four clocks, each naming one register field:
++ *
++ *   pll-ve0  PLL_VE0_CTRL 0x0220 / abs 0x02002220 -- the VCO, N [15:8] and
++ *            M1 [1], enable bit 31, lock bit 28
++ *   ve0pll   the same register's single output tap, P0 [22:20] gated by
++ *            PLL_OUTPUT_GATE bit 27
++ *   pll-ve1  PLL_VE1_CTRL 0x0240 / abs 0x02002240, the same fields
++ *
++ *   ve1pll   its tap
++ *
++ * They sit here, before the NPU, and not with the engines further down,
++ * because NPU_CLK's mux names both taps and needs them declared first.
++ *
++ * VE0PLL = InputFreq*N/M1/P0 with N = PLL_N + 1, and the lower bound on PLL_N
++ * (11) applies to the FIELD, so
++ * N >= 12; M1 = PLL_INPUT_DIV + 1 over 0..1; P0 =
++ * PLL_OUTPUT_DIV + 1 over 0..7. PLL_VE1 reads the same in
++ * the A733 user manual. Split into VCO and tap for the reason PLL_NPU and
++ * PLL_GPU0 are: ccu_nm models N and M1 only, P0 is a divider of its own.
++ *
++ * THE INPUT IS 24 MHz, AND THE UM PROVES IT ARITHMETICALLY. Table 4-2 gives
++ * both rows a 24MHz reference, and each register carries
++ * a worked check: a 26 MHz DCXO is stated to give a default output of 546 MHz
++ * (A733 user manual). The reset word 0x4030_5A00 is N = 91, P0 = 4, and
++ * 24 x 91 / 4 = 546 where 26 x 91 / 4 would be 591.5 -- so the parent is
++ * PLL_REF, not the DCXO. PLL_VE1's 0x4020_5600 is N = 87, P0 = 3, and
++ * 24 x 87 / 3 = 696, its note's number. Both are also Table
++ * 4-3's rows: VE0_PLL 24 / N 91 / VCO 2184 / OUT 546 and VE1_PLL 24 / N 87 /
++ * VCO 2088 / OUT 696.
++ *
++ * In this tree that parent is pll-ref, and pll-ref is 24.000000 MHz: the
++ * 26 MHz DCXO x 96 / 104 (`arm64-dts-a733-model-the-26mhz-dcxo`, `clk-sunxi-ng-a733-feed-pll-ref-from-the-dcxo`; Table 4-3's REF_PLL row). The DCXO
++ * feeds PLL_REF and nothing else here, so these PLLs count in 24, not 26 --
++ * the 24/26 mixup, checked rather than assumed. For the
++ * factors the board is found in (below) this model therefore computes 546 MHz
++ * for VE0PLL and 696 MHz for VE1PLL, from the UM and pll-ref. The vendor's
++ * clk debugfs prints the same 546; that agreement is not the source.
++ *
++ * VCO WINDOW. Table 4-2 reads 1.26G~2.52G, pre-divider 1/2, P0 1~8, lock time
++ * 0.1 ms for both -- PLL_NPU's window, so `clk-sunxi-ng-a733-npu-pll-module-clock-and-resets`'s floor
++ * applies for `clk-sunxi-ng-a733-npu-pll-module-clock-and-resets`'s reason: 1272 = 24 x 53, because ccu_nm_set_rate() does
++ * not clamp and a 1260 MHz floor would be programmed as 24 x 52 = 1248.
++ * The table's TYPICAL VCO for both rows is 1.872G, which is not the reset
++ * rate -- it is 3 x 624 MHz, the operating point the module clocks below are
++ * capped at and the device tree asks for (`arm64-dts-a733-ve-decoder-and-encoder-nodes`).
++ *
++ * NEITHER VCO IS CLK_IS_CRITICAL IN THIS TREE, because nothing in it
++ * enables a video-engine clock: there is no VE driver, so a critical VCO would
++ * only run for nothing, and left alone both stay in the state the boot chain
++ * hands over (PLL_EN clear). A VE driver must bring the flag back with it (or
++ * an enable helper that follows Method 2), for the reason that follows; it is
++ * a decision about the enable SEQUENCE, not about who uses them. UM 4.1.4.1 Method 2
++ * opens PLL_OUTPUT_GATE only after LOCK and a further 20 us. Mainline's
++ * ccu_nm_enable() sets PLL_EN and returns without waiting, and the tap's gate
++ * is opened straight after it; with PLL_EN as the clock's enable, every
++ * consumer enable would hand the engine an unlocked output for up to the
++ * 0.1 ms lock time. On this SoC that class of failure is measured: a PLL_GPU0
++ * transition under a clocked GPU stops the SoC without a word, which is why
++ * `clk-sunxi-ng-a733-pll-gpu0-must-be-running-before-the-gpu-binds` made PLL_GPU0 critical. And the VE driver makes the transition
++ * routine -- the vendor's cedar_ve.c disables every VE clock on the last
++ * IOCTL_ENGINE_REL and around every rate change (disable_cedar_hw_clk(),
++ * setup_ve_freq()) and enables them again on the next IOCTL_ENGINE_REQ.
++ * The vendor survives that because its own PLL enable helper does Method 2;
++ * the silicon shows it switching PLL_EN, and even PLL_LDO_EN, per request
++ * (table below). Mainline has no such helper, so the transition is kept off
++ * the VCO instead: critical keeps each VCO running and locked from
++ * registration on, and only the output gate -- the tap -- follows the
++ * consumer, which is Method 2's order.
++ * Mainline's A523 driver reaches the same state by forcing PLL_EN on every
++ * PLL in probe and presenting the output gate as the enable
++ * (ccu-sun55i-a523.c, sun55i_a523_ccu_probe()). The cost is two VCOs that
++ * run while the engines sleep.
++ *
++ * A RATE STILL MOVES ONLY WITH THE OUTPUT GATED: the module clocks carry
++ * CLK_SET_RATE_GATE, so while an engine holds its clock prepared a rate
++ * request is refused instead of relocking the PLL under it.
++ *
++ * SWEPT FOR OTHER CONSUMERS. Exactly three CCU registers name VE0PLL or
++ * VE1PLL in a mux: VE_ENC0_CLK, VE_DEC_CLK and NPU_CLK -- every register in
++ * the A733 user manual whose field enum carries either string, and
++ * UM figure 4-2's list, "VE_DEC, VE_ENC0, NPU" for both PLLs.
++ * NPU_CLK is pinned to NPUPLL by the NPU node's assigned-clock-parents,
++ * and `arm64-dts-a733-ve-decoder-and-encoder-nodes` pins VE_DEC to VE0PLL and VE_ENC0 to VE1PLL. Each PLL has one
++ * consumer, so a rate request on one engine cannot reach the other.
++ *
++ * WHAT THE BOARD IS FOUND IN, all read-only on the 8 GiB board:
++ *
++ *   state                                     PLL_VE0_CTRL  PLL_VE1_CTRL
++ *   ours, no VE model (test run, 09-17)    0x41305a00    0x41205600
++ *   vendor 6.6.98-4-aw2511, VE idle           0x01305a00    0x01205600
++ *   vendor, decoder requested (09-21)         0xf9305a00    as idle
++ *   vendor, encoder requested (09-21)         as idle       0xf9205600
++ *
++ * (read on the board; the
++ * vendor rows were read the same way -- the
++ * engine requested through the vendor driver with IOCTL_ENGINE_REQ, read,
++ * released, nothing written.) Ours is the reset word plus bit 24, the
++ * reserved bit `clk-sunxi-ng-a733-npu-pll-module-clock-and-resets` already decoded as a power-on value on PLL_NPU,
++ * PLL_VIDEO1 and PLL_DE; nothing here writes it, and probe() and
++ * ccu_nm_set_rate() both read-modify-write. The vendor leaves PLL_LDO_EN
++ * CLEAR at idle -- `clk-sunxi-ng-a733-npu-pll-module-clock-and-resets`'s finding on PLL_NPU, again -- so probe() forces it
++ * instead of trusting the reset default. A requested engine has bits 31..27
++ * set on its own PLL -- PLL_EN, LDO_EN, LOCK_ENABLE, LOCK, OUTPUT_GATE --
++ * with the factor fields untouched, and the other engine's PLL stays off:
++ * the one-consumer claim above, witnessed. Untouched factors mean the vendor
++ * runs an engine whose rate nobody set at 546 MHz (decoder) and 696 MHz
++ * (encoder); the module clocks below say what this tree does instead.
++ *
++ * NOT MODELLED: VEPLL_GATE_EN_REG 0x1918 / abs 0x02003918, a second gate
++ * stage behind each tap -- bits 17/16 VEnPLL_GATE_SW_CFG (reset 1 =
++ * Enable), bits 1/0 VEnPLL_AUTO_GATE_EN (reset 1 = No-Auto), register reset
++ * 0x0003_0003. Our boot reads the reset value
++ * (0x00030003, read on the board); the vendor reads 0x00030000 idle
++ * AND with either engine running, i.e. auto-gating on, the software gates at
++ * their reset value. The software gates pass in both states, so neither
++ * needs a write from us -- the call `clk-sunxi-ng-a733-npu-pll-module-clock-and-resets` made for NPUPLL_GATE_EN.
++ *
++ * WHAT THE VENDOR DOES DIFFERENTLY (its ccu-sun60iw2.c is a hint, never a
++ * source):
++ *   - one ccu_nm per PLL with P0 folded in as its ".m" (_SUNXI_CCU_DIV(20, 3))
++ *     and PLL_INPUT_DIV not modelled at all, so a boot that left M1 = 2 would
++ *     be reported at twice its rate. Here M1 is modelled and P0 is the tap.
++ *   - a sigma-delta pattern on PAT0/PAT1 (0x0228/0x022C, 0x0248/0x024C). Not
++ *     modelled: 624 MHz is an integer N, PAT0 reads 0 under both kernels in
++ *     the 09-17 dumps, and `clk-sunxi-ng-a733-gpu-pll-module-clock-bus-gates-and-reset` left PLL_GPU0's pattern registers out for
++ *     the same reason.
++ *   - CLK_IGNORE_UNUSED plus a Method-2 enable helper of its own
++ *     (ccu_pll_gate_helper_enable(): output gate off, LDO, PLL_EN,
++ *     LOCK_ENABLE, wait for LOCK, output gate on). Mainline has no such
++ *     helper; CLK_IS_CRITICAL on the VCO is the substitute.
++ *
++ * A523: its single pll-ve (0x058, one ccu_nkmp, CLK_SET_RATE_GATE) carries
++ * nothing over. The A733 has two PLLs at 0x0220/0x0240 and two engines, and
++ * no A523 offset, bit or bound is used here.
++ */
++#define SUN60IW2_PLL_VE0_REG		0x0220
++#define SUN60IW2_PLL_VE1_REG		0x0240
++
++/* Table 4-2's window with `clk-sunxi-ng-a733-npu-pll-module-clock-and-resets`'s floor: 1272 = 24 x 53, 2520 = 24 x 105. */
++#define SUN60IW2_PLL_VE_MIN_VCO		1272000000U
++#define SUN60IW2_PLL_VE_MAX_VCO		2520000000U
++
++/* PLL_VEn_CTRL bits that are not modelled as clock gates; forced in probe(). */
++#define SUN60IW2_PLL_VE_LDO_EN		BIT(30)
++#define SUN60IW2_PLL_VE_LOCK_ENABLE	BIT(29)
++
++static struct ccu_nm pll_ve0_clk = {
++	.enable		= BIT(31),
++	.lock		= BIT(28),
++	.n		= _SUNXI_CCU_MULT_OFFSET_MIN_MAX(8, 8, 1, 12, 255),
++	.m		= _SUNXI_CCU_DIV(1, 1),
++	.min_rate	= SUN60IW2_PLL_VE_MIN_VCO,
++	.max_rate	= SUN60IW2_PLL_VE_MAX_VCO,
++	.common		= {
++		.reg		= SUN60IW2_PLL_VE0_REG,
++		.hw.init	= CLK_HW_INIT_PARENTS_HW("pll-ve0",
++				pll_ref_hws, &ccu_nm_ops,
++				CLK_SET_RATE_UNGATE),
++	},
++};
++
++static const struct clk_hw *pll_ve0_hws[] = { &pll_ve0_clk.common.hw };
++
++static struct ccu_nm pll_ve1_clk = {
++	.enable		= BIT(31),
++	.lock		= BIT(28),
++	.n		= _SUNXI_CCU_MULT_OFFSET_MIN_MAX(8, 8, 1, 12, 255),
++	.m		= _SUNXI_CCU_DIV(1, 1),
++	.min_rate	= SUN60IW2_PLL_VE_MIN_VCO,
++	.max_rate	= SUN60IW2_PLL_VE_MAX_VCO,
++	.common		= {
++		.reg		= SUN60IW2_PLL_VE1_REG,
++		.hw.init	= CLK_HW_INIT_PARENTS_HW("pll-ve1",
++				pll_ref_hws, &ccu_nm_ops,
++				CLK_SET_RATE_UNGATE),
++	},
++};
++
++static const struct clk_hw *pll_ve1_hws[] = { &pll_ve1_clk.common.hw };
++
++/*
++ * The output taps, PLL_OUTPUT_DIV [22:20] (P0 = field + 1) behind
++ * PLL_OUTPUT_GATE bit 27. Named after the UM's own mux labels, "VE0PLL" and
++ * "VE1PLL", as npupll and gpupll are -- "pll-ve0" is
++ * the VCO, and the two names would otherwise differ by word order alone in a
++ * clk_summary dump. NOT critical: this gate is the one the consumer owns.
++ * CLK_SET_RATE_PARENT, so one clk_set_rate() on a module clock configures
++ * divider, tap and VCO.
++ */
++static SUNXI_CCU_M_HWS_WITH_GATE(ve0pll_clk, "ve0pll", pll_ve0_hws,
++				 SUN60IW2_PLL_VE0_REG, 20, 3, BIT(27),
++				 CLK_SET_RATE_PARENT);
++static SUNXI_CCU_M_HWS_WITH_GATE(ve1pll_clk, "ve1pll", pll_ve1_hws,
++				 SUN60IW2_PLL_VE1_REG, 20, 3, BIT(27),
++				 CLK_SET_RATE_PARENT);
++
+ /*
+  * The NPU -- a VeriSilicon VIP ("3 Tops NPU"; model 0x9000,
+  * revision 0x9202 read off silicon).
+@@ -1375,30 +1572,22 @@ static SUNXI_CCU_M_HWS_WITH_GATE(npupll_clk, "npupll", pll_npu_hws,
+  * short array does not fail loudly -- it silently maps a high field onto the
+  * wrong parent or onto nothing.
+  *
+- * ⚠ TWO OF THE SEVEN CANNOT BE NAMED BY THIS TREE. PLL_VE0 and PLL_VE1 are
+- * the video-engine PLLs; this CCU models neither, and the video milestone
+- * (patch range `soc-sunxi-cedar-ve-carry-the-vendor-video-engine-interface`) is where they arrive. Their slots therefore carry a
+- * .name-only clk_parent_data with .index = -1, which resolves to nothing:
+- * clk_core_get() skips the DT path because index < 0 and fw_name is NULL, and
+- * clk_core_lookup("pll-ve0") finds no such clock.
+- *
+- * ⚠ .index = -1 IS NOT OPTIONAL. With the structure's default .index = 0 the
+- * lookup takes the DT path instead and parses the CCU node's OWN "clocks"
+- * property at index 0 -- which on this board is the 24 MHz oscillator. A
+- * silently wrong parent, not a missing one.
+- *
+- * ⚠ AND IF THE MUX IS EVER FOUND AT 100 OR 101 THE FAILURE IS AN OOPS, NOT A
+- * DIAGNOSTIC. Say so plainly, because the obvious guess -- "it just shows as
+- * an orphan in clk_summary" -- is wrong and was written here first.
+- * clk_core_get_parent_by_index() returns NULL, so the clock is parentless; and
+- * CLK_SET_RATE_NO_REPARENT sends ccu_mux_helper_determine_rate() down the
++ * All seven are clocks this CCU models. VE0PLL and VE1PLL, the video engine's
++ * PLL taps, arrived with `clk-sunxi-ng-a733-ve-plls-module-clocks-gates-and-resets`; until then their two slots were .name-only
++ * placeholders that resolved to nothing. They are .hw pointers now and not
++ * names, because the obvious name would resolve to the WRONG clock: "pll-ve0"
++ * is the VCO, and this mux sees the tap behind P0.
++ *
++ * ⚠ ENCODING 111 IS UNDOCUMENTED, AND A MUX FOUND THERE IS AN OOPS, NOT A
++ * DIAGNOSTIC. The field is 3 bits, this array is 7 long, and
++ * ccu_mux_helper_get_parent() hands the raw value back, so
++ * clk_core_get_parent_by_index() returns NULL and the clock is parentless;
++ * CLK_SET_RATE_NO_REPARENT then sends ccu_mux_helper_determine_rate() down the
+  * branch that does best_parent = clk_hw_get_parent(hw) followed by
+  * clk_hw_get_rate(best_parent) (ccu_mux.c) -- and clk_hw_get_rate() reads
+  * hw->core with no NULL check, unlike clk_core_get_rate_nolock() which has
+  * one. So the first clk_set_rate()/clk_round_rate() on such a clock
+- * dereferences NULL. The same is true of encoding 111, which the UM does not
+- * document at all: the field is 3 bits, this array is 7 long, and
+- * ccu_mux_helper_get_parent() hands the raw value back.
++ * dereferences NULL.
+  *
+  * What forecloses it is in the device tree, and that makes `arm64-dts-a733-add-the-npu`'s
+  * assigned-clock-parents load-bearing rather than decorative:
+@@ -1419,7 +1608,8 @@ static SUNXI_CCU_M_HWS_WITH_GATE(npupll_clk, "npupll", pll_npu_hws,
+  * registers behind the framework. NO_REPARENT, because which source drives
+  * the NPU is a pipeline decision that belongs in the device tree -- and
+  * without it ccu_mux_helper_determine_rate() would walk all seven parents on
+- * every rate request, including the two that resolve to nothing.
++ * every rate request -- the two VE taps included, whose PLLs belong to the
++ * video engine.
+  *
+  * ⚠ Index 110 is DEPLL3X, and `clk-sunxi-ng-a733-display-engine-clock-gate-reset`'s header carries a standing warning about
+  * it: "a future VE, NPU or DRAM driver that selects DEPLL3X from its own mux
+@@ -1433,8 +1623,8 @@ static const struct clk_parent_data npu_parents[] = {
+ 	{ .hw = &pll_peri0_800m_clk.common.hw },	/* 001 PERI0_800M */
+ 	{ .hw = &pll_peri0_600m_clk.hw },		/* 010 PERI0_600M */
+ 	{ .hw = &pll_peri0_480m_clk.common.hw },	/* 011 PERI0_480M */
+-	{ .index = -1, .name = "pll-ve0" },		/* 100 VE0PLL     */
+-	{ .index = -1, .name = "pll-ve1" },		/* 101 VE1PLL     */
++	{ .hw = &ve0pll_clk.common.hw },		/* 100 VE0PLL     */
++	{ .hw = &ve1pll_clk.common.hw },		/* 101 VE1PLL     */
+ 	{ .hw = &de_pll3x_clk.common.hw },		/* 110 DEPLL3X    */
+ };
+ 
+@@ -1794,6 +1984,217 @@ static SUNXI_CCU_GATE_HWS(iommu1_sys_hclk_clk, "iommu1-sys-hclk", ahb_hws,
+ static SUNXI_CCU_GATE_HWS(mbus_iommu1_clk, "mbus-iommu1", ahb_hws,
+ 			  0x05E0, BIT(1), CLK_IS_CRITICAL);
+ 
++/*
++ * The video engine: a decoder, VE_DEC at 0x01C0E000 (8K), and an
++ * encoder, VE_ENC at 0x01C10000 (4K), group VE_SYS (A733 user manual,
++ * memory map). Per engine one module clock, one bus
++ * gate, one reset and three bus-matrix gates -- ten clocks here; the two
++ * PLLs and their taps sit above the NPU, whose mux names them.
++ *
++ *   ve-enc0       VE_ENC0_CLK 0x0A80, gate 31, mux [26:24], M [4:0]
++ *
++ *   ve-dec        VE_DEC_CLK  0x0A88, the same fields
++ *
++ *   bus-ve-enc0   VE_BGR 0x0A8C bit 0 VE_ENC0_GATING
++ *   bus-ve-dec    VE_BGR 0x0A8C bit 2 VE_DEC_GATING
++ *   ahb-ve-enc0   AHB_MAT_CLK_GATING 0x05C0 bit 1 VE_ENC_AHB_GATE_SW_CFG,
++ *                 reset 1
++ *   ahb-ve-dec    AHB_MAT_CLK_GATING 0x05C0 bit 0 VE_DEC_AHB_GATE_SW_CFG,
++ *                 reset 1
++ *   mbus-ve-enc0  MBUS_MAT_CLK_GATING 0x05E0 bit 12 VE_ENC0_MBUS_GATE_SW_CFG,
++ *                 reset 1
++ *   mbus-ve-dec   MBUS_MAT_CLK_GATING 0x05E0 bit 14 VE_DEC_MBUS_GATE_SW_CFG,
++ *                 reset 1
++ *   mclk-ve-enc0  MBUS_GATE_EN 0x05E4 bit 1 VE_ENC0_MCLK_EN, reset 0
++ *
++ *   mclk-ve-dec   MBUS_GATE_EN 0x05E4 bit 18 VE_DEC_MCLK_EN, reset 0
++ *
++ *   resets        VE_BGR 0x0A8C bit 16 VE_ENC0_RST, bit 18 VE_DEC_RST,
++ *                 0 = Assert
++ *
++ * UM V1.00 (section 4.1) carries every one of these registers with the
++ * same fields and the same defaults as v0.92, so the two revisions
++ * agree here.
++ *
++ * "mbus-" AND "mclk-" ARE TWO DIFFERENT REGISTERS, and the names say which.
++ * 0x05E0 bits are the engines' master ports on the MBUS matrix, the kind of
++ * gate mbus-npu and mbus-gpu0 are. 0x05E4 bits are MBUS_GATE_EN's clock
++ * enables, the register mbus-gmac0 (bit 11) already sits in; that one kept
++ * the "mbus-" prefix while it was the only 0x05E4 clock here. With one of
++ * each per engine, the UM's field names (..._MCLK_EN) decide.
++ *
++ * THE TWO MODULE MUXES ARE NOT IN THE SAME ORDER. VE_ENC0_CLK has 000 VE0PLL,
++ * 001 VE1PLL; VE_DEC_CLK has 000 VE1PLL, 001 VE0PLL
++ * (A733 user manual). A parent array copied from one to the other would
++ * silently swap the engines' PLLs. The other five slots agree: 010
++ * PERI0_800M, 011 PERI0_600M, 100 PERI0_480M, 101 DEPLL3X, 110 NPUPLL. All
++ * seven are clocks this CCU models; 111 is undocumented and nothing writes
++ * it. At reset both fields are 000, so the engines start CROSSED -- encoder
++ * on VE0PLL, decoder on VE1PLL -- which is what our board reads (both
++ * registers 0x00000000, read on the board). The vendor reads 0x01000000 in
++ * both at idle and 0x81000000 with the engine requested
++ * (mux 001, M = 0) --
++ * decoder on VE0PLL, encoder on VE1PLL, gate 31 following the request. That
++ * is the pairing its device tree hands the driver as "pll_ve", and the one
++ * `arm64-dts-a733-ve-decoder-and-encoder-nodes` pins.
++ *
++ * Flags on both module clocks:
++ *   CLK_SET_RATE_PARENT -- one clk_set_rate() configures M, P0 and N, and it
++ *     is the only rate call the vendor driver makes (setup_ve_freq() ->
++ *     clk_set_rate() on "ve").
++ *   CLK_SET_RATE_NO_REPARENT -- which source drives an engine is the device
++ *     tree's choice, and slot 101 is DEPLL3X, a clock the display retunes
++ *     (`clk-sunxi-ng-a733-display-engine-clock-gate-reset`'s standing warning to any VE driver).
++ *   CLK_SET_RATE_GATE -- a rate changes only while the engine's clock is
++ *     unprepared, i.e. never under a running engine; the PLL block above says
++ *     why. The vendor driver already gates before it retunes, so this costs
++ *     it nothing; it makes the rule the framework's instead of the driver's.
++ *
++ * AND A CEILING OF 624 MHz, as .common.max_rate. VDD-VE is fed by DCDC2 with
++ * VDD-SYS and the DRAM, and DCDC2 is held at 800 mV -- register 0x13 reads
++ * 0x9e on the 8 GiB board (DCDC2 row; the same
++ * reading was repeated). The one source that pairs a VE rate
++ * with a voltage is the vendor's VF table (sun60iw2p1-cpu-vf.dtsi,
++ * ve_opp_table), and all eleven of its bins read 624 MHz at 800 mV -- a hint
++ * and not a spec, but the only one, and Table 4-2's typical VCO of 1.872 GHz
++ * for both VE PLLs is exactly 3 x 624. The vendor does not enforce it
++ * anywhere. Its driver passes any IOCTL_SET_VE_FREQ from 50 to 900 MHz
++ * (VE_CLK_LOW_WATER/VE_CLK_HIGH_WATER) straight to clk_set_rate(), and an
++ * engine whose rate nobody set runs at its PLL's reset factors -- measured:
++ * the requested encoder at 696 MHz (PLL_VE1 0xf9205600, VE_ENC0_CLK
++ * 0x81000000, M = 0), above the vendor's own table, and the decoder at
++ * 546 MHz (09-21). With the
++ * ceiling, ccu_common registers the range (clk_hw_set_rate_range()), the
++ * framework clamps a request to it before rounding
++ * (clk_core_determine_round_nolock()), and 900 MHz from userspace becomes
++ * 624 instead of an under-volt that does not announce itself -- the failure
++ * `arm64-dts-a733-dcdc4-is-vdd-gpu-and-it-gets-a-window` and `arm64-dts-a733-pin-the-gpu-to-1008-mhz` guard the GPU against. Raising the rail is not the way round it:
++ * DCDC2 carries the DRAM, and its inductor is at ~98 % of its budget
++ * (it also feeds VDD-SYS and VDD-VE).
++ */
++static const struct clk_parent_data ve_enc0_parents[] = {
++	{ .hw = &ve0pll_clk.common.hw },		/* 000 VE0PLL     */
++	{ .hw = &ve1pll_clk.common.hw },		/* 001 VE1PLL     */
++	{ .hw = &pll_peri0_800m_clk.common.hw },	/* 010 PERI0_800M */
++	{ .hw = &pll_peri0_600m_clk.hw },		/* 011 PERI0_600M */
++	{ .hw = &pll_peri0_480m_clk.common.hw },	/* 100 PERI0_480M */
++	{ .hw = &de_pll3x_clk.common.hw },		/* 101 DEPLL3X    */
++	{ .hw = &npupll_clk.common.hw },		/* 110 NPUPLL     */
++};
++
++static const struct clk_parent_data ve_dec_parents[] = {
++	{ .hw = &ve1pll_clk.common.hw },		/* 000 VE1PLL     */
++	{ .hw = &ve0pll_clk.common.hw },		/* 001 VE0PLL     */
++	{ .hw = &pll_peri0_800m_clk.common.hw },	/* 010 PERI0_800M */
++	{ .hw = &pll_peri0_600m_clk.hw },		/* 011 PERI0_600M */
++	{ .hw = &pll_peri0_480m_clk.common.hw },	/* 100 PERI0_480M */
++	{ .hw = &de_pll3x_clk.common.hw },		/* 101 DEPLL3X    */
++	{ .hw = &npupll_clk.common.hw },		/* 110 NPUPLL     */
++};
++
++/* The ceiling above; 624 = 24 x 78 / 3, exact from PLL_REF. */
++#define SUN60IW2_VE_MAX_RATE		624000000U
++
++/*
++ * Spelled out rather than SUNXI_CCU_M_DATA_WITH_MUX_GATE(), which has no
++ * slot for .max_rate. VE_ENC0_CLK = Clock Source / M with M = FACTOR_M + 1,
++ * field 0..31; VE_DEC_CLK the same
++ * (A733 user manual).
++ */
++static struct ccu_div ve_enc0_clk = {
++	.enable		= BIT(31),
++	.div		= _SUNXI_CCU_DIV(0, 5),
++	.mux		= _SUNXI_CCU_MUX(24, 3),
++	.common		= {
++		.reg		= 0x0A80,
++		.max_rate	= SUN60IW2_VE_MAX_RATE,
++		.hw.init	= CLK_HW_INIT_PARENTS_DATA("ve-enc0",
++				ve_enc0_parents, &ccu_div_ops,
++				CLK_SET_RATE_PARENT |
++				CLK_SET_RATE_NO_REPARENT |
++				CLK_SET_RATE_GATE),
++	},
++};
++
++static struct ccu_div ve_dec_clk = {
++	.enable		= BIT(31),
++	.div		= _SUNXI_CCU_DIV(0, 5),
++	.mux		= _SUNXI_CCU_MUX(24, 3),
++	.common		= {
++		.reg		= 0x0A88,
++		.max_rate	= SUN60IW2_VE_MAX_RATE,
++		.hw.init	= CLK_HW_INIT_PARENTS_DATA("ve-dec",
++				ve_dec_parents, &ccu_div_ops,
++				CLK_SET_RATE_PARENT |
++				CLK_SET_RATE_NO_REPARENT |
++				CLK_SET_RATE_GATE),
++	},
++};
++
++/*
++ * The eight bus gates carry flags 0 -- no CLK_IS_CRITICAL, no
++ * CLK_IGNORE_UNUSED -- because each has a consumer that names it. The vendor
++ * driver requests its four per-engine gates by name ("bus_ve", "ahb_gate",
++ * "mbus_gate", "mbus_ve") and enables them in enable_cedar_hw_clk_module()
++ * before the module clock, and `arm64-dts-a733-ve-decoder-and-encoder-nodes` hands them over under exactly those
++ * names. That is the difference to `clk-sunxi-ng-a733-gpu-bus-matrix-gates-are-critical`: the GPU binding had no slot for its
++ * matrix gates, nothing claimed them, and clk_disable_unused() closed the
++ * port the firmware needed.
++ *
++ * THE MATRIX GATES ARE PER-USE ON SILICON, NOT PARKED AT THEIR RESET VALUE,
++ * and every bit above is witnessed doing its job. The vendor kernel on the 8 GiB board
++ * with the VE idle reads AHB_MAT 0x11010390, MBUS_MAT 0xf0010003,
++ * MBUS_GATE_EN 0x00000805 and VE_BGR 0 -- all ten VE bits clear. With an
++ * engine requested through the vendor driver, exactly that engine's bits
++ * come on and nothing else in the four registers moves
++ *:
++ *
++ *   engine    AHB_MAT     MBUS_MAT    MBUS_GATE_EN  VE_BGR
++ *   decoder   0x11010391  0xf0014003  0x00040805    0x00040004
++ *             bit 0       bit 14      bit 18        bits 2, 18
++ *   encoder   0x11010392  0xf0011003  0x00000807    0x00010001
++ *             bit 1       bit 12      bit 1         bits 0, 16
++ *
++ * `clk-sunxi-ng-a733-npu-pll-module-clock-and-resets` found the same per-use pattern for the NPU's two matrix gates. The
++ * 0x05E4 bits also read back as written, so the read-modify-write in
++ * ccu_gate_helper_enable() cannot drop one when a neighbour (mbus-gmac0,
++ * bit 11) is written.
++ *
++ * WHAT THIS CHANGES ON A KERNEL WITH NO VE DRIVER BOUND, named so it is not
++ * discovered later: clk_disable_unused() clears AHB_MAT bits 0/1 and MBUS_MAT
++ * bits 12/14, 1 -> 0. Our kernel reads 0x110103bf and 0xf1015803 today, all
++ * four set.
++ * MBUS_GATE_EN bits 1/18 are 0 already (0x00000804, read on the board), and so are
++ * both module clock gates and both VE_BGR gates. All four fields are VE-only
++ * by their UM names, and it is the state the vendor leaves the silicon in.
++ *
++ * THE VENDOR MODELS ALL SIX MATRIX GATES AS CLK_IS_CRITICAL, WITH A "KEY".
++ * Its SUNXI_CCU_GATE_WITH_KEY ORs a constant into every write of the
++ * register: AHB_MASTER_KEY_VALUE 0x10000FF on 0x05C0, MBUS_MASTER_KEY_VALUE
++ * 0x41055800 on 0x05E0, MBUS_GATE_KEY_VALUE 0x40302 on 0x05E4. The UM
++ * documents no key field in any of the three -- every one of those bits is an
++ * ordinary R/W gate -- so the "key" re-opens a set of
++ * gates on every write, whoever writes: enabling GMAC0's MBUS clock would
++ * also switch on the VE, CSI and ISP ones. `clk-sunxi-ng-a733-gpu-bus-matrix-gates-are-critical` measured a write to 0x05C0
++ * with and without the key and read back the same. Not carried over. And the
++ * vendor kernel reads the six VE bits CLEAR at idle, which that source could
++ * not produce, so the vendor's running CCU is not the BSP copy we read and
++ * its flags are no evidence either way.
++ *
++ * Parent: ahb_hws, as for every matrix gate in this file; only the enable
++ * bit is consumed, never a rate. 0x05C0, 0x05E0 and 0x05E4 are shared with
++ * existing clocks, which is safe because devm_sunxi_ccu_probe() hands every
++ * clock of this CCU the same spinlock (`clk-sunxi-ng-a733-npu-pll-module-clock-and-resets` says so for the NPU's two).
++ */
++static SUNXI_CCU_GATE_HWS(bus_ve_enc0_clk,  "bus-ve-enc0",  ahb_hws, 0x0A8C, BIT(0),  0);
++static SUNXI_CCU_GATE_HWS(bus_ve_dec_clk,   "bus-ve-dec",   ahb_hws, 0x0A8C, BIT(2),  0);
++static SUNXI_CCU_GATE_HWS(ahb_ve_enc0_clk,  "ahb-ve-enc0",  ahb_hws, 0x05C0, BIT(1),  0);
++static SUNXI_CCU_GATE_HWS(ahb_ve_dec_clk,   "ahb-ve-dec",   ahb_hws, 0x05C0, BIT(0),  0);
++static SUNXI_CCU_GATE_HWS(mbus_ve_enc0_clk, "mbus-ve-enc0", ahb_hws, 0x05E0, BIT(12), 0);
++static SUNXI_CCU_GATE_HWS(mbus_ve_dec_clk,  "mbus-ve-dec",  ahb_hws, 0x05E0, BIT(14), 0);
++static SUNXI_CCU_GATE_HWS(mclk_ve_enc0_clk, "mclk-ve-enc0", ahb_hws, 0x05E4, BIT(1),  0);
++static SUNXI_CCU_GATE_HWS(mclk_ve_dec_clk,  "mclk-ve-dec",  ahb_hws, 0x05E4, BIT(18), 0);
++
+ /* ccu_common-based clocks (registered and reset-mapped by the core). */
+ static struct ccu_common *sun60iw2_ccu_clks[] = {
+ 	&pll_ref_clk.common,
+@@ -1880,6 +2281,20 @@ static struct ccu_common *sun60iw2_ccu_clks[] = {
+ 	&iommu1_sys_pclk_clk.common,
+ 	&iommu1_sys_hclk_clk.common,
+ 	&mbus_iommu1_clk.common,
++	&pll_ve0_clk.common,
++	&ve0pll_clk.common,
++	&pll_ve1_clk.common,
++	&ve1pll_clk.common,
++	&ve_enc0_clk.common,
++	&ve_dec_clk.common,
++	&bus_ve_enc0_clk.common,
++	&bus_ve_dec_clk.common,
++	&ahb_ve_enc0_clk.common,
++	&ahb_ve_dec_clk.common,
++	&mbus_ve_enc0_clk.common,
++	&mbus_ve_dec_clk.common,
++	&mclk_ve_enc0_clk.common,
++	&mclk_ve_dec_clk.common,
+ };
+ 
+ static struct clk_hw_onecell_data sun60iw2_hw_clks = {
+@@ -1981,8 +2396,22 @@ static struct clk_hw_onecell_data sun60iw2_hw_clks = {
+ 		[CLK_IOMMU1_SYS_PCLK]	= &iommu1_sys_pclk_clk.common.hw,
+ 		[CLK_IOMMU1_SYS_HCLK]	= &iommu1_sys_hclk_clk.common.hw,
+ 		[CLK_MBUS_IOMMU1]	= &mbus_iommu1_clk.common.hw,
++		[CLK_PLL_VE0]		= &pll_ve0_clk.common.hw,
++		[CLK_VE0PLL]		= &ve0pll_clk.common.hw,
++		[CLK_PLL_VE1]		= &pll_ve1_clk.common.hw,
++		[CLK_VE1PLL]		= &ve1pll_clk.common.hw,
++		[CLK_VE_ENC0]		= &ve_enc0_clk.common.hw,
++		[CLK_VE_DEC]		= &ve_dec_clk.common.hw,
++		[CLK_BUS_VE_ENC0]	= &bus_ve_enc0_clk.common.hw,
++		[CLK_BUS_VE_DEC]	= &bus_ve_dec_clk.common.hw,
++		[CLK_AHB_VE_ENC0]	= &ahb_ve_enc0_clk.common.hw,
++		[CLK_AHB_VE_DEC]	= &ahb_ve_dec_clk.common.hw,
++		[CLK_MBUS_VE_ENC0]	= &mbus_ve_enc0_clk.common.hw,
++		[CLK_MBUS_VE_DEC]	= &mbus_ve_dec_clk.common.hw,
++		[CLK_MCLK_VE_ENC0]	= &mclk_ve_enc0_clk.common.hw,
++		[CLK_MCLK_VE_DEC]	= &mclk_ve_dec_clk.common.hw,
+ 	},
+-	.num	= CLK_BUS_ITS_PCIE0_ACLK + 1,
++	.num	= CLK_MCLK_VE_DEC + 1,
+ };
+ 
+ static struct ccu_reset_map sun60iw2_ccu_resets[] = {
+@@ -2028,6 +2457,9 @@ static struct ccu_reset_map sun60iw2_ccu_resets[] = {
+ 	[RST_BUS_PCIE_PWRUP]	= { 0x138C, BIT(16) },
+ 	[RST_BUS_PCIE]		= { 0x138C, BIT(17) },
+ 	[RST_BUS_ITS_PCIE0]	= { 0x0574, BIT(16) },
++	/* VE_BGR_REG 0x0A8C: bit16 VE_ENC0_RST, bit18 VE_DEC_RST, 0 = assert. */
++	[RST_BUS_VE_ENC0]	= { 0x0A8C, BIT(16) },
++	[RST_BUS_VE_DEC]	= { 0x0A8C, BIT(18) },
+ };
+ 
+ static const struct sunxi_ccu_desc sun60iw2_ccu_desc = {
+@@ -2056,6 +2488,12 @@ static const u32 video_pll_regs[] = {
+ 	SUN60IW2_PLL_VIDEO2_REG,
+ };
+ 
++/* The VE PLLs: LDO_EN and LOCK_ENABLE only; PLL_EN is the framework's. */
++static const u32 ve_pll_regs[] = {
++	SUN60IW2_PLL_VE0_REG,
++	SUN60IW2_PLL_VE1_REG,
++};
++
+ static int sun60iw2_ccu_probe(struct platform_device *pdev)
+ {
+ 	void __iomem *reg;
+@@ -2147,6 +2585,24 @@ static int sun60iw2_ccu_probe(struct platform_device *pdev)
+ 	val |= SUN60IW2_PLL_NPU_LDO_EN | SUN60IW2_PLL_NPU_LOCK_ENABLE;
+ 	writel(val, reg + SUN60IW2_PLL_NPU_REG);
+ 
++	/*
++	 * PLL_VE0 and PLL_VE1: LDO_EN and LOCK_ENABLE, the two bits PLL_NPU gets
++	 * above and for the same reason. Here the write is also an ORDERING
++	 * requirement: both VCOs are CLK_IS_CRITICAL, so PLL_EN is set inside
++	 * devm_sunxi_ccu_probe() below, and a PLL enabled with its LDO off cannot
++	 * lock. The vendor kernel leaves exactly that behind on the 8 GiB board --
++	 * PLL_VE0_CTRL 0x01305a00 and PLL_VE1_CTRL 0x01205600, bit 30 clear (the
++	 * PLL comment above lists the readings). LOCK_ENABLE resets to 0 on both (A733 user
++	 * manual), and without it ccu_nm_set_rate() polls a LOCK bit that never
++	 * asserts -- `clk-sunxi-ng-a733-pll-gpu0-lock-detector-must-be-enabled`'s measured finding on PLL_GPU0. Neither bit is a gate
++	 * and neither changes a rate.
++	 */
++	for (i = 0; i < ARRAY_SIZE(ve_pll_regs); i++) {
++		val = readl(reg + ve_pll_regs[i]);
++		val |= SUN60IW2_PLL_VE_LDO_EN | SUN60IW2_PLL_VE_LOCK_ENABLE;
++		writel(val, reg + ve_pll_regs[i]);
++	}
++
+ 	return devm_sunxi_ccu_probe(&pdev->dev, reg, &sun60iw2_ccu_desc);
+ }
+ 
+diff --git a/include/dt-bindings/clock/sun60i-a733-ccu.h b/include/dt-bindings/clock/sun60i-a733-ccu.h
+--- a/include/dt-bindings/clock/sun60i-a733-ccu.h
++++ b/include/dt-bindings/clock/sun60i-a733-ccu.h
+@@ -172,4 +172,34 @@
+ #define CLK_PCIE_AXI_SLV	95
+ #define CLK_BUS_ITS_PCIE0_ACLK	96
+ 
++/*
++ * The video engine: a decoder and an encoder, each with its own PLL,
++ * module clock, bus gate and three bus-matrix gates. Fourteen clocks, each
++ * naming one register field:
++ *
++ *   PLL_VE0_CTRL 0x0220, PLL_VE1_CTRL 0x0240 -- the VCO (N, M1) and its single
++ *     output tap "VE0PLL"/"VE1PLL" ([22:20] P0 + output gate bit 27)
++ *   VE_ENC0_CLK 0x0A80, VE_DEC_CLK 0x0A88 -- the module clocks
++ *   VE_BGR 0x0A8C bit 0 (ENC0) and bit 2 (DEC) -- the blocks' own bus gates
++ *   AHB_MAT_CLK_GATING 0x05C0 bit 1 (ENC) and bit 0 (DEC)
++ *   MBUS_MAT_CLK_GATING 0x05E0 bit 12 (ENC0) and bit 14 (DEC)
++ *   MBUS_GATE_EN 0x05E4 bit 1 (ENC0) and bit 18 (DEC) -- the MBUS clocks
++ *
++ * 97-110 are the next free ids on main; 94-96 are PCIe's.
++ */
++#define CLK_PLL_VE0		97
++#define CLK_VE0PLL		98
++#define CLK_PLL_VE1		99
++#define CLK_VE1PLL		100
++#define CLK_VE_ENC0		101
++#define CLK_VE_DEC		102
++#define CLK_BUS_VE_ENC0		103
++#define CLK_BUS_VE_DEC		104
++#define CLK_AHB_VE_ENC0		105
++#define CLK_AHB_VE_DEC		106
++#define CLK_MBUS_VE_ENC0	107
++#define CLK_MBUS_VE_DEC		108
++#define CLK_MCLK_VE_ENC0	109
++#define CLK_MCLK_VE_DEC		110
++
+ #endif /* _DT_BINDINGS_CLK_SUN60I_A733_CCU_H_ */
+diff --git a/include/dt-bindings/reset/sun60i-a733-ccu.h b/include/dt-bindings/reset/sun60i-a733-ccu.h
+--- a/include/dt-bindings/reset/sun60i-a733-ccu.h
++++ b/include/dt-bindings/reset/sun60i-a733-ccu.h
+@@ -79,4 +79,12 @@
+ #define RST_BUS_PCIE		35
+ #define RST_BUS_ITS_PCIE0	36
+ 
++/*
++ * Video engine -- VE_BGR_REG 0x0A8C, bit16 VE_ENC0_RST and bit18
++ * VE_DEC_RST (0 = Assert, 1 = De-assert). 37-38 are the next free reset ids
++ * on main; 34-36 are PCIe's.
++ */
++#define RST_BUS_VE_ENC0		37
++#define RST_BUS_VE_DEC		38
++
+ #endif /* _DT_BINDINGS_RST_SUN60I_A733_CCU_H_ */

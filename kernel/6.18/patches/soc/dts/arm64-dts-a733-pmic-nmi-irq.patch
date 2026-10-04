@@ -1,0 +1,102 @@
+From a15f8a8cc0d4806a539e3177e06fc6de7ed9e47e Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Mon, 20 Jul 2026 19:30:00 +0200
+Subject: [PATCH] arm64: dts: a733: wire AXP318W PMIC IRQ via the NMI/R-INTC
+
+The AXP8191/AXP318W PMIC (`clk-sunxi-ng-a733-r-ccu-add-r-i2c0-gate-reset`, HW-proven at r_i2c0 0-0036) was
+described without an interrupt, so the mfd core runs it with no IRQ --
+no power-key events, no regulator/thermal/battery interrupts, only
+polled access. Add its interrupt path through the A733 NMI (R-INTC)
+controller.
+
+The NMI controller is three registers in the PRCM at 0x07010000:
+NMI_INT_CTRL 0x0320, NMI_INT_EN 0x0324, NMI_INT_PEND 0x0328, i.e. a 0xc window at 0x07010320 -- the
+same reg the A523 NMI node uses, register-for-register. Its GIC line,
+however, is A733-specific: the A733 user manual lists source
+"NMI" at intid 220 -> gic_spi 188 (vector 0x0370). The A523 dtsi uses
+GIC_SPI 148; that value is REJECTED here -- copying it blindly is the
+exact a523-derived error that already produced a wrong r_i2c0 base and
+IRQ on this track. USE 188, verified against the interrupt list of the A733 user manual.
+
+Because the register layout is identical to the A523 NMI, the in-tree
+sun55i-a523-nmi irqchip driver (CONFIG_SUNXI_NMI_INTC) is reused via a
+fallback compatible "allwinner,sun60i-a733-nmi","allwinner,sun55i-a523-nmi",
+the same pattern the r_pio node uses for the r-pinctrl.
+
+The AXP IRQ pin is active-low and wired to NMI input line 0, so the
+pmic@36 node gets interrupt-parent = <&nmi_intc> / interrupts =
+<0 IRQ_TYPE_LEVEL_LOW>. The PMIC is itself the irq controller for its
+sub-devices, hence interrupt-controller / #interrupt-cells = <1>,
+matching the mainline axp examples and the sun55i-a523 avaota axp717
+node.
+
+Compile-verified: dtb builds with 0 warnings and decompiles with the
+nmi_intc node (interrupts GIC_SPI 188) and the pmic@36
+interrupt-parent/interrupts present; the sun55i-a523-nmi irqchip object
+compiles with CONFIG_SUNXI_NMI_INTC=y.
+HW-PENDING: actual IRQ delivery is unproven -- it needs a PMIC event
+stimulus (power-key press / IRQ-status change) on a live board.
+
+Assisted-by: Claude
+---
+ .../sun60i-a733-cubie-a7s-minimal.dts         | 37 +++++++++++++++++++
+ 1 file changed, 37 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+index 412164a..a95f325 100644
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -1565,6 +1565,28 @@ r_ccu: clock-controller@7010000 {
+ 			#reset-cells = <1>;
+ 		};
+ 
++		/*
++		 * NMI / R-INTC. Three registers in the PRCM (0x07010000):
++		 * NMI_INT_CTRL 0x0320, NMI_INT_EN 0x0324, NMI_INT_PEND 0x0328
++		 * -- so the controller window is
++		 * 0x07010320 + 0xc. Its GIC line is the A733 "NMI" interrupt:
++		 * per the UM interrupt list, intid 220 -> gic_spi 188
++		 * (vector 0x0370). This is NOT the A523's GIC_SPI 148 -- that
++		 * number is wrong for this silicon, and is exactly the class of
++		 * a523-copy error that already bit the r_i2c0 base/IRQ on this
++		 * track. Register layout is identical to the A523 NMI, so the
++		 * in-tree sun55i-a523-nmi driver is reused via the fallback
++		 * compatible (same pattern as the r_pio node below).
++		 */
++		nmi_intc: interrupt-controller@7010320 {
++			compatible = "allwinner,sun60i-a733-nmi",
++				     "allwinner,sun55i-a523-nmi";
++			reg = <0x0 0x07010320 0x0 0xc>;
++			interrupt-controller;
++			#interrupt-cells = <2>;
++			interrupts = <GIC_SPI 188 IRQ_TYPE_LEVEL_HIGH>;
++		};
++
+ 		r_pio: pinctrl@7025000 {
+ 			compatible = "allwinner,sun60i-a733-r-pinctrl",
+ 				     "allwinner,sun55i-a523-r-pinctrl";
+@@ -1619,6 +1641,21 @@ pmic@36 {
+ 				compatible = "x-powers,axp318w";
+ 				reg = <0x36>;
+ 
++				/*
++				 * AXP IRQ pin is active-low and feeds the NMI
++				 * input, line 0. The PMIC is itself the irq
++				 * controller for its sub-devices (power key,
++				 * regulators), so #interrupt-cells = <1> (matches
++				 * the mainline axp examples / the sun55i-a523
++				 * avaota axp717 node). HW-PENDING: the actual IRQ
++				 * delivery still needs a PMIC event stimulus on a
++				 * board to be proven.
++				 */
++				interrupt-parent = <&nmi_intc>;
++				interrupts = <0 IRQ_TYPE_LEVEL_LOW>;
++				interrupt-controller;
++				#interrupt-cells = <1>;
++
+ 				regulators {
+ 					/*
+ 					 * SWOUT1 = reg 0x11 BIT(3) = Maxio PHY
+-- 
+2.55.0
+

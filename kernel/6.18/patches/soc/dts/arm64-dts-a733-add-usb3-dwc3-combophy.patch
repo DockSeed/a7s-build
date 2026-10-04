@@ -1,0 +1,284 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: allwinner: A733 minimal — add USB3 (dwc3 + COMB0 combo-PHY)
+
+Wires the USB3.1 SuperSpeed path on the minimal A733 boot DT: the USB3 DRD
+controller (@0x06A00000, xHCI 1.20 — Allwinner names this block "USB2" in the
+CCU/IRQ tables), the SERDES subsystem clock/reset controller that gates it, the
+COMB0 SERDES combo-PHY that carries its SuperSpeed lanes to Type-C J4, the
+RTC-CCU that gates the SERDES DCXO, and the J4 VBUS switch.
+
+- usb3@6a00000: "allwinner,sun60i-a733-dwc3", the flattened generic glue (no
+  child node). It takes all five clocks and the controller reset and creates the
+  core only once they are up. The earlier bare "snps,dwc3" shape could not do
+  that: dwc3 enables only clocks it knows by name, and two of these five have no
+  such name — the SERDES bus gates are not CCU clocks at all, and CLK_USB2_MF is
+  required although its name fits no dwc3 slot (booting the same Image without
+  it gives "soft reset failed / -ETIMEDOUT / -110", and so does dropping U2_REF
+  and calling MF "ref"; SUSPEND was never removed on a boot, and the two SERDES
+  gates have never been modelled as clocks on a boot at all). It also made the bring-up depend on the
+  combo-PHY probing first, which stopped happening when the Type-C connector's
+  graph closed a devlink ring. IRQ GIC_SPI 155 (INTID 187, UM source "USB2" —
+  the controller IRQ, not the COMB0 USB3 event INTID
+  217 = GIC_SPI 185; INTID 185 is PCIE0_MSI). reset RST_USB_2. phys = u2phy +
+  combophy0. dr_mode host, super-speed-plus.
+- serdes_ccu@6c00000: allwinner,sun60i-a733-serdes-ccu (patch `clk-sunxi-ng-a733-add-serdes-subsystem-clocks`), 16 bytes
+  covering SUBSYS_PCIE_BGR (0x0004, not modelled yet) and SUBSYS_USB3P1_BGR
+  (0x0008). Its two input clocks are the SERDES bus-matrix gates the CCU does
+  have -- AHB 0x05C0 bit8 and MBUS 0x05E0 bit28, added
+  to the CCU in `clk-sunxi-ng-a733-add-serdes-combophy-clock` -- so the tree reads AHB/MBUS -> matrix gate -> subsystem
+  gate -> block, which is what the hardware is. It consumes RST_BUS_SERDES,
+  without which its own registers read zero and swallow writes.
+- combophy0@6c01000: allwinner,sun60i-a733-usb3-combophy (patch `phy-allwinner-a733-add-serdes-combophy`). Three
+  windows ioremapped by index: link 0x06C01000, top2 0x06C06000, PMA
+  0x06C80000. The SERDES subsystem page it used to map as window 0 belongs to
+  serdes_ccu now, so the node moved to the address of its first remaining
+  window. clocks serdes (main-CCU CLK_SERDES_PHY_CFG) + dcxo-serdes0 (RTC-CCU);
+  reset RST_BUS_SERDES, shared with serdes_ccu; #phy-cells 0
+  (of_phy_simple_xlate).
+- u2phy@6b00000: gains resets = <&serdes_ccu RST_USB3_USB2PHY>. That bit was
+  written from the combo-PHY's phy_init before, which is another device's
+  driver.
+- rtc_ccu@7090000: allwinner,sun60i-a733-rtc-ccu (patch `clk-sunxi-ng-a733-add-minimal-rtc-ccu`), parent r-ahb.
+- reg_usb3_vbus: SGM2576 U2, enable USB0-DRVVBUS = PL2 (r_pio bank 0 pin 2),
+  verified against the schematic.
+
+usb3, combophy0 and u2phy ship status = "okay". They were disabled until an SS
+link was proven on iron, on the grounds that a half-probe could disturb the
+shared COMB0/DP power domain. That condition is met: 2026-07-21 on the 8 GiB board the link
+trains at 10 Gbps in both plug orientations.
+
+The J4 VBUS regulator is deliberately NOT regulator-always-on. Its enable is a
+GPIO (PL2 = USB0-DRVVBUS on the SGM2576 U2) precisely so the Type-C port
+controller can gate it, and TCPM needs that control: SRC_ATTACH_WAIT only
+advances to SRC_ATTACHED when `tcpm_port_is_source(port) && port->vbus_vsafe0v`
+(tcpm.c), i.e. VBUS must be off before a source port attaches -- Rp is advertised
+with VBUS down, the sink presents Rd, and only then does the source raise VBUS.
+Holding VBUS on permanently kept the state machine in SRC_ATTACH_WAIT forever:
+CC interrupts arrived on every plug (the TCPC irq counter moved 1 -> 3 across an
+unplug/replug on the 8 GiB board, 2026-07-21) and no partner ever appeared.
+
+Verified: dtc builds it with no new warning and the compiled dtb carries the
+serdes_ccu node, the five clock phandles on usb3 and the reset on u2phy. NOT
+verified here: the board.
+
+Assisted-by: Claude
+
+diff --git a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -16,8 +16,11 @@
+ #include <dt-bindings/interrupt-controller/arm-gic.h>
+ #include <dt-bindings/clock/sun60i-a733-ccu.h>
+ #include <dt-bindings/clock/sun60i-a733-r-ccu.h>
++#include <dt-bindings/clock/sun60i-a733-rtc-ccu.h>
++#include <dt-bindings/clock/sun60i-a733-serdes-ccu.h>
+ #include <dt-bindings/gpio/gpio.h>
+ #include <dt-bindings/reset/sun60i-a733-ccu.h>
++#include <dt-bindings/reset/sun60i-a733-serdes-ccu.h>
+ 
+ / {
+ 	model = "Radxa Cubie A7S (A733 minimal M1)";
+@@ -514,6 +517,23 @@
+ 		regulator-always-on;
+ 	};
+ 
++	/*
++	 * VBUS for the Type-C J4 SuperSpeed port, switched by SGM2576 U2 whose
++	 * enable is USB0-DRVVBUS = PL2 (the "USB0" net name is a schematic label;
++	 * on page-12 it gates J4's VBUS switch).
++	 * PL2 = r_pio bank index 0 (PL), pin 2.
++	 * Deliberately NOT regulator-always-on: the HUSB311 owns this rail as its
++	 * vbus-supply, and TCPM only leaves SRC_ATTACH_WAIT with VBUS down.
++	 */
++	reg_usb3_vbus: regulator-usb3-vbus {
++		compatible = "regulator-fixed";
++		regulator-name = "usb3-vbus";
++		regulator-min-microvolt = <5000000>;
++		regulator-max-microvolt = <5000000>;
++		gpio = <&r_pio 0 2 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++	};
++
+ 	memory@40000000 {
+ 		device_type = "memory";
+ 		/* Fallback 1 GiB; the bootloader fixes up the real size. */
+@@ -1129,6 +1149,160 @@
+ 		};
+ 
+ 		/*
++		 * USB3.1 SuperSpeed: the USB3 DRD (Allwinner "USB2" block,
++		 * UM USB3P1_DRD @0x06A00000, xHCI 1.20) + the COMB0 SERDES combo-PHY
++		 * that carries the SuperSpeed lanes to Type-C J4.
++		 *
++		 * dwc3 is described flat, through the generic glue: the glue owns the
++		 * clocks and the reset and only then creates the core, so the
++		 * controller is never reached before its bus clocks run. The bare
++		 * snps,dwc3 shape this replaced could not express that -- two of the
++		 * five clocks have no dwc3 clock name to go by -- and it left the
++		 * bring-up depending on the combo-PHY probing first, which fw_devlink
++		 * stopped honouring once the Type-C connector closed a graph ring.
++		 *
++		 * IRQ = GIC_SPI 155 (INTID 187, UM source "USB2" -- the controller
++		 * IRQ, not the COMB0 USB3 event, which is INTID 217 = GIC_SPI 185.
++		 * The old note here said "IRQ 185" and mixed the two numbering
++		 * spaces: INTID 185 is PCIE0_MSI.
++		 */
++		usb3: usb@6a00000 {
++			compatible = "allwinner,sun60i-a733-dwc3";
++			reg = <0x0 0x06a00000 0x0 0x10000>;
++			interrupts = <GIC_SPI 155 IRQ_TYPE_LEVEL_HIGH>;
++			/*
++			 * MF and U2_REF are each measured as required: booting
++			 * the same Image without either gives "soft reset
++			 * failed / -110" (the 8 GiB board, 2026-07-29). SUSPEND has never
++			 * been removed on a boot, and aclk/hclk -- gates in the
++			 * SERDES subsystem page, not in the CCU -- have never
++			 * existed as modelled clocks on a boot at all, so their
++			 * necessity here is reasoned, not measured. The first
++			 * board test of this node is what settles them.
++			 */
++			clocks = <&ccu CLK_USB2_U2_REF>,
++				 <&ccu CLK_USB2_MF>,
++				 <&ccu CLK_USB2_SUSPEND>,
++				 <&serdes_ccu CLK_USB3_ACLK>,
++				 <&serdes_ccu CLK_USB3_HCLK>;
++			clock-names = "ref", "mf", "suspend", "aclk", "hclk";
++			/* Force the suspend clock to sys24M (mux bit24=1); POR is
++			 * osc32k (32 kHz). Feeds GCTL.PWRDNSCALE. */
++			assigned-clocks = <&ccu CLK_USB2_SUSPEND>;
++			assigned-clock-rates = <24000000>;
++			resets = <&ccu RST_USB_2>;
++			phys = <&u2phy>, <&combophy0>;
++			phy-names = "usb2-phy", "usb3-phy";
++			dr_mode = "host";
++			maximum-speed = "super-speed-plus";
++			/*
++			 * Vendor dwc3 quirks: without the susphy quirks the core
++			 * soft-reset sends the PHYs to suspend and waits for an ack
++			 * that never comes -> DCTL.CSFTRST never clears -> -110.
++			 */
++			snps,dis_enblslpm_quirk;
++			snps,dis-u1-entry-quirk;
++			snps,dis-u2-entry-quirk;
++			snps,dis_u3_susphy_quirk;
++			snps,dis_u2_susphy_quirk;
++
++			/* Target for the connector's mandatory port@0 (HS). Inert:
++			 * dwc3 only builds a role switch when usb-role-switch is
++			 * present, and this port is host-only.
++			 */
++			status = "okay";
++
++			port {
++				usb3_hs: endpoint {
++					remote-endpoint = <&usb_con_hs>;
++				};
++			};
++		};
++
++		/*
++		 * SERDES subsystem clock/reset controller (patch `clk-sunxi-ng-a733-add-serdes-subsystem-clocks`). Two registers:
++		 * the PCIe bus gates at 0x0004 (not modelled yet) and the USB3 ones at
++		 * 0x0008 -- bit17 AXI, bit16 AHB, bit4 the companion PHY's reset-n.
++		 * The whole page is dead while
++		 * RST_BUS_SERDES is asserted, so the controller consumes that reset
++		 * and holds it deasserted for everyone behind it.
++		 */
++		serdes_ccu: clock-controller@6c00000 {
++			compatible = "allwinner,sun60i-a733-serdes-ccu";
++			reg = <0x0 0x06c00000 0x0 0x10>;
++			/*
++			 * The two bus-matrix gates that feed the whole SERDES
++			 * block: AHB 0x05C0 bit8 and
++			 * MBUS 0x05E0 bit28. They are the upstream of the
++			 * per-device gates in this page.
++			 */
++			clocks = <&ccu CLK_BUS_SERDES>, <&ccu CLK_MBUS_SERDES>;
++			clock-names = "ahb", "mbus";
++			resets = <&ccu RST_BUS_SERDES>;
++			#clock-cells = <1>;
++			#reset-cells = <1>;
++		};
++
++		/*
++		 * COMB0 SERDES combo-PHY (allwinner,sun60i-a733-usb3-combophy, patch
++		 * `phy-allwinner-a733-add-serdes-combophy`). Three windows the driver ioremaps by index: 0 = link
++		 * @0x06C01000 (LINK_CTRL0-3 + LINK_STUS), 1 = SERDES top2 @0x06C06000
++		 * (PIPE-clk mux + DP raw-serdes conv), 2 = PMA @0x06C80000 (0xC008
++		 * reset-path nudge). The SERDES subsystem page at 0x06C00000 is NOT
++		 * one of them -- it is the serdes_ccu's, above. serdes-phy-cfg =
++		 * 100 MHz config clock (main CCU); dcxo-serdes0 = RTC-CCU DCXO gate.
++		 * #phy-cells = 0 (of_phy_simple_xlate). vbus is on reg_usb3_vbus.
++		 */
++		combophy0: phy@6c01000 {
++			compatible = "allwinner,sun60i-a733-usb3-combophy";
++			reg = <0x0 0x06c01000 0x0 0x1000>,
++			      <0x0 0x06c06000 0x0 0x1000>,
++			      <0x0 0x06c80000 0x0 0x20000>;
++			clocks = <&ccu CLK_SERDES_PHY_CFG>,
++				 <&rtc_ccu CLK_RTC_DCXO_SERDES0>;
++			clock-names = "serdes", "dcxo-serdes0";
++			/* shared: the serdes_ccu holds it deasserted too */
++			resets = <&ccu RST_BUS_SERDES>;
++			#phy-cells = <0>;
++
++			/* The SS lane mux lives inside COMB0 -- there is no
++			 * external mux and no select GPIO on this board
++			 * at all. So the PHY itself is
++			 * the Type-C orientation switch, and TCPM reaches it
++			 * through the graph below. The property must sit on this
++			 * node: the framework matches the endpoint's remote
++			 * *device* parent.
++			 */
++			orientation-switch;
++
++			status = "okay";
++
++			port {
++				combophy0_ss: endpoint {
++					remote-endpoint = <&usb_con_ss>;
++				};
++			};
++		};
++
++		/*
++		 * USB2.0 UTMI companion PHY for the USB3 DRD (net USB2-U2). The dwc3
++		 * core soft-reset needs this out of power-down. Driver = patch `phy-allwinner-a733-add-usb2-companion-phy`
++		 * (clk res-dcap, Rext RESCAL via res_base, VBUSVLDEXT + clear SIDDQ).
++		 * Its reset-n is bit4 of the SERDES subsystem's USB3 gate register, so
++		 * it comes from the serdes_ccu rather than from this block.
++		 */
++		u2phy: phy@6b00000 {
++			compatible = "allwinner,sun60i-a733-usb2-phy";
++			reg = <0x0 0x06b00000 0x0 0x800>,   /* u2_base */
++			      <0x0 0x03000000 0x0 0x300>;   /* SYSCFG res_base (Rext) */
++			clocks = <&ccu CLK_RES_DCAP_24M>;
++			clock-names = "res_dcap";
++			resets = <&serdes_ccu RST_USB3_USB2PHY>;
++			#phy-cells = <0>;
++			status = "okay";
++		};
++
++		/*
+ 		 * AON / CPUS domain. The R-CCU (PRCM @0x07010000) provides the AON
+ 		 * bus clocks; the r_pio (S_GPIO @0x07025000) is the AON pin bank
+ 		 * PL/PM. Base + geometry from the pin tables of the A733 user manual (PL @0x00/14 pins, PM @0x30/
+@@ -1181,5 +1355,18 @@
+ 			interrupt-controller;
+ 			#interrupt-cells = <3>;
+ 		};
++
++		/*
++		 * RTC-CCU (PRCM @0x07090000, AON domain). Provides the two SERDES
++		 * DCXO gates (XO_CTRL1 @0x16c bit4/5); the COMB0 combo-PHY consumes
++		 * dcxo-serdes0. Parent = r-ahb (from the R-CCU). Driver = patch `clk-sunxi-ng-a733-add-minimal-rtc-ccu`.
++		 */
++		rtc_ccu: clock-controller@7090000 {
++			compatible = "allwinner,sun60i-a733-rtc-ccu";
++			reg = <0x0 0x07090000 0x0 0x400>;
++			clocks = <&r_ccu CLK_R_AHB>;
++			clock-names = "r-ahb";
++			#clock-cells = <1>;
++		};
+ 	};
+ };

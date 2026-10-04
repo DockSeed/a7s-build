@@ -1,0 +1,753 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] drm/a733: de, kms: position the primary plane on a black background
+
+[Recipe cut: regenerated: the hunks that touched the removed DE debugfs
+knobs are gone.]
+
+MEASURED, 2026-09-26, the 6 GiB board, kernel 6.18.53 with the series before this patch,
+a monitor on DP-1 at 1920x1200, no other DRM master (display
+manager and kmscon stopped, nothing holding /dev/dri/card*). The documented
+playback pipeline
+
+  gst-launch-1.0 filesrc ! qtdemux ! h264parse ! omxh264dec \
+    ! videoconvert ! kmssink driver-name=sun60i-kms
+
+fails at preroll with "drmModeSetPlane failed: Invalid argument (22)", and
+drm.debug says why:
+
+  [drm:drm_atomic_helper_check_plane_state] Plane must cover entire CRTC
+  [drm:drm_rect_debug_print] dst: 1920x1080+0+60
+  [drm:drm_rect_debug_print] clip: 1920x1200+0+0
+  [drm:drm_atomic_helper_check_planes] [PLANE:33:plane-0] atomic driver check failed
+
+The driver has one plane, the primary, and it could neither move nor scale.
+kmssink centres a 1080-line video on the 1200-line mode, which is the most
+ordinary thing a video sink does.
+
+WHAT CHANGES
+
+The primary plane becomes positionable (can_position = true), still 1:1. No
+register is written that the pipe did not already write. Four words change
+their SOURCE from the mode to the plane's clipped destination rectangle:
+
+  register                  address       was          now
+  VI0 LAY0_MBSIZE           0x05101004    mode size    dst size
+  VI0 OVL_SIZE              0x051010e8    mode size    dst size
+  BLD pipe 0 INSIZE         0x05281008    mode size    dst size
+  BLD pipe 0 COORD          0x0528100c    0            (y << 16) | x
+  (the blender words in all four blender instances, +k*0x400, as before)
+
+Three stay tied to the mode, now on purpose rather than by coincidence: BLD
+OUTSIZE (0x0528108c) and the mixer's GLOBAL_SIZE (0x05008108), which is
+what the blender hands TCON_TV1, and BKCOLOR (0x05281088 = 0xff000000,
+opaque black), which is what fills the screen outside the plane.
+LAY0_MBCOOR stays 0: it is the layer's corner inside the channel's own
+overlay window, not on the screen, and with one layer the window is the
+layer. LAY0_TOP_LADDR becomes the address of the first SHOWN pixel, taken
+from the clipped source origin (sun60i_kms_plane_scanout()), because the
+layer has no crop register; drm_fb_dma_get_gem_addr() adds the unclipped
+src_x/src_y, which is wrong for a plane that hangs over the top or left
+edge.
+
+For a plane that covers the mode every one of those words equals what the
+mode gave before -- 0x04af077f three times and 0 at 1920x1200 -- and the
+address is the same to the byte. A page flip at a fixed rectangle writes
+exactly the layer words it always wrote and no blender word: only a plane
+whose rectangle changed restages pipe 0's INSIZE and COORD, in the same
+batch, after the layer (mainline sun8i's order). fbcon, kmscon and X
+program the display engine as before; the enable path writes the same words
+in the same order.
+
+Refused, each with a drm.debug line saying why:
+  - scaling: min = max = DRM_PLANE_NO_SCALING, unchanged. The channel's
+    VSU8 would need a coefficient table that no UM page documents and no
+    capture of ours has confirmed; VSU_CTL stays 0.
+  - a source origin between two pixels (src.x1/src.y1 & 0xffff): a
+    sub-pixel phase is scaling by another name, and truncating it would
+    show a picture other than the one asked for.
+  - an active CRTC whose primary plane lies wholly off the mode.
+    drm_atomic_helper_check_plane_state() calls such a plane "not visible"
+    and returns success -- with can_position false as well, so this was
+    reachable before -- and .atomic_update then returned early and left the
+    PREVIOUS framebuffer scanning. The CRTC check refuses it now, and the
+    plane update turns the layer off should it ever be reached, as
+    mainline's sun8i layers do.
+The display engine's exported seam refuses a rectangle outside the mode
+with -EINVAL, so a caller that forgot to clip cannot wrap a 16-bit
+coordinate.
+
+WHERE THE VALUES COME FROM
+
+The A733 UM does not document the display engine's registers. V1.00 section
+14.3 "Display Engine (DE)", printed pages 641-642 (PDF 662-663), is feature
+prose -- output size up to 4096x2048, up to seven alpha-blending channels feeding two
+display outputs, four overlay layers per channel, an independent scaler --
+and no register table; the V1.00
+text extract has zero hits for BLD_, OVL_, BKCOLOR, OUTSIZE, MBSIZE or
+blender. So no value here carries a UM line. The register map is the one
+this driver already rests on, from the live vendor capture: INSIZE at blender +0x08,
+OUTSIZE at +0x8c, MBSIZE at VI +0x04, OVL_SIZE at VI +0xe8, all four
+holding 0x04af077f on a live 1920x1200 link. What that capture cannot show,
+because its layer is full screen:
+
+  - COORD's half order. The live value is 0, which fits either order.
+    Mainline (SUN8I_MIXER_COORD(x, y) = (y) << 16 | (x)) and the vendor's
+    field map (de_bld_type.h, bld_coord_reg: xcoord [15:0], ycoord [31:16])
+    agree, and the vendor writes it that way (de_bld.c:248-250). Open until
+    read back.
+  - That INSIZE and OVL_SIZE follow the plane and OUTSIZE the mode.
+    Mainline: sun8i_ui_layer.c/sun8i_vi_layer.c write LAYER_SIZE and
+    OVL_SIZE from the source, BLEND_ATTR_INSIZE from the destination and
+    COORD from dst.x1/y1; sun8i_mixer.c writes OUTSIZE from the mode and
+    BKCOLOR black. The vendor: mbsize and win_size from the layer
+    (de_ovl.c:440-521), in_size and in_coord from the channel's screen
+    window (de_bld.c:229-250, de_channel.c:405-425), out_size from the
+    output (de_bld.c:102-131).
+
+WHAT THE VENDOR DOES DIFFERENTLY (allwinner-bsp, branch cubie-aiot-v1.4.8,
+drivers/drm/, read for this patch; no code taken)
+
+  - It clips nothing. sunxi_drm_crtc.c:1082-1092 installs no plane
+    .atomic_check, de_channel.c:405-408 takes crtc_x/y/w/h and :450-466
+    src_x/y/w/h straight from the uAPI, and de_bld.c:248-250 masks x and y
+    into 16 bits. A plane hanging over the left edge is written as a
+    coordinate near 65535, one over the right edge as a window reaching
+    past OUTSIZE. Here the helper clips first, and the clipped source
+    offset goes into the scanout address.
+  - BKCOLOR = 0 for an RGB output (de_bld.c:128-131), with [31:24] reserved
+    in its own field map (de_bld_type.h, bld_bg_color_reg). Ours stays
+    mainline's 0xff000000 -- the same RGB -- and what that byte reads back
+    is a board reading, not an argument. This corrects sun60i-de.c, which
+    said the vendor does not initialise BKCOLOR: it writes 0, and 0 is what
+    the live capture holds.
+  - For an unscaled RGB layer it clears only the scaler's enable bit and
+    leaves the scaler's output size alone (de_channel.c:584-590,
+    de_scaler.c:1221-1242) -- the VSU_CTL = 0 this driver writes. That is
+    the vendor's own evidence that a smaller unscaled window needs nothing
+    more from the VSU; the A523 series' claim that the VSU is never
+    bypassed is what the test boot below can falsify.
+  - It delivers every write through the RCQ, which latches at frame start,
+    so a move never shows a half-written window. Ours is direct MMIO like
+    every other datapath write in this driver: a move can show one frame in
+    which the channel and the blender disagree about the window. Stage 3's
+    line-window guard is where that belongs, and sun60i_de_kms_scanout()
+    says so.
+
+VERIFIED BEFORE THE BOARD
+
+  - apply-patches: every series entry at --fuzz=0 on a freshly unpacked
+    6.18.53, including arm64-dts-a733-display-engine-behind-iommu1, which
+    edits comments in both files after this patch.
+  - compile-check green; drivers/gpu/drm/sun60i/ rebuilt with W=1: no
+    warning from sun60i-de.c or sun60i-kms.c.
+  - a full kernel build (localversion -t804), for the test boot below.
+
+HARDWARE-PROVEN on the 6 GiB board, 2026-09-26 (6.18.53-t804 and -t390),
+1920x1200 mode, fbcon:
+  * a script issuing SETPLANE on plane 33: 1920x1080
+    at +0+60 -> MBSIZE, OVL_SIZE, INSIZE 0x0437077F, COORD 0x003C0000;
+    1280x720 at +320+240 -> 0x02CF04FF, COORD 0x00F00140; OUTSIZE and
+    GLOBAL_SIZE stay 0x04AF077F; closing the card gives fbcon back
+    full screen (0x04AF077F, COORD 0). Before this patch the same kmssink
+    request failed "Plane must cover entire CRTC", dst 1920x1080+0+60.
+  * kmssink 1080p on the 1200 mode runs to EOS with the vblank interrupt working (10 of
+    10 with ORC_CODE=backup; with ORC's NEON code 6 of 10 crash in
+    videoconvert, unrelated to this patch).
+  * X (lightdm) and kmscon unchanged: full-screen words as before, no
+    (EE) in Xorg.0.log.
+  * BKCOLOR reads back 0x00000000 after the driver's 0xff000000: bits
+    [31:24] do not store, as the vendor's field layout says.
+  Not run: a human looking at the bars, and the BKCOLOR colour stimulus
+  (item 2 below) -- both need eyes at the monitor.
+
+OWED BY THE BOARD (the plan before the run), with the falsifier of each
+
+  1. The kmssink pipeline above, 1080p on the 1920x1200 mode, runs to EOS:
+     picture on rows 60..1139, black bars above and below, 1:1, not
+     sheared. Falsified by -EINVAL at preroll, a picture at the top, a
+     picture that collapses or repeats a column (the VSU claim), or bars
+     that are not black.
+  2. The bars are BKCOLOR, shown by stimulus: while playing, write
+     0x000000ff into BKCOLOR of all four instances (0x05281088 + k*0x400)
+     -- the bars turn blue and the video does not; write 0xff000000 back.
+  3. Readback while playing: 0x05101004 = 0x051010e8 = 0x05281008 =
+     0x0437077f, 0x0528100c = 0x003c0000, 0x05101008 = 0, 0x0528108c =
+     0x05008108 = 0x04af077f; 0x05281088 reads 0xff000000 or 0x00000000 and
+     says which. debugfs `state` prints "1920x1080 at +0+60" as the layer.
+  4. After EOS fbcon is back full screen: 0x05281008 = 0x04af077f,
+     0x0528100c = 0; the console proof passes 16/16; kmscon and the X
+     desktop come up and look as before.
+
+Assisted-by: Claude
+---
+
+diff --git a/drivers/gpu/drm/sun60i/sun60i-de.c b/drivers/gpu/drm/sun60i/sun60i-de.c
+--- a/drivers/gpu/drm/sun60i/sun60i-de.c
++++ b/drivers/gpu/drm/sun60i/sun60i-de.c
+@@ -118,6 +118,7 @@
+ #include <linux/seq_file.h>
+ 
+ #include <drm/drm_modes.h>
++#include <drm/drm_rect.h>
+ 
+ #include "sun60i-display.h"
+ #include "sun60i-kms.h"
+@@ -326,6 +327,7 @@
+ /* Values. */
+ #define DE_VERSION_A733			0x03520100
+ #define DE_SIZE(w, h)			((((h) - 1) << 16) | ((w) - 1))
++#define DE_COORD(x, y)			(((y) << 16) | (x))
+ #define DE2TCON_MUX_LIVE		0x0000fff5
+ #define BLD_COLOR_BLACK			0xff000000
+ #define BLD_MODE_SRCOVER		0x03010301
+@@ -434,6 +436,14 @@ struct sun60i_de {
+ 	 */
+ 	bool				kms_owned;
+ 	struct drm_display_mode		mode;
++	/*
++	 * Where the layer lands on the mode, in pixels, clipped to it. The
++	 * layer is fetched at this size and the blender places it at this
++	 * position; nothing scales, so one rectangle describes both. The
++	 * debugfs path always sets it to the whole mode; only a KMS plane
++	 * moves it.
++	 */
++	struct drm_rect			dst;
+ 
+ 	dma_addr_t			fb_dma;
+ 	u32				fb_pitch;
+@@ -463,6 +473,33 @@ static u32 sun60i_de_bld(unsigned int instance)
+ 	return DE_DISP0 + DE_DISP_BLD + instance * DE_BLD_STRIDE;
+ }
+ 
++/*
++ * The layer's rectangle in the two encodings the registers use: a size as
++ * (h - 1, w - 1) and a position as (y, x), each in two 16-bit halves.
++ */
++static u32 sun60i_de_dst_size(const struct sun60i_de *de)
++{
++	return DE_SIZE(drm_rect_width(&de->dst), drm_rect_height(&de->dst));
++}
++
++static u32 sun60i_de_dst_coord(const struct sun60i_de *de)
++{
++	return DE_COORD(de->dst.x1, de->dst.y1);
++}
++
++/*
++ * At least one pixel, and entirely inside the mode. The KMS half clips before
++ * it calls, so this is not a second clip: it is the exported seam refusing a
++ * rectangle that would wrap a 16-bit coordinate or run past BLD_OUTSIZE.
++ */
++static bool sun60i_de_dst_fits(const struct drm_display_mode *mode,
++			       const struct drm_rect *dst)
++{
++	return dst->x1 >= 0 && dst->y1 >= 0 &&
++	       dst->x2 > dst->x1 && dst->y2 > dst->y1 &&
++	       dst->x2 <= mode->hdisplay && dst->y2 <= mode->vdisplay;
++}
++
+ /*
+  * The one place the device tree's window split exists. Every other offset in
+  * this file counts from the DE aperture base, which is what the capture, the
+@@ -952,27 +989,51 @@ static void sun60i_de_channel_quiesce(struct sun60i_de *de)
+  *   FCOLOR(0)                COMPUTED -- AARRGGBB. Opaque black by default,
+  *                            which is mainline's BLEND_COLOR_BLACK and what
+  *                            silicon carries.
+- *   INSIZE(0), COORD(0)      COMPUTED from the mode -- full screen at the
+- *                            origin.
++ *   INSIZE(0)                COMPUTED from de->dst -- the layer's size on the
++ *                            screen, (h - 1, w - 1) like every size here.
++ *   COORD(0)                 COMPUTED from de->dst -- the layer's top-left
++ *                            corner in the mode, y in [31:16] and x in [15:0].
++ *                            Mainline's SUN8I_MIXER_COORD() and the vendor's
++ *                            bld_coord_reg (allwinner-bsp de_bld_type.h) both
++ *                            put the halves that way round; the live link
++ *                            carries 0, which cannot tell them apart.
++ *                            A full-screen plane gives exactly the words the
++ *                            mode gave before planes could move: the mode's
++ *                            size, and 0.
+  *   ROUTE        0           COMPUTED -- four bits per pipe, pipe 0 <- channel
+  *                            0. The zero is the right answer here, not merely
+  *                            an untouched register.
+- *   OUTSIZE                  COMPUTED from the mode.
++ *   OUTSIZE                  COMPUTED from the MODE, never from the plane. It
++ *                            is what the blender hands the TCON, and it must
++ *                            match TCON_TV1's raster whatever the plane does.
+  *   BLEND_MODE(0) 0x03010301 CARRIED, and honestly so: mainline's own comment
+  *                            on this constant is "some still unknown magic
+  *                            numbers", and the prior art calls it SRCOVER
+  *                            without explaining it either. The A733 carries the
+  *                            same word verbatim.
+  *
++ * WHAT FILLS THE SCREEN OUTSIDE THE LAYER. Two colours are in play, and on this
++ * pipe both are opaque black. Pipe 0 covers only its window (INSIZE at COORD);
++ * inside it the layer is shown, with the pipe's fill colour behind it because
++ * FC_EN(0) is set, as mainline and the vendor both set it. Outside that window
++ * no pipe contributes and the blender outputs BKCOLOR, up to OUTSIZE. So a
++ * plane smaller than the mode is shown on BKCOLOR, and that is the whole of
++ * what "letterbox" means here: no register beyond these nine is involved.
++ * Which of the two colours paints the bars is a board reading, not a
++ * derivation -- change one of them by hand and watch the bars.
++ *
+  * TWO REGISTERS ARE WRITTEN THAT THE LIVE LINK LEAVES AT ZERO, and both are
+  * departures this driver owns rather than discovers later. PREMULTIPLY = 0 is
+  * the value either way, and is written so that a bootloader cannot leave it set
+- * for an XRGB8888 layer that has no alpha to premultiply. BKCOLOR = opaque
+- * black is what mainline initialises and the vendor does not; it is invisible
+- * behind a full-screen opaque layer, which is exactly why the vendor can do
+- * without writing it, and it is the first thing that shows the moment a plane is
+- * smaller than the screen. The out-of-tree series later added a patch titled
+- * "black blender background" for that reason.
++ * for an XRGB8888 layer that has no alpha to premultiply. BKCOLOR is written
++ * 0xff000000, mainline's BLEND_COLOR_BLACK. ⛔ An earlier version of this
++ * comment said the vendor does not initialise it. It does: an RGB output gets
++ * bg_color = 0 (allwinner-bsp de_bld.c:128-131), which its own field map reads
++ * as RGB [23:0] = black with [31:24] RESERVED (de_bld_type.h,
++ * bld_bg_color_reg), and the live link's 0 matches that write. So the two
++ * values differ only in a byte the vendor calls reserved, and both are black.
++ * The value is kept, because it is what this pipe has always written; what the
++ * top byte reads back is recorded rather than assumed (`state`).
+  *
+  * BLD_OUTCTL, which mainline places at +0xfc and uses for the interlace bit, is
+  * NOT written -- and that is a disagreement rather than an oversight. The A523
+@@ -984,7 +1045,7 @@ static void sun60i_de_channel_quiesce(struct sun60i_de *de)
+ static void sun60i_de_blender(struct sun60i_de *de)
+ {
+ 	const struct drm_display_mode *mode = &de->mode;
+-	u32 size = DE_SIZE(mode->hdisplay, mode->vdisplay);
++	u32 out = DE_SIZE(mode->hdisplay, mode->vdisplay);
+ 	unsigned int i;
+ 
+ 	for (i = 0; i < DE_BLD_INSTANCES; i++) {
+@@ -992,12 +1053,14 @@ static void sun60i_de_blender(struct sun60i_de *de)
+ 
+ 		sun60i_de_stage(de, bld + BLD_ATTR_FCOLOR(DE_BLD_PIPE),
+ 				de->background);
+-		sun60i_de_stage(de, bld + BLD_ATTR_INSIZE(DE_BLD_PIPE), size);
+-		sun60i_de_stage(de, bld + BLD_ATTR_COORD(DE_BLD_PIPE), 0);
++		sun60i_de_stage(de, bld + BLD_ATTR_INSIZE(DE_BLD_PIPE),
++				sun60i_de_dst_size(de));
++		sun60i_de_stage(de, bld + BLD_ATTR_COORD(DE_BLD_PIPE),
++				sun60i_de_dst_coord(de));
+ 		sun60i_de_stage(de, bld + BLD_ROUTE, 0);
+ 		sun60i_de_stage(de, bld + BLD_PREMULTIPLY, 0);
+ 		sun60i_de_stage(de, bld + BLD_BKCOLOR, BLD_COLOR_BLACK);
+-		sun60i_de_stage(de, bld + BLD_OUTSIZE, size);
++		sun60i_de_stage(de, bld + BLD_OUTSIZE, out);
+ 		sun60i_de_stage(de, bld + BLD_MODE(DE_BLD_PIPE),
+ 				BLD_MODE_SRCOVER);
+ 		sun60i_de_stage(de, bld + BLD_PIPE_CTL,
+@@ -1007,10 +1070,47 @@ static void sun60i_de_blender(struct sun60i_de *de)
+ }
+ 
+ /*
+- * The layer -- six registers that matter, every one COMPUTED from the mode and
+- * the framebuffer, and the live link's ATTCTL word decodes completely under
+- * them with no residue: 0xff008403 is global alpha 0xff, RGB_MODE set, FBFMT
+- * 4 = XRGB8888, alpha mode 01 = layer, EN.
++ * Pipe 0's window alone -- the two blender words a moving plane changes. Every
++ * other blender word depends on the mode or on nothing, and a plane update
++ * that is not a modeset leaves them where sun60i_de_blender() put them.
++ */
++static void sun60i_de_blender_window(struct sun60i_de *de)
++{
++	unsigned int i;
++
++	for (i = 0; i < DE_BLD_INSTANCES; i++) {
++		u32 bld = sun60i_de_bld(i);
++
++		sun60i_de_stage(de, bld + BLD_ATTR_INSIZE(DE_BLD_PIPE),
++				sun60i_de_dst_size(de));
++		sun60i_de_stage(de, bld + BLD_ATTR_COORD(DE_BLD_PIPE),
++				sun60i_de_dst_coord(de));
++	}
++}
++
++/*
++ * The layer -- six registers that matter, every one COMPUTED from the layer's
++ * rectangle (de->dst) and the framebuffer, and the live link's ATTCTL word
++ * decodes completely under them with no residue: 0xff008403 is global alpha
++ * 0xff, RGB_MODE set, FBFMT 4 = XRGB8888, alpha mode 01 = layer, EN.
++ *
++ * THREE WORDS DESCRIBE A SIZE OR A POSITION, AND NONE OF THEM IS THE SCREEN.
++ *   MBSIZE    the layer's fetch size -- how many pixels per line and lines.
++ *   MBCOOR    the layer's corner inside the CHANNEL's overlay window, not on
++ *             the screen. One layer per channel makes the window the layer,
++ *             so this is 0 wherever the plane sits; the vendor computes it as
++ *             the layer's offset from the channel's bounding box
++ *             (allwinner-bsp de_channel.c:478-482), 0 for a single layer.
++ *   OVL_SIZE  the overlay window, which is what leaves the channel for the
++ *             blender. With VSU_CTL = 0 nothing rescales it, so it must equal
++ *             the blender's INSIZE -- which it does, both being de->dst's size.
++ * Where the layer lands on the screen is the blender's COORD, and only that.
++ * Scaling would make MBSIZE/OVL_SIZE (the source) differ from INSIZE (the
++ * screen) and needs the VSU -- which is exactly what is not done here.
++ *
++ * The address is the first SHOWN pixel, not the buffer's start: the caller has
++ * already added the source offset of a panned or clipped plane, the way
++ * mainline's sun8i layers add src.x1/src.y1. There is no crop register.
+  *
+  * The plane-1 and plane-2 pitches and addresses are written as zero rather than
+  * left alone. They are unused for a packed RGB format and the live link has
+@@ -1070,9 +1170,8 @@ static void sun60i_de_blender(struct sun60i_de *de)
+  */
+ static void sun60i_de_layer(struct sun60i_de *de)
+ {
+-	const struct drm_display_mode *mode = &de->mode;
+ 	u32 ovl = sun60i_de_chn(DE_VI0_SLOT) + DE_CHN_OVL;
+-	u32 size = DE_SIZE(mode->hdisplay, mode->vdisplay);
++	u32 size = sun60i_de_dst_size(de);
+ 	unsigned int plane;
+ 
+ 	for (plane = 1; plane < OVL_VI_PLANES; plane++) {
+@@ -1127,13 +1226,20 @@ static int sun60i_de_layer_disable(struct sun60i_de *de)
+  * flag should say after a commit that did not land is a question no backend
+  * in this tree can yet pose, and inventing an answer here would change a path
+  * silicon has walked.
++ *
++ * @moved restages pipe 0's window in the same batch, after the layer -- the
++ * order mainline's sun8i layers write them in (layer and overlay size, then
++ * blender coordinate and size). Only a plane whose rectangle changed passes
++ * it, so a page flip at a fixed position writes exactly what it always wrote.
+  */
+-static int sun60i_de_layer_enable(struct sun60i_de *de)
++static int sun60i_de_layer_enable(struct sun60i_de *de, bool moved)
+ {
+ 	int ret;
+ 
+ 	de->commit->begin(de);
+ 	sun60i_de_layer(de);
++	if (moved)
++		sun60i_de_blender_window(de);
+ 	ret = de->commit->arm(de);
+ 	de->layer_on = true;
+ 
+@@ -1321,6 +1427,7 @@ static int sun60i_de_state_show(struct seq_file *s, void *unused)
+ 		{ "bld0 PIPE_CTL",	bld + BLD_PIPE_CTL },
+ 		{ "bld0 FCOLOR0",	bld + BLD_ATTR_FCOLOR(DE_BLD_PIPE) },
+ 		{ "bld0 INSIZE0",	bld + BLD_ATTR_INSIZE(DE_BLD_PIPE) },
++		{ "bld0 COORD0",	bld + BLD_ATTR_COORD(DE_BLD_PIPE) },
+ 		{ "bld0 ROUTE",		bld + BLD_ROUTE },
+ 		{ "bld0 BKCOLOR",	bld + BLD_BKCOLOR },
+ 		{ "bld0 OUTSIZE",	bld + BLD_OUTSIZE },
+@@ -1348,6 +1455,9 @@ static int sun60i_de_state_show(struct seq_file *s, void *unused)
+ 	seq_printf(s, "module clock   : %lu Hz\n", clk_get_rate(de->mod_clk));
+ 	seq_printf(s, "scanout        : %pad, pitch %u, XRGB8888\n",
+ 		   &de->fb_dma, de->fb_pitch);
++	seq_printf(s, "layer          : %dx%d at +%d+%d on the mode, unscaled\n",
++		   drm_rect_width(&de->dst), drm_rect_height(&de->dst),
++		   de->dst.x1, de->dst.y1);
+ 	seq_printf(s, "address kind   : %s\n",
+ 		   device_iommu_mapped(de->dev) ?
+ 		   "IOVA (behind an IOMMU) -- NOT comparable with a vendor capture" :
+@@ -1373,6 +1483,8 @@ static int sun60i_de_state_show(struct seq_file *s, void *unused)
+ 		   de->cold_version, de->cold_ccsc, de->cold_vsu,
+ 		   de->cold_tfbd);
+ 
++	seq_puts(s, "\nINSIZE0 at COORD0 is the layer's window (y in the high half), OUTSIZE\n");
++	seq_puts(s, "is the mode's, and everything outside the window is BKCOLOR.\n");
+ 	seq_puts(s, "\nRCQ_HEAD_LEN must read 0: this driver commits by CPU store, and an\n");
+ 	seq_puts(s, "armed queue would reload the datapath from DRAM on every frame-start.\n");
+ 	seq_puts(s, "\nThe three de_top ENABLE words open the channel and blender windows. With any\n");
+@@ -1404,6 +1516,7 @@ DEFINE_SHOW_ATTRIBUTE(sun60i_de_state);
+  */
+ int sun60i_de_kms_enable(struct sun60i_de *de,
+ 			 const struct drm_display_mode *mode,
++			 const struct drm_rect *dst,
+ 			 dma_addr_t scanout, u32 pitch)
+ {
+ 	guard(mutex)(&de->lock);
+@@ -1414,7 +1527,11 @@ int sun60i_de_kms_enable(struct sun60i_de *de,
+ 	if (de->enabled)
+ 		return -EBUSY;
+ 
++	if (!sun60i_de_dst_fits(mode, dst))
++		return -EINVAL;
++
+ 	drm_mode_copy(&de->mode, mode);
++	de->dst = *dst;
+ 	de->fb_dma = scanout;
+ 	de->fb_pitch = pitch;
+ 
+@@ -1452,18 +1569,32 @@ EXPORT_SYMBOL_GPL(sun60i_de_kms_disable);
+  * unguarded. So the risk here is not only a torn line: it is a write that lands
+  * on a frame boundary. Stage 3 owns it, it needs the TCON interrupt first, and
+  * the two functions above are what it should look like.
++ *
++ * A plane that MOVES is the same write plus pipe 0's window, and it carries the
++ * same missing guard: for the part of one frame between the layer's size words
++ * and the blender's, the channel and the blender can disagree about the
++ * window. Only a move pays that; a flip at a fixed rectangle writes no
++ * blender register at all, exactly as before planes could move.
+  */
+-int sun60i_de_kms_scanout(struct sun60i_de *de, dma_addr_t scanout, u32 pitch)
++int sun60i_de_kms_scanout(struct sun60i_de *de, const struct drm_rect *dst,
++			  dma_addr_t scanout, u32 pitch)
+ {
++	bool moved;
++
+ 	guard(mutex)(&de->lock);
+ 
+ 	if (!de->enabled)
+ 		return -ENODEV;
+ 
++	if (!sun60i_de_dst_fits(&de->mode, dst))
++		return -EINVAL;
++
++	moved = !drm_rect_equals(&de->dst, dst);
++	de->dst = *dst;
+ 	de->fb_dma = scanout;
+ 	de->fb_pitch = pitch;
+ 
+-	return sun60i_de_layer_enable(de);
++	return sun60i_de_layer_enable(de, moved);
+ }
+ EXPORT_SYMBOL_GPL(sun60i_de_kms_scanout);
+ 
+diff --git a/drivers/gpu/drm/sun60i/sun60i-kms.c b/drivers/gpu/drm/sun60i/sun60i-kms.c
+--- a/drivers/gpu/drm/sun60i/sun60i-kms.c
++++ b/drivers/gpu/drm/sun60i/sun60i-kms.c
+@@ -347,12 +347,38 @@ static inline struct sun60i_kms_plane *to_kms_plane(struct drm_plane *plane)
+  *   - LINEAR ONLY. TFBD (tiled-framebuffer decode) is left at reset by `drm-a733-display-engine-dram-into-tcon-tv1` and
+  *     read back rather than written, so there is no compressed source to
+  *     describe. DRM_FORMAT_MOD_LINEAR is therefore the complete list.
+- *   - FULL SCREEN, NO SCALING, NO POSITIONING. The VSU8 scaler sits in the
+- *     channel datapath unconditionally on this DE generation -- it filters
+- *     every pixel and there is no bypass by omission -- and `drm-a733-display-engine-dram-into-tcon-tv1` stages it at
+- *     unity. A scaled or offset plane would need real VSU coefficients and a
+- *     step, which is stage 4 work, so the check refuses rather than programs
+- *     something plausible.
++ *   - POSITIONED, NOT SCALED. The plane may sit anywhere on the mode and be
++ *     smaller than it -- a 1080-line video centred on a 1200-line mode is the
++ *     case that asked for it -- and what it does not cover is the blender's
++ *     background, opaque black. That costs no new kind of register: the layer
++ *     is fetched at its own size (LAY0_MBSIZE, OVL_SIZE) and the blender puts
++ *     it at its position (pipe 0 INSIZE, COORD) over BKCOLOR, while OUTSIZE
++ *     stays the mode's. For a plane that covers the mode every one of those
++ *     words is the value the mode alone gave before, so fbcon, kmscon and X
++ *     program exactly what they always did. mainline's sun8i layers are the
++ *     model (can_position true, BKCOLOR black, OUTSIZE = mode).
++ *     Scaling is still refused. The VSU8 scaler is the channel's own and `drm-a733-display-engine-dram-into-tcon-tv1`
++ *     writes VSU_CTL = 0; scaling would need its coefficient table, which no
++ *     UM page documents and no capture of ours has confirmed, so min = max =
++ *     DRM_PLANE_NO_SCALING, and a source origin between two pixels -- a phase
++ *     only the scaler could honour -- is refused with it.
++ *     ⚠ Whether VSU_CTL = 0 is a true bypass is the A523 series' open claim
++ *     (sun60i-de.c, above sun60i_de_channel_quiesce()). A full-screen picture
++ *     has been correct with it since `drm-a733-display-engine-dram-into-tcon-tv1`; a window smaller than the mode is
++ *     the first case in which the scaler's output size, left at 0, could
++ *     matter. A picture at the right place, the right size and not collapsed
++ *     is that claim's falsifier. The vendor agrees in code: when the sizes
++ *     match it clears only the scaler's enable bit and leaves its output size
++ *     alone (de_channel.c:584-590, de_scaler.c:1221-1242).
++ *
++ *     WHAT THE VENDOR DOES DIFFERENTLY. It has no plane .atomic_check (the
++ *     table in the header), so nothing is clipped: de_channel.c:405-408 takes
++ *     crtc_x/y/w/h and :450-466 src_x/y/w/h straight from the uAPI, and
++ *     de_bld.c:246-250 masks the position into a 16-bit field. A plane that
++ *     hangs over the left edge is written as a coordinate near 65535, and one
++ *     over the right edge as a window reaching past OUTSIZE. Here the helper
++ *     clips first, and the source offset of a clipped or panned plane goes
++ *     into the scanout address, the way mainline's sun8i layers do it.
+  */
+ static const u32 sun60i_kms_plane_formats[] = {
+ 	DRM_FORMAT_XRGB8888,
+@@ -364,6 +390,29 @@ static const u64 sun60i_kms_plane_modifiers[] = {
+ 	DRM_FORMAT_MOD_INVALID,
+ };
+ 
++/*
++ * The address of the first pixel the layer SHOWS: the buffer, plus the source
++ * rectangle's origin AFTER clipping. drm_fb_dma_get_gem_addr() is not used
++ * because it adds the unclipped src_x/src_y, which is the right answer only
++ * while the plane lies wholly on the mode; a plane hanging over the top or left
++ * edge has lost the rows and columns in front of src.x1/src.y1, and the layer
++ * has no crop register to skip them with. For a plane that is not clipped the
++ * two agree to the byte. The same computation as mainline's sun8i UI layer.
++ */
++static dma_addr_t sun60i_kms_plane_scanout(const struct drm_plane_state *state)
++{
++	struct drm_framebuffer *fb = state->fb;
++	struct drm_gem_dma_object *gem = drm_fb_dma_get_gem_obj(fb, 0);
++
++	/* What drm_fb_dma_get_gem_addr() answers for a missing object. */
++	if (!gem)
++		return 0;
++
++	return gem->dma_addr + fb->offsets[0] +
++	       (dma_addr_t)(state->src.y1 >> 16) * fb->pitches[0] +
++	       (dma_addr_t)(state->src.x1 >> 16) * fb->format->cpp[0];
++}
++
+ static int sun60i_kms_plane_atomic_check(struct drm_plane *plane,
+ 					 struct drm_atomic_state *state)
+ {
+@@ -380,21 +429,31 @@ static int sun60i_kms_plane_atomic_check(struct drm_plane *plane,
+ 	if (!crtc_state)
+ 		return -EINVAL;
+ 
++	/*
++	 * can_position = true: the plane may be smaller than the mode and sit
++	 * anywhere on it, and the helper clips src and dst to the mode. What it
++	 * leaves uncovered is BKCOLOR (sun60i-de.c, sun60i_de_blender()).
++	 */
+ 	ret = drm_atomic_helper_check_plane_state(new_state, crtc_state,
+ 						  DRM_PLANE_NO_SCALING,
+ 						  DRM_PLANE_NO_SCALING,
+-						  false, true);
++						  true, true);
+ 	if (ret)
+ 		return ret;
+ 
+ 	if (!new_state->visible)
+ 		return 0;
+ 
+-	if (new_state->dst.x1 || new_state->dst.y1 ||
+-	    drm_rect_width(&new_state->dst) != crtc_state->mode.hdisplay ||
+-	    drm_rect_height(&new_state->dst) != crtc_state->mode.vdisplay) {
++	/*
++	 * Whole pixels only. With min = max = DRM_PLANE_NO_SCALING the source
++	 * and destination sizes already agree; an origin between two pixels is
++	 * a sub-pixel phase, and only the channel's scaler could honour it.
++	 * Truncating it would put a different picture on the screen than the
++	 * one asked for, so it is refused like any other scaling.
++	 */
++	if ((new_state->src.x1 | new_state->src.y1) & 0xffff) {
+ 		drm_dbg_atomic(plane->dev,
+-			       "plane must cover the whole mode: the layer geometry and the blender input size are both programmed from the mode, and the scaler is staged at unity\n");
++			       "source origin is not on a pixel boundary: a sub-pixel phase needs the channel scaler, which this driver leaves off\n");
+ 		return -EINVAL;
+ 	}
+ 
+@@ -402,9 +461,9 @@ static int sun60i_kms_plane_atomic_check(struct drm_plane *plane,
+ 	 * Refused HERE rather than at commit time, where the only symptom would
+ 	 * be a screen that stays black while every register reads back
+ 	 * correctly -- the failure shape this pipe already paid a session for
+-	 * on 2026-08-19.
++	 * on 2026-08-19. The address checked is the one the layer is given.
+ 	 */
+-	addr = drm_fb_dma_get_gem_addr(new_state->fb, new_state, 0);
++	addr = sun60i_kms_plane_scanout(new_state);
+ 	if (upper_32_bits(addr)) {
+ 		drm_dbg_atomic(plane->dev,
+ 			       "framebuffer at %pad is above 4 GiB and the layer address register is 32 bits\n",
+@@ -424,12 +483,21 @@ static void sun60i_kms_plane_atomic_update(struct drm_plane *plane,
+ 	dma_addr_t addr;
+ 	int ret;
+ 
+-	if (!new_state->visible)
++	/*
++	 * The CRTC check refuses an active CRTC whose primary plane is off the
++	 * mode, so on an active CRTC this is not reached. If it ever is, the
++	 * layer stops fetching rather than keep scanning a framebuffer the
++	 * helpers are free to release -- mainline's sun8i layers do the same.
++	 */
++	if (!new_state->visible) {
++		sun60i_de_kms_layer_off(kms->de);
+ 		return;
++	}
+ 
+-	addr = drm_fb_dma_get_gem_addr(new_state->fb, new_state, 0);
++	addr = sun60i_kms_plane_scanout(new_state);
+ 
+-	ret = sun60i_de_kms_scanout(kms->de, addr, new_state->fb->pitches[0]);
++	ret = sun60i_de_kms_scanout(kms->de, &new_state->dst, addr,
++				    new_state->fb->pitches[0]);
+ 	if (ret)
+ 		drm_err(plane->dev, "scanout from %pad: %d\n", &addr, ret);
+ }
+@@ -496,6 +564,8 @@ static int sun60i_kms_crtc_atomic_check(struct drm_crtc *crtc,
+ {
+ 	struct drm_crtc_state *crtc_state =
+ 		drm_atomic_get_new_crtc_state(state, crtc);
++	struct drm_plane_state *plane_state;
++	int ret;
+ 
+ 	if (!crtc_state->active)
+ 		return 0;
+@@ -507,7 +577,31 @@ static int sun60i_kms_crtc_atomic_check(struct drm_crtc *crtc,
+ 	 * that belongs to nothing -- and the screen would go black with every
+ 	 * register reading back correct.
+ 	 */
+-	return drm_atomic_helper_check_crtc_primary_plane(crtc_state);
++	ret = drm_atomic_helper_check_crtc_primary_plane(crtc_state);
++	if (ret)
++		return ret;
++
++	/*
++	 * The same rule for a primary plane that is attached but lies wholly
++	 * off the mode. drm_atomic_helper_check_plane_state() calls that "not
++	 * visible" and returns success -- with can_position false as well, so
++	 * the state was reachable before, and the plane update then returned
++	 * early and left the PREVIOUS framebuffer scanning. A plane that moves
++	 * makes it easy to reach, and there is no rectangle to give the layer.
++	 * The plane checks run before this one, in
++	 * drm_atomic_helper_check_planes(), so .visible is settled. A plane not
++	 * in this state keeps its committed state, which passed here when it
++	 * was committed.
++	 */
++	plane_state = drm_atomic_get_new_plane_state(state, crtc->primary);
++	if (plane_state && plane_state->fb && !plane_state->visible) {
++		drm_dbg_atomic(crtc->dev,
++			       "[CRTC:%d:%s] the primary plane lies wholly off the mode\n",
++			       crtc->base.id, crtc->name);
++		return -EINVAL;
++	}
++
++	return 0;
+ }
+ 
+ /*
+@@ -576,14 +670,15 @@ static void sun60i_kms_crtc_atomic_enable(struct drm_crtc *crtc,
+ 	int ret;
+ 
+ 	plane_state = drm_atomic_get_new_plane_state(state, crtc->primary);
+-	if (!plane_state || !plane_state->fb) {
+-		drm_err(crtc->dev, "enable with no framebuffer on the primary plane\n");
++	if (!plane_state || !plane_state->fb || !plane_state->visible) {
++		drm_err(crtc->dev, "enable with no visible framebuffer on the primary plane\n");
+ 		return;
+ 	}
+ 
+-	addr = drm_fb_dma_get_gem_addr(plane_state->fb, plane_state, 0);
++	addr = sun60i_kms_plane_scanout(plane_state);
+ 
+-	ret = sun60i_de_kms_enable(kms->de, &crtc_state->adjusted_mode, addr,
++	ret = sun60i_de_kms_enable(kms->de, &crtc_state->adjusted_mode,
++				   &plane_state->dst, addr,
+ 				   plane_state->fb->pitches[0]);
+ 	if (ret) {
+ 		drm_err(crtc->dev, "display engine: %d\n", ret);
+diff --git a/drivers/gpu/drm/sun60i/sun60i-kms.h b/drivers/gpu/drm/sun60i/sun60i-kms.h
+--- a/drivers/gpu/drm/sun60i/sun60i-kms.h
++++ b/drivers/gpu/drm/sun60i/sun60i-kms.h
+@@ -33,6 +33,7 @@
+ #include <linux/types.h>
+ 
+ struct drm_display_mode;
++struct drm_rect;
+ struct sun60i_de;
+ struct sun60i_tcon_tv;
+ 
+@@ -46,12 +47,20 @@ struct sun60i_tcon_tv;
+  * bound refuses these. The A/B arm survives either way -- a kernel booted with
+  * no display-engine node in its device tree, or a master unbound by hand, still
+  * has the verbs.
++ *
++ * @dst is where the layer lands on the mode, in pixels, already clipped to it,
++ * and nothing is scaled: the engine fetches drm_rect_width(dst) x
++ * drm_rect_height(dst) pixels from @scanout, @pitch bytes per line. @scanout is
++ * the address of the first pixel that is SHOWN, not the start of the buffer.
++ * Everything outside @dst is the blender's background colour.
+  */
+ int sun60i_de_kms_enable(struct sun60i_de *de,
+ 			 const struct drm_display_mode *mode,
++			 const struct drm_rect *dst,
+ 			 dma_addr_t scanout, u32 pitch);
+ void sun60i_de_kms_disable(struct sun60i_de *de);
+-int sun60i_de_kms_scanout(struct sun60i_de *de, dma_addr_t scanout, u32 pitch);
++int sun60i_de_kms_scanout(struct sun60i_de *de, const struct drm_rect *dst,
++			  dma_addr_t scanout, u32 pitch);
+ void sun60i_de_kms_layer_off(struct sun60i_de *de);
+ 
+ /* TCON_TV1 -- implemented in sun60i-tcon-tv.c, same ownership rule. */

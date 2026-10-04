@@ -1,0 +1,94 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] clk: sunxi-ng: A733 - do not pass mmc rate requests up to the shared PLLs
+
+The SMHC module clocks were registered with CLK_SET_RATE_PARENT. Their parents
+are fixed taps of PLL_PERI0/PLL_PERI1, so a rate request that walks up to them
+cannot be honoured -- but the clock framework records the parent rate it asked
+for regardless, and ccu_mp_set_rate() then picks its dividers against that
+fictional parent rate.
+
+Measured on the 8 GiB board, 2026-07-25, with the eMMC in HS400:
+
+    SMHC2_CLK = 0x81000000    source 1 = pll-peri0-800m, M = 1, N = 1
+    PLL_PERI0 = 0xFF156310    N = 100 -> VCO 2400 MHz, so the tap really is 800
+
+Without the flag the mux + dual divider has to hit the rate from the parents it
+has, which it can, exactly:
+
+    200 MHz card -> 400 MHz module = pll-peri*-800m / 2
+    150 MHz card -> 300 MHz module = pll-peri*-600m / 2
+
+which is also what the vendor programs on this silicon (SMHC2_CLK = 0x83000001
+= pll-peri1-800m with M = 2). Mainline's A523 driver -- the one this file is
+derived from -- passes 0 for its mmc clocks for the same reason, and retuning a
+peripheral PLL shared by half the SoC to serve one MMC controller was never
+wanted here either.
+
+Note for the reader working through the rest of this file: ahb, apb0, apb1 and
+the 0x0538 clock still carry CLK_SET_RATE_PARENT while the A523 passes 0 there
+too. Nothing calls clk_set_rate() on a bus clock today, so this patch does not
+touch them -- but the same trap is armed there, and it is worth a separate look
+rather than a silent inheritance.
+
+Silicon evidence: SMHC2_CLK read back as 0x81000000 on the board.
+
+Assisted-by: Claude
+---
+--- a/drivers/clk/sunxi-ng/ccu-sun60iw2.c
++++ b/drivers/clk/sunxi-ng/ccu-sun60iw2.c
+@@ -272,33 +272,52 @@ static const struct clk_parent_data smhc2_parents[] = {
+ 	{ .hw = &pll_peri0_800m_clk.common.hw },/* pll-peri0-800m */
+ 	{ .hw = &pll_peri0_600m_clk.hw },	/* pll-peri0-600m */
+ 	{ .hw = &pll_peri1_800m_clk.common.hw },/* pll-peri1-800m */
+ 	{ .hw = &pll_peri1_600m_clk.hw },	/* pll-peri1-600m */
+ };
+ 
++/*
++ * No CLK_SET_RATE_PARENT here, and that is load-bearing rather than a style
++ * choice. The parents are fixed taps of the shared peripheral PLLs, so a rate
++ * request that walks up to them cannot be honoured -- but the clock framework
++ * records the parent rate it asked for anyway, and ccu_mp_set_rate() then
++ * computes the dividers against that fictional parent rate. On 2026-07-25 the
++ * eMMC asked for a 400 MHz module clock, the framework left the 800 MHz tap
++ * alone and programmed M = N = 1, and the bus ran at 800 MHz module / 400 MHz
++ * card while /sys/kernel/debug/mmcN/ios reported 200 MHz throughout (silicon:
++ * SMHC2_CLK = 0x81000000 read back).
++ * Every HS400 result in this series was measured on that bus.
++ *
++ * Without the flag the mux+dual-divider is asked to hit the rate from the
++ * parents it has, which it can: 800M / 2 = 400 MHz for a 200 MHz card, 600M / 2
++ * = 300 MHz for 150 MHz. That is also what the vendor programs (SMHC2_CLK =
++ * 0x83000001 = pll-peri1-800m, M = 2). Retuning a shared peripheral PLL for one
++ * consumer was never wanted in the first place. Mainline's A523 driver, which
++ * this file derives from, passes 0 for its mmc clocks for the same reason.
++ */
+ static SUNXI_CCU_DUALDIV_MUX_GATE(smhc0_clk, "smhc0", smhc0_parents,
+ 					     0x0D00,
+ 					     0, 5,	/* M */
+ 					     8, 5,	/* N */
+ 					     24, 3,	/* mux */
+ 					     BIT(31),	/* gate */
+-					     CLK_SET_RATE_PARENT);
++					     0);
+ static SUNXI_CCU_DUALDIV_MUX_GATE(smhc1_clk, "smhc1", smhc0_parents,
+ 					     0x0D10,
+ 					     0, 5,	/* M */
+ 					     8, 5,	/* N */
+ 					     24, 3,	/* mux */
+ 					     BIT(31),	/* gate */
+-					     CLK_SET_RATE_PARENT);
++					     0);
+ static SUNXI_CCU_DUALDIV_MUX_GATE(smhc2_clk, "smhc2", smhc2_parents,
+ 					     0x0D20,
+ 					     0, 5,	/* M */
+ 					     8, 5,	/* N */
+ 					     24, 3,	/* mux */
+ 					     BIT(31),	/* gate */
+-					     CLK_SET_RATE_PARENT);
++					     0);
+ 
+ /* SMHC bus gates: the gate bit (0) of each per-instance BGR register. */
+ static SUNXI_CCU_GATE_HWS(bus_smhc0_clk, "bus-smhc0", ahb_hws, 0x0D0C, BIT(0), 0);
+ static SUNXI_CCU_GATE_HWS(bus_smhc1_clk, "bus-smhc1", ahb_hws, 0x0D1C, BIT(0), 0);
+ static SUNXI_CCU_GATE_HWS(bus_smhc2_clk, "bus-smhc2", ahb_hws, 0x0D2C, BIT(0), 0);
+ 

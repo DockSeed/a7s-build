@@ -1,0 +1,15 @@
+# a7s-build: the image is written at the size of its content; the root
+# partition and its ext4 grow to the end of the card on the first boot.
+[Unit]
+Description=Grow the root partition and filesystem to fill the card
+Documentation=file:/usr/local/sbin/a7s-growroot
+After=local-fs.target
+ConditionPathIsReadWrite=/
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/a7s-growroot
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,335 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Sun, 4 Oct 2026 12:00:00 +0200
+Subject: [PATCH] feat(allwinner): CPU_ON and CPU_OFF for the new MPIDR format
+
+Based on Jernej Skrabec's commit b5de74a685fb ("to be cleaned", no
+message body) in Yixun Lan's TF-A tree (Link below), which added CPU_ON
+and CPU_OFF for the A523.
+
+Changes against that commit: selected by SUNXI_NEW_MPIDR_FMT instead of
+replacing sunxi_cpu_ops.c for every SoC; AArch64 reset bit from the
+platform's CLU0_CPUn_CTRL_REG instead of the A523 address; bounded PPU
+waits with an error return; MPIDRs that name no core rejected; A523
+parts dropped; rebased onto TF-A master.
+
+SoCs with DynamIQ cores (the A733) report MPIDR_EL1 in the DynamIQ
+layout: MT set, Aff0 = 0 (thread), Aff1 = core, Aff2 = cluster; the SoCs
+this platform code was written for put the cluster in Aff1 and the core
+in Aff0. Their cores are also powered differently: every core sits
+behind an Arm Power Policy Unit (PPU), and the CPUIDLE block
+(SUNXI_R_CPUCFG_BASE) holds those PPUs next to a hotplug controller,
+where the older SoCs use the CPUCFG power-gating registers that
+sunxi_cpu_ops.c drives. With SUNXI_NEW_MPIDR_FMT := 1,
+plat_my_core_pos() and plat_core_pos_by_mpidr() take the core from Aff1
+and the cluster from Aff2, and sunxi_cpu_new_ops.c replaces
+sunxi_cpu_ops.c and provides sunxi_cpu_on(), sunxi_cpu_off() and
+sunxi_cpu_power_off_others(). CPU_ON, for core = Aff1: (1) set the
+core's AArch64 reset-state bit (SUNXI_CPUCFG_CPU_CTRL_REG, from the
+platform's sunxi_cpucfg.h), so it leaves reset in AArch64 state at its
+reset vector; (2) wait until the core's PPU reports OFF: a CPU_ON can
+follow a CPU_OFF whose core is still in its dynamic power-down after the
+WFI; (3) set POWER_ON and HOTPLUG_EN: the hotplug controller asks the
+PPU for ON; (4) wait until the PPU reports ON; (5) clear HOTPLUG_EN and
+POWER_ON again, and GIC_WAKEUP_DISABLE, which CPU_OFF set. Both waits
+are bounded by the system counter (10 ms; a whole CPU_ON measured 52-161
+us on the A733, 350 calls). On timeout sunxi_cpu_on() logs the PPU
+status, withdraws its power request and returns an error, and
+sunxi_pwr_domain_on() answers PSCI_E_INTERN_FAIL, so the PSCI core puts
+the target back to OFF instead of hanging the caller in EL3.
+sunxi_cpu_on() returns int for every platform; the old-format
+implementation returns 0. CPU_OFF clears POWER_ON and sets
+GIC_WAKEUP_DISABLE; the core is then taken down by its PPU after the WFI
+that ends the PSCI CPU_OFF path. plat_core_pos_by_mpidr() requires the
+affinity level that carries no topology to be zero (Aff0 in the new
+format, Aff2 in the old one), so a value that names no core does not
+alias one that does: PSCI CPU_ON and AFFINITY_INFO answer
+INVALID_PARAMETERS for it (measured on the A733 before this:
+AFFINITY_INFO(0x101) answered the state of 0x100).
+
+Link: https://github.com/dlan17/trusted-firmware-a/commit/b5de74a685fb73b784e45bbbd18dd9a0c528d8b2
+Assisted-by: Claude
+---
+ plat/allwinner/common/allwinner-common.mk     |  14 +-
+ plat/allwinner/common/include/sunxi_private.h |   6 +-
+ plat/allwinner/common/plat_helpers.S          |   5 +
+ plat/allwinner/common/sunxi_cpu_new_ops.c     | 135 ++++++++++++++++++
+ plat/allwinner/common/sunxi_cpu_ops.c         |   4 +-
+ plat/allwinner/common/sunxi_native_pm.c       |   4 +-
+ plat/allwinner/common/sunxi_topology.c        |  20 ++-
+ 7 files changed, 180 insertions(+), 8 deletions(-)
+ create mode 100644 plat/allwinner/common/sunxi_cpu_new_ops.c
+
+diff --git a/plat/allwinner/common/allwinner-common.mk b/plat/allwinner/common/allwinner-common.mk
+index 05c8c98a7..18c19791c 100644
+--- a/plat/allwinner/common/allwinner-common.mk
++++ b/plat/allwinner/common/allwinner-common.mk
+@@ -47,9 +47,19 @@ ifeq (${SUNXI_PSCI_USE_NATIVE}${SUNXI_PSCI_USE_SCPI},00)
+ $(error "At least one of SCPI or native PSCI ops must be enabled")
+ endif
+ 
++# SoCs with DynamIQ cores report MPIDR_EL1 with MT set, the core in Aff1
++# and the cluster in Aff2, and power their cores through Arm PPUs.
++SUNXI_NEW_MPIDR_FMT	?=	0
++$(call assert_boolean,SUNXI_NEW_MPIDR_FMT)
++$(eval $(call add_define,SUNXI_NEW_MPIDR_FMT))
++
+ ifeq (${SUNXI_PSCI_USE_NATIVE},1)
+-BL31_SOURCES		+=	${AW_PLAT}/common/sunxi_cpu_ops.c	\
+-				${AW_PLAT}/common/sunxi_native_pm.c
++ifeq (${SUNXI_NEW_MPIDR_FMT},1)
++BL31_SOURCES		+=	${AW_PLAT}/common/sunxi_cpu_new_ops.c
++else
++BL31_SOURCES		+=	${AW_PLAT}/common/sunxi_cpu_ops.c
++endif
++BL31_SOURCES		+=	${AW_PLAT}/common/sunxi_native_pm.c
+ endif
+ 
+ ifeq (${SUNXI_PSCI_USE_SCPI},1)
+diff --git a/plat/allwinner/common/include/sunxi_private.h b/plat/allwinner/common/include/sunxi_private.h
+index b9ca3f600..75216a7b4 100644
+--- a/plat/allwinner/common/include/sunxi_private.h
++++ b/plat/allwinner/common/include/sunxi_private.h
+@@ -15,7 +15,11 @@ extern const struct psci_cpu_idle_state sunxi_idle_states[];
+ 
+ void sunxi_configure_mmu_el3(int flags);
+ 
+-void sunxi_cpu_on(u_register_t mpidr);
++#if SUNXI_NEW_MPIDR_FMT
++/* sunxi_cpu_new_ops.c; the old-format sunxi_cpu_ops.c keeps its own static. */
++void sunxi_cpu_off(u_register_t mpidr);
++#endif
++int sunxi_cpu_on(u_register_t mpidr);
+ void sunxi_cpu_power_off_others(void);
+ void sunxi_cpu_power_off_self(void);
+ void sunxi_power_down(void);
+diff --git a/plat/allwinner/common/plat_helpers.S b/plat/allwinner/common/plat_helpers.S
+index b00c7aefd..08f23550a 100644
+--- a/plat/allwinner/common/plat_helpers.S
++++ b/plat/allwinner/common/plat_helpers.S
+@@ -34,9 +34,14 @@ endfunc plat_crash_console_flush
+ 
+ func plat_my_core_pos
+ 	mrs	x0, mpidr_el1
++#if SUNXI_NEW_MPIDR_FMT
++	/* One cluster: the core position is Aff1. */
++	ubfx	x0, x0, #MPIDR_AFF1_SHIFT, #MPIDR_AFFINITY_BITS
++#else
+ 	and	x1, x0, #MPIDR_CLUSTER_MASK
+ 	and	x0, x0, #MPIDR_CPU_MASK
+ 	add	x0, x0, x1, LSR #6
++#endif
+ 	ret
+ endfunc plat_my_core_pos
+ 
+diff --git a/plat/allwinner/common/sunxi_cpu_new_ops.c b/plat/allwinner/common/sunxi_cpu_new_ops.c
+new file mode 100644
+index 000000000..d0f9ff121
+--- /dev/null
++++ b/plat/allwinner/common/sunxi_cpu_new_ops.c
+@@ -0,0 +1,135 @@
++/*
++ * Copyright (c) 2025, ARM Limited and Contributors. All rights reserved.
++ *
++ * SPDX-License-Identifier: BSD-3-Clause
++ */
++
++#include <stdbool.h>
++
++#include <platform_def.h>
++
++#include <arch_helpers.h>
++#include <common/debug.h>
++#include <lib/mmio.h>
++#include <lib/utils_def.h>
++#include <plat/common/platform.h>
++
++#include <sunxi_cpucfg.h>
++#include <sunxi_mmap.h>
++#include <sunxi_private.h>
++
++/*
++ * CPU power control on SoCs with DynamIQ cores (SUNXI_NEW_MPIDR_FMT): every
++ * core sits behind an Arm PPU in the CPUIDLE block at SUNXI_R_CPUCFG_BASE,
++ * next to a hotplug controller. The DSU PPU is at +0x1000, core n's at
++ * +0x2000 + n * 0x1000.
++ */
++#define HOTPLUG_CONTROL_REG(n)		(SUNXI_R_CPUCFG_BASE + 0x200 + (n) * 4)
++#define HOTPLUG_POWERMODE_REG(n)	(SUNXI_R_CPUCFG_BASE + 0x220 + (n) * 4)
++#define PPU_PWSR(n)			(SUNXI_R_CPUCFG_BASE + 0x2000 + \
++					 (n) * 0x1000 + 0x008)
++#define PPU_PWR_STATUS_MASK		0xf
++
++#define STATE_ON			8
++#define STATE_OFF			0
++
++#define GIC_WAKEUP_DISABLE		BIT(1)
++#define POWER_ON			BIT(0)
++
++#define HOTPLUG_EN			BIT(0)
++
++/*
++ * Bound for each PPU state wait in sunxi_cpu_on(). A whole CPU_ON call,
++ * both waits included, measured 52-161 us on the A733 (350 calls over 50
++ * hotplug rounds); 10 ms is about sixty times the longest, so the bound only
++ * ends a wait that is not going to finish.
++ */
++#define PPU_WAIT_US			10000U
++
++/* Wait until the core's PPU reports `state`; false once the bound passes. */
++static bool ppu_wait(unsigned int core, uint32_t state)
++{
++	uint64_t t0 = read_cntpct_el0();
++	uint64_t ticks = ((uint64_t)read_cntfrq_el0() * PPU_WAIT_US) / 1000000U;
++
++	while ((mmio_read_32(PPU_PWSR(core)) & PPU_PWR_STATUS_MASK) != state) {
++		if ((read_cntpct_el0() - t0) > ticks) {
++			return false;
++		}
++	}
++
++	return true;
++}
++
++void sunxi_cpu_off(u_register_t mpidr)
++{
++	unsigned int cluster = MPIDR_AFFLVL2_VAL(mpidr);
++	unsigned int core    = MPIDR_AFFLVL1_VAL(mpidr);
++
++	VERBOSE("PSCI: Powering off cluster %d core %d\n", cluster, core);
++
++	mmio_clrbits_32(HOTPLUG_POWERMODE_REG(core), POWER_ON);
++
++	mmio_setbits_32(HOTPLUG_CONTROL_REG(core), GIC_WAKEUP_DISABLE);
++}
++
++int sunxi_cpu_on(u_register_t mpidr)
++{
++	unsigned int cluster = MPIDR_AFFLVL2_VAL(mpidr);
++	unsigned int core    = MPIDR_AFFLVL1_VAL(mpidr);
++
++	VERBOSE("PSCI: Powering on cluster %d core %d\n", cluster, core);
++
++	/* Leave reset in AArch64 state, at RVBAR. */
++	mmio_setbits_32(SUNXI_CPUCFG_CPU_CTRL_REG(core),
++			SUNXI_CPUCFG_CPU_CTRL_AA64);
++
++	/*
++	 * A CPU_ON can follow a CPU_OFF whose core is still in its dynamic
++	 * power-down after the WFI. A core whose PPU never reports OFF, or
++	 * never reaches ON, would keep this CPU in EL3 for good, with
++	 * interrupts masked. Give up instead: the caller answers
++	 * INTERNAL_FAILURE and PSCI puts the target back to OFF
++	 * (lib/psci/psci_on.c).
++	 */
++	if (!ppu_wait(core, STATE_OFF)) {
++		ERROR("PSCI: core %u PPU never reported OFF (PWSR 0x%x)\n",
++		      core, mmio_read_32(PPU_PWSR(core)));
++		return -1;
++	}
++
++	mmio_setbits_32(HOTPLUG_POWERMODE_REG(core), POWER_ON);
++	mmio_setbits_32(HOTPLUG_CONTROL_REG(core), HOTPLUG_EN);
++
++	if (!ppu_wait(core, STATE_ON)) {
++		ERROR("PSCI: core %u PPU never reached ON (PWSR 0x%x)\n",
++		      core, mmio_read_32(PPU_PWSR(core)));
++		mmio_clrbits_32(HOTPLUG_CONTROL_REG(core), HOTPLUG_EN);
++		mmio_clrbits_32(HOTPLUG_POWERMODE_REG(core), POWER_ON);
++		return -1;
++	}
++
++	mmio_clrbits_32(HOTPLUG_CONTROL_REG(core), HOTPLUG_EN);
++	mmio_clrbits_32(HOTPLUG_POWERMODE_REG(core), POWER_ON);
++
++	mmio_clrbits_32(HOTPLUG_CONTROL_REG(core), GIC_WAKEUP_DISABLE);
++
++	return 0;
++}
++
++void sunxi_cpu_power_off_others(void)
++{
++	u_register_t self = read_mpidr();
++	unsigned int cluster;
++	unsigned int core;
++
++	for (cluster = 0; cluster < PLATFORM_CLUSTER_COUNT; ++cluster) {
++		for (core = 0; core < PLATFORM_MAX_CPUS_PER_CLUSTER; ++core) {
++			u_register_t mpidr = (cluster << MPIDR_AFF2_SHIFT) |
++					     (core    << MPIDR_AFF1_SHIFT) |
++					     MPIDR_MT_MASK | BIT(31);
++			if (mpidr != self)
++				sunxi_cpu_off(mpidr);
++		}
++	}
++}
+diff --git a/plat/allwinner/common/sunxi_cpu_ops.c b/plat/allwinner/common/sunxi_cpu_ops.c
+index 30841e2ea..7976ada62 100644
+--- a/plat/allwinner/common/sunxi_cpu_ops.c
++++ b/plat/allwinner/common/sunxi_cpu_ops.c
+@@ -85,7 +85,7 @@ static void sunxi_cpu_off(u_register_t mpidr)
+ 	}
+ }
+ 
+-void sunxi_cpu_on(u_register_t mpidr)
++int sunxi_cpu_on(u_register_t mpidr)
+ {
+ 	unsigned int cluster = MPIDR_AFFLVL1_VAL(mpidr);
+ 	unsigned int core    = MPIDR_AFFLVL0_VAL(mpidr);
+@@ -131,6 +131,8 @@ void sunxi_cpu_on(u_register_t mpidr)
+ 		/* power up(?) debug core */
+ 		mmio_setbits_32(SUNXI_C0_CPU_CTRL_REG(core), BIT(8));
+ 	}
++
++	return 0;
+ }
+ 
+ void sunxi_cpu_power_off_others(void)
+diff --git a/plat/allwinner/common/sunxi_native_pm.c b/plat/allwinner/common/sunxi_native_pm.c
+index 4bc10366f..8aded84ce 100644
+--- a/plat/allwinner/common/sunxi_native_pm.c
++++ b/plat/allwinner/common/sunxi_native_pm.c
+@@ -22,7 +22,9 @@
+ 
+ static int sunxi_pwr_domain_on(u_register_t mpidr)
+ {
+-	sunxi_cpu_on(mpidr);
++	if (sunxi_cpu_on(mpidr) != 0) {
++		return PSCI_E_INTERN_FAIL;
++	}
+ 
+ 	return PSCI_E_SUCCESS;
+ }
+diff --git a/plat/allwinner/common/sunxi_topology.c b/plat/allwinner/common/sunxi_topology.c
+index 68a597531..f17922249 100644
+--- a/plat/allwinner/common/sunxi_topology.c
++++ b/plat/allwinner/common/sunxi_topology.c
+@@ -24,11 +24,25 @@ static const unsigned char plat_power_domain_tree_desc[PLAT_MAX_PWR_LVL + 1] = {
+ 
+ int plat_core_pos_by_mpidr(u_register_t mpidr)
+ {
+-	unsigned int cluster = MPIDR_AFFLVL1_VAL(mpidr);
+-	unsigned int core = MPIDR_AFFLVL0_VAL(mpidr);
++	unsigned int cluster, core, unused;
++
++	/*
++	 * The affinity level that carries no topology must be zero, or a
++	 * value that names no core aliases one that does: PSCI CPU_ON and
++	 * AFFINITY_INFO must answer INVALID_PARAMETERS for it.
++	 */
++#if SUNXI_NEW_MPIDR_FMT
++	cluster = MPIDR_AFFLVL2_VAL(mpidr);
++	core = MPIDR_AFFLVL1_VAL(mpidr);
++	unused = MPIDR_AFFLVL0_VAL(mpidr);
++#else
++	cluster = MPIDR_AFFLVL1_VAL(mpidr);
++	core = MPIDR_AFFLVL0_VAL(mpidr);
++	unused = MPIDR_AFFLVL2_VAL(mpidr);
++#endif
+ 
+ 	if (MPIDR_AFFLVL3_VAL(mpidr) > 0 ||
+-	    MPIDR_AFFLVL2_VAL(mpidr) > 0 ||
++	    unused > 0 ||
+ 	    cluster >= PLATFORM_CLUSTER_COUNT ||
+ 	    core >= PLATFORM_MAX_CPUS_PER_CLUSTER) {
+ 		return -1;

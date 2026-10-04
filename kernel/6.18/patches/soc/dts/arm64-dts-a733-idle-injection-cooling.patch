@@ -1,0 +1,344 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: a733: idle injection between throttling and shutdown
+
+The thermal design had one actuator. Between the 90 C passive trip and the
+110 C critical trip, cpufreq throttling was the only thing standing between a
+hot board and a power-off: if dropping to the lowest OPP cannot hold the part,
+nothing else is tried.
+
+The vendor does not have that gap, and this stage is taken from its device
+tree. The vendor sun60iw2p1.dtsi (linux-6.6 BSP) gives cpu2..cpu7 a
+thermal-idle node and declares two idle zones, cpul_idle_zone and
+cpub_idle_zone, each with passive trips at 90 and 100 C; on the 100 C trip it
+maps cpu2..cpu5 at 0..50 and cpu6..cpu7 at 0..100. A running vendor board
+registers idle-cpu2 .. idle-cpu7 next to its cpufreq, fan, NPU, GPU and PCIe
+cooling devices. The
+100 C trip and the choice of cpu2..cpu7 come from there. What is ours is the
+map bounds: lower 50 / upper unbounded on all six CPUs, which is the opposite
+of the vendor's upper limit of 50 on the A55s. The reason is measured and
+given below; the vendor's bounds are not adopted.
+
+Why it belongs in the default rather than beside the fan: it needs no hardware.
+A fan is a property of one board and helps no other; idle injection works on any
+A733, and the board that has no cooling at all is exactly the one with nothing
+left at 100 C. The datasheet makes that case concrete rather than theoretical --
+Ta is specified to 75 C (Table 6-1) and theta-JA is 25.265 C/W typical (Table
+6-3), so in a warm enclosure a couple of watts already puts the junction near the
+125 C absolute maximum before any load margin exists.
+
+Registration path, read in the source rather than assumed. CONFIG_ARM_PSCI_CPUIDLE
+is =y in the arm64 defconfig; psci_idle_init_cpu() runs once per CPU
+(cpuidle-psci.c:434) and each call ends in cpuidle_cooling_register()
+(cpuidle-psci.c:412), which looks for a "thermal-idle" child of that CPU's node
+and registers one cooling device per CPU that has one
+(cpuidle_cooling.c:249-260). That is the shape observed on the 6.6 boards, where
+the devices appear as idle-cpu2 .. idle-cpu7.
+
+Two Kconfig symbols are needed and neither is on by default: IDLE_INJECT (the
+framework, default n) and CPU_IDLE_THERMAL (the cooling device, bool, depends on
+IDLE_INJECT). Both are added to A733_CONFIGS, which asserts them after
+olddefconfig, so a defconfig change cannot silently drop the stage.
+
+cpu0 and cpu1 deliberately get no node. Injecting idle on every core of the
+little cluster starves the system that is trying to recover; two cores stay
+uninjectable so userspace keeps running while the rest are parked. The vendor
+DT leaves the same two cores out; the reason is stated here rather than
+inherited.
+
+duration-us = 10000 is longer than the 3570 us min-residency of both core idle
+states, so an injected period is long enough for the deep state to be worth
+entering. It is also the worst case by which this stage can delay a softirq --
+see the NOHZ note at the end.
+
+exit-latency-us = 500 is a latency budget for the injected state. The
+forced-idle path (idle_inject -> play_idle_precise() ->
+cpuidle_use_deepest_state()) has no governor: find_deepest_state()
+(drivers/cpuidle/cpuidle.c) takes the deepest enabled state whose exit_latency
+is within the limit, and that figure is entry + exit
+(drivers/cpuidle/dt_idle_states.c:64). `arm64-dts-a733-psci-idle-states` declares one core power-down
+state per cluster, with latencies measured on this chain at the lowest OPP:
+cpu_sleep_0_a55, 50 + 150 = 200 us, on cpu0-5 and cpu_sleep_0_a76,
+50 + 210 = 260 us, on cpu6-7. 500 admits both, the slower one 240 us inside
+the limit, so a latency that is remeasured upwards does not silently put the
+injection back on WFI. It also bounds the late start of the next run window
+at 5 % of the 10 ms injected period. The vendor DT and the binding's example
+carry the same value for the same duration; that is noted, not the reason.
+
+A limit of 100 used to keep the injection on WFI on purpose, while the
+firmware refused CPU_SUSPEND: a refused state on this path is selected again
+by the do_idle() loop until the injection timer fires (kernel/sched/idle.c,
+no governor, no fallback), a full-clock spin instead of idle. That hazard
+belongs to declaring a state the firmware does not implement. `arm64-dts-a733-psci-idle-states` declares
+core power-down only, which the firmware implements (the TF-A patch `allwinner-a733-native-psci-cpu-suspend`).
+
+Measured on the DT before `arm64-dts-a733-psci-idle-states` took per-cluster states: one state,
+cpu_sleep_0, 46 + 59 = 105 us on both clusters, with the same PSCI parameter
+and firmware path as the two states now; a limit of 500 admits either. Same
+kernel and DT except this value, 50 % injection on cpu2..cpu7
+set by hand (step_wise leaves a state at the map's lower bound alone while the
+trip is not crossed), one stress-ng matrixprod worker pinned per CPU, 240 s per
+arm, arms in one boot in the order WFI, deep, deep, WFI. The WFI arms disable
+cpu_sleep_0 on the injected CPUs, which find_deepest_state() skips exactly as
+it skips a state over the limit; a run on the old limit of 100 matched them.
+
+                              WFI           core power-down
+  cpul / cpub, last ~140 s    53.0-53.3 C   51.4 C
+                              53.5 C        51.7-51.8 C
+  wall power, same window     6.22 W        5.99-6.03 W
+  injected idle, s, A55s+A76s 485.9 + 243.3 486.5 + 245.3
+
+For the same injected time both zones run ~1.8 C cooler and the board draws
+0.21 W less, 9 % of what the load adds over idle. The throughput cost on the
+injected cores is about the size of the spread between runs of the uninjected
+ones (+-1.3 %): -1.4 % on the A76s, of which the wake itself explains ~0.6 %
+(117 us at the top OPP, where the load ran, once per 20 ms period); the rest
+is not attributed. On the A55s it is not resolved.
+
+One injected core per run did not get the deep state: one A55 injected all
+of its idle in WFI, and 75-90 % of the injected time was in core power-down.
+The leading explanation is the tick broadcast. This DT has no always-on
+broadcast timer, so the hrtimer broadcast is in use, and the CPU it is bound to
+gets -EBUSY from tick_broadcast_enter() (kernel/time/tick-broadcast.c,
+broadcast_needs_cpu()); cpuidle_enter_state() then falls back to the deepest
+state without CPUIDLE_FLAG_TIMER_STOP, which is WFI.
+
+One log line this stage will produce, once per boot at most (ratelimit 10 in
+report_idle_softirq(), kernel/time/tick-sched.c:1159):
+
+  NOHZ tick-stop error: local softirq work is pending, handler #80!!!
+
+0x80 = BIT(7) = SCHED_SOFTIRQ (include/linux/interrupt.h:547-561). It is a known
+upstream consequence of idle injection, not a defect in this patch: the
+idle_inject/N kthreads are SCHED_FIFO prio 50 (idle_inject.c:296-299 ->
+sched_set_fifo()) while ksoftirqd is SCHED_OTHER, so a softirq punted to
+ksoftirqd while injection is running does not set need_resched
+(wakeup_preempt(), kernel/sched/core.c:2208-2223), and can_stop_idle_tick()
+reaches report_idle_softirq() with a softirq still pending. Frederic Weisbecker
+described exactly this in the 2022 "Forced idle and Non-RCU local softirq
+pending" RFC, whose fix was never merged -- 6.18.36's play_idle_precise() has no
+ksoftirqd check. Cost: one skipped tick-stop, and a softirq delayed by at most
+duration-us. Correctness is unaffected; rcutorture's console-badness.sh filters
+the message out of its failure detection.
+
+The trip sits at 100 C: above the 90 C throttle so it only engages when
+throttling could not hold the part, and 10 C below critical so there is room for
+it to act. The 100 C value is the vendor DT's idle trip (its idle zones also
+carry a 90 C trip, with no cooling map on it).
+
+Effect measured rather than argued, on a 6.6 board that already carries the
+mechanism: under a constant eight-core load, 50 % injection takes the CPU zones
+from 74-76 C to 64 C -- and the cpufreq cooling states fall back to 0, i.e. both
+clusters return to full clock because the die is cool enough not to need them.
+100 % reaches 53-58 C. Its cost was NOT measured (the throughput counter in that
+run died in a timeout); ~50 % injection implies roughly half throughput, which is
+exactly why the stage sits above the cpufreq trip and not below it.
+
+That measurement is also where the map's lower bound comes from, and the bound is
+load-bearing. A cpuidle cooling device is percentile: max_state is a fixed 100
+(cpuidle_cooling.c:68-73). With lower left at THERMAL_NO_LIMIT it reads as 0, and
+step_wise enters a newly throttled instance at clamp(cur_state + 1, lower, upper)
+= 1 (gov_step_wise.c, get_target_state) -- one percent injection, about 0.2 K of
+authority, in a band that is 10 K wide. It then climbs one percent per poll and
+depends on the trend staying RAISING to do even that. The first bare-test boot
+shows exactly this: the die crossed 100 C at t=70 s and 103 C at t=86 s, sixteen
+seconds and about thirty-two governor polls, and the injection states reached 4
+and 1. The stage was registered, bound, entered and worthless.
+
+lower = 50 fixes it at the one place the trend defect cannot reach: the entry
+state is taken on the first poll after the trip is crossed, without traversing
+the ladder, so it does not matter how the trend dithers afterwards. 50 is the
+measured number above rather than a round one -- it is the injection level shown
+to remove the entire cpufreq throttling demand and buy ~10 K, which is the width
+of the band between this trip and critical. upper stays unbounded so the ladder
+can still climb to 100 if 50 does not hold, and the descent floor becomes
+min(lower + 1, upper) = 51 until the trip clears entirely.
+
+Trip and map numbering: trip-2 and map1 are left free for the board fan patch,
+which is held back until a fan on J7 has actually been shown to turn, so this
+takes trip-3 and map2. The gap in the node names is deliberate and means the fan
+patch drops in later without renumbering anything here. Names are names -- what
+the thermal core reads is the position in the trip array, and that is unchanged
+either way. Reusing a name would not create a second node: dtc merges same-named
+nodes and would silently keep one temperature.
+
+Falsifier: /sys/class/thermal gains six idle-cpuN cooling devices; under a load
+that cpufreq alone cannot hold, their cur_state leaves 0 before the critical
+trip is approached; and while they inject, the usage of cpuidle state1
+(cpu-sleep-0-a55 on cpu2..cpu5, cpu-sleep-0-a76 on cpu6..cpu7) rises by about
+one entry per injected period.
+
+Assisted-by: Claude
+---
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -2543,6 +2543,120 @@
+ 	#cooling-cells = <2>;
+ };
+ 
++/*
++ * Idle injection, the stage between throttling and the emergency shutdown.
++ *
++ * Without it the only actuator between the 90 C passive trip and the 110 C
++ * critical trip is cpufreq: if throttling to the lowest OPP cannot hold the
++ * part, the next event is a power-off. The stage itself is the vendor's: its
++ * sun60iw2p1.dtsi puts thermal-idle on cpu2..cpu7 and adds two idle zones
++ * with passive trips at 90 and 100 C, mapping cpu2-5 at 0..50 and cpu6-7 at
++ * 0..100 on the 100 C trip, and a vendor board registers idle-cpu2..7. The
++ * 100 C trip and the choice of cpu2..7 come from there. The map bounds do not:
++ * ours are lower 50 / upper unbounded (see below), the opposite of the vendor's
++ * upper limit of 50 on the A55s.
++ *
++ * Measured on a 6.6 board that already carries the mechanism: under a
++ * constant eight-core load, 50 % injection takes the CPU zones from 74-76 C to
++ * 64 C and lets both clusters return to full clock with cpufreq back at state 0;
++ * 100 % reaches 53-58 C. It removes real heat, and it costs roughly its own
++ * percentage in throughput -- which is why it sits ABOVE the cpufreq trip.
++ *
++ * It needs no hardware, and that is why it belongs in the default rather than
++ * beside the fan: the board with no cooling at all is exactly the one with
++ * nothing left at 100 C. Datasheet Ta max is 75 C with theta-JA 25.265 C/W, so a
++ * warm enclosure leaves very little room to begin with.
++ *
++ * Registration path, read rather than assumed: ARM_PSCI_CPUIDLE is =y in the
++ * arm64 defconfig, psci_idle_init_cpu() runs per CPU and each call ends in
++ * cpuidle_cooling_register(), which looks for a "thermal-idle" child of that
++ * CPU's node (drivers/thermal/cpuidle_cooling.c:249-260). One cooling device per
++ * CPU that carries the node, named idle-cpuN.
++ *
++ * cpu0 and cpu1 deliberately carry no node. Injecting idle on every core of the
++ * little cluster starves the system that is trying to recover; two cores stay
++ * uninjectable so userspace keeps running while the rest are parked.
++ *
++ * duration-us 10000: longer than the 3570 us min-residency of both core idle
++ * states, and also the worst case by which this stage can delay a softirq.
++ * exit-latency-us 500: the forced-idle path takes the deepest state whose
++ * entry + exit latency (dt_idle_states.c:64) fits the limit. 500 admits both
++ * core power-down states, cpu_sleep_0_a55 at 50 + 150 = 200 us on cpu2-5 and
++ * cpu_sleep_0_a76 at 50 + 210 = 260 us on cpu6-7, the slower one 240 us inside
++ * the limit, and it caps the late restart of the run window at 5 % of the 10 ms
++ * injected period. Against the same injection pinned to WFI, at a fixed 50 %
++ * under an eight-core load: both CPU zones ~1.8 C cooler and 0.21 W less at the
++ * wall, for the same injected time. See the commit message.
++ *
++ * Trip and map numbering: trip-2 and map1 are left free for the board fan
++ * patch (held back, not applied), so this takes trip-3 and map2 and the
++ * fan patch can drop in without renumbering. Reusing a node name would not
++ * create a second node -- dtc would merge the two and silently keep one
++ * temperature.
++ *
++ * The lower bound of 50 in the maps below is load-bearing, not decoration. A
++ * cpuidle cooling device is percentile with max_state fixed at 100
++ * (drivers/thermal/cpuidle_cooling.c). step_wise enters a newly throttled
++ * instance at clamp(cur_state + 1, lower, upper), so an unbounded lower reads
++ * as 0 and the stage starts at 1 % -- about 0.2 K of authority in a band 10 K
++ * wide -- then climbs one percent per poll and needs the trend to stay RAISING
++ * to do even that. Measured on a bare board: 100 C at t=70 s, 103 C at t=86 s,
++ * roughly thirty-two governor polls, injection states reached 4 and 1.
++ *
++ * 50 is the measured injection level above -- the one shown to remove the
++ * entire cpufreq throttling demand and buy ~10 K, which is exactly the width of
++ * the band between this trip and critical. It is applied on entry, before any
++ * ladder is traversed, so trend noise cannot keep the stage down. upper stays
++ * unbounded so it can still climb to 100 %.
++ */
++&cpu2 {
++	cpu2_idle: thermal-idle {
++		#cooling-cells = <2>;
++		duration-us = <10000>;
++		exit-latency-us = <500>;
++	};
++};
++
++&cpu3 {
++	cpu3_idle: thermal-idle {
++		#cooling-cells = <2>;
++		duration-us = <10000>;
++		exit-latency-us = <500>;
++	};
++};
++
++&cpu4 {
++	cpu4_idle: thermal-idle {
++		#cooling-cells = <2>;
++		duration-us = <10000>;
++		exit-latency-us = <500>;
++	};
++};
++
++&cpu5 {
++	cpu5_idle: thermal-idle {
++		#cooling-cells = <2>;
++		duration-us = <10000>;
++		exit-latency-us = <500>;
++	};
++};
++
++&cpu6 {
++	cpu6_idle: thermal-idle {
++		#cooling-cells = <2>;
++		duration-us = <10000>;
++		exit-latency-us = <500>;
++	};
++};
++
++&cpu7 {
++	cpu7_idle: thermal-idle {
++		#cooling-cells = <2>;
++		duration-us = <10000>;
++		exit-latency-us = <500>;
++	};
++};
++
+ / {
+ 	thermal-zones {
+ 		cpul_thermal: cpul-thermal {
+@@ -2562,6 +2676,11 @@
+ 					type = "critical";
+ 					hysteresis = <0>;
+ 				};
++				cpul_idle: cpul-trip-3 {
++					temperature = <100000>;
++					type = "passive";
++					hysteresis = <2000>;
++				};
+ 			};
+ 
+ 			cooling-maps {
+@@ -2569,6 +2688,13 @@
+ 					trip = <&cpul_passive>;
+ 					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+ 				};
++				map2 {
++					trip = <&cpul_idle>;
++					cooling-device = <&cpu2_idle 50 THERMAL_NO_LIMIT>,
++							<&cpu3_idle 50 THERMAL_NO_LIMIT>,
++							<&cpu4_idle 50 THERMAL_NO_LIMIT>,
++							<&cpu5_idle 50 THERMAL_NO_LIMIT>;
++				};
+ 			};
+ 		};
+ 
+@@ -2589,6 +2715,11 @@
+ 					type = "critical";
+ 					hysteresis = <0>;
+ 				};
++				cpub_idle: cpub-trip-3 {
++					temperature = <100000>;
++					type = "passive";
++					hysteresis = <2000>;
++				};
+ 			};
+ 
+ 			cooling-maps {
+@@ -2596,6 +2727,11 @@
+ 					trip = <&cpub_passive>;
+ 					cooling-device = <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+ 				};
++				map2 {
++					trip = <&cpub_idle>;
++					cooling-device = <&cpu6_idle 50 THERMAL_NO_LIMIT>,
++							<&cpu7_idle 50 THERMAL_NO_LIMIT>;
++				};
+ 			};
+ 		};
+ 

@@ -1,0 +1,495 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] drm: a733: dp: repair three error paths nothing has ever walked
+
+Three defects in sun60i-dp.c, all of them on branches that run only after
+something else has already failed. A test boot trains the link from
+cold, follows the cable and puts a login prompt on /dev/fb0 with zero `err` and
+zero `warn` lines from any of the four display modules -- and that is exactly
+why these three survived: the success path is exercised on every boot, the
+error paths are exercised by nothing.
+
+⚠ SAID FIRST BECAUSE IT IS THE WEAKEST PART OF THIS PATCH: NONE OF THE THREE
+PATHS HAS EVER EXECUTED ON HARDWARE, neither before this patch nor after it.
+They were found by reading `drm-allwinner-a733-displayport-aux`..`drm-a733-dp-chain-a-hpd-bridge-on-the-typec-receptacle` applied in order onto a freshly unpacked
+6.18.36 (items 1, 4 and 8 of a review of that code) -- not by a
+board. Everything below is a derivation with file:line for each step, and each
+fix carries a concrete falsifier at the end. Nothing here may be quoted as
+hardware-proven.
+
+Line numbers in `sun60i-dp.c` are the file as it stands AFTER `drm-a733-dp-chain-a-hpd-bridge-on-the-typec-receptacle`, i.e. the
+tree this patch applies to. Line numbers in every other file are stock 6.18.36.
+
+1. USE-AFTER-FREE OF THE drm_device THROUGH dp->aux.drm_dev
+------------------------------------------------------------
+
+.attach, sun60i-dp.c:3304-3309:
+
+	dp->aux.drm_dev = bridge->dev;
+	ret = drm_dp_aux_register(&dp->aux);
+	if (ret) {
+		dev_err(dp->dev, "DP AUX register: %d\n", ret);
+		return ret;			/* aux.drm_dev stays set */
+	}
+
+The field is assigned before the call and not cleared when the call fails, and
+from that return nothing clears it either:
+
+  * drm_bridge_attach() calls .attach at drm_bridge.c:437-438 and, on a negative
+    return, goes to err_reset_bridge (:440), which does
+    `bridge->dev = NULL; bridge->encoder = NULL; list_del(&bridge->chain_node);`
+    (:464-466). The bridge is now OUT of encoder->bridge_chain.
+  * drm_encoder_cleanup() walks exactly that list to detach
+    (drm_encoder.c:197-199), so .detach is never called for this bridge -- and
+    sun60i_dp_aux_unregister_locked() (sun60i-dp.c:3261-3268, the only place
+    that nulls dp->aux.drm_dev, at :3266) is only reached from .detach (:3354)
+    and from .attach's OTHER failure branch (:3334). This branch reaches
+    neither.
+  * The error propagates sun60i_kms_output_init() (sun60i-kms.c:721-724) ->
+    sun60i_kms_bind() (:941-943, `goto unbind_all`) -> `put_drm:` ->
+    drm_dev_put() (:983). The drm_device is freed with dp->aux.drm_dev still
+    pointing at it, and dp outlives it: dp is the DP platform device's driver
+    data, not the KMS master's.
+
+The dangling pointer is then dereferenced by the DP helpers on every DPCD
+access: drm_dp_dpcd_read() and its write counterpart call drm_dp_dump_access()
+(drm_dp_helper.c:666, :756, :788), which is `drm_dbg_dp(aux->drm_dev, ...)`
+(:562-565). Every debugfs verb in this file that touches DPCD reaches it --
+`train` through sun60i_dp_link_probe(), `dpcd` and `edid` directly -- as does a
+hot-plug that arrives after the failed bind.
+
+TRIGGER: drm_dp_aux_register() returns non-zero. Two ways inside it:
+drm_dp_aux_register_devnode() (drm_dp_helper.c:2404) or i2c_add_adapter()
+(:2408) -- an allocation failure, or a sysfs name collision.
+
+WHAT CHANGES: `dp->aux.drm_dev = NULL;` in that failure branch, plus a comment
+saying why the assignment cannot simply be moved after the call:
+drm_dp_aux_register() opens with `WARN_ON_ONCE(!aux->drm_dev)`
+(drm_dp_helper.c:2393), so the field must be set BEFORE it runs and can only be
+undone afterwards.
+
+NULL is a state this code already runs in and tolerates. .detach leaves it NULL
+for the rest of the driver's life, and the log helpers take it: __drm_to_dev()
+returns NULL for a NULL drm_device (drm_print.h:608-611) and
+__drm_dev_vprintk() has an explicit `if (dev) ... else printk(...)` arm
+(drm_print.c). So the fix trades a freed pointer for an unprefixed debug line,
+not for a NULL dereference.
+
+2. BOTH .attach FAILURE BRANCHES LEAVE THE DRIVER WITH NO DDC ADAPTER
+----------------------------------------------------------------------
+
+.attach opens by taking the I2C-over-AUX adapter away from this driver, because
+drm_dp_aux_register() is about to add the very same struct i2c_adapter itself
+(drm_dp_helper.c:2398-2408):
+
+	if (dp->ddc_owner == SUN60I_DP_DDC_DRIVER) {
+		i2c_del_adapter(&dp->aux.ddc);
+		dp->ddc_owner = SUN60I_DP_DDC_NONE;
+	}				  -- sun60i-dp.c:3299-3302
+
+If drm_dp_aux_register() then fails (:3305), or if drm_bridge_attach() for the
+Type-C receptacle's bridge fails (:3331), .attach returns an error having put
+nothing back. Neither branch is left holding a registered adapter by accident:
+drm_dp_aux_register() unwinds its own devnode when i2c_add_adapter() fails
+(drm_dp_helper.c:2409-2412), and the second branch calls
+sun60i_dp_aux_unregister_locked() (:3334), which removes what the core added.
+
+So the driver returns with `dp->enabled` still true, an AUX channel that is up
+and answering, `ddc_owner == SUN60I_DP_DDC_NONE`, and NO adapter registered
+anywhere. EDID is gone and nothing says so. Worse, it does not heal:
+sun60i_dp_aux_disable() only deletes the adapter it owns (:1372-1375), so with
+ownership NONE an `echo 0 > aux_enable` removes nothing -- only the following
+`echo 1` re-adds one, and only because ownership is NONE again by then.
+
+TRIGGER: a user has brought AUX up by hand first -- `echo 1 > aux_enable`,
+which is the pre-KMS path this file documents at :317-318 and :625-627, and
+the only way ddc_owner is DRIVER at .attach time -- and the KMS master then binds and one of
+the two calls above fails. The first is the same allocation/collision failure as
+defect 1. The second is narrower on this board: drm_aux_hpd_bridge_attach()
+refuses only a missing DRM_BRIDGE_ATTACH_NO_CONNECTOR (aux-hpd-bridge.c:164),
+which our own .attach has already rejected, so what is left is
+drm_bridge_attach()'s own -EBUSY/-EINVAL guards (drm_bridge.c:414-427) and the
+-ENOMEM from its atomic_reset (:446-450).
+
+WHAT CHANGES: the six statements that add the driver-owned adapter move out of
+sun60i_dp_aux_enable() into sun60i_dp_ddc_add_locked(), unchanged, and both
+failure branches call it back through a thin sun60i_dp_ddc_restore_locked()
+that logs when even the re-add fails. One function rather than three copies is
+the same reasoning sun60i_dp_aux_unregister_locked() already carries at the
+other end of the hand-over.
+
+The three i2c_adapter fields are re-filled on every add rather than kept from
+probe, and that is required, not tidiness: i2c_del_adapter() ends with "Clear
+the device structure in case this adapter is ever going to be added again" and
+memsets adap->dev (i2c-core-base.c:1821-1823), and drm_dp_aux_register()
+overwrites owner, dev.parent and name with its own (drm_dp_helper.c:2398-2402).
+An adapter that has been through the core and come back is not the struct that
+was set up the first time.
+
+3. err_gates CLOSES GATES IT DOES NOT OWN
+------------------------------------------
+
+sun60i_dp_video_configure() opens both eDP_REG_PAD clock gates at :1006 and
+jumps to err_gates at :1011 when sun60i_dp_video_transfer_unit() fails.
+err_gates (:1028-1029) closes those two gates and returns -- and stops there.
+
+On the .atomic_enable path that is wrong, because by then it is not the only
+owner of the gates. sun60i_dp_train_output_enable(), added by `drm-a733-dp-enable-the-transmitter-output-before-training` (:2189-2202),
+has ALREADY raised the same two gates (:2197) and set TX_OUTPUT_ENABLE and
+INPUT_SOURCE_ENABLE (:2199-2200) -- and `drm-a733-dp-enable-the-transmitter-output-before-training` measured all four as required for
+this board to reach clock recovery. err_gates therefore leaves the transmitter
+driving a trained link with PAD_DP_LNK_CLK_CFG shut underneath it.
+sun60i_dp_video_disable() takes all four back (:1189-1191); err_gates takes two.
+
+TRIGGER, and this one needs no fault injection at all: any rung where training
+succeeds and the transfer unit then does not fit. The lane ladder falls back to
+one lane, sun60i_dp_train() returns 0, and sun60i_dp_video_transfer_unit()
+returns -EINVAL on `sym16 > TU_SIZE * TU_FRAC_UNITS` because 1620 Mb/s over one
+lane (LinkBW 162) cannot carry the built-in 1920x1200 mode (data rate 462).
+A cable with one good lane produces exactly this.
+
+WHAT CHANGES: the four writes become one function, sun60i_dp_video_output_off(),
+called from both sun60i_dp_video_disable() and the error path, which is renamed
+err_output because it is no longer only about gates. The register sequence
+sun60i_dp_video_disable() emits is byte-for-byte identical to what it emitted
+before; the error path now emits four writes instead of two, in the same reverse
+order.
+
+WHY THE SUCCESS PATH IS NOT TOUCHED -- AND IT IS THE ONLY PATH WITH A PROOF
+----------------------------------------------------------------------------
+
+The success path is the one thing here that silicon has signed off, so it is
+the one thing this patch must not disturb. Statement by statement:
+
+  * Defect 1 adds one store (`dp->aux.drm_dev = NULL`) inside a branch whose
+    next statement is `return ret`.
+  * Defect 2 moves six statements into a function called from the same place,
+    under the same `if (dp->ddc_owner == SUN60I_DP_DDC_NONE)`, in the same
+    order, with the same errno and the same dev_err string. The new calls sit
+    inside `if (ret)` branches.
+  * Defect 3's writes in sun60i_dp_video_disable() are the same three lines in
+    the same order with the same values, emitted from a callee. `err_output` is
+    a label reached only by `goto` from an error return.
+
+No register write is added to, removed from or reordered on any path that
+returns 0. No lock is taken, dropped or reordered: the two new helpers run under
+dp->lock exactly where the code they replace ran, and the only structural change
+to the locking is that .attach's second failure branch grows a braced
+scoped_guard body where it had a single statement -- same scope, same mutex.
+
+The one addition that is not on an error branch is `lockdep_assert_held(&dp->lock)`
+in sun60i_dp_ddc_add_locked(). It compiles to nothing without
+CONFIG_PROVE_LOCKING, which configs/a733_defconfig does not set, and the
+assertion holds anyway: both callers of sun60i_dp_aux_enable() take the mutex
+first (sun60i-dp.c:2418 before :2428, and :3106 before :3137).
+
+VERIFIED
+---------
+
+  applies clean : yes -- `patch -p1 --fuzz=0` onto a freshly unpacked
+                  6.18.36 source tree carrying every patches/*.patch
+                  applied in glob order, i.e. `drm-allwinner-a733-displayport-aux`..`drm-a733-dp-chain-a-hpd-bridge-on-the-typec-receptacle` for this file. Dry run
+                  and real apply both exit 0, no .rej, no .orig.
+  builds        : yes -- `make ARCH=arm64 W=1 drivers/gpu/drm/sun60i/` on that
+                  tree with configs/a733_defconfig, native aarch64 gcc 14.2.0.
+                  All four modules compile and the build log contains not one
+                  occurrence of "warning" or "error". No new symbol is
+                  referenced: lockdep_assert_held, i2c_add_adapter, strscpy,
+                  dev_name, dev_err and writel are all already used in this
+                  file.
+  checkpatch    : `--strict --terse` reports 0 checks and 0 code warnings. The
+                  two lines it does print -- one >75-char prose line and
+                  "Missing Signed-off-by by nominal patch author ''" -- are
+                  artefacts of this tree's headerless patch format and are
+                  printed, one of each, identically for `drm-a733-dp-detect-reports-hot-plug-not-dpcd-valid` and `drm-a733-dp-chain-a-hpd-bridge-on-the-typec-receptacle`.
+  structure     : braces, parentheses and brackets balance across the whole
+                  file after the patch; the label set is unchanged except
+                  err_gates -> err_output, and no label is duplicated; each of
+                  the three new functions has exactly two callers, so nothing
+                  is left unreferenced.
+  on silicon    : NO, and see the warning at the top: neither the defects nor
+                  the fixes have been on a board. The success path this patch
+                  is careful not to touch has been; these three have not. A
+                  clean W=1 build is not evidence that an error path is
+                  correct -- it is evidence that it compiles.
+
+FALSIFIERS -- one per fix, and what each would have to show
+-------------------------------------------------------------
+
+Defect 1 and defect 2 share a provocation, because they share a branch. Neither
+can be reached by typing at a healthy board: drm_dp_aux_register() fails only on
+an allocation failure or a name collision. Two honest ways in, in order of
+preference:
+
+  a) CONFIG_FAILSLAB=y + CONFIG_FAULT_INJECTION_DEBUG_FS=y, fail-slab armed
+     across the KMS bind, so the kzalloc inside i2c_add_adapter() /
+     device_register() is the one that fails. Nothing is edited.
+  b) A one-line temporary substitution of `ret = -ENOMEM;` for the
+     drm_dp_aux_register() call in .attach. Not committed, not built into
+     anything that ships.
+
+Run either with CONFIG_KASAN=y, and with AUX already up by hand so that
+ddc_owner is DRIVER when .attach runs:
+
+    echo 1 > /sys/kernel/debug/5740000.displayport/aux_enable
+    ls -d /sys/class/i2c-adapter/i2c-*      # note the adapter that appears
+    <provoke the bind>                      # expect: DP AUX register: -12
+    ls -d /sys/class/i2c-adapter/i2c-*      # defect 2's observable
+    echo 0 > /sys/kernel/debug/5740000.displayport/train
+
+  DEFECT 1, BEFORE: a KASAN "use-after-free read" report in drm_dp_dump_access()
+  or __drm_dev_vprintk() on that last line -- or, without KASAN, a splat from
+  whatever now occupies the freed drm_device.
+  DEFECT 1, AFTER: no KASAN report; the drm_dbg_dp lines lose their device
+  prefix, which is what a NULL drm_dev looks like.
+  REFUTED BY: a use-after-free report AFTER the patch (the field is being set
+  again from somewhere this reading did not find), or a NULL dereference in the
+  log path (the tolerance claimed above from drm_print.h:608-611 is wrong).
+
+  DEFECT 2, BEFORE: no i2c adapter in the second listing, and none after
+  `echo 0 > aux_enable`; `cat .../link` still says the channel is up.
+  DEFECT 2, AFTER: an adapter is present again. A DIFFERENT i2c-N is expected
+  and correct -- it is a fresh IDR entry, not the old one.
+  REFUTED BY: still no adapter after the patch; or an adapter that is present
+  but whose transfers fail with -ENODEV, which would mean ddc_owner was not
+  restored with it.
+
+Defect 3 needs no injection, which makes it the strongest of the three:
+
+    echo 1 > /sys/kernel/debug/5740000.displayport/aux_enable
+    echo "1620 1"  > /sys/kernel/debug/5740000.displayport/train
+    echo configure > /sys/kernel/debug/5740000.displayport/video
+
+  The write must fail with -EINVAL and dmesg must carry the transfer-unit line
+  ("... 1620 Mb/s over 1 lanes cannot carry 154000 kHz at 24 bpp"). If it does
+  not fail, the premise is gone and nothing below means anything. Then read the
+  two registers -- PAD_DP_LNK_CLK_CFG at 0x05760000 and
+  DP_TRANSMITTER_OUTPUT_ENABLE at 0x05740080:
+
+  BEFORE: 0x00000000 and 0x00000001 -- the transmitter driving with its link
+  clock gate shut, which is the defect stated as two words.
+  AFTER: 0x00000000 and 0x00000000.
+  REFUTED BY: 0x00000001 / 0x00000001 after the patch (err_output did not run),
+  or 0x00000000 / 0x00000001 after the patch (it ran and did not clear the
+  transmitter).
+
+  ⚠ If CONFIG_STRICT_DEVMEM refuses the /dev/mem reads, the same two values come
+  from a temporary seq_printf of both registers placed ABOVE the
+  `!dp->video_configured` early return in sun60i_dp_video_show() (:1269) --
+  temporary, not committed, because the committed diagnostics rule is that
+  nothing is added that the success path pays for.
+
+OPEN
+-----
+
+1. DEFECT 3'S FIX IS A DECISION, NOT A DEDUCTION. The review offered two
+   answers: clear all four, or leave the gates alone in the error path because
+   ownership belongs to sun60i_dp_train_output_enable(). This patch takes the
+   first, on the grounds that a defined-off state is easier to reason about than
+   a state split across two owners -- but the second is defensible and no
+   measurement separates them. If a future patch finds that a failed
+   `configure` should leave a trained link intact for a retry, this is the line
+   to revisit.
+
+2. THE OTHER FIVE FINDINGS OF THE SAME REVIEW ARE NOT IN THIS PATCH.
+   Review items 2, 3, 5, 6 and 7 -- the bpc
+   latch across a sink change, the unlocked `dp->enabled` read in
+   sun60i_dp_aux_transfer(), sun60i-de.c's err_clocks asserting a reset under a
+   fetching layer, the discarded commit->arm() return, and the dev_err in the
+   mode filter -- stand untouched and unrefuted. Item 3 in particular is a race
+   this patch neither creates nor closes.
+
+Assisted-by: Claude
+
+diff --git a/drivers/gpu/drm/sun60i/sun60i-dp.c b/drivers/gpu/drm/sun60i/sun60i-dp.c
+--- a/drivers/gpu/drm/sun60i/sun60i-dp.c
++++ b/drivers/gpu/drm/sun60i/sun60i-dp.c
+@@ -541,6 +541,55 @@ static ssize_t sun60i_dp_aux_transfer(struct drm_dp_aux *aux,
+ 	return msg->size;
+ }
+ 
++/*
++ * Add the I2C-over-AUX adapter under this driver's own ownership. Two callers:
++ * sun60i_dp_aux_enable() on the pre-KMS path, and the restore helper below,
++ * through which .attach's two failure branches put back the adapter they took
++ * off a user who had already opened AUX by hand. One function rather than
++ * three copies, the same reason sun60i_dp_aux_unregister_locked() is one at the
++ * other end of the same hand-over.
++ *
++ * The three fields are set on EVERY call, not once at probe: i2c_del_adapter()
++ * ends with "Clear the device structure in case this adapter is ever going to
++ * be added again" and memsets adap->dev (i2c-core-base.c:1821-1823), so an
++ * adapter that has been handed to the DRM core and taken back is not the struct
++ * that was filled in the first time.
++ */
++static int sun60i_dp_ddc_add_locked(struct sun60i_dp *dp)
++{
++	int ret;
++
++	lockdep_assert_held(&dp->lock);
++
++	dp->aux.ddc.owner = THIS_MODULE;
++	dp->aux.ddc.dev.parent = dp->dev;
++	strscpy(dp->aux.ddc.name, dev_name(dp->dev), sizeof(dp->aux.ddc.name));
++
++	ret = i2c_add_adapter(&dp->aux.ddc);
++	if (ret) {
++		dev_err(dp->dev, "I2C-over-AUX adapter: %d\n", ret);
++		return ret;
++	}
++
++	dp->ddc_owner = SUN60I_DP_DDC_DRIVER;
++
++	return 0;
++}
++
++/*
++ * The same, on a path that cannot report the failure to anybody: .attach is
++ * already returning an error of its own. Losing DDC here is not fatal -- AUX
++ * itself is untouched, and an aux_enable 0 -> 1 cycle rebuilds the adapter --
++ * but it is invisible without a line, and an invisible missing adapter reads
++ * as a dead sink.
++ */
++static void sun60i_dp_ddc_restore_locked(struct sun60i_dp *dp)
++{
++	if (sun60i_dp_ddc_add_locked(dp))
++		dev_err(dp->dev,
++			"DDC lost; aux_enable 0 -> 1 rebuilds the adapter\n");
++}
++
+ /*
+  * Bring the AUX channel up. Split out from probe() on purpose: it is what a
+  * consumer calls once DisplayPort alt mode has actually been entered and the
+@@ -612,18 +661,9 @@ static int sun60i_dp_aux_enable(struct sun60i_dp *dp)
+ 	 * conditional rather than unconditional. See enum sun60i_dp_ddc_owner.
+ 	 */
+ 	if (dp->ddc_owner == SUN60I_DP_DDC_NONE) {
+-		dp->aux.ddc.owner = THIS_MODULE;
+-		dp->aux.ddc.dev.parent = dp->dev;
+-		strscpy(dp->aux.ddc.name, dev_name(dp->dev),
+-			sizeof(dp->aux.ddc.name));
+-
+-		ret = i2c_add_adapter(&dp->aux.ddc);
+-		if (ret) {
+-			dev_err(dp->dev, "I2C-over-AUX adapter: %d\n", ret);
++		ret = sun60i_dp_ddc_add_locked(dp);
++		if (ret)
+ 			goto err_phy_off;
+-		}
+-
+-		dp->ddc_owner = SUN60I_DP_DDC_DRIVER;
+ 	}
+ 
+ 	dp->enabled = true;
+@@ -690,6 +730,25 @@ static void sun60i_dp_video_gates(struct sun60i_dp *dp, bool on)
+ 	writel(on ? VID0_CLK_GATING : 0, dp->pad + PAD_DP_VID_CLK_CFG);
+ }
+ 
++/*
++ * Put the transmitter down together with the two gates underneath it, in the
++ * reverse of the order sun60i_dp_train_output_enable() raised them. All four
++ * writes or none: the gates and the two enables are one unit, and a state with
++ * TX_OUTPUT_ENABLE set over a shut PAD_DP_LNK_CLK_CFG is the one `drm-a733-dp-enable-the-transmitter-output-before-training` measured
++ * as not reaching clock recovery.
++ *
++ * Two callers, which is why it is a function: the ordinary teardown in
++ * sun60i_dp_video_disable(), and sun60i_dp_video_configure()'s error path.
++ * Both have already established that the block is reachable -- `enabled` for
++ * the bus clock and the reset, `pad` for the second register window.
++ */
++static void sun60i_dp_video_output_off(struct sun60i_dp *dp)
++{
++	writel(0, dp->base + DP_INPUT_SOURCE_ENABLE);
++	writel(0, dp->base + DP_TRANSMITTER_OUTPUT_ENABLE);
++	sun60i_dp_video_gates(dp, false);
++}
++
+ static u32 sun60i_dp_video_bpc_code(u8 bpc)
+ {
+ 	switch (bpc) {
+@@ -994,7 +1053,7 @@ static int sun60i_dp_video_configure(struct sun60i_dp *dp)
+ 
+ 	ret = sun60i_dp_video_transfer_unit(dp, mode, bpp);
+ 	if (ret)
+-		goto err_gates;
++		goto err_output;
+ 
+ 	/*
+ 	 * The transmitter output enable must wait until the link output is
+@@ -1011,8 +1070,16 @@ static int sun60i_dp_video_configure(struct sun60i_dp *dp)
+ 
+ 	return 0;
+ 
+-err_gates:
+-	sun60i_dp_video_gates(dp, false);
++	/*
++	 * All four, not just the two this function opened. On the
++	 * .atomic_enable path sun60i_dp_train_output_enable() has already
++	 * raised the same two gates and set both enables, so closing the gates
++	 * alone would leave the transmitter driving a trained link whose clock
++	 * gate is shut -- the asymmetry sun60i_dp_video_disable() does not
++	 * have.
++	 */
++err_output:
++	sun60i_dp_video_output_off(dp);
+ 
+ 	return ret;
+ }
+@@ -1172,9 +1239,7 @@ static void sun60i_dp_video_disable(struct sun60i_dp *dp)
+ 	 */
+ 	writel(0, dp->base + DP_SRC0_STREAM_ENABLE);
+ 	writel(0, dp->base + DP_SRC0_ENABLE);
+-	writel(0, dp->base + DP_INPUT_SOURCE_ENABLE);
+-	writel(0, dp->base + DP_TRANSMITTER_OUTPUT_ENABLE);
+-	sun60i_dp_video_gates(dp, false);
++	sun60i_dp_video_output_off(dp);
+ 
+ 	dp->video_on = false;
+ 	dp->video_configured = false;
+@@ -2683,6 +2748,7 @@ static int sun60i_dp_bridge_attach(struct drm_bridge *bridge,
+ 				   enum drm_bridge_attach_flags flags)
+ {
+ 	struct sun60i_dp *dp = bridge_to_dp(bridge);
++	bool restore_ddc = false;
+ 	int ret;
+ 
+ 	/*
+@@ -2710,12 +2776,26 @@ static int sun60i_dp_bridge_attach(struct drm_bridge *bridge,
+ 		if (dp->ddc_owner == SUN60I_DP_DDC_DRIVER) {
+ 			i2c_del_adapter(&dp->aux.ddc);
+ 			dp->ddc_owner = SUN60I_DP_DDC_NONE;
++			restore_ddc = true;
+ 		}
+ 
++		/*
++		 * Assigned BEFORE the call and not after, because
++		 * drm_dp_aux_register() opens with WARN_ON_ONCE(!aux->drm_dev)
++		 * (drm_dp_helper.c:2393). So it has to be cleared again by hand
++		 * on the failure path: the core takes this bridge back out
++		 * of encoder->bridge_chain there (drm_bridge.c:463-466), so
++		 * .detach -- the only other place that nulls the field -- is
++		 * never called, and sun60i_kms_bind() unwinds to
++		 * drm_dev_put().
++		 */
+ 		dp->aux.drm_dev = bridge->dev;
+ 		ret = drm_dp_aux_register(&dp->aux);
+ 		if (ret) {
+ 			dev_err(dp->dev, "DP AUX register: %d\n", ret);
++			dp->aux.drm_dev = NULL;
++			if (restore_ddc)
++				sun60i_dp_ddc_restore_locked(dp);
+ 			return ret;
+ 		}
+ 
+@@ -2741,8 +2821,11 @@ static int sun60i_dp_bridge_attach(struct drm_bridge *bridge,
+ 	 */
+ 	ret = drm_bridge_attach(encoder, dp->next_bridge, bridge, flags);
+ 	if (ret) {
+-		scoped_guard(mutex, &dp->lock)
++		scoped_guard(mutex, &dp->lock) {
+ 			sun60i_dp_aux_unregister_locked(dp);
++			if (restore_ddc)
++				sun60i_dp_ddc_restore_locked(dp);
++		}
+ 		return ret;
+ 	}
+ 

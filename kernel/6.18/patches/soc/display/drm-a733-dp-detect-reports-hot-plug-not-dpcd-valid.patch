@@ -1,0 +1,338 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] drm: a733: dp: .detect must report hot-plug, not "a DPCD read once worked"
+
+`drm-a733-dp-register-a-drm-bridge` states its own contract in its vendor-comparison table:
+
+  | .detect reads NO register and issues NO transaction. It returns what
+  | .hpd_notify recorded. |
+
+The code returns dp->dpcd_valid instead, and that is a different fact. Nothing
+sets dpcd_valid but sun60i_dp_link_probe() (added by `drm-a733-dp-configure-the-main-link-phy`; sun60i-dp.c:1407-1418
+-- every sun60i-dp.c line number here is the file as it stands AFTER `drm-a733-dp-instrument-the-training-failure-paths`, i.e.
+the tree this patch applies to), and
+every bring-up verb in this file calls it: `link` through
+sun60i_dp_link_configure() (:1515) and `train` through sun60i_dp_train() (:2237).
+So a connector that answers dpcd_valid answers "a user typed a command",
+not "a display is plugged in".
+
+MEASURED, the 8 GiB board, 2026-08-22: at boot
+/sys/class/drm/card0-DP-1/status reads `disconnected`; after a single
+`echo 0 > /sys/kernel/debug/5740000.displayport/train` it reads `connected`,
+with no sink event of any kind and nothing physical touched. The connector is
+lying, and it is lying in the direction that costs a measurement: `drm-a733-dp-register-a-drm-bridge` declines
+DRM_BRIDGE_OP_HPD, so the connector is DRM_CONNECTOR_POLL_CONNECT |
+POLL_DISCONNECT (drm_bridge_connector.c:845-848) and drm_probe_helper's
+output_poll_execute() re-reads it every DRM_OUTPUT_POLL_PERIOD = 10*HZ
+(drm_probe_helper.c:266, :807, :851). A status change from that poll reaches
+drm_kms_helper_hotplug_event() (:848), which hands the link to the
+drm_client_setup() client `drm-a733-kms-drm-device-for-the-display-pipe` registers -- an asynchronous modeset, i.e. a
+second sun60i_dp_train() on a link somebody is measuring, and a TCON disable
+on the way back down. On the run where this was checked explicitly it had NOT
+fired (`main link configured` went 0 -> 3 for exactly three requested rungs,
+and none of `drm-a733-dp-register-a-drm-bridge`'s atomic_enable-only error strings appeared), so this is a
+live hazard and not an observed corruption. It is fixed before it is one.
+
+THE SECOND DEFECT IN THE SAME FUNCTION PAIR, WHICH IS A LATCH
+--------------------------------------------------------------
+
+.detect does not end at its own return. drm_bridge_connector_detect() feeds the
+value straight back into every bridge in the chain:
+
+	status = detect->funcs->detect(detect, connector);
+	if (hdmi)
+		drm_atomic_helper_connector_hdmi_hotplug(connector, status);
+	drm_bridge_connector_hpd_notify(connector, status);
+					(drm_bridge_connector.c:214-219)
+
+and sun60i_dp_bridge_hpd_notify() tears the channel down on anything that is
+not connector_status_connected (sun60i-dp.c:2963-2967, calling
+sun60i_dp_aux_disable(), which clears dpcd_valid at :1362 and enabled at :1363).
+
+Compose the two and the driver has a one-way door. One failed
+drm_dp_read_dpcd_caps() leaves dpcd_valid false; the next .detect -- at most ten
+seconds later, and there is no way to stop it -- reports disconnected; the core
+hands that back to .hpd_notify; .hpd_notify disables AUX. Every subsequent
+detect reports disconnected because dpcd_valid can no longer become true with
+the channel down, and nothing but a real out-of-band connected event reopens it.
+On this board that event has never once arrived (the fwnode mismatch, `drm-a733-dp-register-a-drm-bridge`'s
+OPEN 1), so on this board the door has no handle on the inside at all.
+
+The same composition is why `echo 1 > aux_enable` is unstable today: it sets
+enabled without setting dpcd_valid, so the next poll's detect->hpd_notify pair
+calls sun60i_dp_aux_disable() on a channel the user just opened, within ten
+seconds, silently. NOT separately measured -- it is read off the two call sites
+above and labelled an inference for that reason. What makes it plausible rather
+than merely derivable is that `echo 0 > train` survived on 2026-08-22: train
+calls sun60i_dp_link_probe() first (:2237), so it sets dpcd_valid inside the
+same dp->lock section and the poll finds `connected` afterwards. aux_enable on
+its own sets no such thing.
+
+WHAT THIS DOES
+---------------
+
+One new bool, hpd_asserted, which is what .hpd_notify recorded -- the thing
+`drm-a733-dp-register-a-drm-bridge`'s table already promised .detect would return. Then:
+
+1. .detect returns hpd_asserted. It still reads no register and issues no
+   transaction, so `drm-a733-dp-register-a-drm-bridge`'s decision 1 -- DRM_BRIDGE_OP_DETECT is "affordable
+   only because .detect touches nothing" -- and its WHY .detect TOUCHES NO
+   REGISTER block both stand unchanged.
+
+2. .hpd_notify becomes EDGE-triggered: it returns immediately when the status it
+   is handed equals the state it already holds. This is not an optimisation, it
+   is what makes 1. safe. .detect answers hpd_asserted, the core hands
+   hpd_asserted straight back at drm_bridge_connector.c:219, and the poll
+   therefore does nothing at all -- where a level-triggered .hpd_notify would
+   turn every tenth second into either sun60i_dp_link_probe() (real AUX traffic
+   from the poll, which is exactly the vendor behaviour `drm-a733-dp-register-a-drm-bridge`'s table calls out) or
+   sun60i_dp_aux_disable().
+
+3. .hpd_notify records the new state FIRST and unconditionally, before it
+   touches the channel. That is what breaks the latch: hpd_asserted is a fact
+   about the cable, not about this driver's success with it, so a failed
+   sun60i_dp_aux_enable() or a failed sun60i_dp_link_probe() leaves the
+   connector connected and the core free to retry, instead of reporting
+   disconnected and being told to shut the channel it needs.
+
+No event is lost by edge-triggering. drm_connector_oob_hotplug_event() from the
+alternate mode carries only connected/disconnected
+(drivers/usb/typec/altmodes/displayport.c:190-193, :214-215, :399-401); IRQ_HPD
+is delivered by sysfs_notify() and never reaches DRM at all (:195-197). A
+repeated "connected" from a Status Update is therefore a repeat, not a new
+event, and dropping it is correct.
+
+THE VENDOR DRIVER AND THIS DEFECT
+---------------------------------
+
+The vendor driver does not have this defect, so there is no comparison table.
+This defect cannot exist in sunxi_drm_edp.c: it hand-rolls a connector with
+DRM_CONNECTOR_POLL_HPD (edp.c:4033, quoted in `drm-a733-kms-drm-device-for-the-display-pipe`'s own table) and has no
+drm_bridge at all, so there is no drm_bridge_connector_detect() to feed its
+detect result back into a notify callback. The defect is ours, introduced by
+`drm-a733-dp-register-a-drm-bridge`, and the vendor's connect path has the separate issue `drm-a733-dp-register-a-drm-bridge`
+already records (a once-a-second DPCD poll into a powered-down front end).
+What is genuinely A733 here is only which of the two flags a connector on THIS
+board may answer, and that follows from the HPD_INPUT_STATE measurement `drm-a733-dp-register-a-drm-bridge`
+already carries: the pad reads zero over a live link, so this driver can never
+know hot-plug except by being told.
+
+DIAGNOSTICS
+------------
+
+Nothing is deleted -- in this tree a working diagnostic is never removed, at most demoted. Two lines are added, and
+both are cheap by construction:
+
+  * the `link` debugfs file gains a `hot-plug :` row, so the state .detect
+    answers is readable without dmesg and without provoking a poll. This is the
+    file that already prints `sink caps : not read yet`, which is dpcd_valid --
+    the two now sit next to each other and can be told apart by eye.
+  * .hpd_notify logs one dev_info per TRANSITION. Edge-triggering is what makes
+    that safe: it is one line per physical plug or unplug, never a per-poll
+    line, and it is the observable that closes `drm-a733-dp-register-a-drm-bridge`'s OPEN 1 -- the first time
+    this line appears on this board, the fwnode path works.
+
+.detect itself still prints nothing, deliberately: it runs every ten seconds for
+ever. Its silence is why this defect survived, so the answer is the debugfs row
+above, not a print in the poll path.
+
+⚠ NOT A FIX FOR THE MISSING HOT-PLUG, AND MUST NOT BE READ AS ONE. After this
+patch the connector reports `disconnected` on this board and keeps reporting it,
+because .hpd_notify still never fires -- drm_connector_oob_hotplug_event() from
+typec_displayport targets the usb-c-connector node's fwnode while
+drm_bridge_connector_init() gave our connector edp0's. That is `drm-a733-dp-register-a-drm-bridge`'s OPEN 1,
+it is a separate defect with a separate fix (a drm_aux_hpd_bridge on the
+connector node plus a next_bridge chain), and this patch deliberately touches
+neither the fwnode, the DT, nor probe()/.attach so that the two do not collide.
+What this patch changes is that the connector now says `disconnected` because it
+has not been told otherwise, instead of saying `connected` because somebody ran
+a debugfs command.
+
+VERIFIED
+---------
+
+  applies clean : yes -- `patch -p1 --fuzz=0` on a freshly unpacked 6.18.36
+                  carrying all 125 of patches/*.patch applied in order, i.e.
+                  the full series up to and including
+                  `drm-a733-dp-instrument-the-training-failure-paths`. Dry run and real apply both exit 0, no .rej, no .orig.
+  builds        : yes -- `make ARCH=arm64 W=1 drivers/gpu/drm/sun60i/` on that
+                  tree with the series' own .config, native aarch64 gcc 14.2.0.
+                  sun60i-dp.o and the other three modules compile with NO
+                  warning. No new symbol is referenced: every identifier this
+                  patch uses (dev_info, seq_printf, connector_status_connected,
+                  guard(mutex)) is already used in this file.
+  checkpatch    : `--strict --terse` reports 0 checks and 0 code warnings. The
+                  two lines it does print -- the >75-char subject and "Missing
+                  Signed-off-by by nominal patch author ''" -- are artefacts of
+                  this tree's headerless patch format and are printed
+                  identically for `drm-a733-dp-register-a-drm-bridge` and `drm-a733-dp-instrument-the-training-failure-paths`.
+  on silicon    : NO. Not hardware-proven. The measurement that FOUND the bug is
+                  hardware (see above); the fix is not.
+
+FALSIFIER -- the exact measurement that found the defect, run again
+--------------------------------------------------------------------
+
+On the 8 GiB board, one boot, nothing physically touched at any point:
+
+  cat /sys/class/drm/card0-DP-1/status              # expect: disconnected
+  echo 1 > /sys/kernel/debug/5740000.displayport/aux_enable
+  sleep 25                                          # >= 2 poll periods
+  cat /sys/kernel/debug/5740000.displayport/link    # expect: aux up,
+                                                    #   hot-plug never notified
+  echo 0 > /sys/kernel/debug/5740000.displayport/train
+  sleep 25
+  cat /sys/class/drm/card0-DP-1/status              # expect: STILL disconnected
+  cat /sys/kernel/debug/5740000.displayport/link    # expect: aux STILL up
+
+REFUTED BY any of: `connected` after the train (the flag swap did not take);
+`aux : down` after the sleep (the level trigger is still tearing the channel
+down, i.e. the edge guard is not doing its job); a `hot-plug: sink present` line
+in dmesg on a boot where nothing was plugged (hpd_asserted is being set from
+somewhere other than a real notification); or any DPCD/AUX transaction visible
+on the ten-second cadence.
+
+CONFIRMED FURTHER, once the fwnode defect is fixed by the patch that owns it:
+plugging the monitor produces exactly one `hot-plug: sink present`, the `link`
+file's hot-plug row turns to `asserted`, and status turns `connected` -- and
+unplugging produces exactly one `sink gone`. One line each, not one per poll.
+
+OPEN
+-----
+
+1. A FAILED sun60i_dp_aux_enable() IS STILL NEVER RETRIED. The connector
+   correctly stays `connected` -- the sink is there -- but nothing tries the
+   channel again until the next real hot-plug edge. Observable: a boot where
+   `hot-plug: sink present` is followed by no `AUX up` line and the `link` file
+   reports `aux : down` for ever. Whether the retry belongs here or in the core
+   is not settled and is not settled by guessing.
+
+2. THE POLL IS NOW PURE, AND THAT MAKES IT USELESS ON THIS BOARD. With .detect
+   reading nothing and .hpd_notify never firing, the ten-second poll can never
+   change the answer. It is retained because it costs nothing and because it
+   becomes correct the moment OPEN 1 of `drm-a733-dp-register-a-drm-bridge` is closed. If that fix does not
+   land, the honest follow-up is to stop claiming DRM_BRIDGE_OP_DETECT at all
+   rather than to poll a constant.
+
+Assisted-by: Claude
+
+diff --git a/drivers/gpu/drm/sun60i/sun60i-dp.c b/drivers/gpu/drm/sun60i/sun60i-dp.c
+--- a/drivers/gpu/drm/sun60i/sun60i-dp.c
++++ b/drivers/gpu/drm/sun60i/sun60i-dp.c
+@@ -329,6 +329,16 @@ struct sun60i_dp {
+ 	struct drm_dp_aux	aux;
+ 	struct mutex		lock;		/* serialises enable/disable */
+ 	bool			enabled;
++	/* What .hpd_notify last recorded, and the ONLY thing .detect reports.
++	 * This bridge does not claim DRM_BRIDGE_OP_HPD and cannot read
++	 * hot-plug itself, so nothing but an out-of-band notification can
++	 * ever set it: false is the correct state at bind and probe sets
++	 * nothing (devm_drm_bridge_alloc() zeroes the struct).
++	 *
++	 * Deliberately NOT dpcd_valid, which says the sink answered a DPCD
++	 * read -- a different question, asked by every debugfs verb.
++	 */
++	bool			hpd_asserted;
+ 	/* The sink's own capability bytes, and what was last asked of the PHY.
+ 	 * rate is in Mb/s, the unit phy_configure_opts_dp counts in.
+ 	 */
+@@ -2286,6 +2296,25 @@ static int sun60i_dp_train(struct sun60i_dp *dp, unsigned int rate_mbps,
+  * into a powered-down front end, forever instead of only at bind. So .detect
+  * reports state that .hpd_notify recorded, and only .hpd_notify opens the
+  * channel.
++ *
++ * AND WHY .hpd_notify IS EDGE-TRIGGERED, which is the other half of the same
++ * sentence and was missing until 2026-08-22. .detect does not end at its own
++ * return: drm_bridge_connector_detect() feeds the value straight back into
++ * every bridge in the chain --
++ *
++ *	status = detect->funcs->detect(detect, connector);
++ *	...
++ *	drm_bridge_connector_hpd_notify(connector, status);
++ *					(drm_bridge_connector.c:214-219)
++ *
++ * -- so a .hpd_notify that ACTS on the status it is handed turns the ten-second
++ * poll into a ten-second AUX transaction (on connected) or a ten-second channel
++ * teardown (on disconnected), and .detect's promise to touch nothing becomes
++ * false by a route that is invisible in this file. Acting only on a CHANGE of
++ * the recorded state closes that loop: .detect answers hpd_asserted,
++ * .hpd_notify is handed hpd_asserted back, and nothing happens. The alternate
++ * mode delivers only connected/disconnected through this path -- IRQ_HPD goes
++ * to sysfs and never to DRM (displayport.c:190-197) -- so no event is lost.
+  */
+ 
+ /*
+@@ -2396,13 +2425,21 @@ sun60i_dp_bridge_detect(struct drm_bridge *bridge,
+ 	guard(mutex)(&dp->lock);
+ 
+ 	/*
+-	 * dpcd_valid, not `enabled`: the AUX channel being powered says this
+-	 * driver opened it, the sink's own capability bytes say something
+-	 * answered. No sink is a STATE, not an error -- so this
+-	 * returns disconnected quietly and logs nothing on the ten-second poll.
++	 * The hot-plug state, and nothing else. NOT dpcd_valid: that flag says
++	 * a DPCD read succeeded, which every debugfs verb makes true --
++	 * sun60i_dp_link_probe() is called by `link` and by `train` -- so a
++	 * connector answering it reports "connected" because a user typed
++	 * a command, with no sink event of any kind. Measured on the 8 GiB board on
++	 * 2026-08-22: status reads disconnected at
++	 * boot and connected after one `echo 0 > .../train`, with nothing
++	 * physical touched.
++	 *
++	 * No sink is a STATE, not an error, so this returns
++	 * disconnected quietly and logs nothing on the ten-second poll. What it
++	 * reports is visible without dmesg in the `link` file's hot-plug line.
+ 	 */
+-	return dp->dpcd_valid ? connector_status_connected
+-			      : connector_status_disconnected;
++	return dp->hpd_asserted ? connector_status_connected
++				: connector_status_disconnected;
+ }
+ 
+ static const struct drm_edid *
+@@ -2445,11 +2482,34 @@ static void sun60i_dp_bridge_hpd_notify(struct drm_bridge *bridge,
+ 					enum drm_connector_status status)
+ {
+ 	struct sun60i_dp *dp = bridge_to_dp(bridge);
++	bool asserted = status == connector_status_connected;
+ 	int ret;
+ 
+ 	guard(mutex)(&dp->lock);
+ 
+-	if (status != connector_status_connected) {
++	/*
++	 * EDGE, not level, and this guard is load-bearing rather than an
++	 * optimisation. drm_bridge_connector_detect() calls this function with
++	 * the result of our own .detect (drm_bridge_connector.c:214-219), so on
++	 * a level trigger every ten-second poll would re-open, re-probe or tear
++	 * down the channel -- see the block above sun60i_dp_bridge_link_budget().
++	 */
++	if (asserted == dp->hpd_asserted)
++		return;
++
++	/*
++	 * Recorded FIRST, and unconditionally, because it is a fact about the
++	 * cable and not about this driver's success with it. A version that set
++	 * it only once the channel came up would latch the connector off after
++	 * one failed AUX transaction: .detect would report disconnected, the
++	 * core would hand that back here, and this function would disable a
++	 * channel nothing could then re-enable short of a physical re-plug.
++	 */
++	dp->hpd_asserted = asserted;
++	dev_info(dp->dev, "hot-plug: sink %s\n",
++		 asserted ? "present" : "gone");
++
++	if (!asserted) {
+ 		if (dp->enabled)
+ 			sun60i_dp_aux_disable(dp);
+ 		return;
+@@ -2462,8 +2522,9 @@ static void sun60i_dp_bridge_hpd_notify(struct drm_bridge *bridge,
+ 	}
+ 
+ 	/* Failure is reported by sun60i_dp_link_probe() itself and leaves
+-	 * dpcd_valid false, which is what .detect will then answer. Nothing is
+-	 * retried here -- the DRM core owns AUX retries.
++	 * dpcd_valid false -- which .detect no longer answers, so a sink that
++	 * is physically there stays connected and the core is free to retry the
++	 * EDID. Nothing is retried here; the DRM core owns AUX retries.
+ 	 */
+ 	sun60i_dp_link_probe(dp);
+ }

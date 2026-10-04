@@ -1,0 +1,115 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] aic8800_fdrv: drop the disconnect handshake from the rx completion path
+
+A port of Radxa's fix-usb-suspend-reboot-hang.patch, which sits in debian/patches
+of the pinned tag (upstream radxa-pkg/aic8800 PR #95, merged 2026-07-16), plus a
+stimulus to prove it here.
+
+Code says (aic8800_fdrv/aicwf_usb.c, rwnx_main.c):
+- aicwf_usb_rx_complete(), on urb->status < 0 with wait_disconnect_cb false, sets
+  wait_disconnect_cb = true and, while aicwf_deinit_atomic > 0, takes
+  aicwf_deinit_sem with down(): a sleeping call in URB completion context.
+  aicwf_usb_bus_stop() gives it back only when it is reached with the flag set.
+- While wait_disconnect_cb is true, rwnx_cfg80211_scan() returns -EBUSY ("wait usb
+  disconnect return busy"). The flag is cleared only by resume, by module exit and
+  by rwnx_platform_init(). So one failed bulk-IN transfer that is not followed by
+  a disconnect refuses every later scan.
+- The semaphore taken in completion is not returned on that path either:
+  aicwf_usb_exit() then polls aicwf_deinit_atomic for up to 5 x 500 ms and runs
+  into down_timeout(SEM_TIMOUT = 2000 ms), "semaphore waiting timeout". Radxa's
+  own description is only "fix: avoid usb reboot hang after suspend"
+  (debian/changelog, -7); that the hang is this leak across a suspend, with
+  aicwf_usb_disconnect()'s plain down() never returning, is our reading.
+
+What changes, exactly as Radxa: the block is removed from both completion
+variants, and the matching up() from aicwf_usb_bus_stop(). After it nothing sets
+wait_disconnect_cb to true, so the scan refusal cannot fire. aicwf_usb_disconnect()
+and aicwf_usb_exit() keep their own down()/up() pairs. Two pre-existing
+imbalances there are left alone: disconnect returns without up() when usb_dev is
+NULL, and exit calls up() even after down_timeout() failed.
+
+Diagnostic: rx_inject_urb_error (0644, /sys/module/aic8800_fdrv/parameters): the
+next N good bulk-IN completions are handled as if they had completed with -EPROTO.
+They count in rx_urb_errors (added by aic8800_fdrv-keep-draining-rx-after-a-bad-aggregate). Such a URB is re-armed by the next good
+completion, so 20 or more at once (all rx URBs) stop rx until the bus restarts.
+
+Falsifier, on the board: write 1 to rx_inject_urb_error under traffic, then
+`iw dev wl0 scan`. Expected: scan results, and no "wait usb disconnect return
+busy". Then `modprobe -r aic8800_fdrv`: no "semaphore waiting timeout". The same
+sequence on a build with the stimulus but without this change must show both.
+
+Assisted-by: Claude
+
+--- a/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/aicwf_usb.c
++++ b/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/aicwf_usb.c
+@@ -64,6 +64,9 @@
+ static int rx_urb_last_status;
+ module_param(rx_urb_last_status, int, 0444);
+ MODULE_PARM_DESC(rx_urb_last_status, "urb->status of the last failed bulk-IN rx URB");
++static int rx_inject_urb_error;
++module_param(rx_inject_urb_error, int, 0644);
++MODULE_PARM_DESC(rx_inject_urb_error, "Test stimulus: handle the next N good rx completions as -EPROTO");
+ uint rx_bad_len_drops;
+ module_param(rx_bad_len_drops, uint, 0444);
+ MODULE_PARM_DESC(rx_bad_len_drops, "rx aggregates dropped because a header claimed more than the buffer holds");
+@@ -310,6 +313,11 @@
+     rx_buff = usb_buf->rx_buff;
+     usb_buf->rx_buff = NULL;
+ 
++    if (unlikely(rx_inject_urb_error > 0) && urb->status == 0) {
++        rx_inject_urb_error--;
++        urb->status = -EPROTO;
++    }
++
+     atomic_dec(&rx_urb_cnt);
+     if(atomic_read(&rx_urb_cnt) < 10){
+         AICWFDBG(LOGDEBUG, "%s %d \r\n", __func__, atomic_read(&rx_urb_cnt));
+@@ -337,18 +345,6 @@
+             AICWFDBG(LOGDEBUG, "%s urb->status:%d \r\n", __func__, urb->status);
+             rx_urb_errors++;
+             rx_urb_last_status = urb->status;
+-
+-            if(g_rwnx_plat->wait_disconnect_cb == false){
+-                g_rwnx_plat->wait_disconnect_cb = true;
+-                if(atomic_read(&aicwf_deinit_atomic) > 0){
+-                    atomic_set(&aicwf_deinit_atomic, 0);
+-                    down(&aicwf_deinit_sem);
+-                    AICWFDBG(LOGINFO, "%s need to wait for disconnect callback \r\n", __func__);
+-                }else{
+-                    g_rwnx_plat->wait_disconnect_cb = false;
+-                }
+-            }
+-
+             return;
+         }else{
+             //schedule_work(&usb_dev->rx_urb_work);
+@@ -426,18 +422,6 @@
+         aicwf_usb_rx_buf_put(usb_dev, usb_buf);
+ 		if(urb->status < 0){
+ 			AICWFDBG(LOGDEBUG, "%s urb->status:%d \r\n", __func__, urb->status);
+-
+-			if(g_rwnx_plat->wait_disconnect_cb == false){
+-				g_rwnx_plat->wait_disconnect_cb = true;
+-				if(atomic_read(&aicwf_deinit_atomic) > 0){
+-					atomic_set(&aicwf_deinit_atomic, 0);
+-					down(&aicwf_deinit_sem);
+-					AICWFDBG(LOGINFO, "%s need to wait for disconnect callback \r\n", __func__);
+-				}else{
+-					g_rwnx_plat->wait_disconnect_cb = false;
+-				}
+-			}
+-
+ 			return;
+ 		}else{
+ 			//schedule_work(&usb_dev->rx_urb_work);
+@@ -2020,10 +2004,6 @@
+     if (usb_dev->state == USB_DOWN_ST)
+         return;
+ 
+-    if(g_rwnx_plat && g_rwnx_plat->wait_disconnect_cb == true){
+-        atomic_set(&aicwf_deinit_atomic, 1);
+-        up(&aicwf_deinit_sem);
+-    }
+     aicwf_usb_state_change(usb_dev, USB_DOWN_ST);
+     //aicwf_usb_cancel_all_urbs(usb_dev);//AIDEN
+ }

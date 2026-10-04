@@ -1,0 +1,168 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] mmc: sunxi: A733 eMMC - use the controller's auto-CMD23
+
+Reads on this eMMC are open-ended: the core issues CMD18, the driver sets
+SDXC_SEND_AUTO_STOP, and the controller closes the transfer with CMD12. That
+stop is not free, and on this card it is not close to free.
+
+Measured on the 8 GiB board with the mmc tracepoints and a wall clock taken in the same
+run, HS400 at 200 MHz, 8 bit, governor pinned to performance:
+
+  64 KiB per request, CMD18 + stop_opcode=12   in_req 4761.5 us   gap 20.3 us
+  512 B  per request, CMD17, no stop           in_req  141.1 us   gap 28.5 us
+
+256 * (4761 + 20) us = 1.224 s against a measured 1.23 s for the 16 MiB, so
+the accounting is complete -- the time is inside the request, not around it.
+Dropping the stop takes the per-request cost from ~4.6 ms to ~0.14 ms.
+
+The cost is per request and not per byte: the time per request stays at
+4.86-4.95 ms from 64 KiB all the way to 1 MiB, so the payload is nearly free
+next to it and throughput is simply 1 MiB / 4.9 ms wherever the request size
+lands. Against the vendor stack on the same board and the same card, reading
+the same way: 13.5 vs 276.6 MB/s at 64 KiB, 211.9 vs 325.4 MB/s at 1 MiB.
+
+CMD18 itself is not the slow part. The vendor issues the same CMD18 to the
+same card and pays 234 us for the whole request -- it just tells the device the
+length up front with CMD23, so no stop is needed. The A733 can do that in
+hardware: SMHC_A23A holds the block count (UM 11.3.8.31) and
+SMHC_ECMD bit 0 arms it (UM 11.3.8.34): with the bit set, the controller
+sends CMD23 by itself ahead of the command in SMHC_CMD; a soft reset clears
+the bit again. Vendor silicon under load reads
+SMHC_A23A = 0x800 = 2048 blocks = exactly the 1 MiB it was reading.
+
+So arm it, on the one controller that has it:
+
+- New cfg flag can_auto_cmd23, set only for sun60i-a733-emmc. MMC_CAP_CMD23 is
+  announced only under that flag: announcing it without programming the
+  registers would have the core attach an sbc that nothing sends, and the
+  transfer would stay open-ended with no sign of it.
+- A23A and ECMD are written last, after sunxi_mmc_start_dma(), because the
+  arming bit is cleared by a soft reset and start_dma resets the DMA block.
+- With an sbc present the transfer is length-bounded, so SDXC_SEND_AUTO_STOP is
+  not set and completion waits on DATA_OVER instead of AUTO_COMMAND_DONE.
+- The core deliberately keeps mrq->stop populated even when it supplies an sbc,
+  because a stop is still needed on an error. That path is unchanged: an error
+  still routes through host->manual_stop_mrq, which sends CMD12 by hand.
+- CMD23's own R1 lands in SMHC_ERESP, so mrq->sbc->resp[0] is filled from there
+  rather than from the response registers, which hold the data command's.
+
+Assisted-by: Claude
+---
+--- a/drivers/mmc/host/sunxi-mmc.c
++++ b/drivers/mmc/host/sunxi-mmc.c
+@@ -75,7 +75,10 @@
+ #define SDXC_REG_DS_DL_REG	0x148 /* SMC data strobe delay control */
+ #define SDXC_REG_CSDC		0x054 /* CRC Status Detect Control (HS400) */
+ #define SDXC_REG_THLD		0x100 /* Card Threshold Control */
++#define SDXC_REG_A23A		0x108 /* Auto Command 23 Argument (UM 11.3.8.31) */
+ #define SDXC_REG_EMMC_DSBD	0x10C /* eMMC DDR Start Bit Detect Control */
++#define SDXC_REG_ECMD		0x138 /* Extended Command (UM 11.3.8.34) */
++#define SDXC_REG_ERESP		0x13C /* Extended Response (CMD23's R1) */
+ 
+ /* HS400 data-strobe fields (A733 UM 11.3, V5P3X controller) */
+ #define SDXC_HS400_MD_EN		BIT(31)	  /* EMMC_DSBD: HS400 mode enable */
+@@ -89,6 +92,12 @@
+ #define SDXC_CSDC_OTHER			0x3	  /* CSDC: non-HS400 speed mode */
+ #define SDXC_DS_DL_SW_MASK		0x3f	  /* DS_DL: 6-bit SW delay */
+ 
++/* SMHC_ECMD, UM 11.3.8.34: with the bit set, the controller sends CMD23 by
++ * itself ahead of the command in SMHC_CMD; a soft reset clears the bit.
++ * The self-clearing is why it is armed per request, right
++ * before the command word, and never once at init. */
++#define SDXC_AUTO_CMD23_EN		BIT(0)
++
+ /* SMHC_THLD (UM 11.3.8.29). Reset value is 0x5: both gates ENABLED with a
+  * threshold size of 0, i.e. armed and vacuous -- see sunxi_mmc_set_thld(). */
+ #define SDXC_CARD_THLD_SIZE_MASK	GENMASK(28, 16)
+@@ -297,6 +306,9 @@
+ 	/* controller carries the HS400 data-strobe delay path */
+ 	bool can_hs400;
+ 
++	/* controller has SMHC_A23A + SMHC_ECMD, i.e. hardware auto-CMD23 */
++	bool can_auto_cmd23;
++
+ 	/* SMHC_FIFOTH value; 0 selects SDXC_FIFOTH_DEFAULT */
+ 	u32 fifoth;
+ 
+@@ -612,6 +624,15 @@
+ 			mrq->cmd->resp[0] = mmc_readl(host, REG_RESP0);
+ 		}
+ 
++		/*
++		 * The auto-CMD23 the controller sent on our behalf parks its
++		 * R1 in a register of its own; the normal response registers
++		 * hold the data command's. A failure of either surfaces as a
++		 * controller error and is reported on mrq->cmd above.
++		 */
++		if (host->cfg->can_auto_cmd23 && mrq->sbc)
++			mrq->sbc->resp[0] = mmc_readl(host, REG_ERESP);
++
+ 		if (data)
+ 			data->bytes_xfered = data->blocks * data->blksz;
+ 	}
+@@ -1271,6 +1292,7 @@
+ 	u32 imask = SDXC_INTERRUPT_ERROR_BIT;
+ 	u32 cmd_val = SDXC_START | (cmd->opcode & 0x3f);
+ 	bool wait_dma = host->wait_dma;
++	bool auto_cmd23 = host->cfg->can_auto_cmd23 && mrq->sbc;
+ 	int ret;
+ 
+ 	/* Check for set_ios errors (should never happen) */
+@@ -1306,7 +1328,16 @@
+ 		if ((cmd->flags & MMC_CMD_MASK) == MMC_CMD_ADTC) {
+ 			cmd_val |= SDXC_DATA_EXPIRE | SDXC_WAIT_PRE_OVER;
+ 
+-			if (cmd->data->stop) {
++			/*
++			 * The core keeps mrq->stop populated even when it
++			 * supplies an sbc, because a stop is still required on
++			 * an error (core/block.c, "best left to the host").
++			 * So the choice is ours: with auto-CMD23 armed the
++			 * transfer is length-bounded and ends on DATA_OVER,
++			 * and the error path still issues the stop by hand
++			 * through host->manual_stop_mrq.
++			 */
++			if (cmd->data->stop && !auto_cmd23) {
+ 				imask |= SDXC_AUTO_COMMAND_DONE;
+ 				cmd_val |= SDXC_SEND_AUTO_STOP;
+ 			} else {
+@@ -1350,6 +1381,15 @@
+ 		sunxi_mmc_start_dma(host, data);
+ 	}
+ 
++	/*
++	 * Arm auto-CMD23 last: SDXC_AUTO_CMD23_EN is cleared by a soft reset,
++	 * and sunxi_mmc_start_dma() resets the DMA block just above.
++	 */
++	if (auto_cmd23) {
++		mmc_writel(host, REG_A23A, mrq->sbc->arg);
++		mmc_writel(host, REG_ECMD, SDXC_AUTO_CMD23_EN);
++	}
++
+ 	host->mrq = mrq;
+ 	host->wait_dma = wait_dma;
+ 	mmc_writel(host, REG_IMASK, host->sdio_imask | imask);
+@@ -1586,6 +1626,7 @@
+ 	.mask_data0 = true,
+ 	.needs_new_timings = true,
+ 	.can_hs400 = true,
++	.can_auto_cmd23 = true,
+ 	/* UM 11.3.8.17 recommends BSIZE_OF_TRANS = 3 (MSize 16), TX_TL = 240
+ 	 * and RX_TL = 15, and 11.3.6.2 writes 0x300F00F0 verbatim.
+ 	 * Vendor silicon on the 8 GiB board reads exactly this while writing this eMMC
+@@ -1866,6 +1907,15 @@
+ 				     "allwinner,sun50i-h5-emmc"))
+ 		mmc->caps      |= MMC_CAP_1_8V_DDR | MMC_CAP_3_3V_DDR;
+ 
++	/*
++	 * Offer pre-defined transfers only where the controller can actually
++	 * carry them out on its own. Announcing MMC_CAP_CMD23 without arming
++	 * SMHC_A23A/SMHC_ECMD would make the core attach an sbc that nothing
++	 * ever sends, and the read would silently stay open-ended.
++	 */
++	if (host->cfg->can_auto_cmd23)
++		mmc->caps |= MMC_CAP_CMD23;
++
+ 	ret = mmc_of_parse(mmc);
+ 	if (ret)
+ 		goto error_free_dma;

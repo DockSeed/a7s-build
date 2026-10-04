@@ -1,0 +1,92 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] clk: sunxi-ng: a733: PLL_GPU0's lock detector must be enabled with the PLL
+
+`clk-sunxi-ng-a733-gpu-pll-module-clock-bus-gates-and-reset` gave pll_gpu0_clk `.lock = BIT(28)` so the framework waits for the PLL to
+relock. It never asserts, because bit 28 is only meaningful while bit 29 is
+set, and bit 29's reset default is Disable.
+
+UM PLL_GPU0_CTRL_REG:
+
+  | bit | field       | access | default |
+  | 29  | LOCK_ENABLE | R/W    | 0x0 = Disable |
+  | 28  | LOCK        | R      | 0 = Unlocked, 1 = Locked (stable) |
+
+So ccu_helper_wait_for_lock() polls a bit that cannot become 1: it spins its
+full 70 ms, WARN_ON()s the timeout, and the driver proceeds having confirmed
+nothing about the PLL it just retuned.
+
+MEASURED, not inferred. On the 8 GiB board with a test build (the 1008 MHz pin), every boot
+carried:
+
+  WARNING: CPU: 7 PID: 244 at drivers/clk/sunxi-ng/ccu_common.c:38
+           ccu_helper_wait_for_lock.part.0+0x8c/0xa4
+    x2 : 00000000c9105300   <- this register as we program it
+    x28: 000000003c14dc00   <- 1008000000, the rate being applied
+
+0xc9105300 is bit 31 set, bit 29 CLEAR, bit 28 clear.
+
+AND IT IS OURS, NOT THE SOC'S. Same register block, same boot, read on the
+running board:
+
+  0x02002020  0xF9005400   EN=1  LOCK_ENABLE=1  LOCK=1   (another PLL)
+  0x020020e0  0xC9105300   EN=1  LOCK_ENABLE=0  LOCK=0   (PLL_GPU0)
+
+That other PLL is brought up by the boot chain. PLL_GPU0 is the one PLL this
+driver enables itself, which is exactly why it is the one that never got the
+bit. No PLL in this file sets bit 29 today.
+
+Setting the bit in .enable is how sunxi-ng expresses it: the enable mask is
+written when the PLL is enabled, so the detector comes up with the PLL rather
+than in a separate write that could race the relock.
+
+FALSIFIER, one boot: PLL_GPU0 (0x020020e0) reads bit 29 = 1 AND bit 28 = 1, no
+ccu_helper_wait_for_lock WARNING appears, and the GPU still renders
+correctly at 1008 MHz. If bit 28 stays 0 with bit 29 set, the PLL genuinely is
+not locking and the 1008 MHz pin needs revisiting, not this patch.
+
+Assisted-by: Claude
+---
+--- a/drivers/clk/sunxi-ng/ccu-sun60iw2.c
++++ b/drivers/clk/sunxi-ng/ccu-sun60iw2.c
+@@ -1588,8 +1588,40 @@
+ #define SUN60IW2_PLL_GPU0_MIN_VCO	1272000000U
+ #define SUN60IW2_PLL_GPU0_MAX_VCO	2520000000U
+ 
++/*
++ * ⚠ ENABLE CARRIES TWO BITS, AND THE SECOND ONE IS THE INSTRUMENT.
++ *
++ * PLL_EN is bit 31. Bit 29 is LOCK_ENABLE, R/W, and its reset default is
++ * DISABLE (UM PLL_GPU0_CTRL_REG);
++ * bit 28 LOCK is read-only and only
++ * ever asserts while the detector is on. So declaring .lock = BIT(28) without
++ * setting bit 29 asks ccu_helper_wait_for_lock() to poll a bit that cannot
++ * become 1 -- it spins its full 70 ms, WARN_ON()s, and the driver then
++ * proceeds having confirmed nothing.
++ *
++ * Measured on the 8 GiB board, 2026-09-08, a test build with the 1008 MHz pin: every rate
++ * change produced
++ *
++ *   WARNING: ... at drivers/clk/sunxi-ng/ccu_common.c:38
++ *            ccu_helper_wait_for_lock.part.0+0x8c/0xa4
++ *
++ * with x2 = 0xc9105300, which is this register as we program it: bit 31 set,
++ * bit 29 CLEAR, bit 28 clear.
++ *
++ * That it is ours and not a property of the SoC was settled in the same
++ * register block on the same boot: another PLL at 0x02002020 reads
++ * 0xF9005400 -- enable, LOCK_ENABLE and LOCK all set. The boot chain brings
++ * that one up; PLL_GPU0 is the one PLL this driver enables itself, which is
++ * why it is the one missing the bit.
++ *
++ * ⚠ This is not cosmetic. `clk-sunxi-ng-a733-pll-gpu0-must-be-running-before-the-gpu-binds` exists because a PLL_GPU0 relock under the
++ * wrong conditions kills this SoC without printing anything, and lock
++ * detection is the only thing that can observe a relock at all. Rendering was
++ * byte-exact at 1008 MHz without it -- which is precisely the problem: the
++ * absence of the check is invisible until the day it is not.
++ */
+ static struct ccu_nm pll_gpu0_clk = {
+-	.enable		= BIT(31),
++	.enable		= BIT(31) | BIT(29),
+ 	.lock		= BIT(28),
+ 	.n		= _SUNXI_CCU_MULT_OFFSET_MIN_MAX(8, 8, 1, 12, 255),
+ 	.m		= _SUNXI_CCU_DIV(1, 1),

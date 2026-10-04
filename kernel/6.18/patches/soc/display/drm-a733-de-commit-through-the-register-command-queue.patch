@@ -1,0 +1,1408 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] drm/a733: de: commit the datapath through the register command queue
+
+[Recipe cut: the rcq module parameter is not carried: the register command
+queue is the one datapath variant.]
+
+Cursor-position writes tore the picture. Every display-engine datapath write took effect the moment the CPU
+stored it, wherever the raster was. A cursor-position write that lands
+while the blender is on the cursor's own pixels corrupts the rest of the
+frame: on the 6 GiB board (2026-09-30) one COORD1 write per frame gives
+the two correct sink CRCs at almost every line (the few extra ones matched
+the greeter clock's minute tick), and a delay sweep inside the cursor's
+rows isolates the slot: 11.3-11.9 us into a line, 7 and 9 distinct frames
+for a two-frame sequence; Xorg moves the cursor at 125 Hz with no relation to the raster
+and hits that slot often enough to be seen, and a legacy-cursor stimulus
+through the DRM API gives 49 (125 Hz) and 170 (1000 Hz) distinct CRCs
+where 2 are correct. No
+CPU timing fixes it: the slot moves with the cursor, and a write timed to
+the vertical blank depends on interrupt latency.
+
+THE QUEUE, AS MEASURED
+
+Allwinner's documents give the register command queue one sentence
+(only that the engine supports a register configuration queue, UM V1.00 p.663, 14.3). The head
+layout and the RCQ_CTL / GLB_STS bits are the vendor driver's
+(allwinner-bsp cubie-aiot-v1.4.8, de_base.h, de_top.c), a hint that
+a test-only patch (drm-a733-de-rcq-probe, not carried) checked on silicon (6 GiB board,
+2026-09-30, six requests): after RCQ_CTL bit 0 is set, the engine copies
+each dirty head's block at TCON line 27/28 -- in the vertical blank, before
+the first active line -- whatever line the request was made at (399, 616,
+793, 1232); bit 0 clears itself and GLB_STS RCQ_FINISH sets within 2 us of
+the register effect (bit 0 up to one poll earlier); writing GLB_STS back
+clears FINISH; the head's dirty word is left to software; nothing is copied
+again without a request; GLB_STS bit 4 read set at 399, 616, 793 and clear
+at 1232/1233; GLB_STS[31:16] counts lines 33 behind the TCON. The probe as
+rebased by this patch (6.18.54-trcq2, six runs) places the copy: bit 0
+clears and the register takes the new value in the poll in which bit 4
+rises or up to one poll (~2 us) before it, with the line field at 0, and
+FINISH is set then or one poll later. After a display off, a request that
+never completed left GLB_STS reading 0x02420110 (bit 4 set, line 578) 3
+frames later -- a TCON stop leaving the engine frozen mid-frame (inferred).
+
+WHAT THIS PATCH DOES
+
+- A second commit backend behind begin/stage/arm, the default; module
+  parameter sun60i_de.rcq (bool, 0644, read at each enable) = 0 selects
+  the CPU stores as before, for A/B.
+- 24 blocks, each head 16 bytes in one coherent page, shadows 32-byte
+  aligned: blender attributes (0x60) and route..mode (0x24); VI0 and VI1
+  layer 0 (0x30) and OVL_SIZE; VI0's CCSC, per instance the control word
+  and the 3 x 4 matrix; VI0's VSU_CTL and VSU_OUT_SIZE. Every offset the
+  driver stages is in one; one that is not warns once and is stored.
+  So CCSC and VSU go through the queue like the rest.
+- stage() writes a CPU copy; arm() waits for GLB_STS busy with a line
+  field of at least 1 -- past the engine's first line -- and a status word
+  that moves within two lines (a frozen engine does not; at most twice the
+  vertical blank, vtotal - vdisplay lines, in all), then with interrupts off
+  copies the marked blocks into their shadows, sets their dirty words and
+  -- after clearing FINISH -- sets RCQ_CTL bit 0 (read-modify-write). A
+  request still pending from earlier in the frame takes the new values
+  along: commits coalesce, the last one wins, arm() never waits for a copy.
+  If the pending request completed while the shadows were written, the
+  request is made again; and once bit 0 has cleared, nothing is written
+  until that request's FINISH has been seen (at most two lines' wait), so
+  no write meets a copy still running. An engine that is not scanning (the DE comes up
+  before the TCON and goes down after it) has its blocks written by CPU
+  store.
+- Completion is GLB_STS RCQ_FINISH set, or a newer request made (one is
+  made only after the previous one's bit 0 cleared, and FINISH is cleared
+  right before each). The CRTC's .atomic_flush waits for it
+  (sun60i_de_kms_commit_wait(), sleeping, without the DE lock) and sends
+  the event right after, so a flip completes when the engine has taken it.
+  The copy follows the vblank interrupt in the same blank (interrupt at
+  TCON line 7-9 in 282 of 300 samples, all 300 between line 1232 and 11,
+  none after the copy's 27; measured with a script on the board), so
+  the event carries the vblank count and timestamp of the frame that shows
+  the commit; a vblank reference is held across the send. A legacy cursor
+  update does not wait.
+- A cursor that changes buffer or goes off, the primary layer going off,
+  stop, and start's read-back wait for the copy under the lock -- the
+  paths after which a buffer may be freed or a register is read back.
+- A request not taken within three frames is withdrawn (RCQ_CTL bit 0
+  cleared) and its dirty blocks are written by CPU store, with a log line.
+  Every CPU store of blocks runs last block to last word first, so each
+  enable word (layer ATTCTL, CCSC_CTL, PIPE_CTL) lands after what it
+  enables.
+- DE_BLD_INSTANCES 4 -> 1: the 0x400 steps are aliases of one register set
+  (a write at 0x281400 + x reads back at 0x281000 + x and 0x281800 + x,
+  0x282000 reads 0), and the extra writes would be a
+  second, unqueued path to the shadowed registers.
+- debugfs `state` names the backend, dumps GLB_STS, RCQ_CTL and the head
+  registers, and counts requests, coalesced, direct, late, stale and
+  timeouts.
+
+WHAT THE VENDOR DOES, AND WHAT WE DO INSTEAD (read for this patch, no code
+taken; allwinner-bsp cubie-aiot-v1.4.8, drivers/drm/):
+
+- Its shadows start at zero (bump allocator over dma_alloc_coherent, no
+  read-back), so a dirty block sends every register it never wrote as 0.
+  Here shadows are seeded from the registers at each enable.
+- de_top_set_rcq_update() requests only while GLB_STS busy is set, spins
+  up to 10000 x usleep_range(5, 10) for it, and returns 0 without having
+  requested when it never comes; the caller learns of it only from the
+  FINISH timeout. Here busy comes within one vertical blank on a scanning
+  engine, and an engine that is not scanning is written directly.
+- sunxi_de_atomic_flush() polls FINISH every 2 ms for up to 50 ms on every
+  commit, cursor moves included, so a pointer move can block for a frame.
+  Here only commits that carry an event or free a buffer wait.
+- After FINISH it clears the dirty word of every block
+  (de_rtmx_set_all_reg_dirty(hwde, 0)); a block made dirty between the
+  request and the clear loses its flag. Here dirty words are written only
+  inside the write window, and a request that completed meanwhile is made
+  again.
+- On a timeout it leaves the blocks dirty and sends the flip event anyway
+  (sunxi_crtc_atomic_flush() -> sunxi_crtc_finish_page_flip()). Here the
+  request is withdrawn and its blocks stored before the event goes.
+- Its pad head for the 2-alignment is written one past the end of the head
+  array (sunxi_de.c:363-366). Here the head count is even by construction.
+- Its rtmx_start writes the blender output attributes by MMIO beside the
+  queue so the TCON never sees a DE without output (sunxi_de.c:852-858).
+  Here the engine is enabled before the TCON, so the whole first commit is
+  a CPU store anyway, and start waits for a queued copy when it is not.
+
+VERIFIED
+
+Applies at --fuzz=0 on the full series (6.18.54); compile-check with and
+without A733_TEST_KERNEL=1; sun60i-de.o and sun60i-kms.o W=1 clean.
+
+On silicon, 6 GiB board, 2026-09-30, 6.18.54-trcq2 (this
+patch before the write window moved from "busy" to "busy, line >= 1, status
+moving"), sink CRC:
+- a733-drm-cursor-stress, X stopped: still 1 CRC; jump at 125 Hz 2 and at
+  1000 Hz 2 (before: 49 and 170); page flips at 60 Hz 2 CRCs, 703 of 703
+  flips completed at 58.6 Hz.
+- X pointer through XTest at ~110 Hz between two heights over the
+  greeter's plain background: 2 and 2 CRCs; with sun60i_de.rcq=0 in the
+  same boot (display off/on to re-enable): 45 and 34. Over the login box,
+  where the pointer changes shape between the two heights (COORD1 x 949
+  vs 957: another hotspot) and Xorg rewrites the cursor image in the same
+  buffer: 7 and 6 (rcq=0: 45; default kernel before: 39 and 51). The same
+  few extra CRCs recur in both runs, which fits the intermediate states of
+  Xorg's image-then-move sequence rather than a torn frame (inferred).
+- debugfs state: late 1; stale and timeouts 1 per display off, each a
+  request made into the frozen engine. The version here closes that, and
+  adds the FINISH guard a second review asked for.
+
+This version on silicon, 6.18.54-trcq3, same board and day:
+- cursor stress still 1, jump 125 Hz 2, jump 1000 Hz 2; page flips 2 CRCs,
+  700 of 700 completed at 58.3 Hz;
+- X pointer over the plain background 2 and 2 (rcq=0 in the same boot:
+  28);
+- two display off/on and a lightdm restart: late, stale, timeouts,
+  nofinish all 0; no rcq line in journalctl -k -b.
+- A shape change still corrupts frames while the client's cursor buffer is
+  scanned (center of the greeter 6 and 7; in-place rewrite 17) -- that is
+  drm-a733-the-cursor-scans-a-copy-of-its-image, the next patch.
+
+OBSERVED BY EYE
+
+The pointer moved fast over the desktop menu without flicker, by eye.
+
+Assisted-by: Claude
+
+diff --git a/drivers/gpu/drm/sun60i/sun60i-de.c b/drivers/gpu/drm/sun60i/sun60i-de.c
+--- a/drivers/gpu/drm/sun60i/sun60i-de.c
++++ b/drivers/gpu/drm/sun60i/sun60i-de.c
+@@ -88,10 +88,14 @@
+  *      untested. Its falsifier: all eleven registers written, every one reading
+  *      back, screen black.
+  *
+- * So direct MMIO is the REAL implementation, not a placeholder -- and an RCQ
+- * backend still slots in behind the same three calls (begin, stage, arm)
+- * without moving one register value in this file, for whichever block might
+- * turn out to need it.
++ * So a CPU store DOES reach the datapath -- and that turned out to be the
++ * defect, not the answer. It reaches it at once, wherever the raster is, and a
++ * cursor-position write that lands while the blender is on the cursor's own
++ * pixels corrupts the rest of the frame (measured 2026-09-30). The
++ * datapath is therefore committed through the queue by default, behind the
++ * same three calls (begin, stage, arm), without one register value in this
++ * file moving: see the command queue backend below. CPU stores remain as the
++ * `rcq=0` A/B arm.
+  *
+  * THE OBSERVABLE THIS DRIVER OWES IS NOT "THE REGISTERS READ BACK". It is a
+  * framebuffer this driver painted, on the screen, changing when the pixels
+@@ -103,19 +107,25 @@
+  */
+ 
+ #include <linux/bitfield.h>
++#include <linux/bitmap.h>
+ #include <linux/clk.h>
+ #include <linux/component.h>
+ #include <linux/debugfs.h>
+ #include <linux/delay.h>
+ #include <linux/device.h>
+ #include <linux/dma-mapping.h>
++#include <linux/find.h>
+ #include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/ktime.h>
++#include <linux/lockdep.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
+ #include <linux/reset.h>
+ #include <linux/seq_file.h>
++#include <linux/string.h>
+ 
+ #include <drm/drm_modes.h>
+ #include <drm/drm_rect.h>
+@@ -141,8 +151,8 @@
+  * is the one that matters: the capture, the register map and the vendor's own
+  * addressing all count from 0x05000000, so an offset here can be compared with
+  * a log line by eye -- and the RCQ's descriptor carries exactly this number in
+- * its `reg_offset` word, so an RCQ backend behind the commit ops needs it and a
+- * raw __iomem pointer would have thrown it away. sun60i_de_map() is the one
++ * its `reg_offset` word, so the queue backend behind the commit ops needs it and
++ * a raw __iomem pointer would have thrown it away. sun60i_de_map() is the one
+  * place the window split exists.
+  */
+ #define DE_APERTURE			0x05000000
+@@ -199,9 +209,25 @@
+ #define DE_MIXER0_TOP			0x008100
+ #define  MIXER_GLOBAL_CTL		0x0000
+ #define   MIXER_GLOBAL_CTL_RT_EN	BIT(0)
++/*
++ * GLB_STS. Bits and names are the vendor's (allwinner-bsp de_top.c,
++ * enum de_irq_state, de_top_query_de_busy_state()); what they do on this part
++ * is measured (a test-only patch (drm-a733-de-rcq-probe, not carried), 6 GiB board, 2026-09-30,
++ * on silicon):
++ * RCQ_FINISH sets with a queued copy (within 2 us of the register effect),
++ * and writing the read value back clears it (a stale one was dropped before
++ * each of the six requests); BUSY read set at TCON lines 399, 616 and 793 and
++ * clear at 1232/1233; [31:16] a line counter 33 lines behind the TCON's
++ * (0x016e = 366 at TCON line 399).
++ */
++#define  MIXER_GLOBAL_STS		0x0004
++#define   MIXER_GLOBAL_STS_RCQ_FINISH	BIT(2)
++#define   MIXER_GLOBAL_STS_BUSY		BIT(4)
++#define   MIXER_GLOBAL_STS_LINE		GENMASK(31, 16)
+ #define  MIXER_GLOBAL_SIZE		0x0008
+ #define  MIXER_GLOBAL_CLK		0x000c
+ #define  MIXER_RCQ_CTL			0x0010
++#define   MIXER_RCQ_CTL_UPDATE		BIT(0)
+ #define  MIXER_RCQ_HEAD_LADDR		0x0014
+ #define  MIXER_RCQ_HEAD_HADDR		0x0018
+ #define  MIXER_RCQ_HEAD_LEN		0x001c
+@@ -242,17 +268,17 @@
+ #define DE_CURSOR_PIPE			1
+ 
+ /*
+- * Four blender register files at a 0x400 stride, all four programmed
+- * identically on the live link, on a board with exactly one display pipe up.
+- * The UM lists two display outputs, so "one per lit output" is not
+- * what these are; the prior art's de_top +0x24 UCH2CORE_MUX ("phys UI chn ->
+- * core/disp mux") suggests a core concept between channels and pipes, which
+- * would fit four. That is INFERRED and this driver does not rely on it: it
+- * writes all four identically, because that is the state a working link
+- * demonstrably holds.
++ * ONE blender register set. The live vendor link reads the same words at a
++ * 0x400 stride four times, and this driver used to write four "instances".
++ * Measured on the 6 GiB board (2026-09-30): a write at 0x281400 + x reads
++ * back at 0x281000 + x and 0x281800 + x, and 0x282000 reads 0 -- the 0x400
++ * steps are aliases of one set, not four blenders
++ *. Writing
++ * the aliases would also be a second, unqueued path to the registers the
++ * command queue shadows.
+  */
+ #define DE_BLD_STRIDE			0x0400
+-#define DE_BLD_INSTANCES		4
++#define DE_BLD_INSTANCES		1
+ #define  BLD_PIPE_CTL			0x0000
+ #define   BLD_PIPE_CTL_EN(p)		BIT(8 + (p))
+ #define   BLD_PIPE_CTL_FC_EN(p)		BIT(p)
+@@ -379,11 +405,12 @@
+ #define DE_QUIESCE_FRAMES		2
+ 
+ struct sun60i_de;
++struct sun60i_de_queue;
+ 
+ /**
+  * struct sun60i_de_commit - how datapath register values reach the hardware
+  * @name:  what `state` prints, so a result says which path produced it
+- * @begin: start a batch (a no-op for MMIO; an RCQ backend resets its staging)
++ * @begin: start a batch (a no-op for both backends today)
+  * @stage: deliver one register
+  * @arm:   make the batch take effect, and report whether it did
+  *
+@@ -396,11 +423,10 @@ struct sun60i_de;
+  * ever turns out to need the queue, one backend appears here and not one
+  * register value in this file moves.
+  *
+- * MMIO is measured to reach the datapath for the VI layer's scanout address
+- * (see the RCQ block at the top of this file), so this is the real
+- * implementation. The indirection stays for the two limits recorded there: one
+- * register is not every register, and a COLD DE is not the warm one that was
+- * measured. debugfs `layer` is the probe that confirms it on our own path.
++ * Two backends: CPU stores, which reach the datapath at once (the RCQ block
++ * at the top of this file) and tear when they land on a plane's pixels, and
++ * the register command queue, which copies at frame start and is the default
++ *.
+  */
+ struct sun60i_de_commit {
+ 	const char	*name;
+@@ -432,7 +458,7 @@ struct sun60i_de_window {
+  *
+  * The minimum sizes are computed from what this driver touches, not picked:
+  * de-top up to the version word, top up to the last RCQ register, layers a
+- * whole channel slot, display the blender's four instances.
++ * whole channel slot, display the blender set (DE_BLD_INSTANCES of them).
+  */
+ enum {
+ 	SUN60I_DE_WIN_DE_TOP,
+@@ -449,12 +475,14 @@ struct sun60i_de {
+ 	struct clk			*mod_clk;
+ 	struct reset_control		*reset;
+ 	struct dentry			*dbg;
+-	struct mutex			lock;		/* serialises enable/disable */
++	struct mutex			lock;		/* serialises enable/disable and every commit */
+ 	const struct sun60i_de_commit	*commit;
+ 	bool				enabled;
+ 	bool				layer_on;
+ 	bool				cursor_on;
++	dma_addr_t			cursor_addr;	/* what slot 1 fetches */
+ 	bool				ccsc_on;
++	struct sun60i_de_queue		*queue;	/* the command queue backend */
+ 	/*
+ 	 * A KMS master is bound and owns the datapath. The debugfs verbs that
+ 	 * WRITE are refused while it is set -- two writers on one datapath is a
+@@ -598,6 +626,597 @@ static const struct sun60i_de_commit sun60i_de_commit_mmio = {
+ 	.arm	= sun60i_de_mmio_arm,
+ };
+ 
++/*
++ * THE REGISTER COMMAND QUEUE BACKEND, the default commit path.
++ *
++ * WHY. A datapath register written by CPU store takes effect at once, wherever
++ * the raster is, and a write that lands while the blender is on a plane's own
++ * pixels corrupts the rest of the frame. Measured for the cursor position on
++ * the 6 GiB board (2026-09-30): one COORD1 write per frame is clean at every
++ * line, except 11.3-11.9 us into a line inside the cursor's rows, where the
++ * sink's frame CRC shows 7 and 9 distinct frames for a two-frame sequence;
++ * Xorg's 125 Hz cursor moves hit that slot often enough to be seen.
++ * No CPU timing fixes that:
++ * the slot moves with the cursor, and a write timed to the vertical blank
++ * depends on interrupt latency.
++ *
++ * WHAT THE QUEUE DOES, measured with a test-only patch (drm-a733-de-rcq-probe, not carried) on the
++ * same board and day: after RCQ_CTL bit 0 is set, the engine
++ * copies every head whose dirty word is set from DRAM into its registers,
++ * once, at TCON line 27/28 -- the end of the TCON's vertical blank, where the
++ * engine starts its frame -- whatever line the request was made at (399,
++ * 616, 793, 1232). Bit 0 clears itself within one poll of the copy, the head's dirty word stays as software
++ * left it, and nothing is copied again without a new request. Allwinner's
++ * documents say no more than that the engine supports a register configuration queue
++ * (UM V1.00 p.663, 14.3); the head layout is the vendor driver's
++ * (allwinner-bsp cubie-aiot-v1.4.8, de_base.h struct de_rcq_head), and the
++ * probe is what confirms it.
++ *
++ * HOW. Every datapath register this driver stages lies in one of the blocks
++ * sun60i_de_queue_init() lists. stage() writes a CPU copy of the block and
++ * marks it. arm() then, with interrupts off and GLB_STS busy -- the engine on
++ * an active line -- copies the marked blocks into their DMA shadows, sets
++ * their dirty words and requests one copy. Where the copy sits against busy
++ * is measured (6.18.54-trcq2, on the board): in
++ * all six probe runs bit 0 cleared and the register took the new value in
++ * the poll in which busy rose or up to one poll (~2 us) before it, with the
++ * line field at 0 and FINISH set then or one poll later. So the window is
++ * busy with a line field of at least DE_RCQ_FIRST_LINE -- a line past the
++ * engine's first -- and a request is only made or joined once the previous
++ * one's FINISH has been seen, so no write can meet a copy still running.
++ * If a request is still pending from earlier in the same frame, the new
++ * values go into the same shadows and ride along with it: several commits in
++ * one frame coalesce and the last one wins, and nothing waits. When the
++ * engine is not scanning at all (a modeset brings the DE up before the TCON,
++ * and takes the TCON down first), no pixel can be torn and the blocks are
++ * written by CPU store.
++ *
++ * COMPLETION. A request is complete once GLB_STS RCQ_FINISH is set, or once
++ * a later request has been made (one is made only after the previous one's
++ * RCQ_CTL bit 0 cleared). FINISH, as the vendor uses it, and not bit 0:
++ * bit 0 was seen to clear one poll (2 us) before the register effect.
++ * FINISH is cleared inside the busy window right before each new request,
++ * so a set FINISH belongs to the newest one. sun60i_de_queue_wait() polls exactly that; the KMS half sends a
++ * commit's event after it (sun60i_de_kms_commit_wait()), so a flip completes
++ * when the engine has taken it, not when a vblank passed.
++ *
++ * DIFFERENT FROM THE VENDOR (allwinner-bsp cubie-aiot-v1.4.8, lowlevel_de/
++ * and sunxi_de.c, read for this patch; no code taken):
++ *   - its shadows start at zero and a dirty block sends every register it
++ *     never wrote as 0; here they are seeded from the registers;
++ *   - it requests only while GLB_STS busy is set and spins up to 100 ms for
++ *     it, then returns without having requested and without saying so
++ *     (de_top_set_rcq_update()); here a scanning engine is busy within one
++ *     vertical blank, and an engine that is not is written directly;
++ *   - its atomic_flush waits for FINISH on every commit, cursor moves
++ *     included, so a pointer move can block for a frame; here nothing waits
++ *     except a commit that frees a buffer or carries an event;
++ *   - after FINISH it clears the dirty word of every block, so a block made
++ *     dirty between the request and the clear is lost; here dirty words are
++ *     written only inside the busy window, and a request that completed while
++ *     they were written is made again;
++ *   - on a FINISH timeout it sends the flip event anyway and leaves the
++ *     blocks dirty; here a request that never completes is withdrawn, its
++ *     blocks written by CPU store, and the event goes out after that;
++ *   - its pad head for the 2-alignment is written one past the end of the
++ *     array (sunxi_de.c:363-366); here the count is even by construction.
++ */
++static bool sun60i_de_use_rcq = true;
++
++/* The head, 16 bytes; field layout of the vendor's struct de_rcq_head. */
++struct sun60i_de_rcq_hd {
++	__le32	low_addr;	/* shadow address [31:0] */
++	__le32	dw0;		/* [23:0] length in bytes, [31:24] address [39:32] */
++	__le32	dirty;		/* bit 0: copy this block on the next request */
++	__le32	reg_offset;	/* from the DE aperture base */
++};
++#define DE_RCQ_HD_LEN			GENMASK(23, 0)
++#define DE_RCQ_HD_HADDR			GENMASK(31, 24)
++#define DE_RCQ_HD_DIRTY			BIT(0)
++/* The vendor aligns shadows to 32 bytes ("32 bytes align", de_base.h). */
++#define DE_RCQ_ALIGN			32
++
++/*
++ * The blocks: the blender's attribute and route..mode windows, then per VI
++ * channel (primary, cursor) layer 0 and OVL_SIZE, then the primary channel's
++ * CCSC -- per instance the control word and the 3 x 4 matrix -- and its two
++ * VSU words. An even count, as the vendor requires ("RCQ header block cnt
++ * must be 2 align", sunxi_de.c:336).
++ */
++#define DE_BLD_ATTR_LEN			0x60	/* PIPE_CTL .. pipe 5's COORD */
++#define DE_BLD_ROUTE_LEN		0x24	/* ROUTE .. BLD_MODE(4) */
++#define DE_OVL_LAYER_LEN		0x30	/* one layer at the 0x30 stride */
++#define DE_CCSC_MATRIX_LEN		(CCSC_MATRIX_ROWS * CCSC_COEFF_ROW_STRIDE)
++#define DE_RCQ_BLOCKS			(6 + 2 * DE_CCSC_INSTANCES + 2)
++
++struct sun60i_de_rcq_block {
++	u32	off;	/* from the DE aperture base */
++	u32	len;	/* bytes, a multiple of 4 */
++};
++
++struct sun60i_de_queue {
++	struct sun60i_de_rcq_block	blk[DE_RCQ_BLOCKS];
++	void				*buf;		/* heads, then shadows */
++	dma_addr_t			dma;
++	struct sun60i_de_rcq_hd		*hd;
++	u32				*shadow[DE_RCQ_BLOCKS];	/* what the engine copies */
++	u32				*staged[DE_RCQ_BLOCKS];	/* what stage() writes */
++	DECLARE_BITMAP(marked, DE_RCQ_BLOCKS);
++	unsigned long			gen;		/* requests made */
++	ktime_t				requested;	/* when the last one was */
++	bool				fresh;		/* delivered by the queue since the last wait */
++	bool				awaiting;	/* last request not yet seen FINISHed */
++	/* for `state` */
++	unsigned long			coalesced, direct, late, stale, timeouts;
++	unsigned long			nofinish;
++};
++
++/* The engine's vertical blank is where the copy happens; waits count in it. */
++#define DE_RCQ_POLL_US			1
++#define DE_RCQ_SLEEP_US			250
++#define DE_RCQ_WINDOW_TRIES		3
++#define DE_RCQ_STALE_FRAMES		3
++#define DE_RCQ_MOVE_LINES		2
++#define DE_RCQ_FIRST_LINE		1
++
++static u32 sun60i_de_lines_us(const struct sun60i_de *de, u32 lines)
++{
++	return DIV_ROUND_UP_ULL((u64)lines * de->mode.htotal * USEC_PER_MSEC,
++				de->mode.clock);
++}
++
++static void sun60i_de_queue_add(struct sun60i_de_queue *q, unsigned int *n,
++				u32 off, u32 len)
++{
++	q->blk[*n].off = off;
++	q->blk[*n].len = len;
++	(*n)++;
++}
++
++static void sun60i_de_queue_blocks(struct sun60i_de_queue *q)
++{
++	u32 bld = sun60i_de_bld(0);
++	u32 ccsc = sun60i_de_chn(DE_VI0_SLOT) + DE_CHN_CCSC;
++	u32 vsu = sun60i_de_chn(DE_VI0_SLOT) + DE_CHN_VSU;
++	unsigned int slot, i, n = 0;
++
++	sun60i_de_queue_add(q, &n, bld + BLD_PIPE_CTL, DE_BLD_ATTR_LEN);
++	sun60i_de_queue_add(q, &n, bld + BLD_ROUTE, DE_BLD_ROUTE_LEN);
++	for (slot = DE_VI0_SLOT; slot <= DE_CURSOR_SLOT; slot++) {
++		u32 ovl = sun60i_de_chn(slot) + DE_CHN_OVL;
++
++		sun60i_de_queue_add(q, &n, ovl + OVL_LAY_ATTCTL(DE_OVL_LAYER),
++				    DE_OVL_LAYER_LEN);
++		sun60i_de_queue_add(q, &n, ovl + OVL_VI_OVL_SIZE, sizeof(u32));
++	}
++	for (i = 0; i < DE_CCSC_INSTANCES; i++) {
++		u32 base = ccsc + i * DE_CCSC_STRIDE;
++
++		sun60i_de_queue_add(q, &n, base + CCSC_CTL, sizeof(u32));
++		sun60i_de_queue_add(q, &n, base + CCSC_COEFF_ROW0,
++				    DE_CCSC_MATRIX_LEN);
++	}
++	sun60i_de_queue_add(q, &n, vsu + VSU_CTL, sizeof(u32));
++	sun60i_de_queue_add(q, &n, vsu + VSU_ATTR_OUT_SIZE, sizeof(u32));
++
++	WARN_ON(n != DE_RCQ_BLOCKS);
++}
++
++/*
++ * One coherent page: the heads, then each block's shadow at a 32-byte
++ * boundary, and a CPU copy of the same layout for stage(). Allocated at probe,
++ * because the backend can be chosen at every enable.
++ */
++static int sun60i_de_queue_init(struct sun60i_de *de)
++{
++	struct sun60i_de_queue *q;
++	size_t at = ALIGN(sizeof(*q->hd) * DE_RCQ_BLOCKS, DE_RCQ_ALIGN);
++	u32 *staged;
++	unsigned int i;
++
++	q = devm_kzalloc(de->dev, sizeof(*q), GFP_KERNEL);
++	staged = devm_kzalloc(de->dev, PAGE_SIZE, GFP_KERNEL);
++	if (!q || !staged)
++		return -ENOMEM;
++
++	q->buf = dmam_alloc_coherent(de->dev, PAGE_SIZE, &q->dma, GFP_KERNEL);
++	if (!q->buf)
++		return -ENOMEM;
++
++	sun60i_de_queue_blocks(q);
++	q->hd = q->buf;
++	for (i = 0; i < DE_RCQ_BLOCKS; i++) {
++		dma_addr_t sdma = q->dma + at;
++
++		q->shadow[i] = q->buf + at;
++		q->staged[i] = (void *)staged + at;
++		q->hd[i].low_addr = cpu_to_le32(lower_32_bits(sdma));
++		q->hd[i].dw0 = cpu_to_le32(FIELD_PREP(DE_RCQ_HD_LEN, q->blk[i].len) |
++					   FIELD_PREP(DE_RCQ_HD_HADDR,
++						      upper_32_bits(sdma)));
++		q->hd[i].reg_offset = cpu_to_le32(q->blk[i].off);
++		at = ALIGN(at + q->blk[i].len, DE_RCQ_ALIGN);
++	}
++	if (WARN_ON(at > PAGE_SIZE))
++		return -EINVAL;
++
++	de->queue = q;
++
++	return 0;
++}
++
++/* Write the status back: its set RCQ_FINISH (write-1-to-clear) goes. */
++static void sun60i_de_queue_clear_finish(struct sun60i_de *de)
++{
++	void __iomem *reg = sun60i_de_map(de, DE_MIXER0_TOP + MIXER_GLOBAL_STS);
++
++	writel(readl(reg), reg);
++}
++
++/*
++ * Arm the queue for this enable: shadows and CPU copies start as the
++ * registers are -- called after the control plane is up and the windows are
++ * open -- nothing is dirty, and the head array is pointed at. An armed queue
++ * copies nothing until it is asked (measured on the board).
++ */
++static void sun60i_de_queue_start(struct sun60i_de *de)
++{
++	struct sun60i_de_queue *q = de->queue;
++	unsigned int i, w;
++
++	for (i = 0; i < DE_RCQ_BLOCKS; i++) {
++		for (w = 0; w < q->blk[i].len / sizeof(u32); w++)
++			q->shadow[i][w] = sun60i_de_read(de, q->blk[i].off +
++							 w * sizeof(u32));
++		memcpy(q->staged[i], q->shadow[i], q->blk[i].len);
++		q->hd[i].dirty = 0;
++	}
++	bitmap_zero(q->marked, DE_RCQ_BLOCKS);
++	q->fresh = false;
++	q->awaiting = false;
++	sun60i_de_queue_clear_finish(de);
++
++	/* writel() orders the head stores above before the engine sees them. */
++	sun60i_de_write(de, DE_MIXER0_TOP + MIXER_RCQ_HEAD_LADDR,
++			lower_32_bits(q->dma));
++	sun60i_de_write(de, DE_MIXER0_TOP + MIXER_RCQ_HEAD_HADDR,
++			upper_32_bits(q->dma));
++	sun60i_de_write(de, DE_MIXER0_TOP + MIXER_RCQ_HEAD_LEN,
++			DE_RCQ_BLOCKS * sizeof(*q->hd));
++}
++
++static int sun60i_de_queue_find(const struct sun60i_de_queue *q, u32 off)
++{
++	unsigned int i;
++
++	for (i = 0; i < DE_RCQ_BLOCKS; i++)
++		if (off >= q->blk[i].off && off - q->blk[i].off < q->blk[i].len)
++			return i;
++
++	return -ENOENT;
++}
++
++static void sun60i_de_queue_begin(struct sun60i_de *de)
++{
++}
++
++static void sun60i_de_queue_stage(struct sun60i_de *de, u32 off, u32 val)
++{
++	struct sun60i_de_queue *q = de->queue;
++	int i = sun60i_de_queue_find(q, off);
++
++	/*
++	 * Every offset this driver stages is in a block; one that is not is a
++	 * bug in the block list, delivered the old way and named.
++	 */
++	if (WARN_ONCE(i < 0, "rcq: 0x%06x is in no block\n", off)) {
++		sun60i_de_write(de, off, val);
++		return;
++	}
++
++	q->staged[i][(off - q->blk[i].off) / sizeof(u32)] = val;
++	__set_bit(i, q->marked);
++}
++
++static void __iomem *sun60i_de_queue_reg(struct sun60i_de *de, u32 reg)
++{
++	return sun60i_de_map(de, DE_MIXER0_TOP + reg);
++}
++
++static bool sun60i_de_queue_pending(struct sun60i_de *de)
++{
++	return readl(sun60i_de_queue_reg(de, MIXER_RCQ_CTL)) &
++	       MIXER_RCQ_CTL_UPDATE;
++}
++
++/* RCQ_CTL read-modify-write: the other bits are the vendor's DFS/fifo fields. */
++static void sun60i_de_queue_ctl(struct sun60i_de *de, bool update)
++{
++	void __iomem *reg = sun60i_de_queue_reg(de, MIXER_RCQ_CTL);
++	u32 val = readl(reg) & ~MIXER_RCQ_CTL_UPDATE;
++
++	writel(val | (update ? MIXER_RCQ_CTL_UPDATE : 0), reg);
++}
++
++static void sun60i_de_queue_store_block(struct sun60i_de *de, unsigned int i)
++{
++	struct sun60i_de_queue *q = de->queue;
++	unsigned int w;
++
++	for (w = q->blk[i].len / sizeof(u32); w-- > 0; )
++		sun60i_de_write(de, q->blk[i].off + w * sizeof(u32),
++				q->shadow[i][w]);
++	q->hd[i].dirty = 0;
++}
++
++/*
++ * The engine is not scanning, so nothing is on its way to a pixel and a CPU
++ * store cannot tear. The shadows follow, so they stay what the registers hold.
++ *
++ * Blocks last to first and words last to first: every enable word this driver
++ * writes is the first word of its block, and its block comes after the ones
++ * it enables -- layer ATTCTL after its address and pitch, CCSC_CTL after its
++ * matrix, the blender's PIPE_CTL after both layers -- so each enable lands
++ * last, as the stage order had it (sun60i_de_ccsc_one(), sun60i_de_layer()).
++ */
++static void sun60i_de_queue_store(struct sun60i_de *de)
++{
++	struct sun60i_de_queue *q = de->queue;
++	int i;
++
++	for (i = DE_RCQ_BLOCKS - 1; i >= 0; i--) {
++		if (!test_bit(i, q->marked))
++			continue;
++		memcpy(q->shadow[i], q->staged[i], q->blk[i].len);
++		sun60i_de_queue_store_block(de, i);
++	}
++	bitmap_zero(q->marked, DE_RCQ_BLOCKS);
++	q->direct++;
++}
++
++/*
++ * A request that did not complete: withdrawn, and what it carried written by
++ * CPU store. Reached only when the TCON stopped under a request, or when the
++ * queue does not behave as measured -- both worth a line in the log.
++ */
++static void sun60i_de_queue_withdraw(struct sun60i_de *de)
++{
++	struct sun60i_de_queue *q = de->queue;
++	int i;
++
++	sun60i_de_queue_ctl(de, false);
++	q->awaiting = false;
++	for (i = DE_RCQ_BLOCKS - 1; i >= 0; i--)
++		if (le32_to_cpu(q->hd[i].dirty) & DE_RCQ_HD_DIRTY)
++			sun60i_de_queue_store_block(de, i);
++	q->stale++;
++	dev_warn_ratelimited(de->dev,
++			     "rcq: request %lu not taken in %u frames (GLB_STS 0x%08x), written by CPU store\n",
++			     q->gen, DE_RCQ_STALE_FRAMES,
++			     readl(sun60i_de_queue_reg(de, MIXER_GLOBAL_STS)));
++}
++
++static u32 sun60i_de_frames_us(const struct sun60i_de *de, u32 frames)
++{
++	return sun60i_de_lines_us(de, frames * de->mode.vtotal);
++}
++
++static void sun60i_de_queue_check_stale(struct sun60i_de *de)
++{
++	struct sun60i_de_queue *q = de->queue;
++
++	if (!sun60i_de_queue_pending(de))
++		return;
++	if (ktime_us_delta(ktime_get(), q->requested) <
++	    sun60i_de_frames_us(de, DE_RCQ_STALE_FRAMES))
++		return;
++
++	sun60i_de_queue_withdraw(de);
++}
++
++/* The write window: an active line past the engine's first. */
++static bool sun60i_de_queue_open(u32 sts)
++{
++	return (sts & MIXER_GLOBAL_STS_BUSY) &&
++	       FIELD_GET(MIXER_GLOBAL_STS_LINE, sts) >= DE_RCQ_FIRST_LINE;
++}
++
++/*
++ * Wait for the write window on a scanning engine. A scanning engine reaches
++ * an active line within one vertical blank, vtotal - vdisplay lines (35 for
++ * the 1235-line mode; busy was read clear at TCON lines 1232/1233 and set at
++ * 399..793), so twice that without one means it is not scanning.
++ *
++ * The window alone is not enough: after a display off, a request that never
++ * completed left GLB_STS reading 0x02420110 -- busy set, line 578 -- when it
++ * was read 3 frames later (6 GiB board, 2026-09-30).
++ * A stopped TCON
++ * leaving the engine frozen mid-frame is what that reads as (inferred). So
++ * the status word must also move within DE_RCQ_MOVE_LINES lines, as the line
++ * field does once per line on a scanning engine.
++ */
++static bool sun60i_de_queue_wait_busy(struct sun60i_de *de)
++{
++	void __iomem *reg = sun60i_de_queue_reg(de, MIXER_GLOBAL_STS);
++	u32 blank = de->mode.vtotal - de->mode.vdisplay;
++	u32 sts, s0;
++
++	if (readx_poll_timeout_atomic(readl, reg, sts, sun60i_de_queue_open(sts),
++				      DE_RCQ_POLL_US,
++				      sun60i_de_lines_us(de, 2 * blank)))
++		return false;
++
++	s0 = sts;
++	return !readx_poll_timeout_atomic(readl, reg, sts, sts != s0,
++					  DE_RCQ_POLL_US,
++					  sun60i_de_lines_us(de, DE_RCQ_MOVE_LINES));
++}
++
++/*
++ * Bit 0 has cleared, but the last request's FINISH has not been seen: the copy
++ * may still be running (FINISH came up to one poll, ~2 us, after bit 0 in the
++ * probe runs). Wait for it, at most DE_RCQ_MOVE_LINES lines; a FINISH that
++ * does not come by then (another writer of GLB_STS, the test-only probe) is
++ * counted, and the copy is taken as over.
++ */
++static void sun60i_de_queue_await_finish(struct sun60i_de *de)
++{
++	struct sun60i_de_queue *q = de->queue;
++	u32 sts;
++
++	if (readx_poll_timeout_atomic(readl,
++			sun60i_de_queue_reg(de, MIXER_GLOBAL_STS), sts,
++			sts & MIXER_GLOBAL_STS_RCQ_FINISH, DE_RCQ_POLL_US,
++			sun60i_de_lines_us(de, DE_RCQ_MOVE_LINES)))
++		q->nofinish++;
++	q->awaiting = false;
++}
++
++/* A new request: FINISH cleared first, so a set FINISH is this request's. */
++static void sun60i_de_queue_request(struct sun60i_de *de)
++{
++	struct sun60i_de_queue *q = de->queue;
++
++	sun60i_de_queue_clear_finish(de);
++	sun60i_de_queue_ctl(de, true);
++	WRITE_ONCE(q->gen, q->gen + 1);
++	q->requested = ktime_get();
++	q->awaiting = true;
++}
++
++/*
++ * Shadows, dirty words and the request, inside one busy window with
++ * interrupts off -- a few microseconds, while every copy seen landed at the
++ * first active line. A request still pending takes the new values along. If it
++ * completed while they were written (RCQ_CTL bit 0 clear on the re-read), the
++ * copy may have missed them, so the request is made again; a copy is
++ * idempotent. The second GLB_STS read checks the window held; `late` counts
++ * when it did not.
++ */
++static bool sun60i_de_queue_deliver(struct sun60i_de *de)
++{
++	struct sun60i_de_queue *q = de->queue;
++	void __iomem *sts_reg = sun60i_de_queue_reg(de, MIXER_GLOBAL_STS);
++	unsigned long flags;
++	unsigned int i;
++	bool pending;
++	u32 s0, s1;
++
++	local_irq_save(flags);
++	pending = sun60i_de_queue_pending(de);
++	if (!pending && q->awaiting)
++		sun60i_de_queue_await_finish(de);
++	s0 = readl(sts_reg);
++	if (!sun60i_de_queue_open(s0)) {
++		local_irq_restore(flags);
++		return false;
++	}
++
++	for (i = 0; i < DE_RCQ_BLOCKS; i++) {
++		if (test_bit(i, q->marked)) {
++			memcpy(q->shadow[i], q->staged[i], q->blk[i].len);
++			q->hd[i].dirty = cpu_to_le32(DE_RCQ_HD_DIRTY);
++		} else if (!pending) {
++			q->hd[i].dirty = 0;
++		}
++	}
++
++	/* The MMIO accesses below order the shadow and head stores first. */
++	if (pending && sun60i_de_queue_pending(de))
++		q->coalesced++;
++	else
++		sun60i_de_queue_request(de);
++	s1 = readl(sts_reg);
++	local_irq_restore(flags);
++
++	if (!sun60i_de_queue_open(s1) ||
++	    FIELD_GET(MIXER_GLOBAL_STS_LINE, s1) < FIELD_GET(MIXER_GLOBAL_STS_LINE, s0))
++		q->late++;
++
++	bitmap_zero(q->marked, DE_RCQ_BLOCKS);
++	q->fresh = true;
++
++	return true;
++}
++
++static int sun60i_de_queue_arm(struct sun60i_de *de)
++{
++	struct sun60i_de_queue *q = de->queue;
++	unsigned int tries;
++
++	if (bitmap_empty(q->marked, DE_RCQ_BLOCKS))
++		return 0;
++
++	sun60i_de_queue_check_stale(de);
++
++	for (tries = 0; tries < DE_RCQ_WINDOW_TRIES; tries++) {
++		if (!sun60i_de_queue_wait_busy(de))
++			break;
++		if (sun60i_de_queue_deliver(de))
++			return 0;
++	}
++
++	if (tries == DE_RCQ_WINDOW_TRIES)
++		dev_warn_ratelimited(de->dev,
++				     "rcq: no busy window in %u tries, CPU store\n",
++				     tries);
++
++	sun60i_de_queue_store(de);
++
++	return 0;
++}
++
++static const struct sun60i_de_commit sun60i_de_commit_queue = {
++	.name	= "register command queue",
++	.begin	= sun60i_de_queue_begin,
++	.stage	= sun60i_de_queue_stage,
++	.arm	= sun60i_de_queue_arm,
++};
++
++static bool sun60i_de_queue_done(struct sun60i_de *de, unsigned long gen)
++{
++	return READ_ONCE(de->queue->gen) != gen ||
++	       readl(sun60i_de_queue_reg(de, MIXER_GLOBAL_STS)) &
++	       MIXER_GLOBAL_STS_RCQ_FINISH;
++}
++
++/*
++ * Sleep until request @gen is complete; the caller decides whether it holds
++ * de->lock. -ETIMEDOUT after DE_RCQ_STALE_FRAMES; the caller withdraws.
++ */
++static int sun60i_de_queue_wait(struct sun60i_de *de, unsigned long gen)
++{
++	bool done;
++
++	return read_poll_timeout(sun60i_de_queue_done, done, done,
++				 DE_RCQ_SLEEP_US,
++				 sun60i_de_frames_us(de, DE_RCQ_STALE_FRAMES),
++				 false, de, gen);
++}
++
++/*
++ * With de->lock held: if anything went out through the queue since the last
++ * settle, wait until the engine has taken it. For the paths that are about
++ * to free a buffer the engine may still fetch -- a cursor that changes
++ * buffer or goes off, the layer going off, a stop -- and for start, whose
++ * read-back must see the copied values.
++ */
++static void sun60i_de_settle(struct sun60i_de *de)
++{
++	struct sun60i_de_queue *q = de->queue;
++
++	lockdep_assert_held(&de->lock);
++
++	if (de->commit != &sun60i_de_commit_queue || !q->fresh)
++		return;
++
++	q->fresh = false;
++	if (sun60i_de_queue_wait(de, q->gen)) {
++		q->timeouts++;
++		sun60i_de_queue_withdraw(de);
++	}
++}
++
+ static void sun60i_de_stage(struct sun60i_de *de, u32 off, u32 val)
+ {
+ 	de->commit->stage(de, off, val);
+@@ -858,12 +1477,13 @@ static int sun60i_de_verify(struct sun60i_de *de)
+ /*
+  * Disarm the register command queue before anything else touches the datapath.
+  *
+- * This driver commits by CPU store. An RCQ left armed -- by a bootloader, by a
+- * previous kernel, by this driver's own future self -- would walk a descriptor
+- * array in DRAM on every frame-start pulse from the TCON and overwrite the
+- * datapath with whatever that memory now holds, silently, once per frame. The
++ * A queue left armed with a request pending -- by a bootloader, by a previous
++ * kernel -- would walk a descriptor array in DRAM at the next frame-start and
++ * overwrite the datapath with whatever that memory now holds. (Without a
++ * request an armed queue copies nothing: measured.) The
+  * length goes to zero FIRST, so there is no window in which a walk begins from
+- * a valid length and a half-written pointer.
++ * a valid length and a half-written pointer. The queue backend then points
++ * the heads at its own page (sun60i_de_queue_start()).
+  *
+  * On a cold DE all four of these read zero already, so on the intended path
+  * this is four no-op stores. It is here for the path that is not intended.
+@@ -1012,7 +1632,7 @@ static void sun60i_de_channel_quiesce(struct sun60i_de *de)
+ }
+ 
+ /*
+- * The blender, nine registers per instance times four instances.
++ * The blender, nine registers in its one register set (DE_BLD_INSTANCES).
+  *
+  *   PIPE_CTL     0x101       COMPUTED -- PIPE_CTL_EN(0) or-ed with FC_EN(0),
+  *                            mainline's two macros and the prior art's
+@@ -1254,8 +1874,8 @@ static int sun60i_de_layer_disable(struct sun60i_de *de)
+  * reset with them at 0 on every slot, and nothing in this driver sets them
+  *.
+  *
+- * The blender words go to all four instances, like every other blender write
+- * in this file. PIPE_CTL is written whole, pipe 0's bits included, because
++ * The blender words go to its one register set, like every other blender
++ * write in this file. PIPE_CTL is written whole, pipe 0's bits included, because
+  * the register holds both pipes and nothing else owns it.
+  */
+ static u32 sun60i_de_cursor_attctl(void)
+@@ -1433,6 +2053,15 @@ static int sun60i_de_start(struct sun60i_de *de)
+ 	sun60i_de_disarm_rcq(de);
+ 	sun60i_de_top_setup(de);
+ 
++	/*
++	 * The backend is chosen here, at every enable, so the `rcq` parameter
++	 * can be flipped for an A/B between two modesets without a reboot.
++	 */
++	de->commit = sun60i_de_use_rcq ? &sun60i_de_commit_queue :
++					 &sun60i_de_commit_mmio;
++	if (sun60i_de_use_rcq)
++		sun60i_de_queue_start(de);
++
+ 	de->commit->begin(de);
+ 	sun60i_de_channel_quiesce(de);
+ 	sun60i_de_blender(de);
+@@ -1442,6 +2071,7 @@ static int sun60i_de_start(struct sun60i_de *de)
+ 		dev_err(de->dev, "commit (%s): %d\n", de->commit->name, ret);
+ 		goto err_layer;
+ 	}
++	sun60i_de_settle(de);
+ 
+ 	/*
+ 	 * Before any claim of success. The first cut announced "scanning ..."
+@@ -1471,10 +2101,10 @@ static int sun60i_de_start(struct sun60i_de *de)
+ 	 * sun60i_de_check_alive() still jumps straight there.
+ 	 *
+ 	 * From sun60i_de_layer() onwards it is not. That call stages
+-	 * LAY0_ATTCTL with the enable bit and the scanout address, and
+-	 * .stage on the only backend this driver has is a plain
+-	 * sun60i_de_write() -- so by the time either of the two checks below it
+-	 * can fail, the layer is armed to fetch from de->fb_dma on the TCON's
++	 * LAY0_ATTCTL with the enable bit and the scanout address, and either
++	 * backend delivers it -- by CPU store, or by the queue with start
++	 * waiting for the copy -- so by the time either of the two checks below
++	 * it can fail, the layer is armed to fetch from de->fb_dma on the TCON's
+ 	 * next frame-start pulse. Dropping into err_clocks from there asserts
+ 	 * the DE's reset underneath a live AXI master, which is precisely what
+ 	 * the comment at DE_QUIESCE_FRAMES exists to forbid, and on the debugfs
+@@ -1484,6 +2114,7 @@ static int sun60i_de_start(struct sun60i_de *de)
+ 	 */
+ err_layer:
+ 	sun60i_de_layer_disable(de);
++	sun60i_de_settle(de);
+ 	sun60i_de_quiesce(de);
+ err_clocks:
+ 	sun60i_de_clocks_off(de);
+@@ -1511,6 +2142,7 @@ static void sun60i_de_stop(struct sun60i_de *de)
+ 	if (de->cursor_on)
+ 		sun60i_de_cursor_disable(de);
+ 	sun60i_de_layer_disable(de);
++	sun60i_de_settle(de);
+ 	sun60i_de_quiesce(de);
+ 	sun60i_de_clocks_off(de);
+ 	de->enabled = false;
+@@ -1536,6 +2168,30 @@ static void sun60i_de_dump(struct seq_file *s, struct sun60i_de *de,
+ 			   regs[i].off, sun60i_de_read(de, regs[i].off));
+ }
+ 
++/*
++ * What the queue has done since probe, for a board session: a request
++ * per frame at most, the rest coalesced; `direct` counts commits written by
++ * CPU store because the engine was not scanning (every modeset has some);
++ * `late`, `stale`, `timeouts` and `nofinish` are the ones that must stay 0.
++ */
++static void sun60i_de_queue_show(struct seq_file *s, struct sun60i_de *de)
++{
++	const struct sun60i_de_queue *q = de->queue;
++
++	if (de->commit != &sun60i_de_commit_queue) {
++		seq_puts(s, "\nRCQ_HEAD_LEN reads 0: this enable commits by CPU store (rcq=0), and a\n");
++		seq_puts(s, "write that lands while the blender is on its plane's pixels tears.\n");
++		return;
++	}
++
++	seq_printf(s, "\nqueue          : %u heads at %pad, RCQ_HEAD_LEN must read 0x%x\n",
++		   DE_RCQ_BLOCKS, &q->dma,
++		   (u32)(DE_RCQ_BLOCKS * sizeof(*q->hd)));
++	seq_printf(s, "requests %lu  coalesced %lu  direct %lu  late %lu  stale %lu  timeouts %lu  nofinish %lu\n",
++		   q->gen, q->coalesced, q->direct, q->late, q->stale,
++		   q->timeouts, q->nofinish);
++}
++
+ static int sun60i_de_state_show(struct seq_file *s, void *unused)
+ {
+ 	struct sun60i_de *de = s->private;
+@@ -1551,6 +2207,9 @@ static int sun60i_de_state_show(struct seq_file *s, void *unused)
+ 		{ "mixer0 GLOBAL_CTL",	DE_MIXER0_TOP + MIXER_GLOBAL_CTL },
+ 		{ "mixer0 GLOBAL_SIZE",	DE_MIXER0_TOP + MIXER_GLOBAL_SIZE },
+ 		{ "mixer0 GLOBAL_CLK",	DE_MIXER0_TOP + MIXER_GLOBAL_CLK },
++		{ "mixer0 GLOBAL_STS",	DE_MIXER0_TOP + MIXER_GLOBAL_STS },
++		{ "mixer0 RCQ_CTL",	DE_MIXER0_TOP + MIXER_RCQ_CTL },
++		{ "mixer0 RCQ_HEAD_LADDR", DE_MIXER0_TOP + MIXER_RCQ_HEAD_LADDR },
+ 		{ "mixer0 RCQ_HEAD_LEN", DE_MIXER0_TOP + MIXER_RCQ_HEAD_LEN },
+ 	};
+ 	const struct sun60i_de_reg datapath[] = {
+@@ -1612,8 +2271,9 @@ static int sun60i_de_state_show(struct seq_file *s, void *unused)
+ 
+ 	seq_puts(s, "\ncontrol plane (plain MMIO, latches directly):\n");
+ 	sun60i_de_dump(s, de, control, ARRAY_SIZE(control));
+-	seq_printf(s, "\ndatapath (through the commit path -- %s):\n",
++	seq_printf(s, "\ndatapath (through the commit path -- %s; the registers,\n",
+ 		   de->commit->name);
++	seq_puts(s, "which trail a queued commit until the next frame start):\n");
+ 	sun60i_de_dump(s, de, datapath, ARRAY_SIZE(datapath));
+ 	seq_puts(s, "\nthe three trap blocks:\n");
+ 	sun60i_de_dump(s, de, traps, ARRAY_SIZE(traps));
+@@ -1631,8 +2291,7 @@ static int sun60i_de_state_show(struct seq_file *s, void *unused)
+ 
+ 	seq_puts(s, "\nINSIZE0 at COORD0 is the layer's window (y in the high half), OUTSIZE\n");
+ 	seq_puts(s, "is the mode's, and everything outside the window is BKCOLOR.\n");
+-	seq_puts(s, "\nRCQ_HEAD_LEN must read 0: this driver commits by CPU store, and an\n");
+-	seq_puts(s, "armed queue would reload the datapath from DRAM on every frame-start.\n");
++	sun60i_de_queue_show(s, de);
+ 	seq_puts(s, "\nThe three de_top ENABLE words open the channel and blender windows. With any\n");
+ 	seq_puts(s, "of them at zero those windows do not accept a write AT ALL and every datapath\n");
+ 	seq_puts(s, "line above reads 0x00000000 -- which is what unmapped space reads too.\n");
+@@ -1700,28 +2359,18 @@ EXPORT_SYMBOL_GPL(sun60i_de_kms_disable);
+ 
+ /*
+  * A new scanout address, staged through the same commit path as everything
+- * else. This is the page flip, and what it is NOT is a flip synchronised to
+- * anything: the write lands the moment it is made. The TCON's vblank
+- * interrupt is serviced now, but it only decides when the flip's event is
+- * sent (the next vblank, sun60i-kms.c), not when this write happens.
+- *
+- * ⚠ AND THE MISSING GUARD HAS A SHAPE, WHICH IS WORTH MORE THAN "expect
+- * tearing". The vendor does not write the datapath at an arbitrary point in the
+- * frame: it reads the TCON's current line and, if it is outside
+- * [vtotal/4, 3*vtotal/4], arms an hrtimer and waits until it is
+- * (rcq_update_timer_start(), allwinner-bsp sunxi_de.c:665-691), and the TCON
+- * separately derives a per-mode deadline from its own start delay and refuses
+- * an update past it (sunxi_tcon_calc_judge_line(), sunxi_tcon.c:121-150). Two
+- * independent line-window guards on the same write this function does
+- * unguarded. So the risk here is not only a torn line: it is a write that lands
+- * on a frame boundary. Stage 3 owns it, the TCON interrupt it needed is
+- * wired, and the two functions above are what it should look like.
+- *
+- * A plane that MOVES is the same write plus pipe 0's window, and it carries the
+- * same missing guard: for the part of one frame between the layer's size words
+- * and the blender's, the channel and the blender can disagree about the
+- * window. Only a move pays that; a flip at a fixed rectangle writes no
+- * blender register at all, exactly as before planes could move.
++ * else. This is the page flip. With the queue (the default) the layer words
++ * are copied at the next frame start, before the engine's first line, so a
++ * flip never lands mid-frame; the CRTC's .atomic_flush then waits for that copy and
++ * sends the event (sun60i_de_kms_commit_wait()). With CPU stores (`rcq=0`)
++ * the write lands the moment it is made and the event waits for the next
++ * vblank.
++ *
++ * A plane that MOVES is the same write plus pipe 0's window. Through the
++ * queue both go out in one copy, so the channel and the blender never
++ * disagree about the window; with CPU stores they can, for the part of one
++ * frame between the two writes. A flip at a fixed rectangle writes no
++ * blender register at all.
+  */
+ int sun60i_de_kms_scanout(struct sun60i_de *de, const struct drm_rect *dst,
+ 			  dma_addr_t scanout, u32 pitch)
+@@ -1755,23 +2404,31 @@ void sun60i_de_kms_layer_off(struct sun60i_de *de)
+ 	/*
+ 	 * Dropped for the same reason as in sun60i_de_stop(), and for one more:
+ 	 * the caller is .atomic_disable, which returns void to the atomic
+-	 * helpers and has nowhere to put an error either.
++	 * helpers and has nowhere to put an error either. The settle is what
++	 * lets the helpers free the buffer after this returns.
+ 	 */
+ 	sun60i_de_layer_disable(de);
++	sun60i_de_settle(de);
+ }
+ EXPORT_SYMBOL_GPL(sun60i_de_kms_layer_off);
+ 
+ /*
+- * The cursor plane's two calls. Same commit path and the same missing
+- * line-window guard as sun60i_de_kms_scanout() -- a move lands mid-frame, so
+- * for one frame the cursor can sit at two heights. The writes take effect as
+- * they are made, so once this returns slot 1 no longer fetches the previous
+- * buffer, which is what the legacy cursor path's skipped vblank wait relies
+- * on.
++ * The cursor plane's two calls. A move goes out through the commit path and
++ * returns without waiting: with the queue it is copied at the next frame
++ * start, several moves in one frame coalesce, and the last one wins.
++ *
++ * What the legacy cursor path relies on is different: it skips the vblank
++ * wait and may free the previous buffer as soon as this returns. So a cursor
++ * that CHANGES buffer, or goes off, waits until the engine has taken the new
++ * state (sun60i_de_settle()) -- at most one frame, and only then. With CPU
++ * stores that wait is empty, as before.
+  */
+ int sun60i_de_kms_cursor(struct sun60i_de *de, const struct drm_rect *dst,
+ 			 dma_addr_t addr, u32 pitch)
+ {
++	bool frees;
++	int ret;
++
+ 	guard(mutex)(&de->lock);
+ 
+ 	if (!de->enabled)
+@@ -1780,7 +2437,13 @@ int sun60i_de_kms_cursor(struct sun60i_de *de, const struct drm_rect *dst,
+ 	if (!sun60i_de_dst_fits(&de->mode, dst))
+ 		return -EINVAL;
+ 
+-	return sun60i_de_cursor_enable(de, dst, addr, pitch);
++	frees = de->cursor_on && addr != de->cursor_addr;
++	ret = sun60i_de_cursor_enable(de, dst, addr, pitch);
++	de->cursor_addr = addr;
++	if (frees)
++		sun60i_de_settle(de);
++
++	return ret;
+ }
+ EXPORT_SYMBOL_GPL(sun60i_de_kms_cursor);
+ 
+@@ -1792,9 +2455,52 @@ void sun60i_de_kms_cursor_off(struct sun60i_de *de)
+ 		return;
+ 
+ 	sun60i_de_cursor_disable(de);
++	sun60i_de_settle(de);
+ }
+ EXPORT_SYMBOL_GPL(sun60i_de_kms_cursor_off);
+ 
++/*
++ * The CRTC's .atomic_flush calls this after the planes are staged, so a
++ * commit's event goes out when the engine has taken the commit -- the
++ * queue's copy at frame start -- rather than at a vblank that may come
++ * before it.
++ *
++ * Returns 1 when registers went out through the queue since the last wait and
++ * the engine has now copied them: send the event now. 0 when nothing is
++ * outstanding -- CPU stores, an engine that was not scanning, or a commit that
++ * staged nothing: arm the event for the next vblank as before. -ETIMEDOUT
++ * when the copy did not come within DE_RCQ_STALE_FRAMES; the request is then
++ * withdrawn and its blocks written by CPU store, and the event may go.
++ *
++ * The wait sleeps without de->lock, so a cursor move from another thread is
++ * never held up behind a flip.
++ */
++int sun60i_de_kms_commit_wait(struct sun60i_de *de)
++{
++	unsigned long gen;
++	int ret;
++
++	scoped_guard(mutex, &de->lock) {
++		if (!de->enabled || de->commit != &sun60i_de_commit_queue ||
++		    !de->queue->fresh)
++			return 0;
++		de->queue->fresh = false;
++		gen = de->queue->gen;
++	}
++
++	ret = sun60i_de_queue_wait(de, gen);
++	if (!ret)
++		return 1;
++
++	guard(mutex)(&de->lock);
++	de->queue->timeouts++;
++	if (de->enabled && !sun60i_de_queue_done(de, gen))
++		sun60i_de_queue_withdraw(de);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(sun60i_de_kms_commit_wait);
++
+ /*
+  * The component hooks do no hardware work at all, and that is deliberate: this
+  * driver is started by a modeset, not by a bind, exactly as it is started by a
+@@ -1974,6 +2680,10 @@ static int sun60i_de_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		return ret;
+ 
++	ret = sun60i_de_queue_init(de);
++	if (ret)
++		return ret;
++
+ 	ret = sun60i_de_resources(dev, de);
+ 	if (ret)
+ 		return ret;
+diff --git a/drivers/gpu/drm/sun60i/sun60i-kms.c b/drivers/gpu/drm/sun60i/sun60i-kms.c
+--- a/drivers/gpu/drm/sun60i/sun60i-kms.c
++++ b/drivers/gpu/drm/sun60i/sun60i-kms.c
+@@ -145,19 +145,23 @@
+  *      plane update) which will cause tcon to think that de is enabled, but bld
+  *      has no output, resulting in missing data" (sunxi_de.c:852-858).
+  *      ⇒ Here the constraint is met by ORDER alone and no special case is
+- *      needed: `drm-a733-display-engine-dram-into-tcon-tv1` commits by direct CPU store, so sun60i_de_blender()'s
+- *      BLD_OUTSIZE has already landed by the time the TCON is programmed. What
+- *      would break it is enabling the TCON first, or moving `drm-a733-display-engine-dram-into-tcon-tv1` to an RCQ
+- *      backend without carrying this rule across.
++ *      needed: the engine is enabled before the TCON, so it is not scanning
++ *      and its command queue backend writes the whole first commit by CPU
++ *      store (sun60i_de_queue_arm()) -- sun60i_de_blender()'s BLD_OUTSIZE
++ *      has landed by the time the TCON is programmed. Were the engine
++ *      scanning already, sun60i_de_start() waits for the queued copy before
++ *      it returns. What would break it is enabling the TCON first.
+  *   2. A DATAPATH WRITE HAS A SAFE WINDOW INSIDE THE FRAME. Before arming its
+  *      queue the vendor reads the TCON's current line and, if it is outside
+  *      [vtotal/4, 3*vtotal/4], delays with an hrtimer until it is
+  *      (rcq_update_timer_start(), sunxi_de.c:665-691); the TCON separately
+  *      computes a per-mode deadline from its own start delay
+  *      (sunxi_tcon_calc_judge_line(), sunxi_tcon.c:121-150) and refuses updates
+- *      past it. ⇒ Nothing here has such a guard, so a page flip lands wherever
+- *      it lands. That is named at sun60i_de_kms_scanout() and is stage 3's, and
+- *      it is the shape the fix will take rather than a theory about tearing.
++ *      past it (that timer path is the vendor's de210 descriptor's only,
++ *      rcq_wait_line; its de352 requests while GLB_STS is busy). ⇒ Here the
++ *      display engine's command queue copies at frame start, and requests
++ *      are made only while the engine is on an active line, where the copy
++ *      never runs (sun60i_de_queue_deliver()).
+  *   3. THE PIXEL CLOCK IS THE MODE'S CLOCK DIVIDED BY PIXEL_MODE.
+  *      clk_set_rate(mclk, timings->pixel_clk / pixel_mode) with the same factor
+  *      written into TV_GCTL[5:4] (sunxi_tcon.c:801-806), the factor coming from
+@@ -742,10 +746,11 @@ static u8 sun60i_kms_crtc_bpc(struct sun60i_kms *kms,
+  * is where it is stated out loud: it special-cases the blender's output size
+  * out of its deferred commit path and writes it straight to MMIO, because
+  * otherwise "tcon will think that de is enabled, but bld has no output,
+- * resulting in missing data" (allwinner-bsp, sunxi_de.c:852-858). `drm-a733-display-engine-dram-into-tcon-tv1` commits
+- * by direct store, so BLD_OUTSIZE is already in the register by the time
+- * sun60i_de_kms_enable() returns and no special case is needed -- but only
+- * because the engine is brought up first. Enabling the TCON before the engine
++ * resulting in missing data" (allwinner-bsp, sunxi_de.c:852-858). The engine
++ * is not scanning yet when it is enabled, so even its command queue backend
++ * writes that first commit by CPU store, BLD_OUTSIZE is in the register by the
++ * time sun60i_de_kms_enable() returns, and no special case is needed -- but
++ * only because the engine is brought up first. Enabling the TCON before the engine
+  * would reproduce exactly the fault that comment describes.
+  *
+  * The scanout address comes out of the ATOMIC STATE rather than from the plane
+@@ -836,13 +841,28 @@ static void sun60i_kms_crtc_atomic_disable(struct drm_crtc *crtc,
+ }
+ 
+ /*
+- * The event of a commit on a running CRTC. The plane writes above have landed
+- * -- they are direct stores -- so the event is armed for the NEXT vblank and
+- * sent by drm_crtc_handle_vblank() from the TCON's interrupt, which also drops
+- * the reference taken here. Without a vblank (no interrupt in DT, or a raster
+- * that failed to start) the get refuses and the event goes out at once, which
+- * is what drm_atomic_helper_fake_vblank() used to do for every flip.
+- * sun4i_crtc_atomic_flush() is the model.
++ * The event of a commit on a running CRTC.
++ *
++ * With the display engine's register command queue (the default) the planes
++ * staged above are copied into the engine at the next frame start, not when
++ * they were written, so the event waits for that copy
++ * (sun60i_de_kms_commit_wait()) and goes out at once after it. The copy lands
++ * at TCON line 27/28, after the vblank interrupt at line 7-9 of the same
++ * vertical blank (measured on the board),
++ * so the vblank count and timestamp the
++ * event carries are those of the frame that shows the commit.
++ *
++ * A legacy cursor update does not wait: it carries no event, and the atomic
++ * helpers skip its vblank wait for the same reason -- a pointer move must not
++ * block. What it may free is the display engine's business
++ * (sun60i_de_kms_cursor()).
++ *
++ * With CPU stores (sun60i_de.rcq=0) the writes above have landed already and
++ * the event is armed for the NEXT vblank, sent by drm_crtc_handle_vblank()
++ * from the TCON's interrupt, which also drops the reference taken here.
++ * Without a vblank (no interrupt in DT, or a raster that failed to start) the
++ * get refuses and the event goes out at once. sun4i_crtc_atomic_flush() is
++ * the model for that half.
+  */
+ static void sun60i_kms_crtc_atomic_flush(struct drm_crtc *crtc,
+ 					 struct drm_atomic_state *state)
+@@ -850,6 +870,13 @@ static void sun60i_kms_crtc_atomic_flush(struct drm_crtc *crtc,
+ 	struct drm_crtc_state *crtc_state =
+ 		drm_atomic_get_new_crtc_state(state, crtc);
+ 	struct drm_pending_vblank_event *event = crtc_state->event;
++	int taken = 0;
++
++	if (!state->legacy_cursor_update)
++		taken = sun60i_de_kms_commit_wait(crtc_to_kms(crtc)->de);
++	if (taken < 0)
++		drm_err(crtc->dev, "display engine did not take the commit: %d\n",
++			taken);
+ 
+ 	if (!event)
+ 		return;
+@@ -857,10 +884,15 @@ static void sun60i_kms_crtc_atomic_flush(struct drm_crtc *crtc,
+ 	crtc_state->event = NULL;
+ 
+ 	spin_lock_irq(&crtc->dev->event_lock);
+-	if (drm_crtc_vblank_get(crtc) == 0)
+-		drm_crtc_arm_vblank_event(crtc, event);
+-	else
++	if (drm_crtc_vblank_get(crtc) != 0) {
+ 		drm_crtc_send_vblank_event(crtc, event);
++	} else if (taken == 0) {
++		drm_crtc_arm_vblank_event(crtc, event);	/* the core puts it */
++	} else {
++		/* Held across the send, so the count it reads is a live one. */
++		drm_crtc_send_vblank_event(crtc, event);
++		drm_crtc_vblank_put(crtc);
++	}
+ 	spin_unlock_irq(&crtc->dev->event_lock);
+ }
+ 
+@@ -1186,8 +1218,9 @@ static int sun60i_kms_attach_components(struct sun60i_kms *kms,
+  * `arm64-dts-a733-tcon-tv1-and-the-dp-phy-pad-window` -- is requested by sun60i-tcon-tv.c, which acks TV_VB_INT_FLAG and hands
+  * each vblank to this CRTC through drm_crtc_handle_vblank(). When the TCON has
+  * it, drm_vblank_init() is called for the one CRTC, drm_dev_has_vblank() is
+- * true and every crtc_state->no_vblank false. Then: a flip's event is armed in
+- * .atomic_flush and sent from the interrupt at the next vblank;
++ * true and every crtc_state->no_vblank false. Then: a flip's event is sent
++ * after the display engine's queued copy, or armed for the next vblank with
++ * CPU stores (sun60i_kms_crtc_atomic_flush());
+  * DRM_IOCTL_WAIT_VBLANK answers (kmssink's drmWaitVBlank got EOPNOTSUPP without
+  * it); drm_atomic_helper_wait_for_vblanks() waits a frame before the old
+  * framebuffer is released; and drm_crtc_wait_one_vblank(), the loop under
+@@ -1201,11 +1234,10 @@ static int sun60i_kms_attach_components(struct sun60i_kms *kms,
+  * without `interrupts` gets no drm_vblank_init(), and its flips complete at
+  * once, as all of them used to.
+  *
+- * What it does not buy: a flip still writes the layer the moment it is
+- * committed, wherever the raster is (sun60i_de_kms_scanout()). The event now
+- * says the new buffer is being scanned; it does not say the write missed the
+- * visible part of a frame. That line-window guard is stage 3's and still open,
+- * and it is also why the tearing test lives there.
++ * What it does not buy by itself: a flip lands at frame start only through the
++ * display engine's register command queue (sun60i_de_kms_scanout());
++ * with CPU stores (sun60i_de.rcq=0) it lands the moment it is committed,
++ * wherever the raster is.
+  */
+ static int sun60i_kms_bind(struct device *dev)
+ {
+diff --git a/drivers/gpu/drm/sun60i/sun60i-kms.h b/drivers/gpu/drm/sun60i/sun60i-kms.h
+--- a/drivers/gpu/drm/sun60i/sun60i-kms.h
++++ b/drivers/gpu/drm/sun60i/sun60i-kms.h
+@@ -68,6 +68,14 @@ void sun60i_de_kms_layer_off(struct sun60i_de *de);
+ int sun60i_de_kms_cursor(struct sun60i_de *de, const struct drm_rect *dst,
+ 			 dma_addr_t addr, u32 pitch);
+ void sun60i_de_kms_cursor_off(struct sun60i_de *de);
++/*
++ * After the planes of a commit are staged: > 0 when they went out through the
++ * register command queue and the engine has now copied them (send the event
++ * now), 0 when nothing is outstanding (arm it for the next vblank), < 0 when
++ * the copy did not come and the engine was written by CPU store instead.
++ * Sleeps; not for a legacy cursor update, which must not wait.
++ */
++int sun60i_de_kms_commit_wait(struct sun60i_de *de);
+ 
+ /*
+  * TCON_TV1 -- implemented in sun60i-tcon-tv.c, same ownership rule.

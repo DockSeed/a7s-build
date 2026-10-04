@@ -1,0 +1,266 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] pinctrl: sunxi: A733 two-bit POW_MOD_SEL io-bias variant
+
+The sunxi core derives a bank's pad withstand-voltage mode from the voltage
+of that bank's `vcc-pX-supply` regulator. Every existing variant writes one
+bit per bank. The A733 has two, and it is not the A523's field:
+
+    GPIO_POW_MOD_SEL  0x02000040   (A733 UM v0.92 18.14.6.1)
+      31:26 -      25:24 VCCIO   23:22 -      21:20 PK
+      19:18 PJ     17:16 -       15:14 PH     13:12 PG
+      11:10 PF      9:8  PE       7:6  PD      5:4  PC     3:0 -
+      00: 3.3V   01: auto   10: 3.3V   11: 1.8V
+
+    SGPIO_POW_MOD_SEL 0x07025340   (18.14.7.20)
+      31:4 -   3:2 PM   1:0 PL      (same encoding)
+
+The 2-bit width is not read off the page alone: writing 11 and then 10 into
+the PI field 17:16 on a second 6 GiB board and reading both back independently proved it
+at silicon. Under mainline's 1-bit model a
+PF bias write would land on bit 5, which is inside PC's field, and the 1-bit
+model is also inverted against the UM's own manual-mode prose.
+
+Patch `pinctrl-sunxi-add-A733-sun60iw2-minimal-pio` therefore left `io_bias_cfg_variant` unset for the A733, which is
+`BIAS_VOLTAGE_NONE`, so `sunxi_pinctrl_set_io_bias_cfg()` returns at its first
+guard and the wrong write can never happen. That was the right call and it has
+held, but it also means the A733 cannot set a bank's withstand mode at all --
+a `vcc-pX-supply` on this SoC is currently a no-op on the bias register.
+
+Add the correct variant instead:
+
+  - a new `BIAS_VOLTAGE_POW_MOD_SEL_2BIT` that read-modify-writes a two-bit
+    field and reads it back inside the lock,
+  - a per-SoC `io_bias_field_shift` table, because the field position is not a
+    function of the bank index here: PA and PI are unbonded and PB's pads sit
+    on VCC-IO, whose field the UM names VCCIO_PWR_MOD_SEL rather than PB's. A
+    bank the UM gives no field is skipped, never guessed -- guessing is exactly
+    how the 1-bit variant ends up in a neighbouring bank's bits.
+
+Two smaller corrections come with it, both from reading the regulator core:
+
+  - the comment on the `uV == 0` early return said the dummy regulator lands
+    there. It does not. `dummy_ops` is an empty struct and `fixed_uV` is 0, so
+    `regulator_get_voltage_rdev()` falls through to `return -EINVAL`
+    (drivers/regulator/core.c), i.e. the `uV < 0` branch above it. Same
+    outcome today, different mechanism, and the difference is the whole point:
+    with a real rail wired, `uV` is positive and the write does happen.
+  - `sunxi_pmx_request()` dropped this function's return value on the floor.
+    A failure there means the pad withstand mode does not match the bank
+    supply; warn instead of staying silent. Not made fatal -- the pin is muxed
+    and powered either way, and failing the request would take the consumer
+    driver down with it.
+
+No functional change until a bank carries a supply: without one, the dummy
+regulator's -EINVAL still stops the path before the register.
+
+Assisted-by: Claude
+---
+diff -uNr a/drivers/pinctrl/sunxi/pinctrl-sun60iw2.c b/drivers/pinctrl/sunxi/pinctrl-sun60iw2.c
+--- a/drivers/pinctrl/sunxi/pinctrl-sun60iw2.c	2026-08-15 09:58:53.498733885 +0200
++++ b/drivers/pinctrl/sunxi/pinctrl-sun60iw2.c	2026-08-15 09:59:52.054817041 +0200
+@@ -43,6 +43,42 @@
+ /*	  PA  PB  PC  PD  PE  PF  PG  PH  PI  PJ  PK */
+ 	{  0, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14 };
+ 
++/*
++ * GPIO_POW_MOD_SEL (0x0040) field positions, indexed by bank (PA = 0).
++ * Transcribed field by field from A733 UM v0.92 18.14.6.1:
++ *
++ *	31:26 -		25:24 VCCIO	23:22 -		21:20 PK
++ *	19:18 PJ	17:16 -		15:14 PH	13:12 PG
++ *	11:10 PF	 9:8  PE	 7:6  PD	 5:4  PC	3:0 -
++ *
++ * Three banks deliberately carry NO_FIELD:
++ *
++ *  - PA and PI have no bonded pins, so no pin of theirs can ever be requested
++ *    and no field of theirs can ever be reached. (PI's 17:16 slot is real and
++ *    writable -- proven by write + read-back on a second 6 GiB board -- but the UM names it
++ *    Reserved.)
++ *  - PB has no field of its own. Its pads are supplied from VCC-IO
++ *    (A733_PINOUT_V0.91, sheet "Pin Description", column "I/O Power
++ *    Supply[7]"), and the
++ *    UM names the 25:24 field VCCIO_PWR_MOD_SEL, not PB_PWR_MOD_SEL. Which
++ *    pads besides PB's that field covers is stated nowhere we can read, so a
++ *    PB pin request does not write it. Closing this needs a document, not a
++ *    guess.
++ */
++static const u8 a733_io_bias_field_shift[SUNXI_PINCTRL_MAX_BANKS] = {
++	[0]  = POW_MOD_SEL_2BIT_NO_FIELD,	/* PA - unbonded */
++	[1]  = POW_MOD_SEL_2BIT_NO_FIELD,	/* PB - on VCC-IO, see above */
++	[2]  = 4,				/* PC */
++	[3]  = 6,				/* PD */
++	[4]  = 8,				/* PE */
++	[5]  = 10,				/* PF */
++	[6]  = 12,				/* PG */
++	[7]  = 14,				/* PH */
++	[8]  = POW_MOD_SEL_2BIT_NO_FIELD,	/* PI - unbonded */
++	[9]  = 18,				/* PJ */
++	[10] = 20,				/* PK */
++};
++
+ static struct sunxi_pinctrl_desc a733_pinctrl_data = {
+ 	/*
+ 	 * Bank PF I/O voltage is selected in the SoC via GPIO_POW_VAL_SET_CTL,
+@@ -50,6 +86,14 @@
+ 	 * 1.8 V signalling switch from the mmc_1v8 pinctrl state.
+ 	 */
+ 	.pf_power_switch = true,
++	/*
++	 * 2-bit POW_MOD_SEL fields, not the A523's 1 bit. Dormant until a bank
++	 * carries a vcc-pX-supply: sunxi_pinctrl_set_io_bias_cfg() is reached
++	 * only from sunxi_pmx_request(), and without a supply the dummy
++	 * regulator makes regulator_get_voltage() return -EINVAL first.
++	 */
++	.io_bias_cfg_variant = BIAS_VOLTAGE_POW_MOD_SEL_2BIT,
++	.io_bias_field_shift = a733_io_bias_field_shift,
+ 	.irq_banks = ARRAY_SIZE(a733_irq_bank_map),
+ 	.irq_bank_map = a733_irq_bank_map,
+ 	.irq_read_needs_mux = true,
+diff -uNr a/drivers/pinctrl/sunxi/pinctrl-sunxi.c b/drivers/pinctrl/sunxi/pinctrl-sunxi.c
+--- a/drivers/pinctrl/sunxi/pinctrl-sunxi.c	2026-08-15 09:58:53.486733868 +0200
++++ b/drivers/pinctrl/sunxi/pinctrl-sunxi.c	2026-08-15 10:02:45.855063853 +0200
+@@ -825,11 +825,19 @@
+ 	if (!pctl->desc->io_bias_cfg_variant)
+ 		return 0;
+ 
++	/*
++	 * A bank with no vcc-pX-supply in DT gets the dummy regulator. Its ops
++	 * are empty -- no get_voltage, no get_voltage_sel, no list_voltage, no
++	 * fixed_uV -- so regulator_get_voltage_rdev() falls all the way through
++	 * to -EINVAL (drivers/regulator/core.c). THAT is the branch the dummy
++	 * takes, not the uV == 0 one below, and the bias register is then never
++	 * touched at all.
++	 */
+ 	uV = regulator_get_voltage(supply);
+ 	if (uV < 0)
+ 		return uV;
+ 
+-	/* Might be dummy regulator with no voltage set */
++	/* A fixed regulator may be declared without a voltage. */
+ 	if (uV == 0)
+ 		return 0;
+ 
+@@ -879,6 +887,44 @@
+ 		       pctl->membase + pctl->pow_mod_sel_offset);
+ 		raw_spin_unlock_irqrestore(&pctl->lock, flags);
+ 		return 0;
++	case BIAS_VOLTAGE_POW_MOD_SEL_2BIT: {
++		u32 before;
++		u8 shift;
++
++		if (!pctl->desc->io_bias_field_shift ||
++		    bank >= SUNXI_PINCTRL_MAX_BANKS)
++			return -EINVAL;
++
++		shift = pctl->desc->io_bias_field_shift[bank];
++		if (shift == POW_MOD_SEL_2BIT_NO_FIELD) {
++			dev_dbg(pctl->dev,
++				"io-bias: bank %u has no POW_MOD_SEL field, left alone\n",
++				(unsigned int)bank);
++			return 0;
++		}
++
++		val = uV <= 1800000 ? POW_MOD_SEL_2BIT_1V8 : POW_MOD_SEL_2BIT_3V3;
++
++		raw_spin_lock_irqsave(&pctl->lock, flags);
++		before = readl(pctl->membase + pctl->pow_mod_sel_offset);
++		reg = before & ~(POW_MOD_SEL_2BIT_MASK << shift);
++		writel(reg | val << shift,
++		       pctl->membase + pctl->pow_mod_sel_offset);
++		/*
++		 * Writing is not the claim -- the claim is that the field
++		 * changed, and only a read-back inside the lock carries it.
++		 */
++		reg = readl(pctl->membase + pctl->pow_mod_sel_offset);
++		raw_spin_unlock_irqrestore(&pctl->lock, flags);
++
++		dev_dbg(pctl->dev,
++			"io-bias: bank %u %d uV -- POW_MOD_SEL %#010x -> %#010x (bits %u:%u = %u)\n",
++			(unsigned int)bank, uV, before, reg,
++			(unsigned int)shift + 1, (unsigned int)shift,
++			(reg >> shift) & POW_MOD_SEL_2BIT_MASK);
++
++		return 0;
++	}
+ 	default:
+ 		return -EINVAL;
+ 	}
+@@ -1008,7 +1054,15 @@
+ 		goto out;
+ 	}
+ 
+-	sunxi_pinctrl_set_io_bias_cfg(pctl, offset, reg);
++	/*
++	 * Not fatal -- the pin is muxed and the bank is powered either way. But
++	 * a silent failure here means the pad withstand mode does not match the
++	 * bank supply, so say so instead of dropping the return on the floor.
++	 */
++	ret = sunxi_pinctrl_set_io_bias_cfg(pctl, offset, reg);
++	if (ret)
++		dev_warn(pctl->dev, "Couldn't set bank P%c I/O bias: %d\n",
++			 'A' + bank, ret);
+ 
+ 	s_reg->regulator = reg;
+ 	refcount_set(&s_reg->refcount, 1);
+diff -uNr a/drivers/pinctrl/sunxi/pinctrl-sunxi.h b/drivers/pinctrl/sunxi/pinctrl-sunxi.h
+--- a/drivers/pinctrl/sunxi/pinctrl-sunxi.h	2026-08-15 09:58:53.474733851 +0200
++++ b/drivers/pinctrl/sunxi/pinctrl-sunxi.h	2026-08-15 09:59:10.870758555 +0200
+@@ -77,6 +77,31 @@
+  */
+ #define A733_POW_VAL_SET_CTL_REG	0x70
+ 
++/*
++ * GPIO_POW_MOD_SEL (main PIO 0x0040) and SGPIO_POW_MOD_SEL (S_GPIO 0x0340)
++ * carry a *two*-bit field per bank on the A733, not the single bit every other
++ * sunxi part uses:
++ *
++ *	00 = 3.3 V	01 = auto	10 = 3.3 V	11 = 1.8 V
++ *
++ * A733 UM v0.92, 18.14.6.1 (main PIO) and 18.14.7.20
++ * (S_GPIO). Confirmed at silicon by write + read-back of the
++ * PI field 17:16 on a second 6 GiB board -- both bits are independently writable and hold
++ * arbitrary 2-bit values.
++ *
++ * The field position is NOT a pure function of the bank index. The main PIO
++ * names fields only for PC..PK; 3:0 (PA/PB), 23:22 and 31:26 are unnamed, and
++ * bank PB's pads are supplied from VCC-IO, whose field sits at 25:24. So the
++ * map is a per-SoC table, and a bank the UM gives no field is skipped rather
++ * than guessed: a guessed position lands in a neighbouring bank's field, which
++ * is exactly what the 1-bit variant does here (PF would write bit 5, inside
++ * PC's field 5:4).
++ */
++#define POW_MOD_SEL_2BIT_MASK		0x3
++#define POW_MOD_SEL_2BIT_3V3		0x2
++#define POW_MOD_SEL_2BIT_1V8		0x3
++#define POW_MOD_SEL_2BIT_NO_FIELD	0xff
++
+ #define PINS_PER_BANK		32
+ 
+ #define IRQ_PER_BANK		32
+@@ -141,6 +166,13 @@
+ 	 * A100 and D1 SoC, for example.
+ 	 */
+ 	BIAS_VOLTAGE_PIO_POW_MODE_CTL,
++	/*
++	 * Bias voltage is set through a two-bit field per bank in
++	 * (SG)PIO_POW_MOD_SEL, at a position given by the desc's
++	 * io_bias_field_shift table, as seen on the A733. See the
++	 * POW_MOD_SEL_2BIT_* defines above.
++	 */
++	BIAS_VOLTAGE_POW_MOD_SEL_2BIT,
+ };
+ 
+ struct sunxi_desc_function {
+@@ -173,6 +205,12 @@
+ 	bool				pf_power_switch;
+ 	enum sunxi_desc_bias_voltage	io_bias_cfg_variant;
+ 	/*
++	 * BIAS_VOLTAGE_POW_MOD_SEL_2BIT only: bit position of each bank's
++	 * two-bit POW_MOD_SEL field, indexed by pin_base-relative bank.
++	 * POW_MOD_SEL_2BIT_NO_FIELD = this bank has no field, leave it alone.
++	 */
++	const u8			*io_bias_field_shift;
++	/*
+ 	 * IRQ register block. Zero keeps the classic layout (IRQ_CFG_REG and
+ 	 * friends, IRQ_MEM_SIZE stride). SoCs that interleave the per-bank IRQ
+ 	 * registers into the bank blocks instead override these.

@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Sat, 3 Oct 2026 18:04:10 +0200
+Subject: [PATCH] feat(gicv3): let a platform read a core's Redistributor base
+
+The driver records where each core's Redistributor frame is, in the
+rdistif_base_addrs[] array the platform hands it (or, with
+USE_GIC_DRIVER=3, the one in gicv3_base.c), from the walk over
+GICR_TYPER in gicv3_driver_init() or the core's own
+gicv3_rdistif_probe(). Platform code that has to touch a Redistributor
+register the driver does not manage, such as an IMPLEMENTATION DEFINED
+power sequence around a cluster power-down, has no way to get at that
+address and ends up computing it from a fixed stride of its own: a
+second source for the same address, which disagrees with the driver as
+soon as the frames are not in core order or are larger (GICv4 VLPI
+frames).
+
+Add gicv3_rdistif_get_base(proc_num), which returns the recorded base
+address, or 0 while the core's frame has not been found.
+
+Assisted-by: Claude
+---
+ drivers/arm/gic/v3/gicv3_main.c | 14 ++++++++++++++
+ include/drivers/arm/gicv3.h     |  1 +
+ 2 files changed, 15 insertions(+)
+
+diff --git a/drivers/arm/gic/v3/gicv3_main.c b/drivers/arm/gic/v3/gicv3_main.c
+index 7ef5559f2..fde273175 100644
+--- a/drivers/arm/gic/v3/gicv3_main.c
++++ b/drivers/arm/gic/v3/gicv3_main.c
+@@ -1419,6 +1419,20 @@ int gicv3_rdistif_probe(const uintptr_t gicr_frame)
+ 	return 0; /* Found matching GICR frame */
+ }
+ 
++/*******************************************************************************
++ * This function returns the base address of the Redistributor frame of the
++ * core 'proc_num', as found by gicv3_driver_init() or by that core's
++ * gicv3_rdistif_probe(). It returns 0 while the frame has not been found.
++ ******************************************************************************/
++uintptr_t gicv3_rdistif_get_base(unsigned int proc_num)
++{
++	assert(gicv3_driver_data != NULL);
++	assert(gicv3_driver_data->rdistif_base_addrs != NULL);
++	assert(proc_num < gicv3_driver_data->rdistif_num);
++
++	return gicv3_driver_data->rdistif_base_addrs[proc_num];
++}
++
+ /******************************************************************************
+  * This function checks the interrupt ID and returns true for SGIs, (E)PPIs
+  * and (E)SPIs IDs. Any interrupt ID outside the range is invalid and returns
+diff --git a/include/drivers/arm/gicv3.h b/include/drivers/arm/gicv3.h
+index 8669f97f4..a88f8eb5d 100644
+--- a/include/drivers/arm/gicv3.h
++++ b/include/drivers/arm/gicv3.h
+@@ -543,6 +543,7 @@ typedef struct gicv3_its_ctx {
+ void gicv3_driver_init(const gicv3_driver_data_t *plat_driver_data);
+ void gicv3_driver_init_default(void);
+ int gicv3_rdistif_probe(const uintptr_t gicr_frame);
++uintptr_t gicv3_rdistif_get_base(unsigned int proc_num);
+ void gicv3_distif_init(void);
+ void gicv3_rdistif_init(unsigned int proc_num);
+ void gicv3_rdistif_on(unsigned int proc_num);

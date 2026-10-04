@@ -1,0 +1,121 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Wed, 30 Sep 2026 09:01:59 +0200
+Subject: [PATCH] arm64: dts: a733: add dynamic-power-coefficient, so an Energy
+ Model exists
+
+Set dynamic-power-coefficient on all eight cpu@N: 170 on the six
+Cortex-A55, 512 on the two Cortex-A76. With it, cpufreq-dt registers an
+Energy Model for both perf domains from the OPP table
+(cpufreq_register_em_with_opp), and Energy Aware Scheduling can run:
+the tree already has asymmetric capacities (capacity-dmips-mhz 454/1024)
+and cpufreq on both clusters.
+
+WHERE THE NUMBERS COME FROM. A wall-power fit on the 8 GiB board, bin 5: one core
+pinned per OPP, the rest idle, P = C * f * V^2 over the 25 OPPs.
+A55 C = 170 +- 4.2 (R^2 0.976), A76 C = 512 +- 7.8 (R^2 0.987), ratio
+3.01. These are wall-referred and not calibrated: the supply's loss sits
+in the numbers (read by hand at two points, P_board ~= 0.864 * P_wall -
+0.44 W), mains moved by about 1 V, the outlet resolves 0.1 W, and the
+A76 fit leaves a +19 mW per-core step the model has no term for. On
+those grounds the measurement alone would not qualify as a DT source.
+It was decided on 2026-09-30 to ship it anyway, and the reason
+holds up: EAS compares the energy of candidate placements across the two
+perf domains, so a factor common to both (the supply) changes no
+decision; what decides placement is the ratio, and that is the quantity
+the A/B below exercised. The absolute scale matters to the power
+allocator thermal governor, which no thermal zone here uses (step_wise).
+
+WHAT THE VENDOR DOES, AND WHY NOT THAT. The vendor BSP DT carries 162 /
+598 (ratio 3.69), unchanged from cubie-aiot-v1.4.8 to 1.5.0, with no
+provenance. It makes the A76 look relatively more expensive, so EAS
+packs more work onto the A55. Measured on the same board, both models
+against EAS off, in the same boots:
+  - bursts of fixed work (100 ms / 1 s / 5 s, 1 and 2 threads, from idle
+    and over a 10 % background): finish time EAS on/off 1.000 +- 2 % for
+    both models, 12 pairs each; the work reaches an A76 after ~27 ms
+    either way (measured with a small burst test program);
+  - one busy thread and full load: no resolved difference;
+  - sustained duty-cycled load, 8 threads at 30 %: throughput EAS on/off
+    0.93 with these values, 0.79 with the vendor's (overnight
+    2026-09-29/30).
+This board is expected to carry sustained partial load, so the model
+that packs less wins. The energy saving EAS buys at that load (a few
+hundred mW at the wall) was not a criterion.
+
+Assisted-by: Claude
+---
+ .../boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts  | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+index dd668bc..ffa1e08 100644
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -84,6 +84,7 @@ cpu0: cpu@0 {
+ 			enable-method = "psci";
+ 			clocks = <&cpupll_ccu CLK_CPU_L>;
+ 			capacity-dmips-mhz = <454>;
++			dynamic-power-coefficient = <170>;
+ 			d-cache-size = <32768>;
+ 			d-cache-line-size = <64>;
+ 			d-cache-sets = <128>;
+@@ -101,6 +102,7 @@ cpu1: cpu@100 {
+ 			enable-method = "psci";
+ 			clocks = <&cpupll_ccu CLK_CPU_L>;
+ 			capacity-dmips-mhz = <454>;
++			dynamic-power-coefficient = <170>;
+ 			d-cache-size = <32768>;
+ 			d-cache-line-size = <64>;
+ 			d-cache-sets = <128>;
+@@ -118,6 +120,7 @@ cpu2: cpu@200 {
+ 			enable-method = "psci";
+ 			clocks = <&cpupll_ccu CLK_CPU_L>;
+ 			capacity-dmips-mhz = <454>;
++			dynamic-power-coefficient = <170>;
+ 			d-cache-size = <32768>;
+ 			d-cache-line-size = <64>;
+ 			d-cache-sets = <128>;
+@@ -135,6 +138,7 @@ cpu3: cpu@300 {
+ 			enable-method = "psci";
+ 			clocks = <&cpupll_ccu CLK_CPU_L>;
+ 			capacity-dmips-mhz = <454>;
++			dynamic-power-coefficient = <170>;
+ 			d-cache-size = <32768>;
+ 			d-cache-line-size = <64>;
+ 			d-cache-sets = <128>;
+@@ -152,6 +156,7 @@ cpu4: cpu@400 {
+ 			enable-method = "psci";
+ 			clocks = <&cpupll_ccu CLK_CPU_L>;
+ 			capacity-dmips-mhz = <454>;
++			dynamic-power-coefficient = <170>;
+ 			d-cache-size = <32768>;
+ 			d-cache-line-size = <64>;
+ 			d-cache-sets = <128>;
+@@ -169,6 +174,7 @@ cpu5: cpu@500 {
+ 			enable-method = "psci";
+ 			clocks = <&cpupll_ccu CLK_CPU_L>;
+ 			capacity-dmips-mhz = <454>;
++			dynamic-power-coefficient = <170>;
+ 			d-cache-size = <32768>;
+ 			d-cache-line-size = <64>;
+ 			d-cache-sets = <128>;
+@@ -203,6 +209,7 @@ cpu6: cpu@600 {
+ 			enable-method = "psci";
+ 			clocks = <&cpupll_ccu CLK_CPU_B>;
+ 			capacity-dmips-mhz = <1024>;
++			dynamic-power-coefficient = <512>;
+ 			d-cache-size = <65536>;
+ 			d-cache-line-size = <64>;
+ 			d-cache-sets = <256>;
+@@ -220,6 +227,7 @@ cpu7: cpu@700 {
+ 			enable-method = "psci";
+ 			clocks = <&cpupll_ccu CLK_CPU_B>;
+ 			capacity-dmips-mhz = <1024>;
++			dynamic-power-coefficient = <512>;
+ 			d-cache-size = <65536>;
+ 			d-cache-line-size = <64>;
+ 			d-cache-sets = <256>;
+-- 
+2.47.3
+

@@ -1,0 +1,244 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] aic_load_fw: track the firmware upload per part, not in one global flag
+
+`int fw_loaded` was file-scope, non-static and module-wide. It is asked a
+per-part question, so with more than one AIC part on a host the answer for one
+part is decided by what happened to another.
+
+The complete inventory (line numbers as in tag 5.0+git20260123.5f7be68d-8; an earlier patch of this series shifts
+the last two to 1769/1787, and does not move the first two):
+
+  write  aicwf_usb.c:42    int fw_loaded = 0;      definition, the only initialiser
+  write  aicwf_usb.c:1781  fw_loaded = 1;          end of a successful probe,
+                                                   immediately after aicfw_download_fw()
+  read   aicwf_usb.c:1685  site 1 -- post-download id AND loaded -> refuse
+  read   aicwf_usb.c:1763  site 2 -- post-download id AND NOT loaded ->
+                                     rwnx_send_reboot(), push it back to download mode
+
+That is all of them, in both modules. There is no EXPORT_SYMBOL, so
+aic8800_fdrv cannot read it, and nothing resets it -- not aicwf_usb_disconnect(),
+not aic_bluetooth_mod_exit(). It is a one-way latch for the module's lifetime.
+
+Why the product id cannot carry this, which was the first thing tried
+--------------------------------------------------------------------
+Both read sites fire only for the post-download identities, and it is the same
+set of parts on both: site 1 keys on id->idProduct {8801, 8d81, 8d41, 8d91,
+8d99}, site 2 on usb_dev->chipid, and aicloadfw_chipmatch() maps 8d81 and 8d41
+onto PRODUCT_ID_AIC8800D81 and 8801 onto PRODUCT_ID_AIC8801. So the id selects
+which *pair* of branches applies, and the flag is the only thing choosing
+between them. Deriving the flag from the id collapses the pair, and both
+collapses are wrong:
+
+  always refuse  -- a part that comes up already at its loaded id is never
+                    rebooted into download mode, so our firmware never reaches it
+  always reboot  -- a normal cold boot loops: 8d80 -> download -> 8d81 -> reboot
+                    -> 8d80 -> download -> ...
+
+The 8d81 descriptor is byte-identical whether we produced it 750 ms ago or a
+previous boot did; there is no counter, timestamp or provenance field in it.
+This is an information argument, not a preference: the state is genuinely
+needed, and it is per part.
+
+Where the state has to live
+---------------------------
+It must survive the download re-enumeration, because that is the gap it spans.
+Measured on the board, one boot of the delivery image:
+
+  usb 2-1.1: new high-speed USB device number 3      <- a69c:8d80
+  usb 2-1.1: USB disconnect, device number 3
+  usb 2-1.1: new high-speed USB device number 4      <- a69c:8d81
+
+So usb_set_intfdata() is out (the interfaces are destroyed) and anything hung
+off struct usb_device is out (a new one is allocated, new device number). What
+does not change is the USB topology path -- both lines above say "2-1.1" -- and
+that is what this patch keys on. dev_name(&udev->dev) is "<busnum>-<devpath>"
+with devpath a char[16] (include/linux/usb.h:663), so the 32-byte slots cannot
+truncate. drivers/usb/core/usb.c:686-690 warns that the busnum half is not
+stable across HCD modprobe order; that does not reach this state, which only
+has to live from one probe to the next inside a single download cycle.
+
+What actually goes wrong today
+------------------------------
+Part A on one port at its download id, part B on another already at its loaded
+id -- B left powered across a kernel reload, or a dongle carrying firmware from
+another host. Correctness then depends on enumeration order:
+
+  A first: A downloads, sets the flag. B hits site 1, is refused, is never
+           rebooted, never receives our firmware. Silent dark radio.
+  B first: B hits site 2, is rebooted into download mode, downloads. A downloads.
+           Both work.
+
+With this patch B's record is empty regardless of what A did, so site 2 fires
+either way and the order stops mattering.
+
+⚠ The module-reload path is NOT this bug, and an earlier note of mine implying
+it was is wrong. rmmod frees the module's data segment, so modprobe starts with
+fw_loaded == 0 -- which is the correct value for a part that is already at its
+loaded id. The reload path takes site 2 and works; this patch leaves it exactly
+as it was (a fresh module has an empty array, which is the same statement).
+
+Risk
+----
+This sits on the decision that gates firmware download on every boot, so the
+relevant question is whether the single-part path can change. It cannot, by
+construction: with one part there is exactly one path string, so the array is
+the old one-bit flag that happens to carry a name. Cold boot -> array empty ->
+aicwf_fw_part_loaded() false -> site 1 cannot fire, site 2 cannot fire (8d80 is
+not a post-download id) -> download -> mark. Re-enumeration as 8d81 -> the path
+is found -> true -> site 1 fires. That is bit-for-bit the old state machine.
+The only divergence is between two different paths, which is the broken case.
+
+The table is a fixed four slots rather than a list because this driver serves
+one soldered part plus at most a stray dongle. A full table answers "already
+loaded", and that direction is deliberate: the opposite would reboot a part it
+cannot record, which returns under its loaded id, is not recorded again, and
+loops forever. Refusing is what the single global did for every part anyway.
+
+Verified on the previous pin, 4.0+git20250410.b99ca8b6-5: applies clean in
+sequence; aicwf_usb.o compiles
+(native aarch64, 6.18.36, 0 errors, only the two pre-existing vendor
+-Wmissing-prototypes). In the built object the global is gone and the
+replacement is entirely file-local -- `B fw_loaded` before, `b aicwf_fw_part` /
+`b aicwf_fw_part_n` / `d aicwf_fw_part_lock` / `t aicwf_fw_part_loaded` after.
+
+Ported to 5.0+git20260123.5f7be68d-8 with all five hunks unchanged: the tag only
+moves the probe sites down by four lines (a new 8800D40X2 branch in
+aicloadfw_chipmatch()) and still has exactly these four fw_loaded sites. Applies
+clean in sequence there; not yet compiled.
+
+NOT hardware-proven: this has never booted, and the two-part case it fixes
+needs a second AIC part, which we do not have. Site 2 (rwnx_send_reboot) has
+still never executed on any board here -- unchanged by this patch, and the one
+concrete observable that would settle it is a modprobe of the loader alone
+against a part already at 8d81.
+
+SPDX-License-Identifier: GPL-2.0-only
+
+Assisted-by: Claude
+
+diff --git a/src/USB/driver_fw/drivers/aic8800/aic_load_fw/aicwf_usb.c b/src/USB/driver_fw/drivers/aic8800/aic_load_fw/aicwf_usb.c
+index 794b5fd..d0b7f75 100644
+--- a/src/USB/driver_fw/drivers/aic8800/aic_load_fw/aicwf_usb.c
++++ b/src/USB/driver_fw/drivers/aic8800/aic_load_fw/aicwf_usb.c
+@@ -20,6 +20,8 @@
+ #include <linux/usb.h>
+ #include <linux/kthread.h>
+ #include <linux/version.h>
++#include <linux/mutex.h>
++#include <linux/string.h>
+ #include "aic_txrxif.h"
+ #include "aicwf_usb.h"
+ #include "aicbluetooth.h"
+@@ -39,7 +41,82 @@ extern uint32_t gpio_dft_lvl;//0:defalut pull down,  1:default pull up
+ u8 chip_id = 0;
+ u8 chip_sub_id = 0;
+ u8 chip_mcu_id = 0;
+-int fw_loaded = 0;
++
++/* Which physical parts this module has already uploaded firmware to.
++ *
++ * The question the probe has to answer is per part -- "is the post-download
++ * part in front of me one that I made?" -- and it has to be answerable ACROSS
++ * the download re-enumeration, because that is exactly the gap it spans: the
++ * part disconnects under its download id and comes back under its loaded id as
++ * a NEW struct usb_device with a new device number. Measured on the vendor
++ * board, one boot of the delivery image:
++ *
++ *   usb 2-1.1: new high-speed USB device number 3      <- a69c:8d80
++ *   usb 2-1.1: USB disconnect, device number 3
++ *   usb 2-1.1: new high-speed USB device number 4      <- a69c:8d81
++ *
++ * So nothing hung off the usb_device or its interfaces lives long enough, and
++ * the product id cannot answer it either: 8d81 is byte-identical whether we
++ * produced it 750 ms ago or a previous boot did. What does not change is the
++ * USB topology path -- both enumerations above are "2-1.1" -- so that is the
++ * key. dev_name(&udev->dev) is "<busnum>-<devpath>"; devpath is char[16]
++ * (include/linux/usb.h:663), so 32 bytes cannot truncate.
++ *
++ * usb.c:686-690 warns that the busnum half is not stable across HCD modprobe
++ * order. That does not reach this state, which only has to live from one probe
++ * to the next inside a single download cycle -- no HCD is registered in that
++ * window.
++ *
++ * A fixed array rather than a list, because this driver serves one soldered
++ * part plus at most a stray dongle. Full table means "treat as already loaded",
++ * and that direction is deliberate: the opposite answer would reboot a part we
++ * cannot record, which comes back under its loaded id, is not recorded again,
++ * and loops forever. Refusing is what the old global did for every part anyway.
++ */
++#define AICWF_FW_PART_MAX 4
++static DEFINE_MUTEX(aicwf_fw_part_lock);
++static char aicwf_fw_part[AICWF_FW_PART_MAX][32];
++static int  aicwf_fw_part_n;
++
++static bool aicwf_fw_part_loaded(struct usb_device *udev)
++{
++	const char *path = dev_name(&udev->dev);
++	bool found = false;
++	int i;
++
++	mutex_lock(&aicwf_fw_part_lock);
++	if (aicwf_fw_part_n >= AICWF_FW_PART_MAX) {
++		found = true;
++	} else {
++		for (i = 0; i < aicwf_fw_part_n; i++) {
++			if (!strcmp(aicwf_fw_part[i], path)) {
++				found = true;
++				break;
++			}
++		}
++	}
++	mutex_unlock(&aicwf_fw_part_lock);
++
++	return found;
++}
++
++static void aicwf_fw_part_mark(struct usb_device *udev)
++{
++	const char *path = dev_name(&udev->dev);
++	int i;
++
++	mutex_lock(&aicwf_fw_part_lock);
++	for (i = 0; i < aicwf_fw_part_n; i++)
++		if (!strcmp(aicwf_fw_part[i], path))
++			goto out;
++	if (aicwf_fw_part_n < AICWF_FW_PART_MAX)
++		strscpy(aicwf_fw_part[aicwf_fw_part_n++], path,
++			sizeof(aicwf_fw_part[0]));
++	else
++		usb_err("firmware-loaded table full, %s not recorded\n", path);
++out:
++	mutex_unlock(&aicwf_fw_part_lock);
++}
+ 
+ void aicwf_usb_tx_flowctrl(struct aic_usb_dev *usb_dev, bool state)
+ {
+@@ -1682,8 +1759,8 @@ static int aicwf_usb_probe(struct usb_interface *intf, const struct usb_device_i
+ 		id->bInterfaceSubClass,
+ 		id->bInterfaceProtocol);
+ 
+-	if(fw_loaded == 1 && 
+-        (id->idProduct == USB_DEVICE_ID_AIC_8801 || 
++	if(aicwf_fw_part_loaded(usb) &&
++        (id->idProduct == USB_DEVICE_ID_AIC_8801 ||
+         id->idProduct == USB_DEVICE_ID_AIC_8800D81 ||
+ 	    id->idProduct == USB_DEVICE_ID_AIC_8800D41 ||
+ 	    id->idProduct == USB_DEVICE_ID_AIC_8800D81X2 ||
+@@ -1766,7 +1843,7 @@ static int aicwf_usb_probe(struct usb_interface *intf, const struct usb_device_i
+         goto out_free_bus;
+     }
+ 
+-	if(fw_loaded == 0 && 
++	if(!aicwf_fw_part_loaded(usb) &&
+         (usb_dev->chipid == PRODUCT_ID_AIC8801 ||
+         usb_dev->chipid == PRODUCT_ID_AIC8800D81||
+         usb_dev->chipid == PRODUCT_ID_AIC8800D81X2 ||
+@@ -1784,7 +1861,7 @@ static int aicwf_usb_probe(struct usb_interface *intf, const struct usb_device_i
+     }
+     
+     usb_dev->app_cmp = true;
+-	fw_loaded = 1;
++	aicwf_fw_part_mark(usb);
+ 
+     return 0;
+ 

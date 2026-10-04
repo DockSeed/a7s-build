@@ -1,0 +1,36 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: allwinner: A733 enable eMMC HS400
+
+Move the eMMC (mmc2) onto the sun60i-a733-emmc compatible so it binds the
+HS400-capable cfg, and advertise HS400 (mmc-hs400-1_8v). max-frequency stays at
+150 MHz: on this board a 200 MHz HS400 clock did not lock (every board test
+-110'd or found no strobe window), so HS400 is first proven at the same 150 MHz
+the eMMC already runs HS200 at, and raised only once 150 MHz is solid. The SD
+node (mmc0) keeps sun60i-a733-mmc / sun20i-d1-mmc and is unaffected.
+
+The chip is HS400-1.8V capable (EXT_CSD DEVICE_TYPE bit6, read on silicon) and
+the data-strobe pin PC0 is already muxed in mmc2_pins. Not enhanced-strobe.
+
+Depends on `mmc-sunxi-add-a733-emmc-hs400`; binding in `dt-bindings-mmc-allwinner-a733-emmc`.
+
+Assisted-by: Claude
+---
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -750,7 +750,7 @@
+ 		};
+ 
+ 		mmc2: mmc@4022000 {
+-			compatible = "allwinner,sun60i-a733-mmc",
++			compatible = "allwinner,sun60i-a733-emmc",
+ 				     "allwinner,sun20i-d1-mmc";
+ 			reg = <0x0 0x04022000 0x0 0x1000>;
+ 			clocks = <&ccu CLK_BUS_SMHC2>, <&ccu CLK_SMHC2>;
+@@ -767,6 +767,7 @@
+ 			non-removable;
+ 			cap-mmc-highspeed;
+ 			mmc-hs200-1_8v;
++			mmc-hs400-1_8v;
+ 			cap-mmc-hw-reset;
+ 			#address-cells = <1>;
+ 			#size-cells = <0>;

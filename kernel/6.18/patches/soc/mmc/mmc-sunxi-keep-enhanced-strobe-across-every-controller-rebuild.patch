@@ -1,0 +1,288 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] mmc: sunxi: keep enhanced strobe across every controller rebuild
+
+The board announces HS400 Enhanced Strobe and then does not run it. Either the
+controller is configured for the mode or the mode is not offered; today it is
+neither, and that is the non-determinism this track is clearing out.
+
+THE MEASUREMENT
+---------------
+the 8 GiB board, 2026-09-20, test kernel 6.18.36-t0147 (main + `mmc-sunxi-stop-the-card-before-tearing-the-data-engine-down` + `mmc-sunxi-program-the-auto-cmd12-argument`
++ `mmc-sunxi-stop-writing-0xceaa-into-smhc-funs` + `arm64-dts-a733-cubie-a7s-emmc-enhanced-strobe`). The switch itself works:
+
+  [ 2.775493] sunxi-mmc 4022000.mmc: HS400 enhanced strobe off, SMHC_CQE_CTRL 0x00000003
+  [ 2.925003] sunxi-mmc 4022000.mmc: HS400 enhanced strobe on, SMHC_CQE_CTRL 0x00000103
+  [ 2.957475] mmc2: new HS400 Enhanced strobe MMC card at address 0001
+
+and /sys/kernel/debug/mmc2/ios keeps saying so: "timing spec: 10 (mmc HS400
+enhanced strobe)", "bus width: 3 (8 bits)", "actual clock: 200000000 Hz".
+
+In steady operation SMHC_CQE_CTRL (0x0402_21A0) reads 0x00000003 -- bit 8
+DS_SAMP_RESP_EN is gone. Read three times with the device pinned awake
+(power/control = on): straight after boot, immediately after a 64 MiB O_DIRECT
+read, and after an idle suspend/resume. 0x00000003 every time, which is the
+register's documented reset value (A733 UM 11.3.8.41, "Default Value:
+0x0000_0003"; the bit is R/W with reset 0). The card frames its command
+responses on the data strobe while the controller samples them on its own
+clock.
+
+WHO CLEARS IT
+-------------
+Not a stray write: nothing in the tree writes 0x1A0 except
+sunxi_mmc_hs400_enhanced_strobe(), and the core calls that op exactly once per
+mode switch (drivers/mmc/core/mmc.c mmc_select_hs400es(), and once from
+core.c mmc_set_initial_state()). What clears it is a reset of the block, and
+the driver does one on every idle. Line numbers are the series-applied tree,
+drivers/mmc/host/sunxi-mmc.c:
+
+  :3005 sunxi_mmc_runtime_suspend()
+        :3019 sunxi_mmc_reset_host()   -> :517 GCTRL soft + FIFO + DMA reset
+        :3020 sunxi_mmc_disable()      -> :2634 reset_control_assert(host->reset)
+
+pm_runtime autosuspend is 50 ms (:2941), so this runs whenever the host goes
+idle. The module reset at :2634 returns the whole SMHC register file to its
+reset values; the GCTRL reset at :517 is the second candidate and this patch
+does not need to separate them, because both are answered at the same place.
+
+And the rebuild path does not put the bit back:
+
+  :2976 sunxi_mmc_runtime_resume()
+        :2986 sunxi_mmc_init_host()          -> :530 FTRGL, TMOUT, IMASK,
+                                                RINTR, DBGC, FUNS, DLBA,
+                                                GCTRL -- nothing at 0x1A0
+        :2987 sunxi_mmc_set_bus_width()
+        :2988 sunxi_mmc_set_clk(host, &mmc->ios)
+
+So the bit survives from 2.925 s until the first 50 ms of idle, and never
+comes back.
+
+THE OTHER HS400 BITS DO NOT HAVE THIS -- CHECKED, NOT ASSUMED
+-------------------------------------------------------------
+This was the second question the change had to ask before touching anything,
+and the answer is no, so nothing about them changes here.
+
+In code: :2988 sunxi_mmc_set_clk() -> sunxi_mmc_clk_set_rate() -> :1420
+sunxi_mmc_hs400_enable(host, ios), which reprograms SMHC_CSDC, SMHC_NTSR,
+SMHC_DS_DL and EMMC_DSBD from ios on every single pass, including every
+runtime resume. They are written from ios each time, not latched once.
+
+On silicon, from the other side -- the 2026-09-19 register sweep on the 8 GiB board, read
+in ordinary operation long after boot:
+
+  EMMC_DSBD  0x0402_210C = 0x80000000   HS400_MD_EN set
+  SMHC_DS_DL 0x0402_2148 = 0x0b8b       the applied strobe delay
+  SMHC_CQE_CTRL 0x0402_21A0 = 0x00000003
+
+One sweep, same board, same steady state: the register file is being rebuilt,
+and SMHC_CQE_CTRL is the one register the rebuild misses. (That sweep predates
+`arm64-dts-a733-cubie-a7s-emmc-enhanced-strobe`, so its 0x3 is "never written"; the 2026-09-20 reading above is the one
+that shows the loss. Both are quoted, neither is mixed up with the other.)
+
+WHAT THIS CHANGES
+-----------------
+The one-bit write moves into sunxi_mmc_hs400_es_write() and gets a second
+caller: sunxi_mmc_hs400_enable(), beside the other four HS400 registers. That
+is the point where controller state is rebuilt, so the ES bit is now rebuilt
+with everything else. Leaving HS400 clears it in the same teardown branch that
+undoes HS400_MD_EN, CSDC, NTSR and DS_DL.
+
+It is derived from ios->enhanced_strobe, not cached in struct sunxi_mmc_host.
+That is deliberate and it is the deviation from the obvious design:
+
+- struct mmc_ios is already this driver's authority for every other mode bit.
+  A copy in host state would be a second thing that can go stale, for no gain.
+- The core keeps the flag set for exactly as long as the mode lasts: set in
+  mmc_select_hs400es() (core/mmc.c:1457), cleared in mmc_set_initial_state()
+  (core/core.c:1000) when the card is reinitialised.
+- Both callers of sunxi_mmc_set_clk() pass the core's own ios -- set_ios
+  (:1825) and runtime_resume (:2988, &mmc->ios) -- so there is no path where
+  the flag read here is not the current one.
+
+Ordering, because it is not obvious: mmc_select_hs400es() calls
+mmc_set_timing(MMC_TIMING_MMC_HS400) *before* it sets ios.enhanced_strobe. So
+on the first pass sunxi_mmc_hs400_enable() writes the bit as 0 and the
+->hs400_enhanced_strobe call immediately behind it writes 1 -- which is
+exactly the pair of log lines at 2.775 and 2.925 above. Every pass after that
+has the flag set and writes 1 directly.
+
+WHAT IT DOES NOT CLAIM
+----------------------
+- No throughput claim. The strobe frames the response, not the payload. If the
+  rate moves at all, that is a finding, not the goal -- see the falsifier.
+- It does not touch HS400_MD_EN, CSDC, NTSR or DS_DL, and it does not change
+  when the data-strobe sweep runs.
+- It does not decide whether SMHC_CQE_CTRL needs the CQE block powered. The bit
+  took the write at 2.925 s with no CQE running, which settles the question for
+  the write; whether it stays taken across a rebuild is what this patch makes
+  measurable.
+
+CROSS-READ -- WHAT THE OTHER DRIVERS DO WITH THEIR ES STATE
+-----------------------------------------------------------
+- dw_mmc: nothing to take. No dw_mmc variant in 6.18.36 implements
+  ->hs400_enhanced_strobe (grep over drivers/mmc/host/dw_mmc*.c: zero hits), so
+  it carries no ES state across resume.
+- mtk-sd: carries it, and carries it incompletely -- the same defect in a
+  milder form, which is why it is named rather than followed.
+  msdc_hs400_enhanced_strobe() (mtk-sd.c:2713) writes EMMC50_CFG0, EMMC50_CFG1,
+  CQHCI_SETTING and EMMC51_CFG0. Its runtime PM saves and restores raw register
+  values around the gated HCLK -- msdc_save_reg()/msdc_restore_reg()
+  (mtk-sd.c:3210/:3239) -- and struct msdc_save_para (mtk-sd.c:415) holds
+  emmc50_cfg0 and emmc50_cfg3 but not emmc50_cfg1, not CQHCI_SETTING and not
+  EMMC51_CFG0. So three of the four registers its ES path writes are outside
+  what it restores.
+  Two things follow, both deliberate here: save-and-restore of raw values is
+  not copied (it can carry a stale value forward, where reprogramming from ios
+  cannot), and the ES write is placed on the rebuild path rather than in a
+  save/restore pair.
+- A733 vendor BSP (sunxi-mmc-v4p5x.c, the v4p6x path this board binds): it
+  offers enhanced strobe on no path at all. No ->hs400_enhanced_strobe anywhere
+  in the BSP; SDXC_REG_CQE_CTRL is defined (sunxi-mmc.h:116) and never written;
+  the only three mentions of MMC_CAP2_HS400_ES are clears inside
+  sunxi_mmc_select_timing() (sunxi-mmc.c:172/:180/:187), a timing-override
+  helper, and nothing ever sets it. Its HS400 register pair is reprogrammed
+  from ios on the clock path (sunxi-mmc-v4p5x.c:816-833, inside
+  sunxi_mmc_clk_set_rate_for_sdmmc_v4p5x(): EDSD HS400_MD_EN + CSDC), which is the same idiom this patch extends the ES bit into -- so the
+  vendor gets the structure right for the two bits it has and simply does not
+  have this one. Nothing to port; nothing it does better.
+
+VERIFIED / NOT VERIFIED
+-----------------------
+- Applies clean at fuzz 0 on a fresh unpack with the full series in series
+  order: yes, checked exactly the way scripts/build.sh applies it.
+- Builds: not asserted here.
+- Silicon: NOT proven. The observable on the 8 GiB board, which is the measurement that
+  found the defect, repeated:
+    * busybox devmem 0x040221A0 32 reads bit 8 set (0x00000103) with the device
+      pinned awake (echo on > /sys/devices/platform/soc/4022000.mmc/power/control)
+      at all three points: right after boot, right after a 64 MiB O_DIRECT
+      read, and after an idle suspend/resume cycle
+    * /sys/kernel/debug/mmc2/ios still reads "timing spec: 10 (mmc HS400
+      enhanced strobe)"
+    * sequential write does not regress -- 156 MiB/s or above, the rate the
+      same board and kernel generation gives today -- and verify is clean
+  What falsifies it: bit 8 still reads 0, and then the loss sits somewhere this
+  patch does not reach; or the write rate falls, and then the bit costs
+  something and the question is a different one.
+
+ISSUE
+-----
+No separate issue: the finding and its fix ship together in this patch.
+It closes the operational half of the hardware proof still open for `mmc-sunxi-stop-claiming-the-controller-cannot-do-enhanced-strobe` and `arm64-dts-a733-cubie-a7s-emmc-enhanced-strobe` -- ES announced is now ES configured, for as long as the
+mode lasts.
+
+Assisted-by: Claude
+---
+--- a/drivers/mmc/host/sunxi-mmc.c
++++ b/drivers/mmc/host/sunxi-mmc.c
+@@ -1614,11 +1614,51 @@
+ }
+ 
+ /*
++ * Enhanced strobe, one bit: SMHC_CQE_CTRL[8] DS_SAMP_RESP_EN (UM 11.3.8.41,
++ * offset 0x01A0, register reset value 0x0000_0003, the bit itself R/W reset 0).
++ *
++ * Split out because it has two callers that must agree. ->hs400_enhanced_strobe
++ * is where the core announces the mode, and sunxi_mmc_hs400_enable() is where
++ * the controller state is rebuilt afterwards -- every runtime resume, for as
++ * long as the card stays in HS400.
++ */
++static void sunxi_mmc_hs400_es_write(struct sunxi_mmc_host *host, bool on)
++{
++	u32 rval = mmc_readl(host, REG_CQE_CTRL);
++
++	if (on)
++		rval |= SDXC_DS_SAMP_RESP_EN;
++	else
++		rval &= ~SDXC_DS_SAMP_RESP_EN;
++
++	mmc_writel(host, REG_CQE_CTRL, rval);
++
++	/*
++	 * The re-apply is silent by design -- it runs on every runtime resume,
++	 * which on this host is every 50 ms of idle. Armable without a rebuild
++	 * when the question comes back:
++	 *   dyndbg="func sunxi_mmc_hs400_es_write +p"
++	 * The standing observable stays the register itself.
++	 */
++	dev_dbg(mmc_dev(host->mmc), "HS400 ES %s, SMHC_CQE_CTRL 0x%08x\n",
++		on ? "on" : "off", mmc_readl(host, REG_CQE_CTRL));
++}
++
++/*
+  * Program the HS400-specific timing bits. Called from the clock-setup path
+  * with the card clock gated, only on controllers that carry the data-strobe
+  * delay (cfg->can_hs400). Everything is gated on the HS400 timing, so the SD
+  * controller (which never selects HS400) is untouched. Register recipe from
+  * the A733 UM ch. 11.3.
++ *
++ * This is also the re-apply point. Runtime suspend asserts the controller's
++ * reset (sunxi_mmc_runtime_suspend -> sunxi_mmc_disable ->
++ * reset_control_assert), so after every resume the whole SMHC register file is
++ * back at its reset values; sunxi_mmc_runtime_resume() rebuilds it through
++ * sunxi_mmc_init_host() and sunxi_mmc_set_clk(), and set_clk lands here. Every
++ * HS400 bit therefore has to be written from ios on each pass, not once at
++ * mode-switch time -- which is exactly why ios->enhanced_strobe is read here
++ * and not cached.
+  */
+ static void sunxi_mmc_hs400_enable(struct sunxi_mmc_host *host,
+ 				   struct mmc_ios *ios)
+@@ -1650,6 +1690,14 @@
+ 		rval = mmc_readl(host, REG_DS_DL_REG);
+ 		rval &= ~(SDXC_DS_DL_SW_MASK | SDXC_CAL_DL_SW_EN);
+ 		mmc_writel(host, REG_DS_DL_REG, rval);
++
++		/*
++		 * Enhanced strobe is part of that teardown: it only ever
++		 * applies inside HS400, and leaving it set while the response
++		 * path goes back to the controller's own sampling clock would
++		 * be the same defect in the other direction.
++		 */
++		sunxi_mmc_hs400_es_write(host, false);
+ 		return;
+ 	}
+ 
+@@ -1718,6 +1766,19 @@
+ 	else
+ 		rval &= ~SDXC_HALF_START_BIT;
+ 	mmc_writel(host, REG_EMMC_DSBD, rval);
++
++	/*
++	 * Enhanced strobe, from ios, on the same pass as the rest. The core
++	 * sets ios->enhanced_strobe in mmc_select_hs400es() *after* the
++	 * mmc_set_timing(MMC_TIMING_MMC_HS400) that brings us here the first
++	 * time, so the first pass writes 0 and the ->hs400_enhanced_strobe
++	 * call right behind it writes 1. From then on the flag is set and
++	 * every later pass -- each runtime resume -- reapplies it, which is
++	 * the whole point: without it the bit is lost at the first idle
++	 * suspend and the card runs HS400ES against a controller that is no
++	 * longer sampling responses on the strobe.
++	 */
++	sunxi_mmc_hs400_es_write(host, ios->enhanced_strobe);
+ }
+ 
+ static int sunxi_mmc_clk_set_rate(struct sunxi_mmc_host *host,
+@@ -2340,20 +2401,16 @@
+  *
+  * The rest of the HS400 register recipe is unchanged and still comes from
+  * sunxi_mmc_hs400_enable(), which the core reaches through mmc_set_timing()
+- * on the ES path exactly as on the plain HS400 path.
++ * on the ES path exactly as on the plain HS400 path -- and which reapplies
++ * this bit too, because the core calls this op exactly once per mode switch
++ * while the controller loses the register on every runtime suspend.
+  */
+ static void sunxi_mmc_hs400_enhanced_strobe(struct mmc_host *mmc,
+ 					    struct mmc_ios *ios)
+ {
+ 	struct sunxi_mmc_host *host = mmc_priv(mmc);
+-	u32 rval;
+ 
+-	rval = mmc_readl(host, REG_CQE_CTRL);
+-	if (ios->enhanced_strobe)
+-		rval |= SDXC_DS_SAMP_RESP_EN;
+-	else
+-		rval &= ~SDXC_DS_SAMP_RESP_EN;
+-	mmc_writel(host, REG_CQE_CTRL, rval);
++	sunxi_mmc_hs400_es_write(host, ios->enhanced_strobe);
+ 
+ 	dev_info(mmc_dev(mmc), "HS400 enhanced strobe %s, SMHC_CQE_CTRL 0x%08x\n",
+ 		 ios->enhanced_strobe ? "on" : "off",

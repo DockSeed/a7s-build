@@ -1,0 +1,91 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] aic_load_fw: return an errno from a failed configuration or upload
+
+Pinned tag plus the series up to
+aic_load_fw-no-rx-urb-in-flight-after-the-bus-stop; kernel 6.18.53).
+
+aicwf_usb_probe() reaches system_config() and aicfw_download_fw() with
+ret still holding aicwf_bus_start()'s 0. Both failure branches jump to
+out_free_bus without setting it, so the probe frees usb_dev, clears the
+interface data, prints "failed with errno 0" at error level and returns
+0. The driver core then counts the interface as bound (really_probe() in
+drivers/base/dd.c treats 0 as success): no other probe runs, a manual
+bind is refused as busy, and the radio stays down until the part is
+re-plugged or the module reloaded, with no errno anywhere in the log.
+
+In the vendor driver: the two reboot exits just above
+(system_reboot(), rwnx_send_reboot()) return 0 through the same label on
+purpose -- the part leaves the bus and re-enumerates, and a new probe
+follows. The configuration and upload failures share the label but not
+that property: the part stays on the bus at its loader id, and nothing
+probes it again.
+
+What changes:
+- system_config()'s result goes into ret. It carries the errno of the
+  firmware message that failed (-EPIPE, -ENOMEM from rwnx_send_msg()), or
+  -1 for an unknown chip, which becomes -EIO. A timed-out message returns
+  0: cmd_mgr_queue() returns 0 after the timeout, and cmd_complete()
+  overwrites the -ETIMEDOUT it stored. The timeout marks the command
+  manager crashed, so the next message returns -EPIPE; only a timeout on
+  the last message goes unseen (see aic_load_fw-a-timed-out-firmware-message-fails-and-is-freed). Not changed here.
+- A failed aicfw_download_fw() sets -EIO: every failure branch of the
+  upload returns a bare -1 (= -EPERM), which names nothing.
+- The stop-race stimulus of aic_load_fw-no-rx-urb-in-flight-after-the-
+  bus-stop, which takes this exit to mirror a failed configuration, sets
+  -EIO the same way, so it keeps mirroring it.
+
+The reboot exits are left alone: returning an error there would print a
+probe failure for what is the expected path of every cold boot.
+
+Not taken:
+- -ENODEV: the driver core logs it at debug level as "rejects match",
+  which would hide a real failure.
+- Propagating the upload's -1: -EPERM reads as a permission problem.
+
+Falsifier, on the board, with the part at its loaded id:
+  modprobe -r aic8800_fdrv aic_load_fw
+  modprobe aic_load_fw rx_loader_inject_stop_race=1
+  (replug or rebind the part so that it enumerates at its loader id)
+Without the fix: "failed with errno 0", and the interface stays listed
+under /sys/bus/usb/drivers/aic_load_fw/. With it: "failed with errno -5",
+the driver core's "probe with driver aic_load_fw failed with error -5",
+and the interface is not listed. One listing with the fix refutes it.
+
+Assisted-by: Claude
+
+diff --git a/src/USB/driver_fw/drivers/aic8800/aic_load_fw/aicwf_usb.c b/src/USB/driver_fw/drivers/aic8800/aic_load_fw/aicwf_usb.c
+index 3899334..7919775 100644
+--- a/src/USB/driver_fw/drivers/aic8800/aic_load_fw/aicwf_usb.c
++++ b/src/USB/driver_fw/drivers/aic8800/aic_load_fw/aicwf_usb.c
+@@ -1978,6 +1978,7 @@ static int aicwf_usb_probe(struct usb_interface *intf, const struct usb_device_i
+         rx_loader_inject_stop_race--;
+         stop_race_pending = true;
+         usb_err("stop race stimulus: error path after the bus start\n");
++        ret = -EIO;
+         goto out_free_bus;
+     }
+ 
+@@ -1996,11 +1997,21 @@ static int aicwf_usb_probe(struct usb_interface *intf, const struct usb_device_i
+ 		goto out_free_bus;
+ 	}
+ 
+-    if (system_config(usb_dev)) {
++    /* A failed configuration or upload leaves the part on the bus at its
++     * loader id, and no re-enumeration follows, unlike the two reboot
++     * exits above. Return an errno, so the driver core does not keep the
++     * interface bound to a probe that has freed everything. The upload
++     * returns a bare -1 (= -EPERM), which names nothing; say -EIO.
++     */
++    ret = system_config(usb_dev);
++    if (ret) {
++        if (ret == -1)
++            ret = -EIO;
+         goto out_free_bus;
+     }
+ 
+-    if (aicfw_download_fw(usb_dev)){
++    if (aicfw_download_fw(usb_dev)) {
++        ret = -EIO;
+         goto out_free_bus;
+     }
+     

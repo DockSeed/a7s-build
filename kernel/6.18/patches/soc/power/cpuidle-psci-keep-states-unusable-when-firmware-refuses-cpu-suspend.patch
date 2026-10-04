@@ -1,0 +1,170 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] cpuidle: psci: keep DT idle states unusable when the firmware refuses CPU_SUSPEND
+
+What. psci_init_cpu_suspend() already asks the firmware
+PSCI_FEATURES(CPU_SUSPEND) and, on NOT_SUPPORTED, only leaves the format
+flags at zero -- CPU_SUSPEND stays wired and cpuidle-psci registers every DT
+idle state as usable. Record the refusal in psci.c, export it as
+psci_cpu_suspend_supported(), and have cpuidle-psci mark every PSCI state
+CPUIDLE_FLAG_UNUSABLE when it is false. WFI stays state 0, the driver still
+registers, the states stay visible in sysfs with usage and rejected at 0.
+
+Why. On our chain (open TF-A v2.12.0, f4c0b0dba) CPU_SUSPEND is not offered:
+plat_setup_psci_ops() falls back to sunxi_native_psci_ops, which has no
+pwr_domain_suspend and no validate_power_state, so lib/psci/psci_setup.c:
+251-254 never sets the CPU_SUSPEND cap. The firmware is honest about it --
+psci_features() returns NOT_SUPPORTED for a missing cap
+(lib/psci/psci_main.c:379-381) -- and every CPU_SUSPEND is answered with
+SMC_UNK (psci_main.c:446-447), -EOPNOTSUPP in Linux (measured 2026-08-15). The kernel is what
+ignores the answer, in three places of 6.18.36:
+
+  - psci.c:664 wires psci_ops.cpu_suspend unconditionally, and
+    psci_init_cpu_suspend() (psci.c:585-591) does not unset it. For
+    SYSTEM_SUSPEND the same file does gate on the answer (psci.c:581) --
+    the asymmetry is the defect.
+  - a rejected entry returns -1; cpuidle_enter_state() counts it in
+    `rejected` (cpuidle.c:334-336) and returns without WFI. do_idle()
+    loops (kernel/sched/idle.c:298) and asks the governor again.
+  - menu learns nothing from it: cpuidle_reflect() drops index < 0
+    (cpuidle.c:405), and menu_select() records the rejection as an
+    interval of UINT_MAX (menu.c:230-238), which pushes the next
+    prediction long, i.e. back to the deepest state. No kernel code turns
+    a state off after repeated rejections.
+
+So an idle core spins through cpu_pm_enter(), tick_broadcast_enter() (the
+states carry local-timer-stop), the arm64 cpu_suspend() context save and one
+SMC to EL3 and back, over and over, until an interrupt ends the idle period.
+Measured on an idle board (load 0.03, 8047 s uptime):
+WFI `time` covers only
+2973 s on cpu0, 3620 s on cpu2 and 5234 s on cpu6; the rest of the wall
+clock, 35-63 %, is in no idle state at all, against 1.0-1.7e8 rejections
+per CPU -- roughly 30 us per rejected round trip. Deep idle was lost when we
+left the vendor BL31; this spin is what replaced it, and it is worse than
+the WFI it is meant to beat.
+
+Why here and not in the DT. The DT describes the states correctly: the vendor
+BL31 v2.5 entered both with these exact parameters on this board (boot of 2026-07-21), and the vendor's own DT carries them
+byte-identical. What changed is the firmware, and the firmware says so at
+boot. Dropping cpu-idle-states from `arm64-dts-a733-psci-idle-states` would (1) take the DT out of step
+with the hardware and put it back in step only by a second DT edit once the
+firmware learns CPU_SUSPEND, and (2) stop cpuidle-psci from probing at all
+(dt_init_idle_driver() returns 0 -> -ENODEV), which also removes the
+cpuidle_cooling_register() call at cpuidle-psci.c:412 -- the only thing that
+registers `arm64-dts-a733-idle-injection-cooling`'s six idle-cpuN cooling devices, proven on hardware. Unsetting
+psci_ops.cpu_suspend in psci.c would do the same via cpuidle-psci.c:324.
+Marking the states unusable keeps both the driver and the cooling devices.
+
+Why UNUSABLE and not OFF. CPUIDLE_FLAG_OFF sets the user bit, and a write
+of 0 to .../disable would put the spin back. UNUSABLE sets the driver bit
+(cpuidle.c:650-651): the firmware said no, sysfs cannot overrule it.
+default_status reads "enabled" and disable reads 0 for these states; what
+tells the reader is the boot log (two lines below) and rejected = 0.
+
+No vendor code. Nothing A733-specific either: any PSCI >= 1.0 firmware that
+reports NOT_SUPPORTED gets the same treatment, and firmware before 1.0 has no
+PSCI_FEATURES, so it is assumed to support CPU_SUSPEND as before.
+
+Expected on silicon, open TF-A:
+  psci: CPU_SUSPEND not supported by firmware
+  CPUidle PSCI: firmware refuses CPU_SUSPEND, 1 DT idle state(s) unusable
+  /sys/devices/system/cpu/cpu*/cpuidle/state1/{usage,rejected} = 0
+(The count is drv->state_count - 1, read at run time. It printed 2 while
+`arm64-dts-a733-psci-idle-states` declared cluster-sleep-0 as well; `arm64-dts-a733-psci-idle-states` v2 declares only
+cpu-sleep-0.)
+  and WFI `time` close to wall-clock time on an idle board;
+  /sys/class/thermal/cooling_device*/type still lists idle-cpu2..idle-cpu7.
+Falsifier: rejected climbing on state1 with this patch in; or the first
+line missing while /sys/kernel/debug/psci prints
+"PSCI_FEATURES(CPU_SUSPEND) error (-1)" (then the probe path is wrong); or
+idle-cpuN cooling devices gone. Under a BL31 that offers CPU_SUSPEND (the
+vendor v2.5) neither line may appear and the states must be entered as they were
+under the vendor BL31 on 2026-07-21 -- anything else means this patch hides a working state.
+
+How to get deep idle back once the firmware limitation is fixed: nothing to revert. A TF-A that
+implements pwr_domain_suspend + validate_power_state sets the cap,
+PSCI_FEATURES answers with the format flags, psci_cpu_suspend_supported()
+returns true and the states are usable with the DT unchanged. The two log
+lines disappearing is the signal. This patch can stay; it only acts on a
+firmware that refuses.
+
+For a comparison build without it: A7S_SKIP_PATCHES=cpuidle-psci-keep-states-unusable-when-firmware-refuses-cpu-suspend
+
+Assisted-by: Claude
+---
+--- a/drivers/firmware/psci/psci.c
++++ b/drivers/firmware/psci/psci.c
+@@ -77,6 +77,7 @@
+ 				PSCI_1_0_EXT_POWER_STATE_TYPE_MASK)
+ 
+ static u32 psci_cpu_suspend_feature;
++static bool psci_cpu_suspend_refused;
+ static bool psci_system_reset2_supported;
+ static bool psci_system_off2_hibernate_supported;
+ 
+@@ -91,6 +92,16 @@
+ 	return psci_cpu_suspend_feature & PSCI_1_0_OS_INITIATED;
+ }
+ 
++/*
++ * False only when the firmware has said so: PSCI_FEATURES(CPU_SUSPEND)
++ * answered NOT_SUPPORTED. Before PSCI 1.0 there is no PSCI_FEATURES to ask,
++ * and CPU_SUSPEND is assumed, as it always has been.
++ */
++bool psci_cpu_suspend_supported(void)
++{
++	return !psci_cpu_suspend_refused;
++}
++
+ static inline bool psci_power_state_loses_context(u32 state)
+ {
+ 	const u32 mask = psci_has_ext_power_state() ?
+@@ -586,8 +597,12 @@
+ {
+ 	int feature = psci_features(PSCI_FN_NATIVE(0_2, CPU_SUSPEND));
+ 
+-	if (feature != PSCI_RET_NOT_SUPPORTED)
++	if (feature != PSCI_RET_NOT_SUPPORTED) {
+ 		psci_cpu_suspend_feature = feature;
++	} else {
++		psci_cpu_suspend_refused = true;
++		pr_info("CPU_SUSPEND not supported by firmware\n");
++	}
+ }
+ 
+ /*
+--- a/include/linux/psci.h
++++ b/include/linux/psci.h
+@@ -20,6 +20,7 @@
+ bool psci_power_state_is_valid(u32 state);
+ int psci_set_osi_mode(bool enable);
+ bool psci_has_osi_support(void);
++bool psci_cpu_suspend_supported(void);
+ 
+ struct psci_operations {
+ 	u32 (*get_version)(void);
+--- a/drivers/cpuidle/cpuidle-psci.c
++++ b/drivers/cpuidle/cpuidle-psci.c
+@@ -409,6 +409,23 @@
+ 		return ret;
+ 	}
+ 
++	/*
++	 * The DT describes the states, the firmware decides whether they can be
++	 * entered. If it answered PSCI_FEATURES(CPU_SUSPEND) with NOT_SUPPORTED,
++	 * every entry would be one SMC round trip that returns an error, and the
++	 * idle loop would re-select the same state at once: nothing in cpuidle
++	 * learns from a rejection. Keep the driver -- WFI and the cooling device
++	 * registered below still need it -- and make the PSCI states unusable.
++	 */
++	if (!psci_cpu_suspend_supported()) {
++		int i;
++
++		for (i = 1; i < drv->state_count; i++)
++			drv->states[i].flags |= CPUIDLE_FLAG_UNUSABLE;
++		pr_warn_once("firmware refuses CPU_SUSPEND, %d DT idle state(s) unusable\n",
++			     drv->state_count - 1);
++	}
++
+ 	ret = cpuidle_register(drv, NULL);
+ 	if (ret)
+ 		goto deinit;

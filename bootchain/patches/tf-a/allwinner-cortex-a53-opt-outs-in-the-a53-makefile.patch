@@ -1,0 +1,76 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Sat, 3 Oct 2026 18:01:20 +0200
+Subject: [PATCH] build(allwinner): keep the Cortex-A53 opt-outs in
+ allwinner-common-a53.mk
+
+d86ddcef6 ("build(allwinner): disable unneeded CVE workarounds and MPAM")
+turns SPE, SVE, MPAM and five CPU CVE workarounds off in
+allwinner-common.mk, so for every Allwinner SoC. Its reasoning holds for
+the Cortex-A53 of all SoCs supported so far: none of those CVEs affects
+it, and it implements none of those features. It does not hold for a
+SoC with Cortex-A76 cores, which are affected by CVE-2018-3639 and
+CVE-2022-23960 (lib/cpus/aarch64/cortex_a76.S implements both) and
+implement SPE.
+
+allwinner-common-a53.mk (2deac7aad) holds the Cortex-A53 specific
+settings and is included by every Cortex-A53 platform right after
+allwinner-common.mk, so move the block there. The Cortex-A53 platforms
+build what they built before (same config.h, same code). A platform
+that does not include allwinner-common-a53.mk keeps the TF-A defaults,
+without an override that depends on where it sits relative to the
+include.
+
+Making them `?=` in allwinner-common.mk would not work:
+make_helpers/defaults.mk and lib/cpus/cpu-ops.mk set all eight before
+the platform makefile is read, so every Allwinner SoC would end up on
+the defaults.
+
+Assisted-by: Claude
+---
+ plat/allwinner/common/allwinner-common-a53.mk | 12 ++++++++++++
+ plat/allwinner/common/allwinner-common.mk     | 11 -----------
+ 2 files changed, 12 insertions(+), 11 deletions(-)
+
+diff --git a/plat/allwinner/common/allwinner-common-a53.mk b/plat/allwinner/common/allwinner-common-a53.mk
+index 6921762c2..e1d224e27 100644
+--- a/plat/allwinner/common/allwinner-common-a53.mk
++++ b/plat/allwinner/common/allwinner-common-a53.mk
+@@ -18,3 +18,15 @@ ERRATA_A53_1530924		:=	1
+ 
+ # This platform is single-cluster and does not require coherency setup.
+ WARMBOOT_ENABLE_DCACHE_EARLY	:=	1
++
++# Disable SPE, SVE and MPAM, since the Cortex-A53 does not implement them.
++ENABLE_SPE_FOR_NS		:=	0
++ENABLE_SVE_FOR_NS		:=	0
++ENABLE_FEAT_MPAM		:=	0
++
++# None of these CVEs affects the Cortex-A53.
++WORKAROUND_CVE_2017_5715	:=	0
++WORKAROUND_CVE_2018_3639	:=	0
++WORKAROUND_CVE_2022_23960	:=	0
++WORKAROUND_CVE_2024_7881	:=	0
++WORKAROUND_CVE_2024_5660	:=	0
+diff --git a/plat/allwinner/common/allwinner-common.mk b/plat/allwinner/common/allwinner-common.mk
+index 18c19791c..885fe245d 100644
+--- a/plat/allwinner/common/allwinner-common.mk
++++ b/plat/allwinner/common/allwinner-common.mk
+@@ -95,17 +95,6 @@ endif
+ # The bootloader is guaranteed to only run on CPU 0 by the boot ROM.
+ COLD_BOOT_SINGLE_CPU		:=	1
+ 
+-# Disable SPE, SVE and MPAM, since they are not supported on Allwinner CPUs.
+-ENABLE_SPE_FOR_NS		:=	0
+-ENABLE_SVE_FOR_NS		:=	0
+-ENABLE_FEAT_MPAM		:=	0
+-
+-WORKAROUND_CVE_2017_5715	:=	0
+-WORKAROUND_CVE_2018_3639	:=	0
+-WORKAROUND_CVE_2022_23960	:=	0
+-WORKAROUND_CVE_2024_7881	:=	0
+-WORKAROUND_CVE_2024_5660	:=	0
+-
+ # The traditional U-Boot load address is 160MB into DRAM.
+ PRELOADED_BL33_BASE		?=	0x4a000000
+ 

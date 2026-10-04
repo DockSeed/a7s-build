@@ -1,0 +1,219 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] mmc: sunxi: report and fail an IDMAC bus error instead of dropping it
+
+What. Turn on the two IDMAC error interrupts for every data request, both
+directions, and handle them in the IRQ path:
+- sunxi_mmc_start_dma() writes SMHC_IDIE = FERR_INT_ENB | DES_UNAVL_INT_ENB
+  (| RX_INT_ENB on a read) right after the SDXC_IDMAC_SOFT_RESET, where the
+  RX enable was written before. finalize still zeroes SMHC_IDIE.
+- sunxi_mmc_irq(): on SMHC_IDST bit 2 or 4 with a data request open, one
+  dev_err with SMHC_IDST raw and decoded (fatal-bus-error, desc-unavailable,
+  card-error-sum, DMAC_ERR_STA[12:10]) and int_sum, then the request goes
+  down the existing error path at once: data->error = -EIO (cmd->error stays
+  -ETIMEDOUT like every other error here), the manual stop where
+  sunxi_mmc_needs_manual_stop() asks for one, the data engine released,
+  the core's block recovery takes over.
+- Clearing is unchanged and is what the UM asks for: the handler already
+  writes the SMHC_IDST value it read back (all used bits are R/W1C, AIS
+  bit 9 has to be cleared whenever a bit that sets it is cleared -- it is
+  in the same word), and release_data_engine()
+  writes 0x337, the UM's own clear value (11.3.6.2 step 5).
+The completion path is untouched: no new bit is looked at unless bit 2 or 4
+is set, and neither is set on any IRQ logged so far (below).
+
+Why. Before this, SMHC_IDIE held RX_INT_ENB on reads and nothing on
+writes. A fatal bus error stops the IDMAC (it halts all bus
+access, 11.3.8.27) and has no bit in SMHC_RINTSTS, so a read waits for an
+RX_INT that cannot come, and a write for the end of a data phase whose
+source has stopped (not measured which RINTSTS error, if any, follows) --
+with no line in the log. If any other interrupt arrived meanwhile, the
+handler wrote bit 2 back with the rest and cleared it unseen.
+
+Register facts, A733 UM V1.00, ch. 11.3:
+- SMHC_DMAC 0x0080 (11.3.8.25): bit 0 IDMAC_RST resets the DMA controller's
+  own registers and clears itself. Which registers that covers is not stated;
+  SMHC_IDIE is written after it on every request, so it does not matter.
+- SMHC_IDST 0x0088 (11.3.8.27): bit 2 FATAL_BERR_INT R/W1C, bit 4
+  DES_UNAVL_INT R/W1C (descriptor OWN bit 0, DES0[31] = 0), bit 5 ERR_FLAG_SUM
+  R/W1C, bit 9 AIS = OR of 2/4/5 R/W1C, bits 12:10 DMAC_ERR_STA R, valid
+  only while the fatal bus error bit is set, 001 host abort during transmission,
+  010 during reception, others reserved.
+- SMHC_IDIE 0x008C (11.3.8.28): bit 2 FERR_INT_ENB, bit 4
+  DES_UNAVL_INT_ENB, bit 5 ERR_SUM_INT_ENB, bits 31:6 reserved.
+- Silicon, the 8 GiB board, 2026-09-23 (SMHC0 read back on the board):
+  SMHC0 IDIE reads 0x00000002 during a read, 0 between
+  requests; IDST reads 0x0000A000 -- bits 15 and 13 are set although the UM
+  marks 31:13 reserved, DMAC_ERR_STA 0. Nothing new is inferred from them.
+- Logged IRQs so far (dyndbg "irq: ... idi", across three
+  board logs): 861 x idi 00000002 and 228 x 00000000 --
+  bit 4 never seen at the end of a normal descriptor chain.
+
+Decisions.
+- ERR_SUM_INT_ENB (bit 5) is NOT enabled. By the UM it is the OR of RINTSTS
+  EBE/RTO/RCRC/SBE/DRTO/DCRC/RE (all also reported in RINTSTS), and this driver
+  already unmasks and fails on those in SMHC_INTMASK. Enabling it adds no
+  event, and treating it as an IDMAC failure would log a line per CRC error
+  in the sample-delay sweep (`mmc-sunxi-tune-the-sample-delay-instead-of-running-it-at-zero`), which produces them by design. It is
+  still decoded in the line when it happens to be set.
+- There is no AIS enable. IDIE bits 2 and 4 are described as working only together
+  with the Abnormal Interrupt Summary Enable, but the A733 IDIE marks
+  everything above bit 5 reserved (the DesignWare IDINTEN this block
+  resembles has NI/AI enables at bits 8/9). Reserved bits are not written.
+  Whether bits 2/4 raise the IRQ line on their own is therefore the first
+  thing the board has to show (below).
+- Upstream names bit 4 SDXC_IDMAC_DESTINATION_INVALID (UM: DES_UNAVL_INT)
+  and defines SDXC_IDMAC_HOST_ABORT_INTERRUPT as BIT(10), which on the A733
+  is the low bit of the 3-bit DMAC_ERR_STA field. Neither is renamed here;
+  the new SDXC_IDMAC_ERR_STA is the field as the UM defines it.
+
+What the vendor does (allwinner-bsp drivers/mmc/sunxi-mmc.c). The same gap:
+SMHC_IDIE = RECEIVE_INTERRUPT on reads only (sunxi-mmc.c:955-956), the IRQ
+tests RX_INT alone and writes SMHC_IDST back (1286, 1322, 1346). It defines
+FATAL_BUS_ERROR, DESTINATION_INVALID, CARD_ERROR_SUM and ABNORMAL_INTERRUPT_
+SUM (sunxi-mmc.h:262-266) and uses none of them. What catches the hang
+there is a periodic software timer (sunxi_timerout_handle, sunxi-mmc.c:270)
+that dumps registers after SUNXI_TRANS_TIMEOUT -- a timeout that names no
+cause. Nothing taken from it; this names the cause and fails the request
+when it happens.
+
+Verified: applies with --fuzz=0 in the full series on a fresh unpack;
+drivers/mmc/host/sunxi-mmc.o builds at W=1 with 0 warnings (native arm64,
+configs/a733_defconfig); checkpatch clean. Not on hardware.
+
+Proof wanted (the 8 GiB board, a test kernel with its own version label, SD and eMMC):
+1. Enables land: busybox devmem of SMHC_IDIE (0x0402008C SD, 0x0402208C
+   eMMC) under a sustained read reads 0x00000016, under a sustained write
+   0x00000014 (bit 2|4 held; 0x2/0x0 means they did not latch).
+2. Normal path unchanged: zero "idmac error" lines over boot, a 256 MiB
+   pattern write + verify on both media, sequential and 4k throughput
+   within the spread of the default kernel.
+3. The error path fires: a test-only kernel (not part of the series) that,
+   on a debugfs trigger, clears DES0 OWN on the first descriptor of the next
+   read must print "idmac error ... desc-unavailable", fail that request
+   with -EIO, and the core's retry must complete it (read returns the right
+   data, no hang). A fatal bus error has no safe stimulus we know of and
+   stays unprovoked; its line is the same code path.
+Falsifier: an "idmac error" line on a normal transfer (DU at the end of a
+chain -> the DU enable is wrong here), IDIE reading back without bits 2/4,
+or the step-3 stimulus hanging without a line (bits 2/4 do not raise the
+IRQ without an AIS enable this IDIE does not have).
+
+Assisted-by: Claude
+---
+--- a/drivers/mmc/host/sunxi-mmc.c
++++ b/drivers/mmc/host/sunxi-mmc.c
+@@ -9,6 +9,7 @@
+  * (C) Copyright 2017 Sootech SA
+  */
+ 
++#include <linux/bitfield.h>
+ #include <linux/clk.h>
+ #include <linux/clk/sunxi-ng.h>
+ #include <linux/delay.h>
+@@ -340,6 +341,18 @@
+ #define SDXC_IDMAC_READ				(6 << 13)
+ #define SDXC_IDMAC_WRITE			(7 << 13)
+ #define SDXC_IDMAC_DESC_CLOSE			(8 << 13)
++/*
++ * The two IDMAC failures SMHC_RINTSTS cannot report, A733 UM 11.3.8.27/28:
++ * SMHC_IDST bit 2 FATAL_BERR_INT (the IDMAC halts all bus access)
++ * and bit 4 DES_UNAVL_INT (a descriptor with OWN = 0), enabled by SMHC_IDIE
++ * bits 2 FERR_INT_ENB and 4 DES_UNAVL_INT_ENB. Both R/W1C. Bit 5, the card
++ * error summary, is left out: it is the OR of RINTSTS errors this driver
++ * already unmasks and fails on.
++ */
++#define SDXC_IDMAC_ERROR_INT	(SDXC_IDMAC_FATAL_BUS_ERROR | \
++				 SDXC_IDMAC_DESTINATION_INVALID)
++/* SMHC_IDST[12:10] DMAC_ERR_STA, valid only with bit 2 set (11.3.8.27) */
++#define SDXC_IDMAC_ERR_STA	GENMASK(12, 10)
+ 
+ /*
+ * If the idma-des-size-bits of property is ie 13, bufsize bits are:
+@@ -480,6 +493,7 @@
+ 	dma_addr_t	sg_dma;
+ 	void		*sg_cpu;
+ 	bool		wait_dma;
++	u32		idma_err;	/* SMHC_IDST of an IDMAC failure */
+ 
+ 	struct mmc_request *mrq;
+ 	struct mmc_request *manual_stop_mrq;
+@@ -743,8 +757,15 @@
+ 
+ 	mmc_writel(host, REG_DMAC, SDXC_IDMAC_SOFT_RESET);
+ 
++	/*
++	 * Written after the soft reset on every request: the UM does not say
++	 * which "internal registers" IDMAC_RST clears, and finalize zeroes
++	 * SMHC_IDIE anyway. The error enables go on for both directions.
++	 */
++	rval = SDXC_IDMAC_ERROR_INT;
+ 	if (!(data->flags & MMC_DATA_WRITE))
+-		mmc_writel(host, REG_IDIE, SDXC_IDMAC_RECEIVE_INTERRUPT);
++		rval |= SDXC_IDMAC_RECEIVE_INTERRUPT;
++	mmc_writel(host, REG_IDIE, rval);
+ 
+ 	mmc_writel(host, REG_DMAC,
+ 		   SDXC_IDMAC_FIX_BURST | SDXC_IDMAC_IDMA_ON);
+@@ -1081,12 +1102,13 @@
+ 	mmc_writel(host, REG_IMASK, host->sdio_imask);
+ 	mmc_writel(host, REG_IDIE, 0);
+ 
+-	if (host->int_sum & sunxi_mmc_error_bits(host, mrq)) {
++	if ((host->int_sum & sunxi_mmc_error_bits(host, mrq)) ||
++	    host->idma_err) {
+ 		sunxi_mmc_dump_errinfo(host);
+ 		mrq->cmd->error = -ETIMEDOUT;
+ 
+ 		if (data) {
+-			data->error = -ETIMEDOUT;
++			data->error = host->idma_err ? -EIO : -ETIMEDOUT;
+ 			if (sunxi_mmc_needs_manual_stop(mrq))
+ 				host->manual_stop_mrq = mrq;
+ 		}
+@@ -1141,6 +1163,7 @@
+ 
+ 	host->mrq = NULL;
+ 	host->int_sum = 0;
++	host->idma_err = 0;
+ 	host->wait_dma = false;
+ 
+ 	return host->manual_stop_mrq ? IRQ_WAKE_THREAD : IRQ_HANDLED;
+@@ -1436,13 +1459,37 @@
+ 
+ 		host->int_sum |= msk_int;
+ 
++		/*
++		 * The IDMAC stopped on a bus error or an unowned descriptor.
++		 * Neither reaches SMHC_RINTSTS, so without this the data never
++		 * completes and nothing says why. Fail the data through the
++		 * error path below; the status is cleared with the rest.
++		 */
++		if (mrq->data && (idma_int & SDXC_IDMAC_ERROR_INT) &&
++		    !host->idma_err) {
++			host->idma_err = idma_int;
++			dev_err(mmc_dev(host->mmc),
++				"cmd %d %s: idmac error, IDST %08x:%s%s%s DMAC_ERR_STA %lu, int_sum %08x\n",
++				mrq->cmd->opcode,
++				mrq->data->flags & MMC_DATA_WRITE ? "WR" : "RD",
++				idma_int,
++				idma_int & SDXC_IDMAC_FATAL_BUS_ERROR ?
++					" fatal-bus-error" : "",
++				idma_int & SDXC_IDMAC_DESTINATION_INVALID ?
++					" desc-unavailable" : "",
++				idma_int & SDXC_IDMAC_CARD_ERROR_SUM ?
++					" card-error-sum" : "",
++				FIELD_GET(SDXC_IDMAC_ERR_STA, idma_int),
++				host->int_sum);
++		}
++
+ 		/* Wait for COMMAND_DONE on RESPONSE_TIMEOUT before finalize */
+ 		if ((host->int_sum & SDXC_RESP_TIMEOUT) &&
+ 				!(host->int_sum & SDXC_COMMAND_DONE))
+ 			mmc_writel(host, REG_IMASK,
+ 				   host->sdio_imask | SDXC_COMMAND_DONE);
+ 		/* Don't wait for dma on error */
+-		else if (host->int_sum & err_bits)
++		else if ((host->int_sum & err_bits) || host->idma_err)
+ 			finalize = true;
+ 		else if (host->busy_wait) {
+ 			/*

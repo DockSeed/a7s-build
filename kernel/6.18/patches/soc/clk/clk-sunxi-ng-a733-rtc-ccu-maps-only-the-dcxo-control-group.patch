@@ -1,0 +1,108 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] clk: sunxi-ng: a733: rtc-ccu maps only the DCXO control group
+
+The RTC-CCU node claims the whole RTC block, 0x07090000 + 0x400, and its
+driver requests that window (devm_platform_ioremap_resource). The RTC
+timekeeper that `arm64-dts-a733-add-the-rtc-timekeeper` adds lives in the same block, below it, and rtc-sun6i
+requests its window the same way. Two requests over one range: whichever
+probes second fails with -EBUSY. So the block is split, and this patch is the
+half that moves the clock provider out of the way.
+
+== The split, from the A733 UM V1.00 9.1.6 register list
+
+  0x000-0x050  LOSC_CTRL ... ALARM0_CONFIG_REG   time counter + alarm 0
+  0x060        CLK32K_FOUT_CTRL_GATING_REG
+  0x100-0x11c  GP_DATA_REG0-7
+  0x15c        XO_CTRL_WP_REG                     \
+  0x160        XO_CTRL0_REG (DCXO_ST [15:14])      | DCXO control group
+  0x164        CALI_CTRL_REG                       | = this provider
+  0x16c        XO_CTRL1_REG (SERDES gates [5:4])  /
+  0x190 ...    VDD_RTC_REG, IC_CHARA_REG, ... RTC_SPI_CLK_CTRL_REG 0x310
+
+This driver reads XO_CTRL0 (the DCXO strap, CLK_RTC_DCXO, `clk-sunxi-ng-a733-rtc-ccu-add-dcxo`) and gates
+two bits of XO_CTRL1 (`clk-sunxi-ng-a733-add-minimal-rtc-ccu`). Nothing else. Its window becomes 0x0709015c +
+0x14, the four registers from XO_CTRL_WP_REG to XO_CTRL1_REG: XO_CTRL_WP is
+the key register for XO_CTRL0 (9.1.7.15), so it stays with the register it
+unlocks even though nothing writes it today. The two offsets move with the
+base: XO_CTRL0 0x160 -> 0x004, XO_CTRL1 0x16c -> 0x010. The DT node and the
+driver change in this one patch; either half alone reads the wrong register.
+
+Why that matters beyond USB: XO_CTRL0[15:14] decides CLK_RTC_DCXO, and the
+three CPU PLLs count in it. A read of the wrong word would decode some other
+field as the strap, and every CPU OPP would be programmed on a wrong
+reference -- 24/26 is 7.7 % (`clk-sunxi-ng-a733-rtc-ccu-add-dcxo`).
+
+== What the vendor does
+
+The BSP's ccu-sun60iw2-rtc.c keeps the whole 0x400 window and maps it with
+plain devm_ioremap(), with the comment "Don't use devm_ioremap_resource()
+here! Or else the RTC driver will not able to get the same resource later in
+rtc-sunxi.c." -- two drivers share one range and the resource tree records
+neither. The vendor DT then puts rtc_ccu@7090000 (0x400) and rtc@7090000
+(0x320) on overlapping ranges. We split the range instead, so /proc/iomem
+names the owner of every register and a third claimant fails loudly.
+
+== A523, rejected
+
+sun55i-a523.dtsi has one rtc@7090000 node, reg 0x400, whose rtc-sun6i driver
+also provides the clocks through ccu-sun6i-rtc. We do not take that shape
+here: our DCXO/SERDES provider is our own driver with its own binding ids,
+consumed by the CPU-CCU, both watchdogs and COMB0/COMB1. Moving those
+consumers is not part of adding a timekeeper.
+
+== Number
+
+== Verification
+
+Applies at fuzz 0 on the full series; compile-check and the board dtb build.
+Not on silicon. What proves it, on a board with this kernel:
+  /proc/iomem           0709015c-0709016f : clock-controller@709015c
+  clk_summary           dcxo 26000000 (the strap: XO_CTRL0 reads 0x983FB0F7 on
+                        both boards), dcxo-serdes0/1 at r-ahb rate
+  USB3 on COMB0         links as before (LINK_STUS0 0x111), and cpufreq
+                        reports the same OPP set as the kernel before it.
+Falsifier: dcxo reads anything but 26000000, or combophy0 fails to probe.
+
+Assisted-by: Claude
+---
+--- a/drivers/clk/sunxi-ng/ccu-sun60i-a733-rtc.c
++++ b/drivers/clk/sunxi-ng/ccu-sun60i-a733-rtc.c
+@@ -26,9 +26,17 @@
+ 
+ #include <dt-bindings/clock/sun60i-a733-rtc-ccu.h>
+ 
+-#define SUN60I_A733_RTC_XO_CTRL0_REG	0x160
++/*
++ * This provider maps only the DCXO control group of the RTC block, the four
++ * registers from XO_CTRL_WP_REG (RTC 0x15c) to XO_CTRL1_REG (RTC 0x16c) in the
++ * A733 UM 9.1.6 register list, so the offsets below are relative to RTC 0x15c.
++ * The RTC time counter, alarm and general-purpose registers below 0x15c belong
++ * to the rtc-sun6i node, which requests its own window; two nodes cannot both
++ * request the whole block.
++ */
++#define SUN60I_A733_RTC_XO_CTRL0_REG	0x004	/* RTC 0x160 */
+ #define SUN60I_A733_RTC_DCXO_ST		GENMASK(15, 14)
+-#define SUN60I_A733_RTC_XO_CTRL1_REG	0x16c
++#define SUN60I_A733_RTC_XO_CTRL1_REG	0x010	/* RTC 0x16c */
+ 
+ /*
+  * The DCXO is the SoC's high-frequency reference oscillator. Which crystal the
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -3072,10 +3072,14 @@
+ 		 * RTC-CCU (PRCM @0x07090000, AON domain). Provides the two SERDES
+ 		 * DCXO gates (XO_CTRL1 @0x16c bit4/5); the COMB0 combo-PHY consumes
+ 		 * dcxo-serdes0. Parent = r-ahb (from the R-CCU). Driver = patch `clk-sunxi-ng-a733-add-minimal-rtc-ccu`.
++		 *
++		 * The window is the DCXO control group only, XO_CTRL_WP_REG 0x15c
++		 * to XO_CTRL1_REG 0x16c (UM 9.1.6), so the rtc node below 0x15c can
++		 * request its own. The driver's offsets are relative to 0x15c (`clk-sunxi-ng-a733-rtc-ccu-maps-only-the-dcxo-control-group`).
+ 		 */
+-		rtc_ccu: clock-controller@7090000 {
++		rtc_ccu: clock-controller@709015c {
+ 			compatible = "allwinner,sun60i-a733-rtc-ccu";
+-			reg = <0x0 0x07090000 0x0 0x400>;
++			reg = <0x0 0x0709015c 0x0 0x14>;
+ 			clocks = <&r_ccu CLK_R_AHB>;
+ 			clock-names = "r-ahb";
+ 			#clock-cells = <1>;

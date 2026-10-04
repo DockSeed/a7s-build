@@ -1,0 +1,440 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] mmc: sunxi: tune the sample delay instead of running it at zero
+
+HS200 on this controller has never been tuned. It runs on the sample delay
+sunxi_mmc_calibrate() writes -- SAMP_DL_SW_EN with a delay of 0 -- and that
+value was never chosen: it is the absence of a choice, the same defect `mmc-sunxi-a733-hs400-data-strobe-delay-value` and `mmc-sunxi-tune-the-hs400-data-strobe-delay`
+found one mode over on the HS400 data strobe.
+
+THE TWO HALVES OF WHY IT WAS INVISIBLE (read in 6.18.36, this series applied)
+-----------------------------------------------------------------------------
+- drivers/mmc/core/core.c, mmc_execute_tuning():
+
+      if (!host->ops->execute_tuning)
+              return 0;
+
+  We register no ->execute_tuning, so the function the core calls to tune HS200
+  succeeds without sending a single tuning block. mmc_hs200_tuning() returns its
+  0, mmc_init_card() carries on, and nothing above the driver can tell a tuned
+  bus from an untuned one.
+- drivers/mmc/host/sunxi-mmc.c, sunxi_mmc_calibrate(): writes SDXC_CAL_DL_SW_EN
+  and nothing else, i.e. the software delay line is enabled at value 0.
+
+WHAT THE UM SAYS ABOUT THE KNOB
+-------------------------------
+a733-um-v0.92, 11.3.8.37, offset 0x0144, SMHC_SAMP_DL, default 0x0000_2000:
+
+  [13:8] SAMP_DL   R    0x20   (listed without a name in the bit table; the
+                                UM's own text for SAMP_DL_SW refers to the
+                                value of SAMP_DL)
+  [7]    SAMP_DL_SW_EN  R/W  0x0  enables the delay set in SAMP_DL_SW
+  [5:0]  SAMP_DL_SW     R/W  0x0  software sample delay: the command and
+                                data lines relative to the clock; the UM
+                                says it is chosen from SAMP_DL, the card
+                                clock period and the device's input timing
+                                requirement
+
+So: a 6-bit software delay, a software enable, and no documented hardware
+calibration engine. The UM saying the value depends on the card clock and
+the device's input timing means it is a measurement, not a constant.
+It was also observed on silicon that [13:8] carries runtime state and must
+never be written.
+
+WHAT THIS DOES
+--------------
+Registers ->execute_tuning and sweeps SAMP_DL_SW 0..63, scoring each candidate
+with mmc_send_tuning(), which sends the tuning command (CMD21 for an eMMC,
+CMD19 for an SD card -- mmc_execute_tuning() picks the opcode) and compares the
+returned block against the JEDEC tuning pattern. A delay passes only when every
+bit came back right. The midpoint of the widest passing run is programmed, in
+the same shape as the HS400 strobe sweep `mmc-sunxi-tune-the-hs400-data-strobe-delay` added, and for the same reason:
+the midpoint has a known distance to both edges, the first passing value does
+not.
+
+Three details that are decisions, not style:
+
+- The window search does not wrap. The delay line is a chain, not a phase ring;
+  63 does not border on 0.
+- The chosen value is re-tested once after it is programmed. The sweep proves a
+  value passed while the sweep was running; the confirmation proves the value
+  the bus is actually left on passes.
+- A sweep that finds nothing does not fail the card. An error here reaches
+  mmc_init_card() through mmc_hs200_tuning() and aborts the entire init
+  ("err = mmc_hs200_tuning(card); if (!err) err = mmc_select_hs400(card); ...
+  if (err) goto free_card"). Failing would therefore be a regression against the
+  untuned driver, which reaches HS200 on delay 0 today. It keeps delay 0, logs
+  at dev_err, and returns 0.
+
+sunxi_mmc_calibrate() now takes the ios and reprograms the tuned value. Without
+that the tuned delay would live until the next set_ios: that path runs on every
+clock change and again from sunxi_mmc_runtime_resume(), which calls
+sunxi_mmc_set_clk() unconditionally. host->samp_dl is 0 until a sweep sets it,
+so every controller and every mode that does not tune writes exactly the byte it
+wrote before.
+
+WHICH TIMINGS GET THE TUNED VALUE
+----------------------------------------------
+Two, and no others:
+
+- the timing the sweep ran at (HS200 on an eMMC, SDR104 on an SD card);
+- HS400, when the sweep ran in HS200 and ios->clock is the clock it ran at.
+
+Every other set_ios writes SAMP_DL_SW_EN | 0, the byte it wrote before. That
+covers the steps mmc_select_hs400() passes through on the way up -- HS, first at
+the HS200 clock and then at hs_max_dtr (drivers/mmc/core/mmc.c:1212-1216), and
+HS400 at that lower clock (mmc.c:1250) until mmc_set_bus_speed() raises it
+(mmc.c:1251) -- and, on the way down, mmc_hs400_to_hs200() lowering the HS400
+clock to hs_max_dtr and passing DDR52 and HS (mmc.c:1290, 1303, 1316). Each of
+them is a set_ios and reaches sunxi_mmc_calibrate(). A gate on the timing alone
+also wrote 0 at the final HS400 set_ios, so the HS200 result never reached the
+mode it was measured for.
+
+Why HS400 gets the HS200 value, line by line against 6.18.36 and the UM:
+
+1. The mmc core never tunes in HS400; it tunes in HS200 for HS400.
+   mmc_init_card() runs mmc_hs200_tuning() and only then mmc_select_hs400()
+   (mmc.c:1836-1841), and mmc_hs200_tuning() first prepares "the HS400 target
+   operation frequency for tuning process" (mmc.c:1601-1608). A retune from
+   HS400 goes down to HS200, tunes there and switches back up (mmc_retune(),
+   drivers/mmc/core/host.c:193-206). So the HS200 result is the only measured
+   sample delay an HS400 bus can ever have; the alternative is the unmeasured 0.
+   Mainline hosts do the same: sdhci-msm restores its HS200 tuning phase for
+   HS400 because "Retuning in HS400 (DDR mode) will fail"
+   (drivers/mmc/host/sdhci-msm.c:924-933).
+2. HS200 and HS400 run the same card clock. mmc_set_bus_speed() gives both
+   ext_csd.hs200_max_dtr (mmc.c:1006-1008), and this driver halves the module
+   clock on its way to the card in both (the div = 2 branch of
+   sunxi_mmc_clk_set_rate(), `mmc-sunxi-hs400-module-clock-at-twice-the-card-clock` and `mmc-sunxi-hs200-module-clock-the-open-question-made-measurable`). Silicon agrees: SMHC2_CLK reads
+   0x81000001, a 400 MHz module clock, in HS400 (the 8 GiB board, 2026-07-25,
+   where the strobe window
+   halving from 44 to 21 steps confirms the doubled card clock) and in HS200
+   (the 8 GiB board, 2026-09-19).
+   A delay measured at one card clock is still not a value for another; the
+   ios->clock test is what holds the code to that, not this paragraph.
+3. The line is still in use in HS400. UM 11.3.8.37 describes SAMP_DL_SW as the
+   delay of the command and data lines relative to the clock, with no
+   mode excepted. In HS400 the card's strobe takes over the read data (UM
+   11.3.5.2, note to Figure 11-7: start bits count at either strobe level,
+   end bits only at the high level) -- through its
+   own delay, SMHC_DS_DL (11.3.8.38), which `mmc-sunxi-tune-the-hs400-data-strobe-delay` sweeps. It does not take over
+   the command response: the one place the UM samples a response on the strobe
+   is SMHC_CQE_CTRL[8] DS_SAMP_RESP_EN, meant for CQE operation in HS400
+   enhanced-strobe mode (11.3.8.41), and this driver sets that bit only in
+   enhanced-strobe mode. In plain HS400 every command response is sampled
+   against the clock through SAMP_DL_SW -- the line CMD21 measured in HS200.
+
+One consequence is intended: on a plain-HS400 card, `mmc-sunxi-tune-the-hs400-data-strobe-delay`'s data-strobe sweep
+(->execute_hs400_tuning, called after mmc_set_bus_speed(), mmc.c:1251-1259) now
+runs on the command sample delay the bus is left on instead of 0. Each of its
+candidates is a CMD8, and the CMD8 response is on this line.
+
+Enhanced strobe is not touched. For an hs400es card mmc_init_card() takes the
+other branch (mmc.c:1847-1852) and never calls mmc_execute_tuning(), so the
+eMMC is not swept, host->samp_dl stays 0, and HS400ES writes SW_EN | 0 as it
+did. Measured on the 8 GiB board, 2026-09-22, with `arm64-dts-a733-cubie-a7s-emmc-enhanced-strobe` applied: SMHC_SAMP_DL
+0x00000080 at timing 10, and the one tuning line in the boot log is the SD's.
+
+WHAT THE VENDOR DOES, AND WHAT THIS DOES INSTEAD
+------------------------------------------------
+The BSP driver behind SMHC2 (drivers/mmc/sunxi-mmc-v4p5x.c, the v4p6x path its
+DT binds) picks the HS400 sample delay from a per-board DT entry for the HS400
+command line and, without one, from the HS200/SDR104 entry of the same table at
+the same frequency (sunxi-mmc-v4p5x.c:364-375, 391-398). So the vendor also
+treats the HS200 value as the HS400 command value. What it carries is a table
+number, not a measurement: on the 8 GiB board its HS400 bus reads SAMP_DL 0x00000080,
+delay 0. Its optional in-kernel tuning (DT execute_tuning_in_kernel) goes the other way and
+writes the one tuned value in every timing it sets, the identification clock
+and the HS and DDR52 switch steps included (sunxi-mmc-v4p5x.c:351-352).
+
+This patch carries a value measured on the running board, and only into the
+timing it was measured in and into HS400, where the card clock and the sampled
+line are the ones it was measured on. Everything else stays on the 0 it ran on.
+
+WHY THIS SWEEP NEEDS NO STATUS DRAIN
+------------------------------------
+`mmc-sunxi-drain-the-card-status-the-hs400-sweep-dirties` had to add sunxi_mmc_drain_card_status() after the HS400 strobe sweep,
+because each failed transfer there made sunxi_mmc_handle_manual_stop() send a
+CMD12 the card could not honour, and the resulting ILLEGAL_COMMAND surfaced as
+"unexpected status 0x400900 after switch". That does not happen here.
+mmc_send_tuning() builds an mrq with data.blocks = 1 and no mrq->stop, and
+sunxi_mmc_needs_manual_stop() returns true only for SD_IO_RW_EXTENDED, for an
+mrq->stop the core attached, or for blocks > 1 -- none of which a tuning block
+is (that third test is `mmc-sunxi-no-stop-command-for-a-single-block-transfer`'s). So a failed candidate sends no stop command, the
+card records nothing, and there is nothing to drain. The failures themselves are
+dev_dbg (sunxi_mmc_dump_errinfo), so a sweep with 50 failing candidates does not
+flood the console either.
+
+SCOPE: THIS ALSO TUNES THE SD SLOT
+----------------------------------
+The ops struct is shared, so SDR104 on SMHC0 gets the same sweep with CMD19.
+That is the intended reach -- the SD has the identical untuned delay 0 and the
+identical register -- but it is the medium that carries root on the 8 GiB board under our
+kernel, so it is the risk this patch carries and the acceptance run must cover
+it. The bounded downside is the never-fail rule above: the worst case is the
+delay 0 the slot runs today, plus 64 tuning commands per tuning pass.
+
+WHERE THE VALUES COME FROM
+--------------------------
+No constant is introduced. The register, its fields and their meaning come from
+the UM register description cited above; the delay itself is measured on the board at every
+init, which is the point. The core's control flow is read in
+drivers/mmc/core/{core.c,mmc.c,host.c} of 6.18.36.
+
+VERIFIED / NOT VERIFIED
+-----------------------
+- Applies at --fuzz=0 on a freshly unpacked 6.18.36 with the whole series in
+  numeric order: yes, this revision (2026-09-22). Every later patch applies
+  unchanged.
+- Builds: drivers/mmc/host/sunxi-mmc.o, arm64, W=1, no warnings, this revision
+  (native, defconfig plus the options the driver needs). The first revision was
+  built by the automated build job.
+- Silicon, first revision (the 8 GiB board, 2026-09-19): the sweep runs on both hosts and
+  prints "sample-delay window 0..63 (64 wide), using 32". Every delay passes, so
+  at this clock the sweep does not discriminate (observable 1 below, the
+  "pointless" outcome). On the eMMC the value then did not survive the HS400
+  switch: SAMP_DL read 0x0080 on mmc2 while mmc0 (SDR104) held 0x20a0.
+- Silicon, this revision: NOT proven. The observable, on a kernel without `arm64-dts-a733-cubie-a7s-emmc-enhanced-strobe`
+  so that the eMMC runs plain HS400 and is tuned in HS200 first: while the
+  eMMC host's debugfs ios reads "timing spec: 10", SMHC_SAMP_DL (0x04022144)
+  reads SW_EN plus the delay the HS200 sweep printed -- 0x000020a0 if it picks
+  32 again, since [13:8] mirrors the applied delay.
+  0x00000080 there means the value is still dropped.
+- Still open from the first revision, on the 8 GiB board:
+  1. A window that discriminates: "tuning: sample-delay window A..B (N wide)"
+     with 0 < N < 64 on a host that reaches HS200 or SDR104. N = 64 (every
+     delay passes) means the delay line does not reach far enough to matter at
+     this clock, or the writes are not landing at all; N = 0 means the opposite.
+     Both would make this patch pointless rather than wrong, and both are
+     visible in the [passed] bitmap printed beside it.
+  2. The HS200 sequential and random numbers from the same raw-region benchmark
+     used in an earlier investigation, against the same run with A7S_SKIP_PATCHES set to this
+     patch's name. If they are equal inside the noise, the delay was not the
+     limit and this patch buys nothing.
+  What remains unproven either way: whether the tuned delay is stable across
+  temperature. The sweep runs once per init, and a retune only happens when the
+  core asks for one.
+
+ISSUE
+-----
+HS200 is half of the "correct and fast in HS400 and in HS200" target, and an
+untuned sample delay is the first thing in that path that was never set. The
+tuned value has to reach HS400, which the maintainer decided on 2026-09-22 to
+repair here rather than drop the patch.
+
+Assisted-by: Claude
+---
+--- a/drivers/mmc/host/sunxi-mmc.c
++++ b/drivers/mmc/host/sunxi-mmc.c
+@@ -452,6 +452,16 @@
+ 	u32		ds_dl;
+ 
+ 	/*
++	 * Sample-delay value (0..63) picked by ->execute_tuning, and the
++	 * ios->timing and ios->clock it was picked at. Zero / MMC_TIMING_LEGACY
++	 * / 0 until a sweep runs, which is what a controller that never tunes
++	 * keeps -- so the delay such a controller programs is unchanged by this.
++	 */
++	u32		samp_dl;
++	unsigned char	samp_dl_timing;
++	unsigned int	samp_dl_clock;
++
++	/*
+ 	 * Hardware busy wait (cfg->can_wait_busy). busy_wait is set while a
+ 	 * request has finished on the bus and the card still holds DAT0;
+ 	 * busy_seq tells busy_work which wait it was started for, because the
+@@ -1316,21 +1326,65 @@
+ 	return 0;
+ }
+ 
+-static int sunxi_mmc_calibrate(struct sunxi_mmc_host *host, int reg_off)
++static int sunxi_mmc_calibrate(struct sunxi_mmc_host *host,
++			       struct mmc_ios *ios, int reg_off)
+ {
++	u32 dl = 0;
++
+ 	if (!host->cfg->can_calibrate)
+ 		return 0;
+ 
+ 	/*
+ 	 * FIXME:
+ 	 * This is not clear how the calibration is supposed to work
+-	 * yet. The best rate have been obtained by simply setting the
+-	 * delay to 0, as Allwinner does in its BSP.
++	 * yet. There is no hardware calibration engine documented behind
++	 * SMHC_SAMP_DL: the UM gives a software enable at [7] and a software
++	 * value at [5:0] and nothing else (11.3.8.37), so the value has to be
++	 * supplied from here. Delay 0 is what this driver has always written
++	 * when nothing was measured.
++	 *
++	 * Once ->execute_tuning has measured a window, reprogram what it found
++	 * whenever the bus is in the timing it was measured in. This path runs
++	 * again on every clock change and on every runtime resume, so without
++	 * it the tuned value would survive exactly until the next set_ios.
++	 *
++	 * HS400 gets the HS200 value too, once it runs at the card clock the
++	 * sweep ran at. That is the measured value for HS400, not a borrowed
++	 * one:
++	 *
++	 * - The core never tunes in HS400. It tunes in HS200 at the HS400
++	 *   target frequency (mmc_hs200_tuning()) and only then calls
++	 *   mmc_select_hs400(); a retune from HS400 drops to HS200, tunes
++	 *   there and switches back (mmc_retune()).
++	 * - Both modes run the same card clock: mmc_set_bus_speed() gives
++	 *   HS200 and HS400 the same ext_csd.hs200_max_dtr. The clock test
++	 *   below holds the code to that rather than assuming it.
++	 * - The line is still in use. SAMP_DL_SW sets the delay of the command
++	 *   and data lines relative to the clock (UM 11.3.8.37).
++	 *   In HS400 the card's strobe frames the read data, through its own
++	 *   delay (SMHC_DS_DL, sunxi_mmc_hs400_enable()). The UM puts the
++	 *   command response on the strobe only through SMHC_CQE_CTRL
++	 *   DS_SAMP_RESP_EN, meant for CQE in HS400 enhanced-strobe mode
++	 *   (11.3.8.41), and this driver never sets it outside enhanced-strobe
++	 *   mode. Without it the response is sampled against the clock,
++	 *   through this register, in HS400 as in HS200.
++	 *
++	 * The HS, DDR52 and legacy steps that mmc_select_hs400() and
++	 * mmc_hs400_to_hs200() pass through write delay 0 as before, and so
++	 * does HS400 until mmc_set_bus_speed() has raised its clock.
+ 	 *
+ 	 * HS400 needs a non-zero data-strobe delay; that is programmed
+ 	 * separately in sunxi_mmc_hs400_enable(), not here.
+ 	 */
+-	writel(SDXC_CAL_DL_SW_EN, host->reg_base + reg_off);
++	if (reg_off == SDXC_REG_SAMP_DL_REG && host->samp_dl &&
++	    (ios->timing == host->samp_dl_timing ||
++	     (host->samp_dl_timing == MMC_TIMING_MMC_HS200 &&
++	      ios->timing == MMC_TIMING_MMC_HS400 &&
++	      ios->clock == host->samp_dl_clock)))
++		dl = host->samp_dl & SDXC_CAL_DL_MASK;
++
++	writel(SDXC_CAL_DL_SW_EN | (dl << SDXC_CAL_DL_SW_SHIFT),
++	       host->reg_base + reg_off);
+ 
+ 	return 0;
+ }
+@@ -1609,7 +1663,7 @@
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = sunxi_mmc_calibrate(host, SDXC_REG_SAMP_DL_REG);
++	ret = sunxi_mmc_calibrate(host, ios, SDXC_REG_SAMP_DL_REG);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -2105,12 +2159,116 @@
+ 	return 0;
+ }
+ 
++/*
++ * Sample-delay tuning for the single-data-rate modes (CMD21 in HS200, CMD19 on
++ * an SD card).
++ *
++ * These modes carry no strobe: the controller samples the command and data
++ * lines against its own clock, and SMHC_SAMP_DL is the only thing that moves
++ * that sampling point. A733 UM 11.3.8.37, offset 0x0144, reset 0x0000_2000:
++ * SAMP_DL_SW at [5:0] is the command and data line delay relative to the
++ * clock, enabled by SAMP_DL_SW_EN at [7]; [13:8] is read-only and
++ * the UM names no calibration engine behind it. The delay is software's job.
++ *
++ * Until now no software did it. sunxi_mmc_calibrate() writes SAMP_DL_SW_EN with
++ * delay 0 on every clock change, and the driver registered no ->execute_tuning,
++ * so mmc_execute_tuning() returned 0 without sending a single tuning block
++ * ("if (!host->ops->execute_tuning) return 0;", core/core.c) and HS200 ran on a
++ * delay of zero -- not a chosen value, the absence of one. That is the defect
++ * `mmc-sunxi-tune-the-hs400-data-strobe-delay` removed for the HS400 data strobe, one mode over.
++ *
++ * So sweep it, in the same shape as the HS400 strobe sweep: 64 candidates, each
++ * scored by a real transfer, then the middle of the widest passing run. The
++ * score is mmc_send_tuning(), which sends the tuning command and compares the
++ * returned block against the JEDEC pattern, so a delay passes only when every
++ * bit of it came back right.
++ *
++ * Three deliberate choices:
++ *
++ * - The delay line is a chain, not a phase ring: 63 does not border on 0, so
++ *   the window search does not wrap.
++ * - The chosen midpoint is re-tested once after it is programmed. The sweep
++ *   proves a value passed while it was being swept; this proves the value the
++ *   bus is left on passes at the moment it is installed.
++ * - A sweep that finds nothing does NOT fail the card. An error here reaches
++ *   mmc_init_card() through mmc_hs200_tuning() and aborts the whole init
++ *   ("err = mmc_hs200_tuning(card); ... if (err) goto free_card"), so failing
++ *   would be a regression against the untuned driver, which reaches HS200 on
++ *   delay 0 and carries root on it today. It keeps delay 0, says so at
++ *   dev_err, and returns 0: never worse than the state it replaces.
++ */
++static int sunxi_mmc_execute_tuning(struct mmc_host *mmc, u32 opcode)
++{
++	struct sunxi_mmc_host *host = mmc_priv(mmc);
++	int i, run_start = -1, run_len = 0, best_start = -1, best_len = 0;
++	u64 passed = 0;
++	u32 dl;
++
++	for (i = 0; i <= SDXC_CAL_DL_MASK; i++) {
++		mmc_writel(host, REG_SAMP_DL_REG,
++			   SDXC_CAL_DL_SW_EN | (i << SDXC_CAL_DL_SW_SHIFT));
++
++		if (!mmc_send_tuning(mmc, opcode, NULL))
++			passed |= BIT_ULL(i);
++	}
++
++	for (i = 0; i <= SDXC_CAL_DL_MASK; i++) {
++		if (passed & BIT_ULL(i)) {
++			if (run_start < 0)
++				run_start = i;
++			run_len++;
++			if (run_len > best_len) {
++				best_len = run_len;
++				best_start = run_start;
++			}
++		} else {
++			run_start = -1;
++			run_len = 0;
++		}
++	}
++
++	if (best_len) {
++		dl = best_start + best_len / 2;
++		mmc_writel(host, REG_SAMP_DL_REG,
++			   SDXC_CAL_DL_SW_EN |
++			   ((dl & SDXC_CAL_DL_MASK) << SDXC_CAL_DL_SW_SHIFT));
++
++		if (mmc_send_tuning(mmc, opcode, NULL)) {
++			dev_err(mmc_dev(mmc),
++				"tuning: sample delay %u failed its confirmation, staying on delay 0 [%016llx]\n",
++				dl, passed);
++			best_len = 0;
++		} else {
++			host->samp_dl = dl;
++			host->samp_dl_timing = mmc->ios.timing;
++			host->samp_dl_clock = mmc->ios.clock;
++			dev_info(mmc_dev(mmc),
++				 "tuning: sample-delay window %d..%d (%d wide), using %u [%016llx]\n",
++				 best_start, best_start + best_len - 1,
++				 best_len, dl, passed);
++		}
++	}
++
++	if (!best_len) {
++		host->samp_dl = 0;
++		host->samp_dl_timing = MMC_TIMING_LEGACY;
++		host->samp_dl_clock = 0;
++		mmc_writel(host, REG_SAMP_DL_REG, SDXC_CAL_DL_SW_EN);
++		dev_err(mmc_dev(mmc),
++			"tuning: no sample delay passes, staying on delay 0 [%016llx]\n",
++			passed);
++	}
++
++	return 0;
++}
++
+ static const struct mmc_host_ops sunxi_mmc_ops = {
+ 	.request	 = sunxi_mmc_request,
+ 	.set_ios	 = sunxi_mmc_set_ios,
+ 	.get_ro		 = mmc_gpio_get_ro,
+ 	.get_cd		 = mmc_gpio_get_cd,
+ 	.enable_sdio_irq = sunxi_mmc_enable_sdio_irq,
++	.execute_tuning	 = sunxi_mmc_execute_tuning,
+ 	.start_signal_voltage_switch = sunxi_mmc_volt_switch,
+ 	.card_hw_reset	 = sunxi_mmc_hw_reset,
+ 	.card_busy	 = sunxi_mmc_card_busy,

@@ -1,0 +1,72 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] PCI: sun60i-a733: remove the root port's VPD capability
+
+Every lspci -vvv on the board logs
+
+  pcieport 0000:00:00.0: VPD access failed.  This is likely a firmware bug
+  on this device.  Contact the card vendor for a firmware update
+
+(6 GB board, 2026-09-21). The
+root port, 1f6d:abcd, lists a VPD capability, and the PCI core then polls its
+flag until pci_vpd_wait() gives up after 125 ms.
+
+WHY IT FAILS
+
+In the DesignWare core VPD is not implemented, it is delegated. UM V1.00
+18.3.8.62 (SII_INT_0, bit 0 PF0_CFG_VPD_INT, p. 1236): the controller only
+pulses cfg_vpd_int; the integrating application must then read the VPD
+Control/Capabilities register, move the four bytes, and set or clear the
+VPD flag to complete the request. The feature list (18.3.1, p. 1178)
+names VPD as a capability of the core, not as a store.
+
+Nothing on the A733 is that application. The User Defined Space has no VPD
+register, the UM describes no VPD store, and `pci-sun60i-a733-root-port-event-irq-on-sii`'s SII handler serves the
+root-port event bits, not bit 0. So the flag never flips and every access
+times out.
+
+THE FIX
+
+One call in `pci-sun60i-a733-root-port-event-irq-on-sii`'s sun60i_a733_pcie_host_init(), beside its MSI and MSI-X
+removals: dw_pcie_remove_capability(pci, PCI_CAP_ID_VPD). host_init runs
+before dw_pcie_setup_rc() and before enumeration, and the helper opens DBI
+read-only writes itself. pci_vpd_init() then finds no capability, the vpd
+attribute in sysfs is not created (vpd_attr_is_visible()), and lspci has
+nothing to read.
+
+Scoped to this compatible on purpose. A PCI quirk would have to key on the
+port's ID, 1f6d:abcd, which is a placeholder, not an allocation.
+
+DEPENDS ON `pci-sun60i-a733-root-port-event-irq-on-sii`
+
+This edits the host_init that `pci-sun60i-a733-root-port-event-irq-on-sii` creates and does not apply without it.
+Apply order: the event-IRQ patch first, then this one.
+
+VERIFIED
+
+Applies at fuzz 0 on main + `pci-sun60i-a733-root-port-event-irq-on-sii`; compile-check passes, and the built
+object calls dw_pcie_remove_capability with 3 = PCI_CAP_ID_VPD from
+sun60i_a733_pcie_host_init. NOT hardware-proven. The observable: lspci -vvv
+-s 00:00.0 lists no "Vital Product Data" capability and the kernel logs no
+"VPD access failed"; /sys/bus/pci/devices/0000:00:00.0/vpd does not exist.
+
+Assisted-by: Claude
+
+diff --git a/drivers/pci/controller/dwc/pcie-sun60i-a733.c b/drivers/pci/controller/dwc/pcie-sun60i-a733.c
+--- a/drivers/pci/controller/dwc/pcie-sun60i-a733.c
++++ b/drivers/pci/controller/dwc/pcie-sun60i-a733.c
+@@ -375,6 +375,15 @@
+ 	dw_pcie_remove_capability(pci, PCI_CAP_ID_MSI);
+ 	dw_pcie_remove_capability(pci, PCI_CAP_ID_MSIX);
+ 
++	/*
++	 * VPD is advertised and nothing serves it. The DesignWare core only
++	 * pulses cfg_vpd_int (SII_INT_0 bit 0, UM V1.00 18.3.8.62) and leaves
++	 * the transfer and the VPD flag to an application the A733 does not
++	 * have, so every access times out in pci_vpd_wait() with "VPD access
++	 * failed". Unlinked, the port says what is true: it has no VPD.
++	 */
++	dw_pcie_remove_capability(pci, PCI_CAP_ID_VPD);
++
+ 	pcie->exp_cap = dw_pcie_find_capability(pci, PCI_CAP_ID_EXP);
+ 	pcie->aer_cap = dw_pcie_find_ext_capability(pci, PCI_EXT_CAP_ID_ERR);
+ 

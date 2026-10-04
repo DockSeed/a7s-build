@@ -1,0 +1,147 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] cpufreq: sun50i: a733: unknown dies get the vendor's fallback set
+
+What. sun60i_a733_efuse_xlate() returns speed index 1 instead of 0 for
+every die it cannot act on: a zero bin field, a programmed second fuse
+copy, a bin >= 32, or a bin no OPP in DT describes. In DT, bit 1 is the
+vf0100 frequency set (arm64-dts-a733-cpu-opps-per-bin-frequency-sets)
+at the vf0100 voltages (opp-microvolt-speed1,
+arm64-dts-a733-cpu-opps-vendor-voltage-per-bin), which equal the
+unnamed worst case at every point bin 1 runs.
+
+Why. Index 0 selected every point, because every point carried BIT(0):
+an unknown die ran up to 2002 MHz. The vendor's own fallback for an
+unmatched fuse value is vf0100, which ends at 1612 / 1794 MHz
+(Allwinner BSP cubie-aiot-v1.5.0, sun60iw2_nvmem_xlate(): index =
+0x0100; cubie-aiot-v1.4.8 had 0x0000, the vf0000 column).
+
+Where the vendor driver differs, and what this patch does:
+  - a zero bin field selects vf0000 there. An unprogrammed fuse reads
+    the same, and vf0000 clocks higher than vf0100, so a zero read
+    takes the fallback here.
+  - a programmed second copy (bits 23:16) is preferred there. It is
+    zero on all three dies we can read, so its meaning is unverified;
+    such a part takes the fallback here, as it took the worst case
+    before.
+  - a failed fuse read selects vf0100 there; here it fails the probe,
+    unchanged.
+
+If a DT ever lacks bit 1 on some CPU, the driver says so with pr_err;
+an unknown die then gets no operating points and cpufreq does not
+start, instead of running a ladder nobody described for it.
+
+Bins 4 and 5 take the same path as before.
+
+Placed after the DT patch in the series, so no tree exists where the
+driver asks for bit 1 and the tables do not carry it.
+
+Verified: applies at fuzz 0; sun50i-cpufreq-nvmem.o builds with W=1
+and no warnings (6.18.54, native arm64). An independent review traced
+every return path to index 1 and the OPP core's fallback to the unnamed
+voltage. Pending on silicon: with the test kernel's a733_test_fuse, the
+log line and the policies' top points for an unknown fuse word (0x700),
+a zero bin (0x0) and a programmed second copy (0x10598); bin 5
+unchanged without the override.
+
+Assisted-by: Claude
+---
+diff --git a/drivers/cpufreq/sun50i-cpufreq-nvmem.c b/drivers/cpufreq/sun50i-cpufreq-nvmem.c
+index 528973467..70b311cd4 100644
+--- a/drivers/cpufreq/sun50i-cpufreq-nvmem.c
++++ b/drivers/cpufreq/sun50i-cpufreq-nvmem.c
+@@ -33,14 +33,14 @@
+  * wafer tester burned in; bits [23:16] hold a second copy.
+  *
+  * The bin value is used directly as the speed index, so an opp-supported-hw
+- * bit position in DT *is* the fuse value: bin 0x04 -> BIT(4). Index 0 is the
+- * worst-case column and is what an unknown die gets - see the comment on
+- * sun60i_a733_efuse_xlate().
++ * bit position in DT *is* the fuse value: bin 0x04 -> BIT(4). Index 1 (the
++ * vendor's vf0100 frequency set) is what an unknown die gets - see the
++ * comment on sun60i_a733_efuse_xlate().
+  */
+ #define SUN60I_A733_NVMEM_MASK		0xff
+ #define SUN60I_A733_NVMEM_SHIFT		8
+ #define SUN60I_A733_NVMEM_BAK_SHIFT	16
+-#define SUN60I_A733_SPEED_WORST_CASE	0
++#define SUN60I_A733_SPEED_FALLBACK	1
+ 
+ static struct platform_device *cpufreq_dt_pdev, *sun50i_cpufreq_pdev;
+ 
+@@ -153,7 +153,7 @@ static u32 sun50i_h616_efuse_xlate(u32 speedbin)
+  * prop_name are set once for all CPUs, so a bin described only in the A76
+  * table would leave the A55 policy with an empty OPP list. Requiring both
+  * clusters to describe the bin turns that into a deterministic demotion to the
+- * worst-case column instead of a cluster that silently loses cpufreq.
++ * fallback set instead of a cluster that silently loses cpufreq.
+  *
+  * Only the A733 xlate uses this. dt_has_supported_hw() below is deliberately
+  * left alone, so nothing changes for the SoCs we cannot test.
+@@ -201,42 +201,50 @@ static u32 sunxi_cpufreq_dt_speed_mask(void)
+  * The A733 speed index is the raw fuse bin value, so DT alone decides which
+  * bins exist - no vendor mapping table is encoded here.
+  *
+- * Index 0 is the worst-case column, and it is selected deterministically
+- * whenever we do not have a bin we can act on:
++ * Index 1 is the fallback, and it is selected deterministically whenever we
++ * do not have a bin we can act on. In DT it is the vendor's vf0100 frequency
++ * set, which is also the vendor's own fallback for an unmatched fuse value
++ * (Allwinner BSP cubie-aiot-v1.5.0, sun60iw2_nvmem_xlate(): index 0x0100;
++ * cubie-aiot-v1.4.8 had 0x0000). It runs the vf0100 voltage column
++ * (opp-microvolt-speed1). The cases:
+  *   - the fuse word reads 0 in bits [15:8]. An unprogrammed fuse and a part
+- *     graded "bin 0" are indistinguishable from outside, so both get the
+- *     worst case. (The vendor BSP has a separate table for a zero read; we
+- *     refuse to guess which of the two situations we are in.)
++ *     graded "bin 0" are indistinguishable from outside. The vendor gives a
++ *     zero read the vf0000 table, which clocks higher than vf0100; we refuse
++ *     to guess which of the two situations we are in.
+  *   - the bin does not fit a u32 bitmask (>= 32).
+- *   - no OPP in DT claims that bin. A die we have no measured voltages for
+- *     must never inherit a table that was measured on a better die.
++ *   - no OPP in DT claims that bin. A die we have no frequency set for must
++ *     never inherit the ladder of a better die.
+  *   - the second fuse copy in bits [23:16] is programmed. The vendor BSP
+  *     prefers that copy when it is non-zero; on all three chips we can read
+- *     (the 8 GiB board, the 6 GiB board, a second 6 GiB board) it is zero, so that preference is an unverifiable
+- *     hint and we do not act on it. A part that has it set is, to us, an
+- *     unknown part.
++ *     it is zero, so that preference is an unverifiable hint and we do not
++ *     act on it. A part that has it set is, to us, an unknown part.
+  */
+ static u32 sun60i_a733_efuse_xlate(u32 speedbin)
+ {
+ 	u32 bin = (speedbin >> SUN60I_A733_NVMEM_SHIFT) & SUN60I_A733_NVMEM_MASK;
+ 	u32 bak = (speedbin >> SUN60I_A733_NVMEM_BAK_SHIFT) & SUN60I_A733_NVMEM_MASK;
++	u32 mask = sunxi_cpufreq_dt_speed_mask();
++
++	if (!(mask & BIT(SUN60I_A733_SPEED_FALLBACK)))
++		pr_err("A733: the OPP tables do not describe the fallback speed index %u; an unknown die gets no operating points\n",
++		       SUN60I_A733_SPEED_FALLBACK);
+ 
+ 	if (bak) {
+-		pr_warn("A733: second speed-bin fuse copy is programmed (0x%02x, primary 0x%02x); its meaning is unverified on this SoC, using the worst-case OPP column\n",
++		pr_warn("A733: second speed-bin fuse copy is programmed (0x%02x, primary 0x%02x); its meaning is unverified on this SoC, using the fallback OPP set\n",
+ 			bak, bin);
+-		return SUN60I_A733_SPEED_WORST_CASE;
++		return SUN60I_A733_SPEED_FALLBACK;
+ 	}
+ 
+ 	if (!bin || bin >= BITS_PER_TYPE(u32)) {
+-		pr_warn("A733: no usable speed bin in fuse word 0x%08x, using the worst-case OPP column\n",
++		pr_warn("A733: no usable speed bin in fuse word 0x%08x, using the fallback OPP set\n",
+ 			speedbin);
+-		return SUN60I_A733_SPEED_WORST_CASE;
++		return SUN60I_A733_SPEED_FALLBACK;
+ 	}
+ 
+-	if (!(sunxi_cpufreq_dt_speed_mask() & BIT(bin))) {
+-		pr_warn("A733: speed bin %u has no operating points in DT, using the worst-case OPP column\n",
++	if (!(mask & BIT(bin))) {
++		pr_warn("A733: speed bin %u has no operating points in DT, using the fallback OPP set\n",
+ 			bin);
+-		return SUN60I_A733_SPEED_WORST_CASE;
++		return SUN60I_A733_SPEED_FALLBACK;
+ 	}
+ 
+ 	pr_info("A733: speed bin %u (fuse word 0x%08x)\n", bin, speedbin);

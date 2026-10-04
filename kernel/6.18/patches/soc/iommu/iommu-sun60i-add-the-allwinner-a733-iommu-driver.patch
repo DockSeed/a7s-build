@@ -1,0 +1,1759 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Tue, 22 Sep 2026 12:00:00 +0200
+Subject: [PATCH] iommu: sun60i: add the Allwinner A733 IOMMU driver
+
+The display engine driver (`drm-a733-display-engine-dram-into-tcon-tv1` and `drm-a733-kms-drm-device-for-the-display-pipe`) runs with a 32-bit DMA mask and the
+board has 8 GiB of RAM. A GPU buffer above 4 GiB is bounced through swiotlb
+when labwc imports it, and a large one fails outright: measured with glmark2
+in a window, 256 swiotlb_bounced events for display-engine and "swiotlb
+buffer is full (sz: 405504 bytes)". That mask
+is the driver's choice, not the hardware's: the DE's layers have a
+high-address byte (VI +0x0d0..+0x0e4, which `drm-a733-display-engine-dram-into-tcon-tv1` does not program).
+The SoC has two IOMMUs that put any page behind a 32-bit IOVA; behind
+IOMMU1 a scanout buffer is one IOVA range over scattered pages, and an
+address outside its mappings faults instead of reaching memory. This driver
+makes them usable through the IOMMU core; `clk-sunxi-ng-a733-iommu-gates-and-resets` to `arm64-dts-a733-display-engine-behind-iommu1` wire IOMMU1 to the
+display engine.
+
+THE SAME CODE AS A v7.3-rc4 VERSION -- revised in place 2026-09-22
+
+The driver, its Kconfig entry and the binding are also kept as a
+two-patch series against v7.3-rc4, which has not been posted; this patch
+carries the same code so that the board proof of this tree covers it.
+drivers/iommu/sun60i-iommu.c differs from that series' file after `git am`
+in two places: attach_dev() has no `old` argument on 6.18 (v7.3 added
+it; the driver never reads it), so the last parameter line of the two
+attach ops differs; and the series' resume_early is not in this
+patch -- this tree adds it with the next one,
+iommu-sun60i-program-the-block-again-on-resume, which also moves the
+block writes of sun60i_iommu_master_translate() into
+sun60i_iommu_master_program(). The master port gate (the
+revision of 2026-09-24 below) is in the series since its regeneration of
+2026-09-25. Everything else is byte for byte the series' file.
+kzalloc_obj(*p, GFP_KERNEL) is valid on both: 6.18.36 takes the GFP
+argument as required, v7.3 as optional (default_gfp()), and both expand to
+__alloc_objs(kzalloc, GFP_KERNEL, typeof(P), 1).
+
+What changed against the first revision, which is the one HW-proven on
+2026-09-18:
+
+  * identifiers a733_*/A733_* are sun60i_*/SUN60I_*, as upstream's A733
+    drivers name theirs;
+  * a command bit that has not dropped after 1 ms is cleared and reported
+    with dev_err_ratelimited() every time. The first revision instead
+    switched that register to the vendor's write-wait-clear sequence for
+    good (a cmd_sticky bitmap, and <linux/delay.h> for its udelay). On
+    a test kernel that path never ran: every bit cleared inside 1 ms;
+  * sun60i_iommu_invalidate() no longer sends the range commands
+    (TLB +0x044/+0x048/+0x054, PTW cache +0x068/+0x070/+0x06c). It runs
+    sun60i_iommu_flush_all(): +0x030 = 3 (macro TLB and PTW cache), then
+    +0x18 of every master with a user, in that order. +0x054's done bit
+    waits on the VE's memory port and never drops while the VE is idle,
+    its default state since
+    `soc-sunxi-cedar-ve-carry-the-vendor-video-engine-interface`; with it
+    every IOMMU1 invalidation timed out, three per boot and one per fault,
+    1 ms each with interrupts off. The poll and the report stay: every
+    command the driver still sends drops at the first read (under
+    UNVERIFIED below);
+  * a second defect: when a fault status survived three handler runs,
+    the handler switched fault interrupts off and left the faulting master
+    stopped -- the display went black until reboot. A first
+    fix reset the masters once more after switching interrupts off; that
+    was provoked on a test kernel and failed the same way (below). The
+    give-up is gone: every handler run clears the status and resets the
+    masters involved, as sun50i-iommu does (sun60i_iommu_reset_masters());
+  * the probe line ("version, ENABLE, TTB") and the "translating",
+    "disabled", "master N translating" and "master N in bypass" lines are
+    dev_dbg (were dev_info), and the translating line no longer reads TTB
+    back. No diagnostic line is deleted, only its level: the proof of this
+    revision switched them on with dyndbg on the test kernel's command line
+    (HARDWARE-PROVEN below); diagnostics stay on until the hardware
+    proves the fix, and dyndbg keeps them reachable.
+    The probe line is dev_dbg in the series' driver too;
+  * probe error strings read "failed to ..." and "unknown version %#x";
+  * Kconfig: `depends on 64BIT` (a 32-bit phys_addr_t would break the
+    `<< 32` in sun60i_ent_addr() and the 34-bit aperture constant under
+    COMPILE_TEST) and a longer help text;
+  * comments carry no board names and no repo paths. A register or bit
+    whose meaning comes from the vendor driver alone is marked "(BSP)" --
+    what the first revision marked [V]. The per-register silicon record
+    that its [S]/[W] marks pointed at is below.
+
+The binding is the one of that series (property order, description,
+example indentation) except for two lines: the maintainers entry (that
+series carries a placeholder) and the example's clock and reset numbers,
+90-93 and 33, which are this tree's CCU ids (`clk-sunxi-ng-a733-iommu-gates-and-resets`). The upstream A733 CCU
+series numbers the same gates 56, 57, 58, 73 and the reset 8.
+
+WHAT THE HARDWARE IS -- and where each fact comes from
+
+The A733 UM V0.92 chapter 10 is one page of features and has no register
+list: two IOMMUs, IOMMU0 masters USB0_USB1, CSI, ISP,
+VE_ENC; IOMMU1 masters VE_MBUS0, VE_MBUS1, DE0, DI, G2D, EINK; a 16 GiB address
+space per IOMMU; at most 15 masters; per-master bypass, prefetch and
+interrupt handling; full flush and local invalidation.
+
+Everything below that is silicon. Read on the 8 GiB board (2026-09-15, our kernel with
+no IOMMU driver, and the vendor system translating for the display engine)
+and on a second board under a vendor-derived driver (2026-09-17):
+
+  * VERSION +0x000 reads 0x16 on all four blocks. The driver refuses any
+    other value: this is the only version the layout was read at.
+  * RESET +0x010 reads 0x00037fff at reset; that bit m holds master m in
+    reset when 0 is (BSP).
+  * ENABLE +0x014: 0 at reset, 1 while translating.
+  * TTB +0x020 = pa(L1) >> 14, and the page table itself, are PROVEN BY A
+    WALK: every one of the display engine's 118 RCQ heads and every page of
+    their buffers translated, and 68 buffers equal the DE registers they feed
+    word for word, with tables and pages above 4 GiB. Format:
+    34-bit IOVA, L1 index IOVA[33:22] (4096 entries, 16 KiB), L2 index
+    IOVA[21:12] (1024 entries); 32-bit entries whose bits 31:12 are the
+    address's bits 31:12 and bits 9:8 its bits 33:32; DTE valid = bits 1:0
+    == 01, PTE valid = bit 1.
+  * Per-master blocks, 0x200 wide from +0x400: four on IOMMU0, six on
+    IOMMU1 -- the UM's counts. +0x00 reads 1 in every implemented block and 0
+    beyond; attach refuses a master whose block reads 0.
+  * BYP +0x04 of a master: 1 at reset, 0 on exactly the translating masters.
+    So the identity domain is the reset state and costs nothing.
+  * Read while translating, and written by this driver to the same values:
+    TLB prefetch +0x02c = 0 (reset 0x00030000; the vendor writes 0 because
+    its DT parser never reads the platform value, see 9. below), TLB and
+    PTW invalidation mode +0x040 / +0x060 = 1, INT_ENABLE +0x080 = 3,
+    per-master interrupt enable +0x30 = 1. The range registers +0x044/+0x048
+    held page numbers and +0x068/+0x070 4 MiB numbers of the last range the
+    vendor invalidated. This driver no longer writes them (see the flush change above).
+  * Per-master TLB flush +0x18 reads 0 on one board after a vendor write of
+    1 that was never undone.
+
+⚠ UNVERIFIED, AND WHAT THE DRIVER DOES ABOUT IT. From the vendor driver
+alone (radxa/allwinner-bsp dd2a41a2, sunxi-iommu-v2.c,
+sunxi-iommu-pgtable.[ch]), marked (BSP) in the source:
+
+  * whether a flush command bit (+0x030, per-master +0x18) dropping also
+    means the operation has completed, and what +0x030's two bits flush.
+    The vendor writes 1, waits 10 us and writes 0. The driver sets the bit
+    and polls 1 ms; if it does not drop it clears it and logs "command %#x
+    at %#x timed out", ratelimited. Under the first revision all four
+    command bits dropped within 1 ms (a tree without
+    `soc-sunxi-cedar-ve-carry-the-vendor-video-engine-interface` and `arm64-dts-a733-ve-decoder-and-encoder-nodes`).
+    ⚠ A later measurement (8 GB board, 2026-09-22, test kernel, devmem and the
+    DP sink CRC): the range command +0x054 does NOT drop while the VE is
+    idle -- on both IOMMUs, IOMMU0 at ENABLE 0 included. Its done bit waits
+    on the VE's MBUS matrix port gate alone (MBUS_MAT_CLK_GATING bit 14 for
+    IOMMU1, bit 12 for IOMMU0); the VE power domains stay on. The
+    invalidation itself takes effect (the sink CRC changed), only the
+    completion never shows. +0x030, +0x06c and m2's +0x18 drop by the first
+    read, about 3.5 us, VE idle or not. A stale entry that master 2 also
+    held in its micro TLB went away only with +0x030 followed by m2's
+    +0x18 (2 of 2); +0x030 alone, +0x18 alone and +0x18 then +0x030 left
+    it. So the driver flushes, in that order, and does not use +0x054.
+    The same effect through the driver's own path, and m2's +0x18 with the
+    display off (DE0 reset asserted, clocks gated), which every sync now
+    writes: HARDWARE-PROVEN below;
+  * whether the END of an invalidation range is inclusive: moot since
+    the range registers are no longer written.
+  * most of the interrupt block. One L1 fault has been provoked on silicon
+    (2026-09-18): INT_STA bit 16, L1PG_INT names the faulting master,
+    INT_ERR_ADDR_L1 holds the IOVA, INT_STA reads clear after the handler;
+    L1PG_INT keeps its bit and no write that clears it is known. The
+    permission bits 14:0, L2 bit 17, the error data format and the prefetch
+    flag bit 31 are (BSP). Every handler run clears the status and resets
+    the masters involved, as sun50i-iommu does; a master that faults
+    continuously interrupts once per fault and runs on once its address is
+    mapped. The give-up this driver had -- fault interrupts off after
+    three runs whose status survived the clear, the masters reset once
+    more -- stopped such a master for good. Provoked on a test kernel with
+    a debug patch (not carried here; called 9991 below) with fault_delay_us = 4000
+    (slowing the handler to what it was on the test kernel where the
+    display went black):
+    one "status 0x10000 did not clear" line, INT_ENABLE 0, m2 INT_ENABLE 0,
+    and the display black (sink CRC 0, TCON underflow) after the layer
+    address was restored, until master 2 was reset by hand. So it was
+    removed; the same run on a test kernel leaves the display running
+    (HARDWARE-PROVEN below). The cost: a master that never stops faulting
+    keeps the CPU in this handler once per fault, ratelimited in its
+    report -- 52 runs of 20 ms each over the 3 s of that test.
+  * the permission bits PTE bit 2 (R) and bit 3 (W): every walked entry had
+    both set, so a direction-restricted mapping is untested.
+  * the vendor's second meaning of entry addresses below 0x40000000 (CPU
+    addresses from 16 GiB up, iommu_phy_to_cpu_phy()). The UM does not
+    describe it; RAM here lies in [0x40000000, 9 GiB). The driver refuses to
+    map anything outside [0x40000000, 16 GiB) rather than encode it on a
+    guess.
+  * that the master blocks sit in their master's power domain (the vendor DT
+    gives each master node a power-domains entry). Not measured, and not
+    what the driver relies on: what an access to a master block needs on
+    this silicon is the master's MBUS port gate, which the driver
+    holds while the master has a user (REVISED 2026-09-24 below). The VE
+    power domains read on in every state measured, so no block has
+    been seen behind a domain that is off.
+
+DESIGN NOTES THAT LEFT THE CODE WITH THE REVISION
+
+  * The reset is only ever de-asserted. `clk-sunxi-ng-a733-iommu-gates-and-resets` makes the eight gates
+    CLK_IS_CRITICAL and the reset reads de-asserted at boot; a measurement showed
+    that a gated IOMMU0 still passes its bypassed USB master's traffic.
+  * builtin_platform_driver(), not builtin_platform_driver_probe(): the
+    latter probes once, and the CCU and reset providers may not be there
+    yet. A deferred IOMMU defers its clients, so a one-shot probe that lost
+    the race would leave the display engine unbound.
+
+WHY NOT sun50i-iommu.c
+
+It implements the H6 generation, and three things differ, each read off its
+source against this silicon: its ENABLE, BYPASS and TTB at 0x20/0x30/0x50
+read zero here (0x20 is this block's TTB); its entries carry 32-bit
+addresses (SUN50I_PTE_PAGE_ADDRESS_MASK GENMASK(31, 12)), which cannot
+reach a page above 4 GiB -- the reason this driver exists; and it has one
+bypass register for masters 0-5 of one block, where this SoC has per-master
+blocks on two IOMMUs. What is taken from it is the 6.18 shape: identity
+domain, domain_alloc_paging, map_pages/unmap_pages, gather-based
+iotlb_sync, report_iommu_fault(). Its GFP_DMA32 table allocation is an H6
+constraint and is not taken.
+
+WHERE THE VENDOR DRIVER DIFFERS, AND WHAT THIS ONE DOES
+
+Read end to end (sunxi-iommu-v2.c 2258 lines, sunxi-iommu-pgtable.c 505,
+sunxi-iommu-pgtable.h 150, sunxi-iommu.h 91):
+
+  1. One global domain and one group for both IOMMUs: domain_alloc returns
+     the same domain to every caller, and every global register is written
+     to both blocks with the read-back comparison left as "TBD" (the
+     READ_EQUAL_REG macro). Here: one DT node per IOMMU, one group per
+     IOMMU (generic_single_device_group), a fresh domain per allocation.
+     The group per IOMMU holds for this patch only: later in the series,
+     iommu-sun60i-one-page-table-for-both-instances gives the
+     masters of both instances one group and one table, which both TTBs
+     name, because the closed VE user space maps every buffer through the
+     decoder's IOMMU. A domain is still allocated per request there, and
+     each block is still written and enabled on its own.
+  2. attach_dev and detach_dev are empty; translation is switched on per
+     master from a second DT cell in probe_finalize, whatever domain the core
+     attaches. There is no identity domain, so the core's view and BYP can
+     disagree. Here: attach sets BYP = 0, the identity domain sets BYP = 1,
+     per master with a user count, and #iommu-cells is 1.
+  3. sunxi_iommu_map() ignores the return of the L2 fill, which overwrites a
+     live entry with only a WARN_ON. Here: -EBUSY, nothing overwritten.
+  4. The L2 fill computes entry i as `pent_val + SPAGE_SIZE * i` in a u32. A
+     contiguous run across a 4 GiB boundary wraps bits 31:12 without
+     carrying into bits 9:8: 0x0_FFFF_F000 plus one page becomes entry
+     address 0, which its own remapping then reads as 16 GiB. Here: every
+     entry is built from its own full physical address.
+  5. Unmap (versions >= 0x14, i.e. this one) invalidates the TLB and PTW
+     cache BEFORE clearing the entries, and iotlb_sync returns early for
+     those versions, so a walk in between caches the stale translation
+     again. Here: clear first, invalidate in iotlb_sync.
+  6. Unmapping a whole 4 MiB frees its L2 table while the IOMMU may still
+     hold the L1 entry in its PTW cache. Here: L2 tables live until the
+     domain is freed, so no walk can reach a freed table.
+  7. The interrupt handler returns IRQ_HANDLED without reading a status
+     first; decodes one cause per interrupt through an else-if chain that
+     checks permission bits 0-6 only (up to 15 masters exist); reports to a
+     private callback table, not report_iommu_fault(). Here: IRQ_NONE when
+     no status bit is set, every cause in one pass, report_iommu_fault(),
+     and a guard for a status that does not clear.
+  8. After a fault it pulses the per-master reset and writes 0xffffffff back,
+     without restoring anything a master reset may clear. Here: the saved
+     reset value is written back, and BYP and interrupt enable of the reset
+     masters are re-applied.
+  9. The DT carries tlb_prefetch = <0x3007f>; the parser never reads it, so
+     0 is written. Both boards read 0 while translating. Here: 0 is written
+     on purpose and said to be the only value seen translating.
+ 10. sunxi_iommu_get_idx_by_name() returns the index of the first master
+     whose name does NOT match (strcasecmp() used as a boolean). Not used
+     here; named because it is exported.
+ 11. It pulses the range invalidation (write 1, udelay(10), write 0) and
+     never reads whether it completed. On this silicon the done bit never
+     drops while the VE is idle, so no completion is ever seen. Here:
+     +0x054 is not used; a full flush, whose command bits drop, is.
+
+Page tables are DMA-mapped for their lifetime against the IOMMU device (a
+34-bit mask, and a mapping that is not the physical address is refused), so
+the cache syncs act on a real mapping, as in sun50i-iommu.
+
+What the vendor has right, and this driver keeps because silicon agrees:
+the register offsets listed under WHAT THE HARDWARE IS, TTB = pa >> 14, and
+the V2 entry format.
+
+A523 VALUE REJECTED: none taken. Mainline's binding files
+allwinner,sun55i-a523-iommu under the allwinner,sun50i-h616-iommu fallback,
+i.e. the H6 layout, which is the layout shown above not to be this one.
+
+VERIFIED HERE, THIS REVISION (2026-09-22, with the flush_all() change): the full
+series applies with fuzz 0 on a freshly unpacked 6.18.36;
+drivers/iommu/sun60i-iommu.o builds for arm64 at W=1 with no warnings
+(native gcc 14.2, configs/a733_defconfig + DYNAMIC_DEBUG, object only; a
+planted W=1 warning is reported); the driver file, diffed against the
+unposted series' file after `git am` onto v7.3-rc4 (tree a445d2fe8e12;
+68bc59995e1d since the Kconfig help change, re-diffed),
+differs in the attach_dev() lines above and nothing else. Re-run a
+second time on the merged tree: 213 of 213 at fuzz 0,
+W=1 clean with 9991 on and off, checkpatch --strict -f 0/0/0. A test Image
+was built from it.
+
+HARDWARE-PROVEN -- THE FIRST REVISION, NOT THIS ONE: the 8 GiB board 2026-09-18, test
+kernel, read by script (with control runs on the
+card's own kernel, same image):
+  * both IOMMUs probe with "version 0x16, ENABLE 0x0, TTB 0x0";
+  * IOMMU1 reaches "translating: L1 table at 0x0000000101e84000, TTB 0x407a1"
+    and "master 2 translating" while IOMMU0 keeps ENABLE 0 and TTB 0, so each
+    IOMMU walks its own TTB -- the one assumption the series carried
+    unmeasured, the vendor driver always having written both equal;
+  * identity = bypass, read per master: IOMMU1 m2 BYP (0x03910804) reads 0,
+    every other master of both IOMMUs reads 1;
+  * the VI0 layer address 0x05101018 reads the IOVA 0xFD000000 (physical
+    0xF0C00000 on the control kernel) and walks through DTE 0x21549101 and
+    PTE 0x0548910E to page 0x105489000, R and W set, above 4 GiB; the table
+    scan finds 9 valid L1 entries and 6750 mapped pages, all >= 4 GiB;
+  * glmark2-es2-wayland for 60 s: zero swiotlb_bounced events for
+    display-engine and no "swiotlb buffer is full" in the whole boot, against
+    294 events and four full-buffer lines on the default kernel;
+  * no fault line from either node, and every polled command bit cleared
+    inside 1 ms;
+  * the fault path, same kernel: "L1 page table
+    fault: iova 0x400000, masters 0x4, data 0x0", and the handler's master
+    reset left m2 at AUTO_GATING 1, INT_ENABLE 1, BYP 0.
+
+HARDWARE-PROVEN -- THIS REVISION: the 8 GiB board 2026-09-22, test kernel
+(6.18.36-t0030fx, this tree with 9991), booted by label with
+  dyndbg="func sun60i_iommu_probe +p; func sun60i_iommu_hw_enable +p;
+          func sun60i_iommu_hw_disable +p; func sun60i_iommu_master_translate +p;
+          func sun60i_iommu_master_bypass +p"
+on one line of its extlinux append; the checks were:
+  * boot, one warm and two cold (power cut): "version 0x16, ENABLE 0x0,
+    TTB 0x0" from 3900000.iommu, "translating: L1 table at ..." and "master
+    2 translating" from 3910000.iommu, no "timed out" line and no fault line;
+  * read by script: IOMMU1 ENABLE 1 on its own TTB while
+    IOMMU0 stays at 0/0, m2 BYP 0 and INT_ENABLE 1, every other master read
+    BYP 1 (the VE blocks are not read while the VE is suspended), the VI0
+    walk to a valid PTE above 4 GiB, 6750 mapped pages all >= 4 GiB, and no
+    swiotlb bounce for display-engine over 50 map/unmap cycles of a 9 MB
+    buffer (glmark2 is not in this image);
+  * fault path by script: "L1 page table fault: iova 0x400000,
+    masters 0x4", INT_STA 0 afterwards, no "did not clear", m2 at
+    AUTO_GATING 1, INT_ENABLE 1, BYP 0, and the display scanning with its
+    picture's sink CRC and no TCON underflow;
+  * stale-entry test through the driver, VE released: a PTE of a scanned page changed
+    behind the IOMMU stays stale with no action (3 of 3), and is dropped by
+    the driver's flush_all() (9991) and by a real map/unmap through the DMA
+    API (a DRM dumb buffer: iotlb_sync_map, then iotlb_sync), at normal
+    pitch and at pitch 0, where master 2's micro TLB holds it (6 of 6).
+    kprobes on sun60i_iommu_cmd() show each sync writing +0x030 = 3, then
+    +0x818 = 1, and nothing else;
+  * flush_all() 10000 times while the display scans: longest 2.5 us, 0 runs
+    over 500 us, no timeout. With the display off (DE0's clocks gated and
+    its reset asserted by sun60i_de_stop()): 1 and 1000 runs, longest
+    2.5 us, and 20 map/unmap cycles -- no stall, no timeout, and the display
+    comes back with its picture's CRC;
+  * the command-timeout path, through 9991's tlb_ivld_cmd: "command 0x1 at
+    0x54 timed out" on both instances with the VE released and +0x054 read
+    as 0 afterwards; no line with decoder and encoder held on;
+  * the fault handler without the give-up (6.18.36-t0030ni): the fault
+    script plain and with 9991's fault_delay_us at 4000 and 10000 -- the
+    handler slowed to what tripped the old give-up, and 2.5 times that: 3,
+    45 and 52 fault interrupts, INT_STA 0, INT_ENABLE 3, m2 INT_ENABLE 1
+    and BYP 0 afterwards, and the display running again after each (sink
+    CRC of its picture, TCON underflow during 0).
+
+REVISED 2026-09-24: the master's MBUS port gate
+
+A master's register block inside the IOMMU (0x400 + 0x200*m) does not
+answer while that master's MBUS matrix port is gated; the access stalls the
+bus. Measured for the invalidation acknowledge on the 8 GB board
+(2026-09-22): the per-master range command completes
+only with the master's port gate set -- MBUS_MAT_CLK_GATING bit 14 for the
+decoder (IOMMU1 m0/m1), bit 12 for the encoder (IOMMU0 m3) -- and times out
+with every other VE clock, gate and reset of that master set alone. A
+plain read of a VE master's block stalled the board the same way (a
+register dump, 2026-09-22), and so does the flush this driver sends on
+every unmap (the control below). Nothing in the first two revisions made
+sure of it:
+
+  * attach_dev() read AUTO_GATING of every fwspec id to refuse a master
+    that does not exist. attach runs from dma_configure, before the
+    consumer's probe (drivers/base/dd.c:700-704 before :719), with the
+    port in whatever state it was left; at boot it was still on (the
+    control attached without a stall), but nothing guarantees that. That
+    read is gone: of_xlate() bounds the id to the 15 slots of the user
+    manual, and a slot without a master reads 0 and ignores writes (read
+    on both instances);
+  * the IOMMU now takes each gated master's port as a named clock,
+    "master0" .. "master14" (binding: optional, after the four it had),
+    prepares it at probe and enables it in sun60i_iommu_master_translate()
+    before the first block access, disabling it in
+    sun60i_iommu_master_bypass() after the last. The gate is held for as
+    long as the master has a user, so flush_all() and the fault handler
+    only ever touch a block whose port is on, and the block never sees its
+    port gated while it holds this driver's state (whether it would keep
+    it is an open question, not measured). Precedent: exynos-iommu's "master" clock
+    (drivers/iommu/exynos-iommu.c:692-722);
+  * the fault handler reads and resets only masters with a user. A stale
+    bit of L1PG_INT/L2PG_INT could name a master in bypass whose
+    port is gated;
+  * probe enables the four named IOMMU clocks instead of every clock the
+    node lists, which would have held every master's port gate on from
+    boot;
+  * attach undoes the masters it switched on if one of them fails.
+
+HARDWARE-PROVEN on the 8 GB board, 2026-09-24 (6.18.36-t407; every arm
+but the control and the power reading again on 6.18.53-t407), with a test
+dtb that puts the VE behind the IOMMUs and one IOMMU1 map + unmap per dumb
+buffer on the display card as the stimulus:
+  * control, the kernel before this revision: the boot completes and the
+    VE masters attach; the first unmap after the engines have suspended
+    stalls the bus, and the hardware watchdog resets the board;
+  * this revision with the master clocks in the test dtb: MBUS_MAT_CLK_GATING bits 12 and 14
+    set while both engines are suspended with their resets asserted and
+    bus gates masked (VE_BGR_REG 0); IOMMU1 m0/m1 and IOMMU0 m3 at BYP 0,
+    INT_EN 1; 1001 unmaps without a stall or a log line; the same with
+    mem=4G (System RAM 0x40000000-0x13fffffff);
+  * this revision with the master clocks removed from the dtb: the stall
+    of the control -- the held gate is what cures it;
+  * product dtb: the gates follow the engines, the display translates;
+    idle draw 3.709 W against 3.711 W with the gates held, at 0.1 W
+    resolution.
+Built with gcc W=1 (0 warnings); dt_binding_check clean; checkpatch
+--strict 0/0/0 on the driver file.
+
+STILL UNEXERCISED: an L1PG_INT bit that does not clear, the R/W bits
+as a permission restriction, and the permission and L2 fault paths. DI,
+G2D, EINK, USB, CSI and ISP have no consumer that translates in this tree.
+
+EXERCISED SINCE, through later patches of the series:
+  * masters other than DE0: the VE decoder (IOMMU1 m0/m1) and
+    encoder (IOMMU0 m3) translate on the product dt since those patches
+    (iommu-sun60i-one-page-table-for-both-instances,
+    arm64-dts-a733-ve-behind-the-iommus; 6 GiB board, 2026-09-26,
+    decode md5-identical, a bent address faults);
+  * suspend and resume: iommu-sun60i-program-the-block-again-on-
+    resume programs the block again in resume_early (8 GiB board,
+    2026-09-25, 3 of 3 resumes after a forced state loss).
+
+Register offsets and the items marked (BSP) come from the vendor driver in
+radxa/allwinner-bsp (commit dd2a41a2): drivers/iommu/sunxi-iommu-v2.c,
+GPL-2.0-or-later (dual BSD/GPL), Copyright(c) 2020 - 2023 Allwinner
+Technology Co.,Ltd. and Copyright (C) 2016-2018 Allwinner Technology CO.,
+LTD. (author zhuxianbin <zhuxianbin@allwinnertech.com>), and
+drivers/iommu/sunxi-iommu-pgtable.[ch], GPL-2.0, Copyright(c) 2020 - 2023
+Allwinner Technology Co.,Ltd. and Copyright (c) 2023 ouyangkun
+<ouyangkun@allwinnertech.com>:
+https://github.com/radxa/allwinner-bsp/tree/dd2a41a23729b7a79ee4ef7d52d2b45f55e6520f/drivers/iommu
+The 6.18 driver shape follows drivers/iommu/sun50i-iommu.c (Linux 6.18,
+GPL-2.0-only OR BSD-2-Clause, Copyright (C) 2016-2018 Allwinner Technology
+CO., LTD. and Copyright (C) 2019-2020 Cerno).
+
+Assisted-by: Claude
+---
+--- /dev/null
++++ b/Documentation/devicetree/bindings/iommu/allwinner,sun60i-a733-iommu.yaml
+@@ -0,0 +1,90 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/iommu/allwinner,sun60i-a733-iommu.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Allwinner A733 IOMMU
++
++maintainers:
++  - DockSeed <dockseed@proton.me>
++
++description:
++  The Allwinner A733 has two IOMMU instances. Each has its own register
++  block, interrupt, clocks and reset, and one page table shared by all of
++  its bus masters. IOMMU0 serves USB0_USB1, CSI, ISP and VE_ENC (masters
++  0-3), IOMMU1 serves VE_MBUS0, VE_MBUS1, DE0, DI, G2D and EINK (masters
++  0-5). The register layout and the page table format differ from the
++  IOMMU described in allwinner,sun50i-h6-iommu.yaml.
++
++properties:
++  compatible:
++    const: allwinner,sun60i-a733-iommu
++
++  reg:
++    maxItems: 1
++
++  interrupts:
++    maxItems: 1
++
++  clocks:
++    minItems: 4
++    maxItems: 19
++    description:
++      The IOMMU's own gates -- SYS_MCLK, SYS_PCLK, SYS_HCLK and its MBUS
++      master gate -- followed, optionally, by the MBUS matrix port gate of
++      each master whose port can be gated while the IOMMU runs. A master's
++      register block inside the IOMMU does not answer while that master's
++      port is gated, so the IOMMU holds the port gate for as long as the
++      master translates.
++
++  clock-names:
++    allOf:
++      - minItems: 4
++        maxItems: 19
++        additionalItems: true
++        items:
++          - const: mclk
++          - const: pclk
++          - const: hclk
++          - const: mbus
++      - items:
++          pattern: '^(mclk|pclk|hclk|mbus|master([0-9]|1[0-4]))$'
++
++  resets:
++    maxItems: 1
++
++  "#iommu-cells":
++    const: 1
++    description:
++      The index of the bus master within this IOMMU.
++
++required:
++  - compatible
++  - reg
++  - interrupts
++  - clocks
++  - clock-names
++  - resets
++  - "#iommu-cells"
++
++additionalProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/interrupt-controller/arm-gic.h>
++    #include <dt-bindings/interrupt-controller/irq.h>
++
++    iommu@3910000 {
++        compatible = "allwinner,sun60i-a733-iommu";
++        reg = <0x03910000 0x10000>;
++        interrupts = <GIC_SPI 171 IRQ_TYPE_LEVEL_HIGH>;
++        clocks = <&ccu 90>, <&ccu 91>, <&ccu 92>, <&ccu 93>,
++                 <&ccu 108>, <&ccu 108>;
++        clock-names = "mclk", "pclk", "hclk", "mbus",
++                      "master0", "master1";
++        resets = <&ccu 33>;
++        #iommu-cells = <1>;
++    };
++
++...
+--- a/drivers/iommu/Kconfig
++++ b/drivers/iommu/Kconfig
+@@ -245,6 +245,20 @@ config SUN50I_IOMMU
+ 	help
+ 	  Support for the IOMMU introduced in the Allwinner H6 SoCs.
+ 
++config SUN60I_IOMMU
++	bool "Allwinner A733 IOMMU Support"
++	depends on HAS_DMA
++	depends on ARCH_SUNXI || COMPILE_TEST
++	depends on 64BIT
++	select IOMMU_API
++	help
++	  Support for the two IOMMUs of the Allwinner A733. Their page
++	  tables carry 34-bit physical addresses, so a device behind them
++	  can use memory above 4 GiB with a 32-bit DMA mask, and a buffer
++	  of scattered pages as one contiguous range.
++
++	  Say Y here if you are using an Allwinner A733 SoC.
++
+ config TEGRA_IOMMU_SMMU
+ 	bool "NVIDIA Tegra SMMU Support"
+ 	depends on ARCH_TEGRA
+--- a/drivers/iommu/Makefile
++++ b/drivers/iommu/Makefile
+@@ -24,6 +24,7 @@ obj-$(CONFIG_OMAP_IOMMU) += omap-iommu.o
+ obj-$(CONFIG_OMAP_IOMMU_DEBUG) += omap-iommu-debug.o
+ obj-$(CONFIG_ROCKCHIP_IOMMU) += rockchip-iommu.o
+ obj-$(CONFIG_SUN50I_IOMMU) += sun50i-iommu.o
++obj-$(CONFIG_SUN60I_IOMMU) += sun60i-iommu.o
+ obj-$(CONFIG_TEGRA_IOMMU_SMMU) += tegra-smmu.o
+ obj-$(CONFIG_EXYNOS_IOMMU) += exynos-iommu.o
+ obj-$(CONFIG_FSL_PAMU) += fsl_pamu.o fsl_pamu_domain.o
+--- /dev/null
++++ b/drivers/iommu/sun60i-iommu.c
+@@ -0,0 +1,1183 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Allwinner A733 (sun60i) IOMMU driver
++ *
++ * The A733 has two IOMMU instances. Each has a global register block at
++ * +0x000..+0x3ff, one 0x200-wide block per bus master from +0x400, one
++ * interrupt, and one page table base register shared by all of its masters.
++ * So one DT node is one IOMMU and one iommu group, and the single cell of
++ * "iommus" is the master index within that IOMMU.
++ *
++ * This is not the generation handled by sun50i-iommu.c: that layout's
++ * ENABLE, BYPASS and TTB registers at 0x20/0x30/0x50 read as zero here, its
++ * page table entries carry 32-bit addresses, and it has a single bypass
++ * register for all masters of a single instance.
++ *
++ * The A733 user manual describes this IOMMU in a one-page feature list and
++ * has no register description. The register offsets below follow
++ * Allwinner's BSP driver (sunxi-iommu-v2.c). Everything this driver needs
++ * for translation was read back on an A733 while the BSP kernel was
++ * translating for the display engine, and the page table format was
++ * confirmed by walking that kernel's live tables. Registers and bits marked
++ * "(BSP)" are taken from the BSP driver alone: their meaning has not been
++ * observed on hardware.
++ */
++
++#include <linux/bitfield.h>
++#include <linux/bitops.h>
++#include <linux/clk.h>
++#include <linux/device.h>
++#include <linux/dma-mapping.h>
++#include <linux/err.h>
++#include <linux/interrupt.h>
++#include <linux/iommu.h>
++#include <linux/iopoll.h>
++#include <linux/io.h>
++#include <linux/of.h>
++#include <linux/of_platform.h>
++#include <linux/platform_device.h>
++#include <linux/reset.h>
++#include <linux/sizes.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/types.h>
++
++#include "iommu-pages.h"
++
++/* Global registers, one set per IOMMU */
++
++/* 0x16 on both instances; the only version this layout is known for. */
++#define SUN60I_IOMMU_VERSION_REG	0x000
++#define SUN60I_IOMMU_VERSION_V16		0x16
++/* Reads 0x00037fff at reset. (BSP) bit m holds master m in reset when 0. */
++#define SUN60I_IOMMU_RESET_REG		0x010
++/* 0 at reset, 1 while translating. */
++#define SUN60I_IOMMU_ENABLE_REG		0x014
++#define SUN60I_IOMMU_ENABLE			BIT(0)
++/* Physical address of the L1 table >> 14. */
++#define SUN60I_IOMMU_TTB_REG		0x020
++#define SUN60I_IOMMU_TTB_SHIFT			14
++/*
++ * 0x00030000 at reset, 0 while the BSP kernel translates. The bit meanings
++ * are unknown; 0 is the only value this IOMMU has been seen translating
++ * with.
++ */
++#define SUN60I_IOMMU_TLB_PREFETCH_REG	0x02c
++/* (BSP) bit 0 flushes the macro TLB, bit 1 the page table walk cache. */
++#define SUN60I_IOMMU_TLB_FLUSH_REG	0x030
++#define SUN60I_IOMMU_TLB_FLUSH_ALL		(BIT(1) | BIT(0))
++/* 1 while translating; (BSP) range invalidation mode. */
++#define SUN60I_IOMMU_TLB_IVLD_MODE_REG	0x040
++/* Page numbers (IOVA >> 12) of the range to invalidate. */
++#define SUN60I_IOMMU_TLB_IVLD_START_REG	0x044
++#define SUN60I_IOMMU_TLB_IVLD_END_REG	0x048
++#define SUN60I_IOMMU_TLB_IVLD_ENABLE_REG	0x054
++/* 1 while translating; (BSP) range invalidation mode. */
++#define SUN60I_IOMMU_PC_IVLD_MODE_REG	0x060
++/* 4 MiB numbers (IOVA >> 22) of the range to invalidate. */
++#define SUN60I_IOMMU_PC_IVLD_START_REG	0x068
++#define SUN60I_IOMMU_PC_IVLD_ENABLE_REG	0x06c
++#define SUN60I_IOMMU_PC_IVLD_END_REG	0x070
++#define SUN60I_IOMMU_IVLD_ENABLE		BIT(0)
++/* 3 while translating: bit 0 L1, bit 1 L2 page table fault. */
++#define SUN60I_IOMMU_INT_ENABLE_REG	0x080
++#define SUN60I_IOMMU_INT_L1_EN			BIT(0)
++#define SUN60I_IOMMU_INT_L2_EN			BIT(1)
++/*
++ * Interrupt clear, status and error registers. An L1 fault has been
++ * provoked on hardware: it sets INT_STA bit 16, names the faulting master
++ * in L1PG_INT and the IOVA in INT_ERR_ADDR_L1, and INT_STA reads clear
++ * after the handler below has run. L1PG_INT keeps the master's bit after
++ * that, and no write that clears it is known. The rest is (BSP).
++ */
++#define SUN60I_IOMMU_INT_CLR_REG	0x084
++#define SUN60I_IOMMU_INT_STA_REG	0x088
++#define SUN60I_IOMMU_INT_STA_MASTER		GENMASK(14, 0)
++#define SUN60I_IOMMU_INT_STA_L1			BIT(16)
++#define SUN60I_IOMMU_INT_STA_L2			BIT(17)
++#define SUN60I_IOMMU_INT_ERR_ADDR_L1_LO	0x08c
++#define SUN60I_IOMMU_INT_ERR_ADDR_L1_HI	0x090
++#define SUN60I_IOMMU_INT_ERR_ADDR_L2_LO	0x094
++#define SUN60I_IOMMU_INT_ERR_ADDR_L2_HI	0x098
++#define SUN60I_IOMMU_INT_ERR_DATA_L1	0x09c
++#define SUN60I_IOMMU_INT_ERR_DATA_L2	0x0a0
++#define SUN60I_IOMMU_L1PG_INT_REG	0x0b0
++#define SUN60I_IOMMU_L2PG_INT_REG	0x0b4
++/* (BSP) set in L1PG/L2PG_INT when the fault came from a prefetch. */
++#define SUN60I_IOMMU_PG_INT_PREFETCH		BIT(31)
++
++/* Per-master "micro TLB" block */
++
++#define SUN60I_IOMMU_MASTER_BASE(m)	(0x400 + 0x200 * (m))
++/* 1 at reset in every implemented master block, 0 where there is none. */
++#define SUN60I_IOMMU_M_AUTO_GATING	0x00
++/* 1 = bypass (reset value), 0 = translate. */
++#define SUN60I_IOMMU_M_BYP		0x04
++/* (BSP) flush this master's TLB. */
++#define SUN60I_IOMMU_M_TLB_FLUSH	0x18
++/* 1 on every master while the BSP kernel translates. */
++#define SUN60I_IOMMU_M_INT_ENABLE	0x30
++/* (BSP) */
++#define SUN60I_IOMMU_M_INT_CLR		0x34
++#define SUN60I_IOMMU_M_INT_ERR_ADDR_LO	0x3c
++#define SUN60I_IOMMU_M_INT_ERR_ADDR_HI	0x40
++#define SUN60I_IOMMU_M_INT_ERR_DATA	0x44
++
++/* The user manual lists 15 as the most masters one IOMMU supports. */
++#define SUN60I_IOMMU_MAX_MASTERS	15
++
++/*
++ * Page table. 34-bit IOVA ("16G space" in the user manual). L1: 4096
++ * entries indexed by IOVA[33:22], 16 KiB, found through TTB = pa >> 14, so
++ * the table must be 16 KiB aligned. L2: 1024 entries indexed by
++ * IOVA[21:12], 4 KiB. Entries are 32 bits wide and carry a 34-bit physical
++ * address: bits 31:12 are the address's bits 31:12, bits 9:8 its bits
++ * 33:32. Tables and pages above 4 GiB have been walked on hardware; the
++ * permission bits have only been seen set together.
++ *
++ *   DTE  31:12 L2 table | 9:8 table 33:32 | 1:0 = 01 valid
++ *   PTE  31:12 page     | 9:8 page 33:32  | 3 W | 2 R | 1 valid
++ */
++#define SUN60I_IOVA_BITS		34
++#define SUN60I_L1_SHIFT			22
++#define SUN60I_L1_ENTRIES		4096
++#define SUN60I_L1_SIZE			SZ_16K
++#define SUN60I_L2_ENTRIES		1024
++#define SUN60I_L2_SIZE			SZ_4K
++#define SUN60I_PAGE_SIZE		SZ_4K
++#define SUN60I_PAGE_SHIFT		12
++
++#define SUN60I_ENT_ADDR_LOW		GENMASK(31, 12)
++#define SUN60I_ENT_ADDR_HIGH		GENMASK(9, 8)
++#define SUN60I_DTE_VALID_MASK		GENMASK(1, 0)
++#define SUN60I_DTE_VALID		0x1
++#define SUN60I_PTE_WRITABLE		BIT(3)
++#define SUN60I_PTE_READABLE		BIT(2)
++#define SUN60I_PTE_VALID		BIT(1)
++
++/*
++ * Physical addresses an entry carries as they are. The BSP driver gives
++ * entry addresses below 0x40000000 a second meaning (see
++ * sun60i_iommu_pa_ok()); RAM on this SoC starts at the lower bound.
++ */
++#define SUN60I_PA_MIN			0x40000000ULL
++#define SUN60I_PA_END			BIT_ULL(SUN60I_IOVA_BITS)
++
++#define SUN60I_IOMMU_CMD_TIMEOUT_US	1000
++
++struct sun60i_iommu {
++	struct iommu_device iommu;
++	struct device *dev;
++	void __iomem *base;
++	/* Serialises every register access of this IOMMU. */
++	spinlock_t lock;
++	/* The paging domain TTB points at, or NULL (all masters in bypass). */
++	struct sun60i_iommu_domain *domain;
++	/* Devices attached to a paging domain, per master. */
++	u8 users[SUN60I_IOMMU_MAX_MASTERS];
++	/*
++	 * The master's MBUS matrix port gate ("masterN"), prepared at probe and
++	 * enabled for as long as the master has a user. A master block does not
++	 * answer while its port is gated: an access stalls the bus. NULL for a
++	 * master whose port is on whenever the IOMMU is (the display engine).
++	 */
++	struct clk *master_clk[SUN60I_IOMMU_MAX_MASTERS];
++};
++
++struct sun60i_iommu_domain {
++	struct iommu_domain domain;
++	u32 *l1;
++	/*
++	 * The IOMMU of the device the domain was allocated for. Tables of one
++	 * IOMMU are never handed to the other (attach refuses it).
++	 */
++	struct sun60i_iommu *iommu;
++};
++
++/* One per client device, dev_iommu_priv. */
++struct sun60i_iommu_client {
++	struct sun60i_iommu *iommu;
++	/* This device holds a count in iommu->users for each of its masters. */
++	bool translating;
++};
++
++static struct sun60i_iommu_domain *to_sun60i_domain(struct iommu_domain *domain)
++{
++	return container_of(domain, struct sun60i_iommu_domain, domain);
++}
++
++static u32 sun60i_read(struct sun60i_iommu *iommu, u32 off)
++{
++	return readl(iommu->base + off);
++}
++
++static void sun60i_write(struct sun60i_iommu *iommu, u32 off, u32 val)
++{
++	writel(val, iommu->base + off);
++}
++
++static void sun60i_mwrite(struct sun60i_iommu *iommu, unsigned int m, u32 off,
++			  u32 val)
++{
++	writel(val, iommu->base + SUN60I_IOMMU_MASTER_BASE(m) + off);
++}
++
++static u32 sun60i_mread(struct sun60i_iommu *iommu, unsigned int m, u32 off)
++{
++	return readl(iommu->base + SUN60I_IOMMU_MASTER_BASE(m) + off);
++}
++
++/* Entries */
++
++static bool sun60i_iommu_pa_ok(phys_addr_t pa, size_t size)
++{
++	/*
++	 * The BSP driver reads an entry address below 0x40000000 (the CPU's
++	 * I/O region) as the CPU address 2^34 above it, and encodes CPU
++	 * addresses from 16 GiB up that way. The user manual does not
++	 * describe this and it has not been observed. RAM starts at
++	 * 0x40000000, so neither range is reached below 15 GiB of RAM: such
++	 * an address is refused rather than encoded on a guess.
++	 */
++	return (u64)pa >= SUN60I_PA_MIN && (u64)pa + size <= SUN60I_PA_END;
++}
++
++static u32 sun60i_mk_addr(phys_addr_t pa)
++{
++	return ((u32)pa & SUN60I_ENT_ADDR_LOW) |
++	       FIELD_PREP(SUN60I_ENT_ADDR_HIGH, (u64)pa >> 32);
++}
++
++static phys_addr_t sun60i_ent_addr(u32 ent)
++{
++	return ((phys_addr_t)FIELD_GET(SUN60I_ENT_ADDR_HIGH, ent) << 32) |
++	       (ent & SUN60I_ENT_ADDR_LOW);
++}
++
++static bool sun60i_dte_valid(u32 dte)
++{
++	return (dte & SUN60I_DTE_VALID_MASK) == SUN60I_DTE_VALID;
++}
++
++static u32 sun60i_mk_pte(phys_addr_t pa, int prot)
++{
++	u32 pte = sun60i_mk_addr(pa) | SUN60I_PTE_VALID;
++
++	if (prot & IOMMU_READ)
++		pte |= SUN60I_PTE_READABLE;
++	if (prot & IOMMU_WRITE)
++		pte |= SUN60I_PTE_WRITABLE;
++	return pte;
++}
++
++static unsigned int sun60i_l1_index(unsigned long iova)
++{
++	return (iova >> SUN60I_L1_SHIFT) & (SUN60I_L1_ENTRIES - 1);
++}
++
++static unsigned int sun60i_l2_index(unsigned long iova)
++{
++	return (iova >> SUN60I_PAGE_SHIFT) & (SUN60I_L2_ENTRIES - 1);
++}
++
++static void sun60i_table_flush(struct sun60i_iommu *iommu, void *vaddr,
++			       unsigned int n)
++{
++	dma_sync_single_for_device(iommu->dev, virt_to_phys(vaddr),
++				   n * sizeof(u32), DMA_TO_DEVICE);
++}
++
++/*
++ * Tables are DMA-mapped for their lifetime, so that the syncs above act on
++ * a mapping. The IOMMU reads a table at its physical address, so the
++ * mapping must not be a bounce buffer: probe sets a 34-bit mask, and a
++ * mapping that does not come back as the physical address is refused.
++ */
++static int sun60i_table_map(struct sun60i_iommu *iommu, void *table,
++			    size_t size)
++{
++	dma_addr_t dma = dma_map_single(iommu->dev, table, size, DMA_TO_DEVICE);
++
++	if (dma_mapping_error(iommu->dev, dma))
++		return -ENOMEM;
++	if (dma != virt_to_phys(table)) {
++		dma_unmap_single(iommu->dev, dma, size, DMA_TO_DEVICE);
++		return -EINVAL;
++	}
++	return 0;
++}
++
++static void sun60i_table_free(struct sun60i_iommu *iommu, void *table,
++			      size_t size)
++{
++	dma_unmap_single(iommu->dev, virt_to_phys(table), size, DMA_TO_DEVICE);
++	iommu_free_pages(table);
++}
++
++/* Commands */
++
++/*
++ * Set a command bit and wait for it to drop. A bit still set after the
++ * timeout is cleared and reported.
++ *
++ * TLB_FLUSH, PC_IVLD_ENABLE and the per-master TLB_FLUSH drop by the first
++ * read, a few microseconds after the write, whatever the video engine
++ * does. TLB_IVLD_ENABLE does not: its bit waits for the video engine's
++ * memory port and stays set while that port's bus clock gate is closed, as
++ * it is while the video engine is idle (the decoder's port for IOMMU1, the
++ * encoder's for IOMMU0, whether or not the instance is enabled), although
++ * the invalidation itself takes effect. The driver does not issue it (see
++ * sun60i_iommu_invalidate()). Whether a bit that drops means that the
++ * operation has completed is not documented.
++ */
++static void sun60i_iommu_cmd(struct sun60i_iommu *iommu, u32 off, u32 bits)
++{
++	u32 val;
++	int ret;
++
++	lockdep_assert_held(&iommu->lock);
++
++	sun60i_write(iommu, off, bits);
++	ret = readl_poll_timeout_atomic(iommu->base + off, val, !(val & bits),
++					10, SUN60I_IOMMU_CMD_TIMEOUT_US);
++	if (ret) {
++		sun60i_write(iommu, off, 0);
++		dev_err_ratelimited(iommu->dev,
++				    "command %#x at %#x timed out\n", bits, off);
++	}
++}
++
++/*
++ * Flush the macro TLB and the page table walk cache, then the micro TLB of
++ * every master that translates, in this order (see
++ * sun60i_iommu_invalidate()). A master in bypass holds no translation of
++ * this table (sun60i_iommu_master_translate() flushes it before it
++ * translates), and its block is not touched. A master with a user has its
++ * port gate held (see sun60i_iommu_master_translate()), so every block this
++ * touches answers.
++ */
++static void sun60i_iommu_flush_all(struct sun60i_iommu *iommu)
++{
++	unsigned int m;
++
++	lockdep_assert_held(&iommu->lock);
++
++	sun60i_iommu_cmd(iommu, SUN60I_IOMMU_TLB_FLUSH_REG,
++			 SUN60I_IOMMU_TLB_FLUSH_ALL);
++	for (m = 0; m < SUN60I_IOMMU_MAX_MASTERS; m++)
++		if (iommu->users[m])
++			sun60i_iommu_cmd(iommu, SUN60I_IOMMU_MASTER_BASE(m) +
++					 SUN60I_IOMMU_M_TLB_FLUSH, BIT(0));
++}
++
++/*
++ * Invalidate [first, last], both inclusive IOVAs, by flushing: the macro
++ * TLB and the page table walk cache first, then the micro TLB of every
++ * master that translates. The order matters. A stale entry that a master
++ * also held in its micro TLB survived the global flush alone, the
++ * per-master flush alone and the per-master flush followed by the global
++ * one; it was gone only after the global flush followed by the per-master
++ * one.
++ *
++ * The range command (TLB_IVLD_ENABLE over TLB_IVLD_START/END) is not used.
++ * It takes effect, but its done bit does not drop while the video engine is
++ * idle (see sun60i_iommu_cmd()), so its completion cannot be waited for. A
++ * flush costs page table walks after every sync, not correctness.
++ */
++static void sun60i_iommu_invalidate(struct sun60i_iommu *iommu,
++				    unsigned long first, unsigned long last)
++{
++	lockdep_assert_held(&iommu->lock);
++
++	sun60i_iommu_flush_all(iommu);
++}
++
++/* Enable / disable */
++
++static void sun60i_iommu_hw_enable(struct sun60i_iommu *iommu,
++				   struct sun60i_iommu_domain *dom)
++{
++	phys_addr_t l1 = virt_to_phys(dom->l1);
++
++	lockdep_assert_held(&iommu->lock);
++
++	sun60i_write(iommu, SUN60I_IOMMU_TTB_REG, l1 >> SUN60I_IOMMU_TTB_SHIFT);
++	sun60i_write(iommu, SUN60I_IOMMU_TLB_PREFETCH_REG, 0);
++	sun60i_write(iommu, SUN60I_IOMMU_TLB_IVLD_MODE_REG, 1);
++	sun60i_write(iommu, SUN60I_IOMMU_PC_IVLD_MODE_REG, 1);
++	sun60i_write(iommu, SUN60I_IOMMU_INT_ENABLE_REG,
++		     SUN60I_IOMMU_INT_L1_EN | SUN60I_IOMMU_INT_L2_EN);
++	sun60i_iommu_flush_all(iommu);
++	sun60i_write(iommu, SUN60I_IOMMU_ENABLE_REG, SUN60I_IOMMU_ENABLE);
++
++	dev_dbg(iommu->dev, "translating: L1 table at %pa\n", &l1);
++}
++
++/* Back to the reset state: no table, every master in bypass. */
++static void sun60i_iommu_hw_disable(struct sun60i_iommu *iommu)
++{
++	lockdep_assert_held(&iommu->lock);
++
++	sun60i_write(iommu, SUN60I_IOMMU_ENABLE_REG, 0);
++	sun60i_write(iommu, SUN60I_IOMMU_INT_ENABLE_REG, 0);
++	sun60i_write(iommu, SUN60I_IOMMU_TTB_REG, 0);
++	sun60i_iommu_flush_all(iommu);
++
++	dev_dbg(iommu->dev, "no master translating, disabled\n");
++}
++
++/*
++ * The first user of master @m: take its port gate, then program its block.
++ * The gate stays enabled until sun60i_iommu_master_bypass(), so the block is
++ * never gated while it holds this driver's state -- whether it would keep
++ * that state across a gated port has not been measured.
++ */
++static int sun60i_iommu_master_translate(struct sun60i_iommu *iommu,
++					 unsigned int m)
++{
++	int ret;
++
++	lockdep_assert_held(&iommu->lock);
++
++	ret = clk_enable(iommu->master_clk[m]);
++	if (ret) {
++		dev_err(iommu->dev, "master %u: port clock: %d\n", m, ret);
++		return ret;
++	}
++
++	sun60i_mwrite(iommu, m, SUN60I_IOMMU_M_INT_ENABLE, 1);
++	sun60i_iommu_cmd(iommu, SUN60I_IOMMU_MASTER_BASE(m) +
++			 SUN60I_IOMMU_M_TLB_FLUSH, BIT(0));
++	sun60i_mwrite(iommu, m, SUN60I_IOMMU_M_BYP, 0);
++
++	dev_dbg(iommu->dev, "master %u translating\n", m);
++	return 0;
++}
++
++static void sun60i_iommu_master_bypass(struct sun60i_iommu *iommu,
++				       unsigned int m)
++{
++	lockdep_assert_held(&iommu->lock);
++
++	sun60i_mwrite(iommu, m, SUN60I_IOMMU_M_BYP, 1);
++	sun60i_mwrite(iommu, m, SUN60I_IOMMU_M_INT_ENABLE, 0);
++	/* Last block access of this master: its port may be gated again. */
++	clk_disable(iommu->master_clk[m]);
++
++	dev_dbg(iommu->dev, "master %u in bypass\n", m);
++}
++
++/* The masters that have a user, i.e. whose port gate this driver holds. */
++static u32 sun60i_iommu_user_mask(struct sun60i_iommu *iommu)
++{
++	unsigned int m;
++	u32 mask = 0;
++
++	for (m = 0; m < SUN60I_IOMMU_MAX_MASTERS; m++)
++		if (iommu->users[m])
++			mask |= BIT(m);
++	return mask;
++}
++
++static bool sun60i_iommu_any_user(struct sun60i_iommu *iommu)
++{
++	unsigned int m;
++
++	for (m = 0; m < SUN60I_IOMMU_MAX_MASTERS; m++)
++		if (iommu->users[m])
++			return true;
++	return false;
++}
++
++/* Domain ops */
++
++static u32 *sun60i_iommu_get_l2(struct sun60i_iommu_domain *dom,
++				unsigned long iova, gfp_t gfp)
++{
++	struct sun60i_iommu *iommu = dom->iommu;
++	u32 *dte = &dom->l1[sun60i_l1_index(iova)];
++	phys_addr_t pa;
++	u32 *l2, old, new;
++	int ret;
++
++	if (sun60i_dte_valid(*dte))
++		return phys_to_virt(sun60i_ent_addr(*dte));
++
++	l2 = iommu_alloc_pages_sz(gfp, SUN60I_L2_SIZE);
++	if (!l2)
++		return ERR_PTR(-ENOMEM);
++
++	pa = virt_to_phys(l2);
++	if (!sun60i_iommu_pa_ok(pa, SUN60I_L2_SIZE)) {
++		iommu_free_pages(l2);
++		return ERR_PTR(-EINVAL);
++	}
++	ret = sun60i_table_map(iommu, l2, SUN60I_L2_SIZE);
++	if (ret) {
++		iommu_free_pages(l2);
++		return ERR_PTR(ret);
++	}
++
++	new = sun60i_mk_addr(pa) | SUN60I_DTE_VALID;
++	old = cmpxchg(dte, 0, new);
++	if (old) {
++		/* Lost a race: somebody installed a table for this 4 MiB. */
++		sun60i_table_free(iommu, l2, SUN60I_L2_SIZE);
++		return phys_to_virt(sun60i_ent_addr(old));
++	}
++	sun60i_table_flush(iommu, dte, 1);
++
++	return l2;
++}
++
++static int sun60i_iommu_map_pages(struct iommu_domain *domain,
++				  unsigned long iova, phys_addr_t paddr,
++				  size_t pgsize, size_t pgcount, int prot,
++				  gfp_t gfp, size_t *mapped)
++{
++	struct sun60i_iommu_domain *dom = to_sun60i_domain(domain);
++	size_t i;
++
++	if (!sun60i_iommu_pa_ok(paddr, pgsize * pgcount)) {
++		dev_warn_ratelimited(dom->iommu->dev,
++				     "refusing to map %pa (+%zu pages): outside [0x40000000, 16 GiB)\n",
++				     &paddr, pgcount);
++		return -EINVAL;
++	}
++
++	for (i = 0; i < pgcount; i++) {
++		unsigned long va = iova + i * pgsize;
++		phys_addr_t pa = paddr + i * pgsize;
++		u32 *l2, *pte;
++
++		l2 = sun60i_iommu_get_l2(dom, va, gfp);
++		if (IS_ERR(l2))
++			return PTR_ERR(l2);
++
++		pte = &l2[sun60i_l2_index(va)];
++		if (*pte & SUN60I_PTE_VALID) {
++			phys_addr_t old = sun60i_ent_addr(*pte);
++
++			dev_err(dom->iommu->dev,
++				"iova %#lx already maps %pa, refusing %pa\n",
++				va, &old, &pa);
++			return -EBUSY;
++		}
++		*pte = sun60i_mk_pte(pa, prot);
++		sun60i_table_flush(dom->iommu, pte, 1);
++		*mapped += pgsize;
++	}
++
++	return 0;
++}
++
++static size_t sun60i_iommu_unmap_pages(struct iommu_domain *domain,
++				       unsigned long iova, size_t pgsize,
++				       size_t pgcount,
++				       struct iommu_iotlb_gather *gather)
++{
++	struct sun60i_iommu_domain *dom = to_sun60i_domain(domain);
++	size_t unmapped = 0;
++	size_t i;
++
++	for (i = 0; i < pgcount; i++) {
++		unsigned long va = iova + i * pgsize;
++		u32 dte = dom->l1[sun60i_l1_index(va)];
++		u32 *pte;
++
++		if (!sun60i_dte_valid(dte))
++			break;
++		pte = (u32 *)phys_to_virt(sun60i_ent_addr(dte)) +
++		      sun60i_l2_index(va);
++		if (!(*pte & SUN60I_PTE_VALID))
++			break;
++		/*
++		 * Cleared here, invalidated in iotlb_sync: the other order
++		 * lets a walk in between cache the entry again. L2 tables are
++		 * kept until the domain is freed, so no walk can reach a
++		 * freed table.
++		 */
++		*pte = 0;
++		sun60i_table_flush(dom->iommu, pte, 1);
++		unmapped += pgsize;
++	}
++
++	if (unmapped)
++		iommu_iotlb_gather_add_range(gather, iova, unmapped);
++
++	return unmapped;
++}
++
++static int sun60i_iommu_iotlb_sync_map(struct iommu_domain *domain,
++				       unsigned long iova, size_t size)
++{
++	struct sun60i_iommu_domain *dom = to_sun60i_domain(domain);
++	struct sun60i_iommu *iommu = dom->iommu;
++	unsigned long flags;
++
++	if (!size)
++		return 0;
++
++	/* A walk may have cached this range while it was still invalid. */
++	spin_lock_irqsave(&iommu->lock, flags);
++	if (iommu->domain == dom)
++		sun60i_iommu_invalidate(iommu, iova, iova + size - 1);
++	spin_unlock_irqrestore(&iommu->lock, flags);
++
++	return 0;
++}
++
++static void sun60i_iommu_iotlb_sync(struct iommu_domain *domain,
++				    struct iommu_iotlb_gather *gather)
++{
++	struct sun60i_iommu_domain *dom = to_sun60i_domain(domain);
++	struct sun60i_iommu *iommu = dom->iommu;
++	unsigned long flags;
++
++	if (gather->start > gather->end)
++		return;
++
++	spin_lock_irqsave(&iommu->lock, flags);
++	if (iommu->domain == dom)
++		sun60i_iommu_invalidate(iommu, gather->start, gather->end);
++	spin_unlock_irqrestore(&iommu->lock, flags);
++}
++
++static void sun60i_iommu_flush_iotlb_all(struct iommu_domain *domain)
++{
++	struct sun60i_iommu_domain *dom = to_sun60i_domain(domain);
++	struct sun60i_iommu *iommu = dom->iommu;
++	unsigned long flags;
++
++	spin_lock_irqsave(&iommu->lock, flags);
++	if (iommu->domain == dom)
++		sun60i_iommu_flush_all(iommu);
++	spin_unlock_irqrestore(&iommu->lock, flags);
++}
++
++static phys_addr_t sun60i_iommu_iova_to_phys(struct iommu_domain *domain,
++					     dma_addr_t iova)
++{
++	struct sun60i_iommu_domain *dom = to_sun60i_domain(domain);
++	u32 dte, pte;
++
++	dte = dom->l1[sun60i_l1_index(iova)];
++	if (!sun60i_dte_valid(dte))
++		return 0;
++	pte = ((u32 *)phys_to_virt(sun60i_ent_addr(dte)))[sun60i_l2_index(iova)];
++	if (!(pte & SUN60I_PTE_VALID))
++		return 0;
++	return sun60i_ent_addr(pte) + (iova & (SUN60I_PAGE_SIZE - 1));
++}
++
++static void sun60i_iommu_domain_free(struct iommu_domain *domain)
++{
++	struct sun60i_iommu_domain *dom = to_sun60i_domain(domain);
++	unsigned int i;
++
++	for (i = 0; i < SUN60I_L1_ENTRIES; i++) {
++		u32 dte = dom->l1[i];
++
++		if (sun60i_dte_valid(dte))
++			sun60i_table_free(dom->iommu,
++					  phys_to_virt(sun60i_ent_addr(dte)),
++					  SUN60I_L2_SIZE);
++	}
++	sun60i_table_free(dom->iommu, dom->l1, SUN60I_L1_SIZE);
++	kfree(dom);
++}
++
++static struct iommu_domain *sun60i_iommu_domain_alloc_paging(struct device *dev)
++{
++	struct sun60i_iommu_client *client = dev_iommu_priv_get(dev);
++	struct sun60i_iommu_domain *dom;
++	phys_addr_t pa;
++
++	dom = kzalloc_obj(*dom, GFP_KERNEL);
++	if (!dom)
++		return NULL;
++
++	/*
++	 * An order-2 block from the page allocator starts on a 16 KiB
++	 * physical boundary, which TTB = pa >> 14 requires. No GFP_DMA32:
++	 * this IOMMU walks tables above 4 GiB.
++	 */
++	dom->l1 = iommu_alloc_pages_sz(GFP_KERNEL, SUN60I_L1_SIZE);
++	if (!dom->l1)
++		goto err_free;
++
++	pa = virt_to_phys(dom->l1);
++	if ((pa & (SUN60I_L1_SIZE - 1)) ||
++	    !sun60i_iommu_pa_ok(pa, SUN60I_L1_SIZE)) {
++		dev_err(client->iommu->dev,
++			"L1 table at %pa cannot be put in TTB\n", &pa);
++		goto err_free_l1;
++	}
++	if (sun60i_table_map(client->iommu, dom->l1, SUN60I_L1_SIZE))
++		goto err_free_l1;
++	dom->iommu = client->iommu;
++
++	dom->domain.pgsize_bitmap = SUN60I_PAGE_SIZE;
++	dom->domain.geometry.aperture_start = 0;
++	dom->domain.geometry.aperture_end = SUN60I_PA_END - 1;
++	dom->domain.geometry.force_aperture = true;
++
++	return &dom->domain;
++
++err_free_l1:
++	iommu_free_pages(dom->l1);
++err_free:
++	kfree(dom);
++	return NULL;
++}
++
++static int sun60i_iommu_attach_paging(struct iommu_domain *domain,
++				      struct device *dev)
++{
++	struct sun60i_iommu_domain *dom = to_sun60i_domain(domain);
++	struct sun60i_iommu_client *client = dev_iommu_priv_get(dev);
++	struct iommu_fwspec *fwspec = dev_iommu_fwspec_get(dev);
++	struct sun60i_iommu *iommu = client->iommu;
++	unsigned long flags;
++	unsigned int i;
++	int ret = 0;
++
++	spin_lock_irqsave(&iommu->lock, flags);
++
++	if (dom->iommu != iommu) {
++		ret = -EINVAL;
++		goto out;
++	}
++
++	/*
++	 * No master block is read here: attach runs from dma_configure, before
++	 * the consumer's probe, with the MBUS port in whatever state it was
++	 * left, and a gated port stalls the bus on the first access. The block
++	 * is touched only in sun60i_iommu_master_translate(), gate held.
++	 * of_xlate() bounds the ids to the 15 master slots of the user manual;
++	 * a slot without a master reads 0 and ignores writes.
++	 */
++
++	if (iommu->domain != dom) {
++		if (iommu->domain) {
++			/* Switching tables under translating masters. */
++			sun60i_write(iommu, SUN60I_IOMMU_TTB_REG,
++				     virt_to_phys(dom->l1) >>
++				     SUN60I_IOMMU_TTB_SHIFT);
++			sun60i_iommu_flush_all(iommu);
++		} else {
++			sun60i_iommu_hw_enable(iommu, dom);
++		}
++		iommu->domain = dom;
++	}
++
++	if (!client->translating) {
++		for (i = 0; i < fwspec->num_ids; i++) {
++			unsigned int m = fwspec->ids[i];
++
++			if (!iommu->users[m]) {
++				ret = sun60i_iommu_master_translate(iommu, m);
++				if (ret)
++					goto undo;
++			}
++			iommu->users[m]++;
++		}
++		client->translating = true;
++	}
++	goto out;
++
++undo:
++	/* Put back the masters this attach switched on, in reverse. */
++	while (i--) {
++		unsigned int m = fwspec->ids[i];
++
++		if (--iommu->users[m] == 0)
++			sun60i_iommu_master_bypass(iommu, m);
++	}
++	if (!sun60i_iommu_any_user(iommu)) {
++		sun60i_iommu_hw_disable(iommu);
++		iommu->domain = NULL;
++	}
++out:
++	spin_unlock_irqrestore(&iommu->lock, flags);
++	return ret;
++}
++
++static void sun60i_iommu_client_bypass(struct device *dev)
++{
++	struct sun60i_iommu_client *client = dev_iommu_priv_get(dev);
++	struct iommu_fwspec *fwspec = dev_iommu_fwspec_get(dev);
++	struct sun60i_iommu *iommu = client->iommu;
++	unsigned long flags;
++	unsigned int i;
++
++	spin_lock_irqsave(&iommu->lock, flags);
++
++	if (client->translating) {
++		for (i = 0; i < fwspec->num_ids; i++)
++			if (--iommu->users[fwspec->ids[i]] == 0)
++				sun60i_iommu_master_bypass(iommu,
++							   fwspec->ids[i]);
++		client->translating = false;
++	}
++
++	if (iommu->domain && !sun60i_iommu_any_user(iommu)) {
++		sun60i_iommu_hw_disable(iommu);
++		iommu->domain = NULL;
++	}
++
++	spin_unlock_irqrestore(&iommu->lock, flags);
++}
++
++static int sun60i_iommu_attach_identity(struct iommu_domain *domain,
++					struct device *dev)
++{
++	sun60i_iommu_client_bypass(dev);
++	return 0;
++}
++
++static const struct iommu_domain_ops sun60i_iommu_identity_ops = {
++	.attach_dev = sun60i_iommu_attach_identity,
++};
++
++/* Bypass is the reset state of every master. */
++static struct iommu_domain sun60i_iommu_identity_domain = {
++	.type = IOMMU_DOMAIN_IDENTITY,
++	.ops = &sun60i_iommu_identity_ops,
++};
++
++static struct iommu_device *sun60i_iommu_probe_device(struct device *dev)
++{
++	struct sun60i_iommu_client *client = dev_iommu_priv_get(dev);
++
++	if (!client)
++		return ERR_PTR(-ENODEV);
++
++	return &client->iommu->iommu;
++}
++
++static void sun60i_iommu_release_device(struct device *dev)
++{
++	struct sun60i_iommu_client *client = dev_iommu_priv_get(dev);
++
++	if (!client)
++		return;
++	sun60i_iommu_client_bypass(dev);
++	dev_iommu_priv_set(dev, NULL);
++	kfree(client);
++}
++
++static int sun60i_iommu_of_xlate(struct device *dev,
++				 const struct of_phandle_args *args)
++{
++	struct sun60i_iommu_client *client = dev_iommu_priv_get(dev);
++	struct platform_device *pdev;
++	struct sun60i_iommu *iommu;
++	u32 id;
++
++	if (args->args_count != 1 ||
++	    args->args[0] >= SUN60I_IOMMU_MAX_MASTERS)
++		return -EINVAL;
++	id = args->args[0];
++
++	pdev = of_find_device_by_node(args->np);
++	if (!pdev)
++		return -ENODEV;
++	iommu = platform_get_drvdata(pdev);
++	put_device(&pdev->dev);
++	if (!iommu)
++		return -EPROBE_DEFER;
++
++	if (!client) {
++		client = kzalloc_obj(*client, GFP_KERNEL);
++		if (!client)
++			return -ENOMEM;
++		client->iommu = iommu;
++		dev_iommu_priv_set(dev, client);
++	} else if (client->iommu != iommu) {
++		/* Masters on both IOMMUs would need two tables per domain. */
++		dev_err(dev, "masters on both IOMMUs are not supported\n");
++		return -EINVAL;
++	}
++
++	return iommu_fwspec_add_ids(dev, &id, 1);
++}
++
++static const struct iommu_ops sun60i_iommu_ops = {
++	.identity_domain	= &sun60i_iommu_identity_domain,
++	.domain_alloc_paging	= sun60i_iommu_domain_alloc_paging,
++	.probe_device		= sun60i_iommu_probe_device,
++	.release_device		= sun60i_iommu_release_device,
++	/* One TTB per IOMMU: all devices behind it share a group and a table. */
++	.device_group		= generic_single_device_group,
++	.of_xlate		= sun60i_iommu_of_xlate,
++	.default_domain_ops = &(const struct iommu_domain_ops) {
++		.attach_dev		= sun60i_iommu_attach_paging,
++		.map_pages		= sun60i_iommu_map_pages,
++		.unmap_pages		= sun60i_iommu_unmap_pages,
++		.iotlb_sync_map		= sun60i_iommu_iotlb_sync_map,
++		.iotlb_sync		= sun60i_iommu_iotlb_sync,
++		.flush_iotlb_all	= sun60i_iommu_flush_iotlb_all,
++		.iova_to_phys		= sun60i_iommu_iova_to_phys,
++		.free			= sun60i_iommu_domain_free,
++	},
++};
++
++/* Faults */
++
++/*
++ * Reset the masters in @mask, as sun50i-iommu does after a fault, and put
++ * back what this driver set in their blocks: what a master reset clears is
++ * not documented.
++ */
++static void sun60i_iommu_reset_masters(struct sun60i_iommu *iommu, u32 mask)
++{
++	u32 saved = sun60i_read(iommu, SUN60I_IOMMU_RESET_REG);
++	unsigned long m, bits = mask;
++
++	lockdep_assert_held(&iommu->lock);
++
++	sun60i_write(iommu, SUN60I_IOMMU_RESET_REG, saved & ~mask);
++	sun60i_write(iommu, SUN60I_IOMMU_RESET_REG, saved);
++	for_each_set_bit(m, &bits, SUN60I_IOMMU_MAX_MASTERS) {
++		sun60i_mwrite(iommu, m, SUN60I_IOMMU_M_INT_ENABLE,
++			      iommu->users[m] ? 1 : 0);
++		sun60i_mwrite(iommu, m, SUN60I_IOMMU_M_BYP,
++			      iommu->users[m] ? 0 : 1);
++	}
++}
++
++static void sun60i_iommu_report(struct sun60i_iommu *iommu, const char *what,
++				u32 masters, u64 iova, u32 data)
++{
++	dev_err_ratelimited(iommu->dev,
++			    "%s fault: iova %#llx, masters %#x, data %#x\n",
++			    what, iova, masters, data);
++	/* The access direction is not decoded: the data format is unknown. */
++	if (iommu->domain)
++		report_iommu_fault(&iommu->domain->domain, iommu->dev, iova,
++				   IOMMU_FAULT_READ);
++	sun60i_iommu_invalidate(iommu, iova, iova);
++}
++
++static irqreturn_t sun60i_iommu_irq(int irq, void *dev_id)
++{
++	struct sun60i_iommu *iommu = dev_id;
++	unsigned long m, bits;
++	u32 sta, l1, l2, masters, reset, clr, users;
++
++	spin_lock(&iommu->lock);
++
++	sta = sun60i_read(iommu, SUN60I_IOMMU_INT_STA_REG);
++	l1 = sun60i_read(iommu, SUN60I_IOMMU_L1PG_INT_REG);
++	l2 = sun60i_read(iommu, SUN60I_IOMMU_L2PG_INT_REG);
++	sta &= SUN60I_IOMMU_INT_STA_MASTER | SUN60I_IOMMU_INT_STA_L1 |
++	       SUN60I_IOMMU_INT_STA_L2;
++	if (!sta) {
++		spin_unlock(&iommu->lock);
++		return IRQ_NONE;
++	}
++
++	/*
++	 * Only masters with a user have their port gate held; the block of any
++	 * other master may not answer. A master without a user runs in bypass
++	 * and has its fault interrupt off, so its bit here would be stale.
++	 */
++	users = sun60i_iommu_user_mask(iommu);
++	masters = sta & SUN60I_IOMMU_INT_STA_MASTER & users;
++	bits = masters;
++	for_each_set_bit(m, &bits, SUN60I_IOMMU_MAX_MASTERS) {
++		u64 iova = sun60i_mread(iommu, m, SUN60I_IOMMU_M_INT_ERR_ADDR_LO) |
++			   (u64)sun60i_mread(iommu, m,
++					     SUN60I_IOMMU_M_INT_ERR_ADDR_HI) << 32;
++
++		sun60i_iommu_report(iommu, "permission", BIT(m), iova,
++				    sun60i_mread(iommu, m,
++						 SUN60I_IOMMU_M_INT_ERR_DATA));
++		sun60i_mwrite(iommu, m, SUN60I_IOMMU_M_INT_CLR, 1);
++	}
++
++	if (sta & SUN60I_IOMMU_INT_STA_L1) {
++		u64 iova = sun60i_read(iommu, SUN60I_IOMMU_INT_ERR_ADDR_L1_LO) |
++			   (u64)sun60i_read(iommu,
++					    SUN60I_IOMMU_INT_ERR_ADDR_L1_HI) << 32;
++
++		if (l1 & SUN60I_IOMMU_PG_INT_PREFETCH)
++			sun60i_iommu_invalidate(iommu, iova, iova);
++		else
++			sun60i_iommu_report(iommu, "L1 page table", l1, iova,
++					    sun60i_read(iommu,
++							SUN60I_IOMMU_INT_ERR_DATA_L1));
++	}
++
++	if (sta & SUN60I_IOMMU_INT_STA_L2) {
++		u64 iova = sun60i_read(iommu, SUN60I_IOMMU_INT_ERR_ADDR_L2_LO) |
++			   (u64)sun60i_read(iommu,
++					    SUN60I_IOMMU_INT_ERR_ADDR_L2_HI) << 32;
++
++		if (l2 & SUN60I_IOMMU_PG_INT_PREFETCH)
++			sun60i_iommu_invalidate(iommu, iova, iova);
++		else
++			sun60i_iommu_report(iommu, "L2 page table", l2, iova,
++					    sun60i_read(iommu,
++							SUN60I_IOMMU_INT_ERR_DATA_L2));
++	}
++
++	/*
++	 * Clear and reset on every run, as sun50i-iommu does. A master that
++	 * faults continuously -- a display engine scanning an unmapped
++	 * address -- interrupts again after each reset and runs on as soon as
++	 * its address is mapped. Its status may read set again right after the
++	 * clear; switching fault interrupts off on that would leave such a
++	 * master stopped, its last fault neither cleared nor reset.
++	 */
++	clr = ((sta & SUN60I_IOMMU_INT_STA_L1) ? SUN60I_IOMMU_INT_L1_EN : 0) |
++	      ((sta & SUN60I_IOMMU_INT_STA_L2) ? SUN60I_IOMMU_INT_L2_EN : 0);
++	sun60i_write(iommu, SUN60I_IOMMU_INT_CLR_REG, clr);
++
++	/*
++	 * L1PG_INT and L2PG_INT keep the bit of a master that faulted before
++	 * (seen for L1PG_INT), so this can reset a master that did not fault
++	 * now.
++	 */
++	reset = (masters | l1 | l2) & SUN60I_IOMMU_INT_STA_MASTER & users;
++	if (reset)
++		sun60i_iommu_reset_masters(iommu, reset);
++
++	spin_unlock(&iommu->lock);
++	return IRQ_HANDLED;
++}
++
++static const char * const sun60i_iommu_clk_names[] = {
++	"mclk", "pclk", "hclk", "mbus",
++};
++
++static void sun60i_iommu_clks_off(void *data)
++{
++	clk_bulk_disable_unprepare(ARRAY_SIZE(sun60i_iommu_clk_names), data);
++}
++
++static int sun60i_iommu_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct clk_bulk_data *clks;
++	struct reset_control *rst;
++	unsigned int m;
++	struct sun60i_iommu *iommu;
++	u32 version;
++	int irq, ret;
++
++	iommu = devm_kzalloc(dev, sizeof(*iommu), GFP_KERNEL);
++	if (!iommu)
++		return -ENOMEM;
++	iommu->dev = dev;
++	spin_lock_init(&iommu->lock);
++
++	iommu->base = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(iommu->base))
++		return PTR_ERR(iommu->base);
++
++	irq = platform_get_irq(pdev, 0);
++	if (irq < 0)
++		return irq;
++
++	/*
++	 * The IOMMU's own clocks, on for the life of the device. Named, not
++	 * "all": the node also lists the masters' port gates, which follow
++	 * their masters (below).
++	 */
++	clks = devm_kcalloc(dev, ARRAY_SIZE(sun60i_iommu_clk_names),
++			    sizeof(*clks), GFP_KERNEL);
++	if (!clks)
++		return -ENOMEM;
++	for (m = 0; m < ARRAY_SIZE(sun60i_iommu_clk_names); m++)
++		clks[m].id = sun60i_iommu_clk_names[m];
++	ret = devm_clk_bulk_get(dev, ARRAY_SIZE(sun60i_iommu_clk_names), clks);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to get clocks\n");
++	ret = clk_bulk_prepare_enable(ARRAY_SIZE(sun60i_iommu_clk_names), clks);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to enable clocks\n");
++	ret = devm_add_action_or_reset(dev, sun60i_iommu_clks_off, clks);
++	if (ret)
++		return ret;
++
++	/*
++	 * Prepared here, enabled only under the lock while the master has a
++	 * user (clk_enable() does not sleep, clk_prepare() may).
++	 */
++	for (m = 0; m < SUN60I_IOMMU_MAX_MASTERS; m++) {
++		char name[sizeof("master14")];
++
++		snprintf(name, sizeof(name), "master%u", m);
++		iommu->master_clk[m] = devm_clk_get_optional_prepared(dev, name);
++		if (IS_ERR(iommu->master_clk[m]))
++			return dev_err_probe(dev, PTR_ERR(iommu->master_clk[m]),
++					     "failed to get %s clock\n", name);
++	}
++
++	/*
++	 * The reset is only ever de-asserted: asserting it would take every
++	 * master of this IOMMU through a reset, including masters that run
++	 * in bypass without a driver of their own attached.
++	 */
++	rst = devm_reset_control_get_exclusive(dev, NULL);
++	if (IS_ERR(rst))
++		return dev_err_probe(dev, PTR_ERR(rst), "failed to get reset\n");
++	ret = reset_control_deassert(rst);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to deassert reset\n");
++
++	/* For the table mappings: tables may live anywhere in RAM. */
++	ret = dma_set_mask(dev, DMA_BIT_MASK(SUN60I_IOVA_BITS));
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to set DMA mask\n");
++
++	version = sun60i_read(iommu, SUN60I_IOMMU_VERSION_REG);
++	if (version != SUN60I_IOMMU_VERSION_V16)
++		return dev_err_probe(dev, -ENODEV,
++				     "unknown version %#x\n", version);
++
++	platform_set_drvdata(pdev, iommu);
++
++	ret = devm_request_irq(dev, irq, sun60i_iommu_irq, 0,
++			       dev_name(dev), iommu);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to request irq\n");
++
++	ret = iommu_device_sysfs_add(&iommu->iommu, dev, NULL, "%s",
++				     dev_name(dev));
++	if (ret)
++		return ret;
++
++	ret = iommu_device_register(&iommu->iommu, &sun60i_iommu_ops, dev);
++	if (ret) {
++		iommu_device_sysfs_remove(&iommu->iommu);
++		return ret;
++	}
++
++	dev_dbg(dev, "version %#x, ENABLE %#x, TTB %#x\n", version,
++		sun60i_read(iommu, SUN60I_IOMMU_ENABLE_REG),
++		sun60i_read(iommu, SUN60I_IOMMU_TTB_REG));
++
++	return 0;
++}
++
++static const struct of_device_id sun60i_iommu_of_match[] = {
++	{ .compatible = "allwinner,sun60i-a733-iommu" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, sun60i_iommu_of_match);
++
++static struct platform_driver sun60i_iommu_driver = {
++	.probe	= sun60i_iommu_probe,
++	.driver = {
++		.name			= "sun60i-a733-iommu",
++		.of_match_table		= sun60i_iommu_of_match,
++		.suppress_bind_attrs	= true,
++	},
++};
++builtin_platform_driver(sun60i_iommu_driver);
++
++MODULE_DESCRIPTION("Allwinner A733 IOMMU driver");
++MODULE_LICENSE("GPL");

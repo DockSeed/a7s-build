@@ -1,0 +1,46 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] drm/a733 de: delete a log line that names the wrong register bit
+
+`sun60i_de_scanout()` printed, unconditionally after every scanout setup:
+
+    the TCON still owns the source: clear TV_SRC_CTL bit 0 to show this
+
+Both halves of that sentence are wrong, and the UM settles it. TV_SRC_CTL_REG
+is TCON_TV + 0x0040, default 0x0000_0000 (UM 15.2.10.5), and its
+bit 0 is VDBIST_MODE:
+
+    0: the DE provides the data source
+    1: the VDBIST test-pattern generator provides it.
+
+So bit 0 CLEAR is the state in which the DE owns the source -- the wanted one --
+and setting it would switch the panel to the TCON's built-in test pattern, which
+is the opposite of what the line asks the reader to do. Bits 2:1 (TV_SRC_SEL)
+only choose which test pattern, and only inside vdbist_mode.
+
+Measured on the 8 GiB board, 2026-09-09, with a picture on the screen:
+`busybox devmem 0x05731040 32` reads `0x00000000`. There is nothing to clear,
+and there never was: 0x0 is the reset default, and `sun60i_tcon_tv_program()`
+writes that register in the TCON's own programming sequence anyway
+(sun60i-kms.c:128 records exactly this).
+
+The line therefore costs the next reader a search for a problem that does not
+exist -- it cost one today. The DE cannot report the true state either: it does
+not map the TCON's register window, so a conditional print is not available to
+it. Delete it. The scanout line above it already says what this function did.
+
+No functional change: one dev_info removed.
+
+Assisted-by: Claude
+
+diff --git a/drivers/gpu/drm/sun60i/sun60i-de.c b/drivers/gpu/drm/sun60i/sun60i-de.c
+--- a/drivers/gpu/drm/sun60i/sun60i-de.c
++++ b/drivers/gpu/drm/sun60i/sun60i-de.c
+@@ -1211,8 +1211,6 @@ static int sun60i_de_start(struct sun60i_de *de)
+ 		 "scanning %dx%d XRGB8888 from %pad, pitch %u, commit by %s\n",
+ 		 de->mode.hdisplay, de->mode.vdisplay, &de->fb_dma,
+ 		 de->fb_pitch, de->commit->name);
+-	dev_info(de->dev,
+-		 "the TCON still owns the source: clear TV_SRC_CTL bit 0 to show this\n");
+ 
+ 	return 0;
+ 

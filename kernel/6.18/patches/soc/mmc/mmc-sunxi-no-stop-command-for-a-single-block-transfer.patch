@@ -1,0 +1,193 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] mmc: sunxi: do not send a stop command for a single-block transfer
+
+On any data error the driver hands the request to the threaded handler, which
+sends CMD12. It does that for every data error, without asking what the transfer
+was. For a single-block transfer that command is not merely useless, it is a
+command the card cannot accept in the state it is then in, and the card records
+that fact.
+
+WHAT THE STOP BIT IS FOR
+------------------------
+The bit sunxi_mmc_send_manual_stop() sets is SMHC_CMD's STOP_ABT_CMD, bit 14.
+The A733 UM defines it as a request to send a stop or abort command (CMD12,
+or CMD52 writing the I/O abort field in the SDIO CCCR) to end a data transfer
+that is currently in progress (a733-um-v0.92, SMHC_CMD @0x0018, bit 14).
+
+A transfer being in progress is the whole condition. A single-block
+transfer has none left once it has failed: the card leaves the data phase after
+its one block by itself. CMD12 then reaches a card in tran, where it is not
+defined, and the card answers it with ILLEGAL_COMMAND.
+
+That is not a deduction, it is already measured and written down in this tree.
+`mmc-sunxi-drain-the-card-status-the-hs400-sweep-dirties` decoded the card's status as 0x400900 -- tran, READY_FOR_DATA, and bit 22
+R1_ILLEGAL_COMMAND -- and named the cause exactly: "each failed data transfer
+makes sunxi_mmc_handle_manual_stop() issue a CMD12 the card cannot honour in the
+state it is then in".
+
+The Linux core states the same rule from its own side. mmc_blk_data_prep()
+attaches a stop for multi-block transfers and explicitly not otherwise
+(core/block.c: "if (brq->data.blocks > 1 || do_rel_wr) ... brq->mrq.stop =
+&brq->stop; else brq->mrq.stop = NULL"), and it keeps that stop attached even
+when it supplies an sbc, because "it is not sufficient to just send CMD23, and
+avoid the final CMD12, as on an error condition CMD12 (stop) needs to be sent
+anyway". Single-block helpers do the same: mmc_send_adtc_data() leaves
+mrq.stop NULL.
+
+JEDEC and the SD Physical Layer spec are not quoted here because neither
+document is in this tree or on this host. The two sources above are what this
+patch rests on, and they agree.
+
+WHY IT WAS UNCONDITIONAL
+------------------------
+Because it is pristine mainline, not something this tree added: the same
+unconditional "if (data) { data->error = -ETIMEDOUT; host->manual_stop_mrq =
+mrq; }" stands at line 524 of drivers/mmc/host/sunxi-mmc.c in the untouched
+6.18.36 tarball.
+
+The code carries no statement of intent, so the case it covers has to be read off
+the request path, and it is a real one. sunxi_mmc_request() arms the controller's
+own automatic stop only for an open-ended multi-block transfer:
+
+    if (cmd->data->stop && !auto_cmd23) {
+            imask |= SDXC_AUTO_COMMAND_DONE;
+            cmd_val |= SDXC_SEND_AUTO_STOP;
+
+On an error the controller aborts and that automatic CMD12 never fires, so the
+card is left mid-transfer and something has to terminate it by hand. That is what
+the manual stop is for, and it stays. The defect is only that the path never
+checked whether such a transfer was running.
+
+So the condition is narrowed, not removed. Three shapes need the stop:
+
+- SD_IO_RW_EXTENDED. SDIO aborts through the CCCR, and mmc_io_rw_extended()
+  attaches no stop of its own -- and in byte mode it sets blocks to 1, so the
+  two tests below would both miss it. This is the case that makes a plain
+  "mrq->stop != NULL" test wrong, and it is asked first.
+- mrq->stop set. The core asking for it, per block.c above, sbc or not.
+- data->blocks > 1. A multi-block transfer built without a stop by some other
+  caller still needs one.
+
+Everything else -- a genuine single-block CMD8/CMD17/CMD24 that failed -- gets no
+CMD12, because there is nothing for it to stop.
+
+WHAT DOES NOT CHANGE
+--------------------
+- The real failure case. A multi-block write that hits a data error carries
+  mrq->stop (block.c:1710) and data->blocks > 1, so it takes the manual stop
+  exactly as before. Both tests hit it; neither is needed alone.
+- Controller cleanup. The DMA reset, FIFO reset, IDST/DMAC clear, dma_unmap_sg
+  and the "mmc_writel(host, REG_RINTR, 0xffff)" all sit in
+  sunxi_mmc_finalize_request() below this hunk and run for every data error
+  whether or not a stop follows. Skipping the stop leaves nothing uncleared.
+- Request completion. sunxi_mmc_finalize_request() returns
+  "host->manual_stop_mrq ? IRQ_WAKE_THREAD : IRQ_HANDLED", and sunxi_mmc_irq()
+  completes the request itself on IRQ_HANDLED ("if (finalize && ret ==
+  IRQ_HANDLED) mmc_request_done(host->mmc, mrq)"). cmd->error and data->error are
+  already set at that point. A skipped stop completes the request one step
+  earlier, in the hard IRQ, with the same error -- it does not drop it.
+- mrq->stop->error is still set below, and is NULL-guarded already.
+
+WHY THIS REPLACES THE EARLIER LOG-LEVEL PATCH RATHER THAN JOINING IT
+---------------------------------------------
+An earlier patch lowered the two manual-stop lines to dev_dbg for the duration of the sweep.
+It is reverted in the commit before this one, and the reason is structural rather
+than a matter of taste: both of those lines live inside
+sunxi_mmc_handle_manual_stop(), which only ever runs when manual_stop_mrq was
+set. The sweep scores its delays with mmc_get_ext_csd(), i.e. a single-block CMD8
+with mrq->stop NULL and blocks 1 and no SDIO opcode -- so after this patch the
+sweep never sets manual_stop_mrq, the threaded handler is never scheduled, and
+the earlier patch's flag would guard a window in which no manual stop can arise. Not merely
+redundant on this board: dead on every board, because the sweep is single-block
+by construction.
+
+Removing the cause also removes what that patch was written to hide, and it removes
+the illegal command from the bus and the status dirt it leaves, which that patch never
+touched.
+
+RELATION TO `mmc-sunxi-drain-the-card-status-the-hs400-sweep-dirties` -- left in place on purpose
+--------------------------------------------
+`mmc-sunxi-drain-the-card-status-the-hs400-sweep-dirties` reads the card status once at the end of the HS400 sweep and throws it away,
+to clear the ILLEGAL_COMMAND that the sweep's CMD12s latch. After this patch the
+sweep sends no CMD12 at all, so that cause is gone and `mmc-sunxi-drain-the-card-status-the-hs400-sweep-dirties` should have nothing
+left to drain. Should. It is not removed here, because "no other cause dirties
+the status" is an argument, not a measurement. The falsifying test is named under
+Pending, and until it has run, `mmc-sunxi-drain-the-card-status-the-hs400-sweep-dirties` stays.
+
+VERIFIED / NOT VERIFIED
+-----------------------
+Applies clean on `mmc-sunxi-sd-sdr104-module-clock-and-fifoth` at fuzz 0. NOT built and NOT hardware-proven.
+
+Pending, as concrete observables on a cold boot of the vendor board:
+ 1. Zero "data error, sending stop command" and zero "send stop command failed"
+    during eMMC init, without dyndbg -- the sweep goes silent at the source.
+ 2. "HS400: data-strobe window 1..21 (21 wide), using 11 [00000000003ffffe]"
+    unchanged with dyndbg on: the sweep must still find the same eye. A changed
+    window would mean the CMD12 was affecting the measurement, which nothing
+    predicts.
+ 3. mmc1 enumerates HS400, read/write/md5 verify, throughput unchanged.
+ 4. For the `mmc-sunxi-drain-the-card-status-the-hs400-sweep-dirties` question, separately: with `mmc-sunxi-drain-the-card-status-the-hs400-sweep-dirties`'s sunxi_mmc_drain_card_status()
+    call removed on top of this patch, a cold boot must not print "mmc1:
+    unexpected status 0x400900 after switch". If it still prints, a second cause
+    exists, `mmc-sunxi-drain-the-card-status-the-hs400-sweep-dirties` stays, and that is worth writing down.
+
+Assisted-by: Claude
+---
+--- a/drivers/mmc/host/sunxi-mmc.c
++++ b/drivers/mmc/host/sunxi-mmc.c
+@@ -603,6 +603,45 @@
+ 		);
+ }
+ 
++/*
++ * Does this failed transfer still need a stop command?
++ *
++ * SMHC_CMD's STOP_ABT_CMD -- bit 14, the bit sunxi_mmc_send_manual_stop() sets --
++ * is defined by the A733 UM as a request to send a stop or abort command (CMD12,
++ * or CMD52 writing the I/O abort field in the SDIO CCCR) while a transfer runs.
++ * A single-block transfer has nothing in progress once it has failed: the card
++ * leaves the data phase after its one block on its own, and a CMD12 that reaches
++ * it in tran is answered with ILLEGAL_COMMAND, which the card then latches until
++ * somebody reads the status away.
++ *
++ * So ask the request what it was, rather than treating every data error alike.
++ * Three shapes need the stop and they are the only three.
++ */
++static bool sunxi_mmc_needs_manual_stop(struct mmc_request *mrq)
++{
++	/*
++	 * SDIO aborts through the CCCR rather than with CMD12, and
++	 * mmc_io_rw_extended() attaches no stop of its own -- not even in byte
++	 * mode, where it sets blocks to 1. Left to the two tests below this
++	 * case would lose its abort, so it is asked first.
++	 */
++	if (mrq->cmd->opcode == SD_IO_RW_EXTENDED)
++		return true;
++
++	/*
++	 * The core attaches a stop to exactly the transfers that need one, and
++	 * keeps it attached even when it also supplies an sbc, because "it is
++	 * not sufficient to just send CMD23, and avoid the final CMD12, as on
++	 * an error condition CMD12 (stop) needs to be sent anyway"
++	 * (core/block.c). So an mrq->stop is the core asking for this.
++	 */
++	if (mrq->stop)
++		return true;
++
++	/* A multiple-block transfer built without one still needs it. */
++	return mrq->data->blocks > 1;
++}
++
+ /* Called in interrupt context! */
+ static irqreturn_t sunxi_mmc_finalize_request(struct sunxi_mmc_host *host)
+ {
+@@ -619,7 +658,8 @@
+ 
+ 		if (data) {
+ 			data->error = -ETIMEDOUT;
+-			host->manual_stop_mrq = mrq;
++			if (sunxi_mmc_needs_manual_stop(mrq))
++				host->manual_stop_mrq = mrq;
+ 		}
+ 
+ 		if (mrq->stop)

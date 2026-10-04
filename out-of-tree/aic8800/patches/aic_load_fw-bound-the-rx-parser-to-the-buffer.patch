@@ -1,0 +1,220 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] aic_load_fw: bound the rx parser and the message dispatch to what was received
+
+Measured failure (2026-09-11 soak, run 1, 4.0 pin; the code below is identical at
+the 5.0 pin): after `modprobe -r aic8800_fdrv; modprobe aic8800_fdrv` the board died
+with "Kernel panic - not syncing: System is deadlocked on memory", Comm
+aicwf_busrx_thr, trace __netdev_alloc_skb <- aicwf_process_rxframes [aic_load_fw]
+<- usb_busrx_thread. Six reload cycles under wl0 rx load on 2026-09-12 did not
+reproduce it, so the trigger is not every reload.
+
+Code says (aic_load_fw):
+- aic_txrxif.c, aicwf_process_rxframes: no header length is checked against
+  skb->len. skb_pull() of more than skb->len pulls nothing and returns NULL
+  (include/linux/skbuff.h); the return is ignored, so the same header is read
+  again, forever.
+- Every pass allocates skb_inblock. The data branch never hands it to anyone, the
+  config branch hands only its contents on, and only the last one is freed after
+  the loop. In a loop that does not end that is an unbounded leak inside a
+  kthread, which is the panic above.
+- skb_inblock lives across buffers: a buffer whose inner loop runs zero times
+  frees the previous buffer's skb_inblock a second time.
+- An allocation failure frees the buffer and returns without
+  atomic_dec(&rx_priv->rx_cnt).
+- aicbluetooth_cmds.c, rwnx_rx_handle_msg: msg_hdlrs[] has one entry,
+  [TASK_DBG] = 1, and is indexed with MSG_T(msg->id) unchecked. A message for
+  TASK_MM (0) dereferences its NULL slot, any task from 2 up reads past the array.
+- cmd_mgr_msgind() copies param_len bytes, clamped to RWNX_CMD_E2AMSG_LEN_MAX but
+  not to the frame they came in.
+Why the loader meets foreign frames at all: aicwf_usb_bus_start() submits its
+bulk-IN URBs before the probe decides whether the part already runs its WLAN
+firmware (aic_load_fw/aicwf_usb.c), so a reload parses live WLAN frames here.
+
+What changes:
+- Each header is checked against the bytes left in the buffer. A frame that does
+  not fit drops the rest of the buffer, with a txrx_err() line.
+- The pull is bounded by skb->len, so the loop always makes progress.
+- Data frames are skipped without an allocation; the loader has no data path.
+- The config copy is freed right after it is handled. A frame shorter than a
+  message header is not handed on, and param_len is clamped to the frame.
+- An allocation failure drops the rest of the buffer; the normal path then frees
+  it and decrements rx_cnt.
+- rwnx_rx_handle_msg bounds both indexes; an unknown task gets no callback.
+
+Diagnostics under /sys/module/aic_load_fw/parameters: rx_loader_frames_dropped,
+rx_loader_foreign_msgs, and the stimulus rx_loader_inject_bad_len (0644: the next
+N frame headers are read as 0xffff bytes long).
+
+Left as the vendor has it: bulk-IN starting before the firmware decision. Moving
+it changes probe ordering, and the parser no longer depends on it.
+
+Falsifier, on the board: with rx_loader_inject_bad_len set, reload the modules
+under wl0 rx load. Expected: rx_loader_frames_dropped rises, a `frame N > buffer M`
+line, no hang, no panic, and after the cycle that lost a frame the next reload
+associates again. Without the stimulus, repeated reloads under load associate
+every time.
+
+Assisted-by: Claude
+
+--- a/src/USB/driver_fw/drivers/aic8800/aic_load_fw/aic_txrxif.c
++++ b/src/USB/driver_fw/drivers/aic8800/aic_load_fw/aic_txrxif.c
+@@ -177,6 +177,9 @@
+     return true;
+ }
+ 
++extern uint rx_loader_frames_dropped;
++extern int rx_loader_inject_bad_len;
++
+ int aicwf_process_rxframes(struct aicwf_rx_priv *rx_priv)
+ {
+     int ret = 0;
+@@ -184,7 +187,7 @@
+     struct sk_buff *skb = NULL;
+     u16 pkt_len = 0;
+     struct sk_buff *skb_inblock = NULL;
+-    u16 aggr_len = 0, adjust_len = 0;
++    u16 aggr_len = 0;
+     u8 *data = NULL;
+ 
+     while (1) {
+@@ -200,52 +203,62 @@
+             break;
+         }
+         while(aicwf_another_ptk(skb)) {
++            u32 need, step;
++            struct ipc_e2a_msg *msg;
++
+             data = skb->data;
+             pkt_len = (*skb->data | (*(skb->data + 1) << 8));
++            if (unlikely(rx_loader_inject_bad_len > 0)) {
++                rx_loader_inject_bad_len--;
++                pkt_len = 0xffff;
++            }
+ 
+             if((skb->data[2] & USB_TYPE_CFG) != USB_TYPE_CFG) { // type : data
+-                aggr_len = pkt_len + RX_HWHRD_LEN;
+-
+-                if (aggr_len & (RX_ALIGNMENT - 1))
+-                    adjust_len = roundup(aggr_len, RX_ALIGNMENT);
+-                else
+-                    adjust_len = aggr_len;
+-
+-                skb_inblock = __dev_alloc_skb(aggr_len + CCMP_OR_WEP_INFO, GFP_KERNEL);//8 is for ccmp mic or wep icv
+-                if(skb_inblock == NULL){
+-                    txrx_err("no more space!\n");
+-                    aicwf_dev_skb_free(skb);
+-                    return -EBADE;
++                /* The loader has no data path: skip the frame, bounded by the buffer. */
++                need = (u32)pkt_len + RX_HWHRD_LEN;
++                step = roundup(need, RX_ALIGNMENT);
++                if (need > skb->len) {
++                    txrx_err("data frame %u > buffer %u, rest dropped\n", need, skb->len);
++                    rx_loader_frames_dropped++;
++                    break;
+                 }
+-
+-                skb_put(skb_inblock, aggr_len);
+-                memcpy(skb_inblock->data, data, aggr_len);
+-                skb_pull(skb, adjust_len);
++                skb_pull(skb, min(step, skb->len));
+             }
+             else { //  type : config
+-                aggr_len = pkt_len;
++                need = (u32)pkt_len + 4;
++                step = roundup((u32)pkt_len, RX_ALIGNMENT) + 4;
++                if (need > skb->len) {
++                    txrx_err("config frame %u > buffer %u, rest dropped\n", need, skb->len);
++                    rx_loader_frames_dropped++;
++                    break;
++                }
+ 
+-                if (aggr_len & (RX_ALIGNMENT - 1))
+-                    adjust_len = roundup(aggr_len, RX_ALIGNMENT);
+-                else
+-                    adjust_len = aggr_len;
+-
+-               skb_inblock = __dev_alloc_skb(aggr_len+4, GFP_KERNEL);
+-               if(skb_inblock == NULL){
+-                   txrx_err("no more space!\n");
+-                   aicwf_dev_skb_free(skb);
+-                   return -EBADE;
++                aggr_len = pkt_len;
++                skb_inblock = __dev_alloc_skb(aggr_len+4, GFP_KERNEL);
++                if(skb_inblock == NULL){
++                    txrx_err("no more space!\n");
++                    break;
+                 }
+ 
+                 skb_put(skb_inblock, aggr_len+4);
+                 memcpy(skb_inblock->data, data, aggr_len+4);
+-                if((*(skb_inblock->data + 2) & 0x7f) == USB_TYPE_CFG_CMD_RSP)
+-                    rwnx_rx_handle_msg(rx_priv->usbdev, (struct ipc_e2a_msg *)(skb_inblock->data + 4));
+-                skb_pull(skb, adjust_len+4);
++                msg = (struct ipc_e2a_msg *)(skb_inblock->data + 4);
++                if (pkt_len < offsetof(struct ipc_e2a_msg, param)) {
++                    /* too short to hold the message header */
++                    txrx_err("config frame %u shorter than a message header\n", pkt_len);
++                    rx_loader_frames_dropped++;
++                } else if((*(skb_inblock->data + 2) & 0x7f) == USB_TYPE_CFG_CMD_RSP) {
++                    /* cmd_mgr_msgind() copies param_len bytes: keep them inside this frame */
++                    if (msg->param_len > pkt_len - offsetof(struct ipc_e2a_msg, param))
++                        msg->param_len = pkt_len - offsetof(struct ipc_e2a_msg, param);
++                    rwnx_rx_handle_msg(rx_priv->usbdev, msg);
++                }
++                dev_kfree_skb(skb_inblock);
++                skb_inblock = NULL;
++                skb_pull(skb, min(step, skb->len));
+             }
+         }
+ 
+-		dev_kfree_skb(skb_inblock);
+         dev_kfree_skb(skb);
+         atomic_dec(&rx_priv->rx_cnt);
+     }
+--- a/src/USB/driver_fw/drivers/aic8800/aic_load_fw/aicbluetooth_cmds.c
++++ b/src/USB/driver_fw/drivers/aic8800/aic_load_fw/aicbluetooth_cmds.c
+@@ -450,10 +450,22 @@
+     [TASK_DBG]   = dbg_hdlrs,
+ };
+ 
++extern uint rx_loader_foreign_msgs;
++
+ void rwnx_rx_handle_msg(struct aic_usb_dev *usbdev, struct ipc_e2a_msg *msg)
+ {
+-    usbdev->cmd_mgr.msgind(&usbdev->cmd_mgr, msg,
+-                            msg_hdlrs[MSG_T(msg->id)][MSG_I(msg->id)]);
++    msg_cb_fct *hdlrs = NULL;
++    msg_cb_fct cb = NULL;
++
++    /* msg_hdlrs[] holds TASK_DBG only; a live-firmware message for TASK_MM went
++     * through its NULL slot, any other task past the array. dbg_hdlrs[] bounds MSG_I. */
++    if (MSG_T(msg->id) < ARRAY_SIZE(msg_hdlrs))
++        hdlrs = msg_hdlrs[MSG_T(msg->id)];
++    if (hdlrs && MSG_I(msg->id) < ARRAY_SIZE(dbg_hdlrs))
++        cb = hdlrs[MSG_I(msg->id)];
++    else
++        rx_loader_foreign_msgs++;
++    usbdev->cmd_mgr.msgind(&usbdev->cmd_mgr, msg, cb);
+ }
+ 
+ 
+--- a/src/USB/driver_fw/drivers/aic8800/aic_load_fw/aic_bluetooth_main.c
++++ b/src/USB/driver_fw/drivers/aic8800/aic_load_fw/aic_bluetooth_main.c
+@@ -33,6 +33,17 @@
+ module_param_string(paringid, paringid, 100, 0660);
+ module_param(flash_erase_len, int, 0660);
+ 
++/* rx parser diagnostics, /sys/module/aic_load_fw/parameters */
++uint rx_loader_frames_dropped;
++module_param(rx_loader_frames_dropped, uint, 0444);
++MODULE_PARM_DESC(rx_loader_frames_dropped, "rx buffers whose rest was dropped because a frame did not fit");
++uint rx_loader_foreign_msgs;
++module_param(rx_loader_foreign_msgs, uint, 0444);
++MODULE_PARM_DESC(rx_loader_foreign_msgs, "config messages for a task the loader has no handler table for");
++int rx_loader_inject_bad_len;
++module_param(rx_loader_inject_bad_len, int, 0644);
++MODULE_PARM_DESC(rx_loader_inject_bad_len, "Test stimulus: treat the next N frame headers as longer than the buffer");
++
+ 
+ static void aicsmac_driver_register(void)
+ {

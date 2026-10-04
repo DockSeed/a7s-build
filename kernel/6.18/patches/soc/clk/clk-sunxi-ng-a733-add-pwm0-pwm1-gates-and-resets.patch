@@ -1,0 +1,128 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] clk: sunxi-ng: a733: add the PWM0 and PWM1 bus gates and their resets
+
+The two PWM controllers need a bus gate and a reset each and the tree modelled
+neither, so a PWM node could not be written at all: PWMn_BGR bit 0 comes out of
+reset as 0 = "Mask", which means the register aperture answers nothing.
+
+  PWM0_BGR_REG  0x0784  bit0 gate, bit16 reset
+  PWM1_BGR_REG  0x078C  bit0 gate, bit16 reset
+
+Both from the A733 UM V0.92 4.1.6.89 / 4.1.6.90 (offsets 1924 and 1932
+decimal; field tables: bit 16 PWMn_RST 0=Assert/1=De-assert, bit 0
+PWMn_GATING 0=Mask/1=Pass). ⚠ Neither register has been read back on silicon
+yet -- this is a doc-only derivation, and the read is named as the pending proof
+below.
+
+What was rejected, and why it matters more than what was taken. The A523 is the
+nearest thing mainline has to this part, and ccu-sun55i-a523.c models exactly
+this pair as
+
+  bus_pwm0  0x7ac BIT(0)      RST_BUS_PWM0  0x7ac BIT(16)
+  bus_pwm1  0x7ac BIT(1)      RST_BUS_PWM1  0x7ac BIT(17)
+
+-- one register for both controllers. Carried over unchanged it compiles, it
+looks right in a diff, and it is wrong in three separate ways on the A733: the
+offset is wrong for PWM0, wrong for PWM1, and the PWM1 gate bit would land on
+PWM0_BGR's reserved bit 1. The failure mode is the quiet one this tree keeps
+paying for -- the write succeeds, the clock never runs, and the PWM block reads
+back as an empty aperture with nothing to say why.
+
+The bus parent is an inference and is labelled as one in the code: the UM names
+the register but not which bus feeds the PWM blocks, so it follows the
+convention already used for bus-smhc0, bus-gmac0 and bus-ths (ahb). It is inert
+for correctness here, because the PWM driver only enables this clock for
+register access and never reads its rate; the rates it does use come from the
+"hosc" and "apb" inputs that the block's own PCCR mux selects between.
+
+Applies clean and builds. NOT hardware-proven: what would prove it is a
+register read on a live board showing 0x02002784 and 0x0200278C at 0x00010001
+(gate passing, reset de-asserted) once a PWM node claims them, and 0x00000000
+before -- the same shape `clk-sunxi-ng-a733-add-ths-and-gpadc-clocks` recorded for THS0_BGR.
+
+Assisted-by: Claude
+---
+--- a/include/dt-bindings/clock/sun60i-a733-ccu.h
++++ b/include/dt-bindings/clock/sun60i-a733-ccu.h
+@@ -77,4 +77,8 @@
+ #define CLK_BUS_THS		55
+ #define CLK_GPADC0_24M		56
+ 
++/* PWM0 and PWM1 bus gates. Separate registers on this part, not one shared. */
++#define CLK_BUS_PWM0		57
++#define CLK_BUS_PWM1		58
++
+ #endif /* _DT_BINDINGS_CLK_SUN60I_A733_CCU_H_ */
+--- a/include/dt-bindings/reset/sun60i-a733-ccu.h
++++ b/include/dt-bindings/reset/sun60i-a733-ccu.h
+@@ -34,4 +34,7 @@
+ 
+ #define RST_BUS_THS		21
+ 
++#define RST_BUS_PWM0		22
++#define RST_BUS_PWM1		23
++
+ #endif /* _DT_BINDINGS_RST_SUN60I_A733_CCU_H_ */
+--- a/drivers/clk/sunxi-ng/ccu-sun60iw2.c
++++ b/drivers/clk/sunxi-ng/ccu-sun60iw2.c
+@@ -447,6 +447,30 @@
+  */
+ static SUNXI_CCU_GATE_HWS(bus_ths_clk,    "bus-ths",    ahb_hws, 0x0FE4, BIT(0),  0);
+ static SUNXI_CCU_GATE_DATA(gpadc0_24m_clk, "gpadc0-24m", osc24M, 0x0FC0, BIT(31), 0);
++
++/*
++ * PWM0 and PWM1. One bus gate and one reset each, and they sit in TWO separate
++ * registers on this part: PWM0_BGR_REG 0x0784 and PWM1_BGR_REG 0x078C, bit0
++ * gate / bit16 reset in both (A733 UM V0.92 4.1.6.89 and 4.1.6.90).
++ *
++ *
++ * ⚠ The A523 was NOT copied here, and this is exactly the inherited-value trap
++ * this tree keeps paying for. ccu-sun55i-a523.c puts both gates in ONE register,
++ * 0x7ac BIT(0) and BIT(1), with the resets at BIT(16) and BIT(17) of the same
++ * word. Taken over unchanged that is plausible, it builds, and it is wrong three
++ * ways on the A733: wrong offset for both controllers, and a PWM1 gate bit that
++ * would land on PWM0_BGR's reserved bit 1 -- so PWM1 would never be clocked and
++ * the write would look like it had succeeded.
++ *
++ * The bus parent is an inference and is marked as one: the UM names the
++ * register but not which bus feeds the PWM blocks. It follows what this tree
++ * already does for every peripheral BGR gate (bus-smhc0, bus-gmac0, bus-ths):
++ * ahb. It is inert for correctness here -- the PWM driver only enables this
++ * clock for register access and never derives a rate from it; the rates it does
++ * use come from the "hosc" and "apb" inputs the PCCR mux selects between.
++ */
++static SUNXI_CCU_GATE_HWS(bus_pwm0_clk,   "bus-pwm0",   ahb_hws, 0x0784, BIT(0),  0);
++static SUNXI_CCU_GATE_HWS(bus_pwm1_clk,   "bus-pwm1",   ahb_hws, 0x078C, BIT(0),  0);
+ static SUNXI_CCU_GATE_HWS(mbus_gmac0_clk, "mbus-gmac0", ahb_hws, 0x05E4, BIT(11), 0);
+ 
+ /* ccu_common-based clocks (registered and reset-mapped by the core). */
+@@ -494,6 +518,8 @@
+ 	&bus_gmac0_clk.common,
+ 	&bus_ths_clk.common,
+ 	&gpadc0_24m_clk.common,
++	&bus_pwm0_clk.common,
++	&bus_pwm1_clk.common,
+ 	&mbus_gmac0_clk.common,
+ };
+ 
+@@ -556,8 +582,10 @@
+ 		[CLK_MBUS_GMAC0]	= &mbus_gmac0_clk.common.hw,
+ 		[CLK_BUS_THS]		= &bus_ths_clk.common.hw,
+ 		[CLK_GPADC0_24M]	= &gpadc0_24m_clk.common.hw,
++		[CLK_BUS_PWM0]		= &bus_pwm0_clk.common.hw,
++		[CLK_BUS_PWM1]		= &bus_pwm1_clk.common.hw,
+ 	},
+-	.num	= CLK_GPADC0_24M + 1,
++	.num	= CLK_BUS_PWM1 + 1,
+ };
+ 
+ static struct ccu_reset_map sun60iw2_ccu_resets[] = {
+@@ -583,6 +611,8 @@
+ 	[RST_BUS_GMAC0]		= { 0x141C, BIT(16) },
+ 	[RST_BUS_GMAC0_AXI]	= { 0x141C, BIT(17) },
+ 	[RST_BUS_THS]		= { 0x0FE4, BIT(16) },
++	[RST_BUS_PWM0]		= { 0x0784, BIT(16) },
++	[RST_BUS_PWM1]		= { 0x078C, BIT(16) },
+ };
+ 
+ static const struct sunxi_ccu_desc sun60iw2_ccu_desc = {

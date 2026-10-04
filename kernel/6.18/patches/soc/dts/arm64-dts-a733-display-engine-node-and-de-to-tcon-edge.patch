@@ -1,0 +1,734 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: a733: the display engine node, and the DE -> TCON_TV1 edge
+
+The device-tree half of `clk-sunxi-ng-a733-display-engine-clock-gate-reset`. Three changes to one file:
+
+  1. a mixer node -- the display engine, DE0 @0x05000000, with the four
+     register windows a DE backend driver has to reach, its bus gate, its
+     module clock, its reset and its interrupt;
+  2. a ports/endpoint pair joining that node to tcon_tv1, because a graph edge
+     only exists if both ends describe it;
+  3. one comment moved back to the node it describes -- see the last section.
+
+⚠ THIS HEADER WAS CORRECTED TWICE, AND THE CLOCK PARENT CHANGED. Its first
+version pinned DE0_CLK to PERI0_480M on the grounds that PLL_DE feeds the SoC
+interconnect and that the reset mux would hand the engine a stopped clock.
+Readings on the vendor system with the display engine live, and then at the
+U-Boot prompt on a cold power-cycle of our own chain, retired the first claim
+and turned the second into an argument for the opposite conclusion. This node
+now pins DEPLL3X -- the mux's reset value, and what the vendor uses. The old
+reasoning is deleted rather than struck through; the new one is below.
+
+WHAT THIS NODE IS FOR
+---------------------
+Everything on the DisplayPort path up to now generates its own picture:
+TCON_TV1 has a built-in test-pattern generator (VDBIST) and that
+is how the 2026-08-18 picture was produced with no display engine, no KMS and
+no DRM device at all. The DE is the block that replaces the test pattern with
+a framebuffer out of DRAM. Nothing binds this node today; the driver is being
+written separately.
+
+WHERE THE VALUES COME FROM -- AND WHERE THEY CANNOT
+----------------------------------------------------
+Documented, and cited:
+
+  DE0 aperture   0x05000000-0x053FFFFF, 4 MiB, group DE_SYS
+                 (A733 user manual memory map)
+  no DE1         DE0 is the only display engine among the UM's 143 modules;
+                 the feature list (up to 7 alpha-blending channels, two display
+                 outputs; A733 user manual) describes two ports of ONE block
+  interrupt      INTID 82 "DE" = GIC_SPI 50,
+                 the A733 user manual -- one interrupt for the whole engine, no
+                 per-channel and no per-output DE interrupt
+  clocks/reset   CLK_BUS_DE0 / CLK_DE0 / RST_BUS_DE0, added by `clk-sunxi-ng-a733-display-engine-clock-gate-reset` from
+                 DE0_BGR_REG 0x0A04 / abs 0x02002A04 bit0+bit16 and DE0_CLK_REG
+                 0x0A00 / abs 0x02002A00
+
+⛔ AND THE PART THAT IS NOT, WHICH GOVERNS THE REST. A733 UM V0.92 chapter 14.3
+"Display Engine" is two pages of prose with no register list, no offset table
+and no field table. Measured over the whole 2.7 MB text extract, not assumed:
+zero hits for GLB_CTL, zero for BLD_, zero for OVL_, zero for blender, zero for
+RCQ as anything but a single feature bullet. Compare TCON_TV,
+which gets its own register chapter with per-bit tables, or eDP, which gets
+15.4.7. So no offset INSIDE the aperture can carry a manual reference, and asking for one
+is asking for a fabrication.
+
+The evidence floor for the four windows is therefore a live capture -- 29 233
+non-zero words read O_RDONLY off the 8 GiB board on 2026-08-18 while the vendor stack drove
+a 1920x1200 four-lane DP link
+-- plus block arithmetic that predicts where things sit, plus candidate names
+from mainline's sun8i_mixer and from the out-of-tree A523/T527 sun55i_de series.
+The evidence was compiled tag by tag from that capture. Two things about that method matter here:
+
+  - a name from code is a HINT; it is kept only where the capture confirms it at
+    that offset and dropped where the capture refuses it. Both outcomes occur in
+    this evidence, which is what makes it a method rather than a transcription.
+  - ⚠ the A523/T527 series is a LEAD, not a source. Treating the A523 as
+    authoritative has caused errors here before. Every window below
+    is INFERRED in exactly this sense and is labelled so; none of it is spec.
+
+THE FOUR WINDOWS
+----------------
+The first three are mainline's DE33 mixer names and order, because that is the
+register model this silicon answers to -- drivers/gpu/drm/sun4i/sun8i_mixer.c
+takes reg index 0 for "layers" and then looks up "top" and "display" BY NAME, so
+"layers" has to stay at index 0:
+
+  layers   0x05100000 + 0x180000  the channel array. Channel n sits at
+           0x05100000 + n * 0x20000; the capture shows seven populated slots on
+           exactly that stride -- {0,1,2} and {6,7,8,9} -- against the UM's seven
+           blend channels. Three independent things agree on
+           that arithmetic, and one of them is our own silicon. The window runs
+           up to where display pipe 0 begins, i.e. slots 0..11.
+  top      0x05008100 + 0x40      mixer 0's per-pipe control block. Four
+           consecutive registers decode as mainline's DE33 layout exactly:
+           GLOBAL_CTL = 0x1 (RT_EN, what sun8i_mixer_init() writes),
+           GLOBAL_STATUS, GLOBAL_SIZE = 0x04af077f = 1920x1200, GLOBAL_CLK = 1.
+           The size is 0x40 because mixer 1's block begins at 0x05008140 -- and
+           that address reads all zero across its whole 0x40 on a board with one
+           display pipe up. A layout that predicts a second block at a specific
+           address and finds it empty for the right reason is an identification,
+           not a coincidence.
+  display  0x05280000 + 0x20000   display pipe 0: the blender at +0x1000 (five
+           registers, four instances, all four programmed identically on the
+           live link) and the output formatter at +0x5000.
+  de-top   0x05008000 + 0x100     the DE-global block below the per-mixer tops.
+           DE2TCON_MUX at +0x10 (live 0x0000fff5) and the version word at +0x14
+           (live 0x03520100 -> DE version 0x352, which the vendor DT string
+           "allwinner,display-engine-v352" and the out-of-tree series' own
+           "de352" independently agree on).
+
+⚠ de-top IS A FOURTH WINDOW WITH NO COUNTERPART IN MAINLINE'S DE33 BINDING, and
+it is deliberately in even though no driver reads it yet. Without it nothing can
+write DE2TCON_MUX, and without that write the composed picture never reaches
+TCON_TV1 -- the block would come up, report its version, accept a framebuffer
+and put it nowhere. This is `arm64-dts-a733-tcon-tv1-and-the-dp-phy-pad-window`'s lesson applied before it costs a session:
+that patch's first cut withheld a second reg window and a clock on the reasoning
+that nothing had been shown to need them, and the driver had to announce the gap
+at probe before anyone noticed. Withholding is not the safe default; it is the
+expensive one.
+
+⚠ WINDOW BOUNDARIES ARE WEAKER EVIDENCE THAN WINDOW BASES, and the difference is
+worth stating rather than hiding behind four tidy numbers. Each base is confirmed
+by a register that decodes at it. Each size comes from where the next block
+starts, which is an inference from the block map. Falsified by: a live register
+outside these four ranges that the datapath needs. The honest fix if that
+happens is to map the whole 4 MiB in one window -- it costs nothing but address
+space, and it is the
+safe answer.
+
+THE CLOCK PARENT: DEPLL3X, AND WHY THAT REVERSED
+-------------------------------------------------
+assigned-clock-parents pins DE0_CLK's seven-way mux to DEPLL3X. It is written
+out rather than left to the reset default so that a boot chain which moved it
+cannot change what this node means silently.
+
+WHAT THE COLD BOARD HANDS US, read at the U-Boot prompt on a cold power-cycle of
+our own chain, nothing having run:
+
+    PLL_DE_CTRL abs 0x020022E0 = 0x41125600   PLL_EN 0 -- the PLL is OFF
+    DE0_CLK     abs 0x02002A00 = 0x00000000   gate off, mux 000 = DEPLL3X
+    DE0_BGR     abs 0x02002A04 = 0x00000000   bus gate off, reset asserted
+    NSI_CLK     abs 0x02002580 = 0xC3000000   CLK_SEL 011 = PERI0_600M
+
+WHAT THE VENDOR DOES, with its display engine genuinely live -- version word
+0x05008014 = 0x03520100, VI scanout 0x05101018 = 0xFC000000, picture on the
+monitor:
+
+    PLL_DE_CTRL abs 0x020022E0 = 0xFD124A00   PLL_EN and LOCK set, N 75
+    DE0_CLK     abs 0x02002A00 = 0x80000000   mux 000 = DEPLL3X, FACTOR_M 0,
+                                              i.e. DIVISOR M = 1 -> 600 MHz
+
+THE REVERSAL. This node first pinned PERI0_480M, on three grounds, and all three
+are now deleted:
+
+  - "PLL_DE feeds NSI, the SoC interconnect, so we must not own it." The UM row
+    "PLL_DE: NSI, DE0, VE, NPU, DRAM0, CSI" is a fan-out map,
+    not active topology: all six reach DEPLL3X through muxes with other inputs,
+    and five were read on the live vendor system -- NSI -> PERI0_600M, DRAM0 abs
+    0x02002C00 -> DDRPLL, VE_ENC0 abs 0x02002A80 -> VE1PLL, VE_DEC abs
+    0x02002A88 -> VE0PLL, NPU abs 0x02002B00 -> NPUPLL. None on DEPLL3X. NSI
+    reads the same value cold, so the answer does not depend on whose operating
+    system is running. The sixth, CSI, has no driver and no node in this tree.
+  - "the reset mux hands the engine a stopped clock." TRUE for our path, and
+    that is now an argument for owning the PLL rather than avoiding it. Cold, the
+    mux already points at DEPLL3X and DEPLL3X is off, so a driver that ungates
+    DE0 and leaves the clock tree alone reads 0x00000000 out of the whole 4 MiB
+    with its gate and reset both correct. There are exactly two ways out and no
+    third: move the mux to a peripheral tap and never own the PLL, or keep the
+    mux where the silicon puts it and own the PLL properly. With the interconnect
+    hazard measured dead, the second describes the block as it is built.
+  - "the UM tells a 2K mode to use another source". True as
+    text, but it is the consequence of the sentence before it -- NSI at 700 MHz
+    means DEPLL3X must not be retuned, so a 2K DE that wants less must look
+    elsewhere. With NSI measured off DEPLL3X the premise does not hold here and
+    the PLL can be tuned to what the mode needs, which is what the vendor does:
+    600 MHz, not the reset 696.
+
+WHAT PINNING DEPLL3X BUYS. The source the silicon defaults to and the vendor
+uses, at the rate mainline's DE33 model also picks. The whole chain is settable,
+so one clk_set_rate() on the module clock configures divider, tap and PLL. And
+4K stays reachable -- 696 MHz is a PLL_DE rate and no PERI0 tap gets near it, so
+PERI0_480M would have capped the engine 20 % below the vendor and ruled 4K out
+permanently.
+
+⚠ WHAT IT COSTS. This display path now owns PLL_DE: a modeset retunes it, and
+clk_disable_unused() switches it off on a kernel where nothing claims it. Bounded
+by the sweep above -- five consumers measured elsewhere, CSI absent from this
+tree -- and it is the same bargain `clk-sunxi-ng-a733-video-plls-and-edp-tv-pixel-clock` struck for PLL_VIDEO1, whose header
+records CSI_MASTER as inheriting it. A future VE, NPU or DRAM driver that selects
+DEPLL3X from its own mux inherits a clock the display retunes.
+
+There is no assigned-clock-rates: the rate belongs to a modeset, not to the
+device tree. ⚠ Like the TCON's, these properties take effect when a driver binds
+this node -- of_clk_set_defaults() runs from platform_probe() -- so today they
+change no register.
+
+⚠ ONE CONSTRAINT ON THE DE DRIVER, because the device tree cannot express it.
+SET THE RATE BEFORE ENABLING THE MODULE CLOCK. ccu_nm_ops waits for PLL lock only
+inside ccu_nm_set_rate(), so a driver that enables first opens the tap on a PLL
+that may not have locked (UM 4.1.4.1 Method 2). mainline's
+sun8i_mixer_probe() already has that order
+(drivers/gpu/drm/sun4i/sun8i_mixer.c:618-625), and `clk-sunxi-ng-a733-display-engine-clock-gate-reset` gives pll-de
+CLK_SET_RATE_UNGATE so the lock poll runs on a PLL that is actually on.
+
+THE PORT GRAPH: ONE EDGE IN, ONE EDGE NAMED AND LEFT OUT
+---------------------------------------------------------
+mixer0 port@1 -> tcon_tv1 port@0 is in, and it is not decoration:
+
+  - mainline's DE2/DE3/DE33 mixer binding makes `ports` with `port@1` REQUIRED
+    (Documentation/devicetree/bindings/display/allwinner,sun8i-a83t-de2-mixer.yaml);
+  - sun8i_mixer_of_get_id() takes the output endpoint, follows it, and returns
+    the REMOTE endpoint's id as the mixer index -- returning -EINVAL if either is
+    missing. A mixer node without this subnode does not probe.
+  - it is a real signal path, and the register that performs it is DE2TCON_MUX
+    at de-top +0x10. Live 0x0000fff5: disp0's nibble is 0x5 and the other three
+    are 0xf, on a board with exactly one display pipe up. ⬜ What the value 0x5
+    MEANS is UNKNOWN and this patch does not pretend otherwise -- the A733 has
+    four TCONs, so a plain index would make TCON_TV1 = 3. Two readings survive
+    (a wider global TCON numbering, or an enable bit plus an index). The graph
+    says WHICH TCON; the driver writes the nibble; the nibble's encoding is
+    settled by writing a different one on a live link and watching the screen.
+
+Neither endpoint carries a reg, so both ids default to 0 (of_graph_parse_endpoint
+leaves them at 0 when the property is absent) and this is mixer 0. A second
+display pipe arrives as a second endpoint on the TCON side with reg = <1>.
+
+⚠ The NEXT edge, TCON_TV1 -> the DisplayPort transmitter, is deliberately NOT
+here. Its shape depends on whether the DP lands as a drm_bridge or as an encoder
+component, and that is explicitly undecided.
+Guessing it would put a property in the tree that
+nothing reads -- which passes the schema, passes review, passes the checks and is
+indistinguishable from a working one until silicon says no, the failure mode
+that grepping the driver for each new property is meant to prevent. It is owed by
+the patch that settles the question. Note that the two omissions are NOT
+symmetric with de-top above: a missing reg window half-works silently, a missing
+graph edge fails loudly at probe. Include what fails silently; name what fails
+loudly.
+
+WHAT IS DELIBERATELY NOT IN THIS PATCH
+--------------------------------------
+A `display-engine` node with `allwinner,pipelines`. If the DE driver reuses
+sun4i_drv.c -- whose component master walks that property -- it needs one, and
+it is four lines:
+
+    de: display-engine {
+            compatible = "allwinner,sun60i-a733-display-engine";
+            allwinner,pipelines = <&mixer0>;
+    };
+
+It is not here because it describes no hardware. It is a driver-model artifact,
+and the driver model is undecided: the two blocks already driven on this path,
+sun60i-dp.c and sun60i-tcon-tv.c, are plain platform drivers with no component
+master between them. Adding a virtual node to serve one of two possible
+architectures is the same mistake as guessing the DP graph edge, and it fails
+the loud way -- the platform device simply never exists -- so it costs a DT edit
+and not a board cycle. The patch that settles the driver shape adds it, or
+deletes this paragraph.
+
+power-domains. CM_DESYS_CFG_REG 0x1B04 reads 0x00020000 = STATUS "Power ON",
+MODULE_MODE 0, which is its reset value, and the 6 GiB board read exactly
+that with its display path up. On this SoC MODULE_MODE is not the effective gate
+for a running block -- the same finding as CM_VO1 on the TCON path and CM_USB2
+on USB. Nothing to write, so no phandle. ⚠ If a driver ever does power-gate this
+domain it must then treat the per-channel scaler coefficient SRAM as
+uninitialised; the prior art reports that gating and re-ungating leaves it
+holding random data, and it is visible on the screen.
+
+iommus. The live layer address in the vendor capture is 0xfc000000, and whether
+that is a physical address or an IOVA behind IOMMU0/IOMMU1 (0x03900000 /
+0x03910000, the memory map of the A733 user manual) is UNKNOWN -- and this tree has no IOMMU node to
+point at either way. A wrong `iommus` is worse than none, because sun8i_mixer.c
+only checks whether the property is PRESENT. Falsified by a scanout that fetches
+nothing from a physically-addressed buffer.
+
+COMPATIBLE
+----------
+"allwinner,sun60i-a733-de-mixer-0", following "allwinner,sun60i-a733-dp" (`arm64-dts-a733-displayport-transmitter`)
+and "allwinner,sun60i-a733-tcon-tv" (`arm64-dts-a733-tcon-tv1-and-the-dp-phy-pad-window`). There is no dt-binding document for
+it, exactly as there is none for those two; the binding is owed by whichever
+patch first sends one of them upstream.
+
+⚠ NO FALLBACK TO "allwinner,sun50i-h616-de33-mixer-0", and the temptation is
+real because that driver is in 6.18.36 and would bind. It must not: the H616 cfg
+carries .map = {0, 6, 7, 8} -- one VI channel and three UI -- while this
+silicon's seven populated slots are {0,1,2} and {6,7,8,9}. Binding the H616
+config to A733 silicon programs the wrong channel base for every layer above the
+first. The layouts match; the channel map does not, and the difference is exactly
+the "an A523/H616 value is plausible, it builds, and it looks right in a diff"
+trap that has caught this tree before.
+
+⚠ CONTRACT WITH THE DE DRIVER, which is being written in parallel and owns
+drivers/gpu/drm/. This node is the DT side of that contract: compatible
+"allwinner,sun60i-a733-de-mixer-0"; reg-names "layers", "top", "display",
+"de-top" with "layers" at index 0; clock-names "bus", "mod"; one unnamed reset;
+one interrupt. If the driver settles on different names, the driver wins and
+this node changes -- but it changes in one place, deliberately, rather than both
+sides guessing.
+
+THE COMMENT THAT MOVED
+----------------------
+The 18-line comment block describing USB3.1 SuperSpeed and the COMB0 combo-PHY
+had drifted away from `usb3: usb@6a00000`, the node it describes: `arm64-dts-a733-displayport-transmitter` and `arm64-dts-a733-tcon-tv1-and-the-dp-phy-pad-window`
+each inserted a node between the two, so it ended up introducing the DP
+transmitter and then the TCON. This patch moves it back to sit directly above
+usb@6a00000 and inserts the display-engine node where the comment used to be.
+Pure text move, no property touched -- and it is in this patch rather than left
+alone because otherwise this patch is the one that makes a USB3 comment appear
+to introduce the display engine. Measured rather than asserted: the dts with
+ONLY that hunk applied compiles to a dtb byte-identical to the pre-patch one
+(26141 bytes, cmp clean).
+
+VERIFIED
+--------
+Applies at fuzz 0 as part of the full ordered series against a freshly unpacked
+6.18.36. scripts/build.sh compile-check passes and the dtb builds with no new
+dtc warning against the pre-patch build (re-run with the dtb deleted first, so
+the DTC line is a real compile and not a cached no-op).
+
+The compiled dtb was decompiled and inspected rather than the exit code trusted:
+mixer@5100000 carries its compatible, four reg windows in the order
+0x5100000/0x180000, 0x5008100/0x40, 0x5280000/0x20000, 0x5008000/0x100, the
+matching reg-names, interrupts <0 50 4>, clocks <ccu 73> <ccu 72> = CLK_BUS_DE0
++ CLK_DE0, resets <ccu 27> = RST_BUS_DE0, assigned-clock-parents <ccu 71> =
+CLK_DE_PLL3X, and a ports/port@1/endpoint whose phandle resolves to the endpoint
+under lcd-controller@5731000's new port@0, and back.
+
+⚠ HARDWARE STATUS. THIS VERSION IS ONLY BUILD-TESTED. An EARLIER version of this node was
+HW-proven and it is not this one: on 2026-08-19 a test kernel put main +
+`clk-sunxi-ng-a733-display-engine-clock-gate-reset` and `arm64-dts-a733-display-engine-node-and-de-to-tcon-edge` + `drm-a733-display-engine-dram-into-tcon-tv1` onto the 8 GiB board and the display engine scanned a real framebuffer out
+of DRAM, through TCON_TV1, over the trained DisplayPort link, onto a monitor --
+the first pixels from DRAM this project has produced. That kernel carried the
+PERI0_480M cut of this node; `assigned-clock-parents` has since changed to
+CLK_DE_PLL3X and `clk-sunxi-ng-a733-display-engine-clock-gate-reset` has since taken ownership of PLL_DE. The clock line is the
+one thing about this node that a re-run has to re-establish.
+
+WHAT THAT RUN PROVED ABOUT THIS NODE, and it is most of it, because only one
+property changed:
+  ✅ THE NODE BINDS AND THE GEOMETRY IS RIGHT. The driver probed against these
+     four windows, read the version word 0x05008014 = 0x03520100, wrote
+     DE2TCON_MUX, GLOBAL_CTL, GLOBAL_SIZE and GLOBAL_CLK through them, and drove
+     a channel and a blender.
+  ✅ THE FOURTH WINDOW WAS THE RIGHT CALL, and for a stronger reason than the
+     one this header first gave -- see the node comment: with de_top +0x00/+0x04/
+     +0x08 at zero the entire mixer datapath is UNWRITABLE, and a raw devmem
+     write to 0x05101000 read back as if the address were unoccupied. A node
+     with only mainline's three DE33 windows could not have reached those
+     registers at all.
+  ✅ `iommus` ABSENT WAS CORRECT. The stated falsifier was "a scanout that
+     fetches nothing from a physically-addressed buffer"; it fetched, from the
+     physical address 0xfe400000, with no IOMMU bound.
+  ✅ CLK_BUS_DE0's ahb parent: bus-de0 measured at 200000000 Hz, the AHB rate.
+  ✅ RST_BUS_DE0: the block came out of reset.
+  ⬜ The `ports` graph edge was NOT exercised -- `drm-a733-display-engine-dram-into-tcon-tv1` is a plain platform driver
+     and walks no of_graph. It stays a description of the route, unread.
+
+WHAT WOULD PROVE IT, AS ONE OBSERVABLE. With the DE driver bound: the DE version
+word at 0x05008014 reads 0x03520100 -- which requires the reset de-asserted, the
+gate passed and a running clock, i.e. it exercises all three of this node's CCU
+references at once -- and then, with the driver writing a background colour into
+display pipe 0 and clearing TCON_TV1's TV_SRC_CTL bit 0, the monitor stops
+showing the VDBIST test pattern and shows that colour, and shows a different one
+when the value is changed.
+
+WHAT WOULD FALSIFY IT, in the order the failures separate. Absolute addresses
+throughout, because an offset read against the wrong base returns a plausible
+number rather than an error:
+
+  - 0x05008014 reads 0x00000000 -> the block is not clocked or not out of reset.
+    Read DE0_BGR abs 0x02002A04 (want 0x00010001), DE0_CLK abs 0x02002A00 (want
+    0x80000000) and PLL_DE_CTRL abs 0x020022E0 (want bit 31 and bit 28 set). If
+    all three are right and the version word is still zero, the base or the
+    window is wrong, not the clock tree.
+  - /sys/kernel/debug/clk/de0/clk_parent (or clk_summary) shows de0's parent as
+    anything but de-pll3x -> this node's assigned-clock-parents did not take.
+  - PLL_DE_CTRL still reads 0x41125600 after a modeset -- the cold reset value.
+    Nothing reached the PLL: propagation is not happening and only DE0_CLK's own
+    divider moved.
+  - PLL_DE_CTRL bit 28 (LOCK) clear after a modeset -> the PLL was enabled
+    without locking, i.e. the DE driver enabled the module clock before setting
+    its rate. That is the one ordering constraint neither this node nor `clk-sunxi-ng-a733-display-engine-clock-gate-reset` can
+    enforce, and it is named in the node comment.
+  - the version word reads correctly but the screen keeps the VDBIST pattern ->
+    the DE is alive and DE2TCON_MUX is wrong, which is the de-top window's own
+    test.
+  - the screen goes black with TV_DEBUG_REG bit30 TV_FIFO_UNDER_FLOW or bit29
+    LOSTWARN set, or its line counter stops -> the DE is driving the TCON and
+    starving it. A commit problem, not a description problem: the engine is on
+    the same 600 MHz source the vendor drives this mode with.
+
+Assisted-by: Claude
+
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -1283,23 +1283,271 @@
+ 		};
+ 
+ 		/*
+-		 * USB3.1 SuperSpeed: the USB3 DRD (Allwinner "USB2" block,
+-		 * UM USB3P1_DRD @0x06A00000, xHCI 1.20) + the COMB0 SERDES combo-PHY
+-		 * that carries the SuperSpeed lanes to Type-C J4.
+-		 *
+-		 * dwc3 is described flat, through the generic glue: the glue owns the
+-		 * clocks and the reset and only then creates the core, so the
+-		 * controller is never reached before its bus clocks run. The bare
+-		 * snps,dwc3 shape this replaced could not express that -- two of the
+-		 * five clocks have no dwc3 clock name to go by -- and it left the
+-		 * bring-up depending on the combo-PHY probing first, which fw_devlink
+-		 * stopped honouring once the Type-C connector closed a graph ring.
+-		 *
+-		 * IRQ = GIC_SPI 155 (INTID 187, UM source "USB2" -- the controller
+-		 * IRQ, not the COMB0 USB3 event, which is INTID 217 = GIC_SPI 185.
+-		 * The old note here said "IRQ 185" and mixed the two numbering
+-		 * spaces: INTID 185 is PCIE0_MSI.
++		 * The display engine -- the block that reads a framebuffer out of
++		 * DRAM, composes it and hands pixels to TCON_TV1. DE0 @0x05000000,
++		 * 4 MiB, group DE_SYS.
++		 *
++		 * ⚠ THERE IS NO DE1, and that is worth stating because the rest of
++		 * this display path comes in pairs (TCON_TV0/TV1, DPSS_TOP0/1,
++		 * VIDEO_OUT0/1). DE0 is the only display engine among the UM's 143
++		 * modules. The two display outputs the UM advertises (its feature list:
++		 * seven blend channels, two outputs) are two ports of this ONE
++		 * block: one aperture, one bus clock, one
++		 * reset, one interrupt.
++		 *
++		 * ⛔ EVERY OFFSET INSIDE THIS APERTURE IS UNDOCUMENTED. A733 UM V0.92
++		 * chapter 14.3 is two pages of prose with no register list: zero hits
++		 * for GLB_CTL, BLD_, OVL_, blender or RCQ over the whole 2.7 MB text.
++		 * So the four windows below carry no manual reference and cannot -- their bases
++		 * come from a live capture of a working vendor link plus the block
++		 * arithmetic that predicts them.
++		 * The APERTURE
++		 * itself (0x05000000, 4 MiB) and everything in the CCU and interrupt
++		 * lines below ARE documented; do not let the gap spread from the
++		 * inside of the block to its edges.
++		 *
++		 * reg, four windows. The first three are mainline's DE33 mixer names
++		 * and order, because that is the register model this silicon answers
++		 * to (drivers/gpu/drm/sun4i/sun8i_mixer.c: reg 0 unnamed for "layers",
++		 * then _byname("top") and _byname("display")) -- so "layers" must stay
++		 * at index 0:
++		 *
++		 *   layers   0x05100000 + 0x180000  the channel array. Channel n lives
++		 *            at 0x05100000 + n * 0x20000; the live capture shows seven
++		 *            populated slots on exactly that stride -- {0,1,2} and
++		 *            {6,7,8,9} -- against the UM's seven blend channels. The
++		 *            window runs to where display pipe 0 starts, i.e. slots
++		 *            0..11.
++		 *   top      0x05008100 + 0x40      mixer 0's per-pipe control block:
++		 *            GLOBAL_CTL / GLOBAL_STATUS / GLOBAL_SIZE / GLOBAL_CLK,
++		 *            four consecutive registers that decode exactly as
++		 *            mainline's DE33 layout, then the four RCQ registers. The
++		 *            size is 0x40 because mixer 1's block begins at
++		 *            0x05008140 -- which reads all zero across its whole 0x40
++		 *            on a board with one display pipe up, the negative control
++		 *            that turns this from a coincidence into an identification.
++		 *   display  0x05280000 + 0x20000   display pipe 0: the blender at
++		 *            +0x1000 and the output formatter at +0x5000.
++		 *   de-top   0x05008000 + 0x100     the DE-global block below the
++		 *            per-mixer tops. It carries DE2TCON_MUX at +0x10, which is
++		 *            how a display pipe reaches a TCON at all, and the version
++		 *            word at +0x14 (live 0x03520100 -- DE version 0x352, the
++		 *            block's only cheap liveness check).
++		 *
++		 * ⚠ de-top is a FOURTH window with no counterpart in mainline's DE33
++		 * mixer binding, and it is HW-PROVEN LOAD-BEARING -- more so than the
++		 * reason first given for it. The original argument was that without it
++		 * nothing can write DE2TCON_MUX, so the composed picture never reaches
++		 * TCON_TV1. What the board showed on 2026-08-19 is stronger and
++		 * different: with de_top +0x00, +0x04 and +0x08 left at zero, the ENTIRE
++		 * MIXER DATAPATH IS UNWRITABLE. Not unlatched -- unwritable. A raw
++		 * devmem write to the channel at 0x05101000 read back 0x00000000,
++		 * identical to 0x05200000 which nothing occupies, while de_top itself
++		 * answered normally; supplying the vendor's three values made the same
++		 * write take, with nothing else changed
++		 *:
++		 *
++		 *   0x05008000 = 0x00010001    0x05008004 = 0x00010001
++		 *   0x05008008 = 0x00000011
++		 *
++		 * The first two carry the sunxi de-assert-reset-plus-gate pattern. Two
++		 * consequences for whoever drives this node, neither of them the device
++		 * tree's to fix:
++		 *  - those three are the datapath's own enables and must be written
++		 *    before any channel or blender write, not after;
++		 *  - they sit BEHIND this node's reset. The same session saw them read
++		 *    back 0x00000000 after an enable/disable cycle, which is what
++		 *    RST_BUS_DE0 (DE0_BGR bit 16) asserting would do -- so they have to
++		 *    be re-applied after every reset_control_deassert(), not once at
++		 *    probe.
++		 *
++		 * It is listed last so that "layers", "top" and "display" keep
++		 * mainline's indices.
++		 *
++		 * ⚠ Window BOUNDARIES are weaker evidence than window BASES. Each base
++		 * is confirmed by a register that decodes at it; each size comes from
++		 * where the next block starts. Falsified by a live register outside
++		 * one of these four ranges that the datapath needs -- in which case the
++		 * honest fix is to map the whole 4 MiB, which costs nothing but address
++		 * space.
++		 *
++		 * interrupts: INTID 82 "DE" = GIC_SPI 50 (
++		 * A733 user manual). ONE interrupt for the whole engine -- there is no
++		 * per-channel and no per-output DE interrupt, so vblank comes from the
++		 * TCON (INTID 90) and not from here. Nothing requests it yet; it is
++		 * here because it describes the hardware.
++		 *
++		 * clocks: DE0_BGR_REG 0x0A04 bit0 as "bus", DE0_CLK_REG 0x0A00 as
++		 * "mod" -- mainline's names for the same two roles, added to the CCU by
++		 * the patch before this one. The reset is DE0_BGR bit16 and is unnamed,
++		 * because that is what devm_reset_control_get(dev, NULL) asks for.
++		 *
++		 * assigned-clock-parents pins DE0_CLK's seven-way source mux to
++		 * DEPLL3X -- which is also the mux's reset value, and where both the
++		 * cold board and the vendor's running stack are found. It is written
++		 * out rather than left to the reset default on purpose: a boot chain
++		 * that moved it would otherwise change what this node means, silently.
++		 *
++		 * ⚠ THIS REPLACES AN EARLIER CHOICE OF PERI0_480M, and the reasoning
++		 * that produced it is deleted rather than qualified. Three claims held
++		 * it up and board readings retired all three:
++		 *
++		 *  - "PLL_DE feeds NSI, the SoC interconnect, so we must not own it."
++		 *    The UM row "PLL_DE: NSI, DE0, VE, NPU, DRAM0, CSI"
++		 *    is a fan-out map, not active topology. All six reach
++		 *    DEPLL3X through muxes with other inputs, and five were read on the
++		 *    vendor system with the DE live: NSI abs 0x02002580 = 0xC3000000 ->
++		 *    PERI0_600M, DRAM0 abs 0x02002C00 -> DDRPLL, VE_ENC0 abs
++		 *    0x02002A80 -> VE1PLL, VE_DEC abs 0x02002A88 -> VE0PLL, NPU abs
++		 *    0x02002B00 -> NPUPLL. NSI reads the same 0xC3000000 at the U-Boot
++		 *    prompt on a cold power-cycle of our own chain, so the answer does
++		 *    not depend on whose OS is running. The sixth, CSI, has no driver
++		 *    and no node in this tree.
++		 *  - "the reset mux hands the engine a stopped clock." Half right, and
++		 *    the half that is right is now an argument FOR owning the PLL
++		 *    rather than for routing around it -- see below.
++		 *  - "the UM tells a 2K mode to use another source".
++		 *    True as text, but it is the consequence of the
++		 *    sentence before it: NSI at 700 MHz means DEPLL3X must not be
++		 *    retuned, so a 2K DE that wants less has to look elsewhere. With
++		 *    NSI measured off DEPLL3X, cold and hot, the premise does not hold
++		 *    here and the PLL can simply be tuned to what the mode needs.
++		 *
++		 * WHAT THE COLD BOARD ACTUALLY HANDS US, read at the U-Boot prompt on a
++		 * cold power-cycle of our own chain, nothing having run:
++		 *
++		 *   PLL_DE_CTRL abs 0x020022E0 = 0x41125600  PLL_EN 0 -- the PLL is OFF
++		 *   DE0_CLK     abs 0x02002A00 = 0x00000000  gate off, mux 000=DEPLL3X
++		 *   DE0_BGR     abs 0x02002A04 = 0x00000000  bus gate off, in reset
++		 *
++		 * The mux already points at DEPLL3X and DEPLL3X is off. So there are
++		 * exactly two ways to give this engine a clock, and no third: move the
++		 * mux to a peripheral tap and never own the PLL, or keep the mux where
++		 * the silicon puts it and own the PLL properly. With the interconnect
++		 * hazard measured dead, the second is the better fit -- it describes
++		 * the block the way it is built instead of routing around a danger that
++		 * is not there.
++		 *
++		 * WHAT PINNING DEPLL3X BUYS. The engine gets the source the silicon
++		 * defaults to and the vendor uses, at the rate mainline's DE33 model
++		 * also picks -- the vendor's live DE0_CLK abs 0x02002A00 = 0x80000000
++		 * is mux 000 with FACTOR_M = 0, i.e. DIVISOR M = 1, i.e. DEPLL3X
++		 * undivided at 600 MHz. The whole chain is settable, so one
++		 * clk_set_rate() on the module clock configures divider, tap and PLL.
++		 * And 4K stays reachable: 696 MHz is a PLL_DE rate and no PERI0 tap
++		 * gets near it, so PERI0_480M would have capped the engine 20 % below
++		 * the vendor and ruled 4K out permanently.
++		 *
++		 * ⚠ WHAT IT COSTS, named so it is not discovered later. This display
++		 * path now owns PLL_DE: a modeset retunes it, and clk_disable_unused()
++		 * switches it off on a kernel where nothing claims it. That is bounded
++		 * by the table above -- five consumers measured elsewhere, CSI absent
++		 * from this tree -- and it is the same bargain `clk-sunxi-ng-a733-video-plls-and-edp-tv-pixel-clock` struck for
++		 * PLL_VIDEO1, whose header records CSI_MASTER as inheriting it. A
++		 * future VE, NPU or DRAM driver that selects DEPLL3X from its own mux
++		 * inherits a clock the display retunes.
++		 *
++		 * There is no assigned-clock-rates: the rate belongs to a modeset, not
++		 * to the device tree. ⚠ Like the TCON's, these properties take effect
++		 * when a driver binds this node -- of_clk_set_defaults() runs from
++		 * platform_probe() -- so today they change no register.
++		 *
++		 * ⚠ ONE CONSTRAINT ON THE DE DRIVER, because the device tree cannot
++		 * express it. Set the rate BEFORE enabling the module clock.
++		 * ccu_nm_ops waits for PLL lock only inside ccu_nm_set_rate(), so a
++		 * driver that enables first opens the output gate on a PLL that may not
++		 * have locked -- UM 4.1.4.1 Method 2, the A733 user manual. mainline's
++		 * sun8i_mixer_probe() already has that order
++		 * (drivers/gpu/drm/sun4i/sun8i_mixer.c:618-625) and `clk-sunxi-ng-a733-display-engine-clock-gate-reset`'s pll-de
++		 * carries CLK_SET_RATE_UNGATE so the lock poll runs on a PLL that is
++		 * actually on.
++		 *
++		 * NOT here, each for a stated reason rather than by omission:
++		 *
++		 *   power-domains  CM_DESYS_CFG_REG 0x1B04 reads 0x00020000 = STATUS
++		 *                  "Power ON", MODULE_MODE 0, which is
++		 *                  its reset value, and the 6 GiB board read exactly that with its
++		 *                  display up. On this SoC MODULE_MODE is not the
++		 *                  effective gate for a running block -- the same
++		 *                  finding as CM_VO1 on the TCON path and CM_USB2 on
++		 *                  USB. Nothing to write, so no phandle. ⚠ If a future
++		 *                  driver DOES power-gate this domain it must then
++		 *                  treat the per-channel scaler coefficient SRAM as
++		 *                  uninitialised.
++		 *   iommus         ✅ VINDICATED ON SILICON, 2026-08-19. The stated
++		 *                  falsifier was "a scanout that fetches nothing from a
++		 *                  physically-addressed buffer". It fetched: the engine
++		 *                  scanned 1920x1200 from the PHYSICAL address
++		 *                  0xfe400000 with no IOMMU bound, onto a monitor. So
++		 *                  the omission is now correct by measurement rather
++		 *                  than by caution. ⚠ And the vendor's own capture is
++		 *                  NOT comparable on this point -- it runs the same path
++		 *                  through sunxi-iommu-v2 as master 8, so its layer
++		 *                  address 0xfc000000 is an IOVA, not a physical
++		 *                  address. Whoever one day adds an IOMMU driver adds
++		 *                  the property then.
++		 *   DE_SYS_BGR, the AHB matrix gate, the MBUS matrix gate: all three
++		 *                  are in their working state at power-on and the
++		 *                  vendor writes none of them -- the CCU patch lists
++		 *                  them with their reset values.
+ 		 */
++		mixer0: mixer@5100000 {
++			compatible = "allwinner,sun60i-a733-de-mixer-0";
++			reg = <0x0 0x05100000 0x0 0x00180000>,
++			      <0x0 0x05008100 0x0 0x00000040>,
++			      <0x0 0x05280000 0x0 0x00020000>,
++			      <0x0 0x05008000 0x0 0x00000100>;
++			reg-names = "layers", "top", "display", "de-top";
++			interrupts = <GIC_SPI 50 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&ccu CLK_BUS_DE0>, <&ccu CLK_DE0>;
++			clock-names = "bus", "mod";
++			resets = <&ccu RST_BUS_DE0>;
++			assigned-clocks = <&ccu CLK_DE0>;
++			assigned-clock-parents = <&ccu CLK_DE_PLL3X>;
++			status = "okay";
++
++			/*
++			 * The output edge, DE display pipe 0 -> TCON_TV1. This is
++			 * not decoration: mainline's DE2/DE3/DE33 mixer binding
++			 * makes `ports` with `port@1` REQUIRED, and
++			 * sun8i_mixer_of_get_id() derives the mixer index from the
++			 * REMOTE endpoint's reg and returns -EINVAL when the
++			 * output endpoint is missing -- i.e. a mixer node without
++			 * this subnode does not probe. The remote endpoint below
++			 * carries no reg, so its id is 0 and this is mixer 0; a
++			 * second display pipe would land on the TCON it is routed
++			 * to with reg = <1>.
++			 *
++			 * The register that actually performs this route is
++			 * DE2TCON_MUX at de-top +0x10 (live 0x0000fff5, disp0's
++			 * nibble 0x5). The graph says which TCON; the driver
++			 * writes the nibble.
++			 *
++			 * ⚠ The next edge, TCON_TV1 -> the DisplayPort
++			 * transmitter, is deliberately NOT here. Its shape depends
++			 * on whether the DP lands as a drm_bridge or as an encoder
++			 * component, which is undecided
++			 *. Guessing it
++			 * would put a property in the tree that nothing reads --
++			 * the failure mode that grepping the driver for each
++			 * new property before adding it is meant to prevent. It is owed by the patch that
++			 * settles that question, and this comment is where the
++			 * debt is recorded.
++			 */
++			ports {
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				mixer0_out: port@1 {
++					reg = <1>;
++
++					mixer0_out_tcon_tv1: endpoint {
++						remote-endpoint = <&tcon_tv1_in_mixer0>;
++					};
++				};
++			};
++		};
++
+ 		/*
+ 		 * TCON_TV1 -- the timing controller that scans the mode and hands it
+ 		 * to the DisplayPort transmitter. UM 15.2: TCON_TV1 is the TCON that drives
+@@ -1355,6 +1603,37 @@
+ 			assigned-clocks = <&ccu CLK_EDP_TV>;
+ 			assigned-clock-parents = <&ccu CLK_VIDEO1_PLL4X>;
+ 			status = "okay";
++
++			/*
++			 * The input edge, DE display pipe 0 -> TCON_TV1. Added
++			 * with the display-engine node, because a graph edge only
++			 * exists if both ends describe it.
++			 *
++			 * The endpoint carries no reg, so its id is 0 -- and that
++			 * is what names the mixer: sun8i_mixer_of_get_id() reads
++			 * the REMOTE endpoint's id, so this 0 is why the block on
++			 * the other end is mixer 0. A second display pipe arrives
++			 * as a second endpoint here with reg = <1>, which then
++			 * needs #address-cells/#size-cells on this port.
++			 *
++			 * Nothing reads this today: sun60i-tcon-tv.c is a plain
++			 * platform driver with no of_graph call, so the edge is
++			 * inert until a KMS driver walks it. It is here because it
++			 * is the route the hardware takes -- the register that
++			 * performs it is DE2TCON_MUX, on the DE side.
++			 */
++			ports {
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				tcon_tv1_in: port@0 {
++					reg = <0>;
++
++					tcon_tv1_in_mixer0: endpoint {
++						remote-endpoint = <&mixer0_out_tcon_tv1>;
++					};
++				};
++			};
+ 		};
+ 
+ 		/*
+@@ -1435,6 +1714,24 @@
+ 			status = "okay";
+ 		};
+ 
++		/*
++		 * USB3.1 SuperSpeed: the USB3 DRD (Allwinner "USB2" block,
++		 * UM USB3P1_DRD @0x06A00000, xHCI 1.20) + the COMB0 SERDES combo-PHY
++		 * that carries the SuperSpeed lanes to Type-C J4.
++		 *
++		 * dwc3 is described flat, through the generic glue: the glue owns the
++		 * clocks and the reset and only then creates the core, so the
++		 * controller is never reached before its bus clocks run. The bare
++		 * snps,dwc3 shape this replaced could not express that -- two of the
++		 * five clocks have no dwc3 clock name to go by -- and it left the
++		 * bring-up depending on the combo-PHY probing first, which fw_devlink
++		 * stopped honouring once the Type-C connector closed a graph ring.
++		 *
++		 * IRQ = GIC_SPI 155 (INTID 187, UM source "USB2" -- the controller
++		 * IRQ, not the COMB0 USB3 event, which is INTID 217 = GIC_SPI 185.
++		 * The old note here said "IRQ 185" and mixed the two numbering
++		 * spaces: INTID 185 is PCIE0_MSI.
++		 */
+ 		usb3: usb@6a00000 {
+ 			compatible = "allwinner,sun60i-a733-dwc3";
+ 			reg = <0x0 0x06a00000 0x0 0x10000>;

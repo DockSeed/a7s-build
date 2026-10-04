@@ -1,0 +1,357 @@
+From 7c8b9e1a3d5f2c4b6e8d0f1a3c5b7d9e2f4a6b8c Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Tue, 21 Jul 2026 11:45:00 +0200
+Subject: [PATCH] arm64: dts: a733: add full cpu-topology + DSU caches (M8)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Replace the single-cpu stub DT `arm64-dts-allwinner-add-A733-minimal-boot-dt` left with the silicon-verified
+A733 cpu complex: 6× Cortex-A55 (cluster0, little) + 2× Cortex-A76
+(cluster1, big) in one DynamIQ Shared Unit, PSCI-enabled, with
+per-core private L2 caches + one shared DSU L3.
+
+Sources (silicon-firm unless explicitly noted):
+
+CLUSTER GEOMETRY (silicon-firm via MIDR_EL1 on the 6 GiB board):
+
+  MIDR_EL1 read via /sys/devices/system/cpu/cpuN/regs/identification/
+  midr_el1 on the 6 GiB board (kernel 6.18.36-edge-sun60iw2):
+    cpu0..cpu5 = 0x412fd050
+      implementer 0x41 (ARM), variant 2, arch 0xf, partnum 0xd05, rev 0
+      → ARM Cortex-A55 r2p0
+    cpu6..cpu7 = 0x414fd0b1
+      implementer 0x41 (ARM), variant 4, arch 0xf, partnum 0xd0b, rev 1
+      → ARM Cortex-A76 r4p1
+  REVIDR_EL1 = 0 on all 8 cpus (no errata metal rev).
+
+  Matches A733 UM section 5.1 (two Cortex-A76 cores plus
+  six Cortex-A55 cores) and the single-DSU statement in
+  the A733 user manual (section "DynamIQ CPU SYSTEM").
+
+PLL DISTRIBUTION (silicon-firm via UM spec):
+
+  A733 UM section 5.1.4.1 (PLL distribution):
+    core0..core5 take CPU_L_PLL as their primary clock
+    core6/core7 take CPU_B_PLL
+    the cluster (DSU) takes CPU_DSU_PLL
+  This is the authoritative split between cluster0 (little) and
+  cluster1 (big). An earlier revision of this patch cited
+  the wrong part of the manual here.
+
+REG VALUES (kernel-DT-view; silicon-firm only indirectly via PSCI):
+
+  cpu@N nodes use the Allwinner MPIDR convention reg = AFF1<<8 |
+  AFF0 with a 0x100 stride (0x000..0x500 for cluster0, 0x600..0x700
+  for cluster1). Read back live from /proc/device-tree/cpus on the 6 GiB board.
+  The silicon-firm anchor is functional: PSCI CPU_ON works on all
+  8 cpus on the 6 GiB board's BSP, which is the indirect MPIDR proof. A
+  direct MPIDR_EL1 read via MRS is pending (no kernel module was
+  built for this pass; the BSP exposes only MIDR/AIDR/REVIDR via
+  sysfs, not MPIDR).
+
+CACHE TOPOLOGY (silicon-firm via UM Figure 5-1):
+
+  A733 UM section 5.1 Figure 5-1 (the CPUX block diagram)
+  (A733 user manual) shows eight separate L1+L2 blocks (one per
+  core, both LITTLE and BIG) feeding a single DSU "L3 cache" +
+  snoop filter. Reinforced textually:
+    - the A733 user manual (A55 features): L2 is optional, unified and private
+    - the A733 user manual (A76 features): L2 is private and unified, holding
+      data and instructions
+    - the A733 user manual (DSU features): L3 is optional, unified and
+      16-way set-associative
+    - the A733 user manual: cache lines are 64 bytes everywhere
+  Encoded here as 8 private L2 nodes (L2_0..L2_7) + one shared L3.
+
+  NOTE on a misleading cross-witness: /sys/devices/system/cpu/cpuN/
+  cache on the 6 GiB board (6.18.36) + a second 6 GiB board (6.6.98) reports L2 + L3 both with
+  shared_cpu_list=0-7 across all 8 cpus. That kernel view was used
+  in v1 of this patch to justify a single shared L2. It was WRONG:
+  both BSP kernels inherit a DT with NO L2/L3 cache nodes, so the
+  kernel's cacheinfo code fell back to a conservative "L2 shared
+  across socket" default in the absence of DT guidance. The UM
+  Figure 5-1 vendor block diagram is authoritative and shows
+  per-core L2.
+
+SCOPE — kills the following boot-log symptoms (K1/K5):
+
+  K1: "cacheinfo: Unable to detect cache hierarchy for CPU 0"
+      Root cause: DT `arm64-dts-allwinner-add-A733-minimal-boot-dt` had only one cpu@0 and zero cache nodes;
+      cacheinfo could not build any hierarchy. With this patch every
+      cpu@N has next-level-cache → its private L2 → the shared L3.
+  K5: "psci: MIGRATE_INFO_TYPE not supported"
+      Cosmetic for single-cluster operation; closed functionally by
+      having the full 8-cpu topology online (PSCI CPU_ON reaches
+      cores 1-7, not just cpu0). Direct MIGRATE_INFO_TYPE is a
+      TF-A implementation choice; the warning itself remains
+      harmless.
+
+DELIBERATELY OMITTED (unverified — separate follow-on patches):
+
+  * capacity-dmips-mhz + dynamic-power-coefficient. The BSP DT on
+    the 6 GiB board has <430>/<1024> and <162>/<598> for cluster0/cluster1
+    respectively, but these are NOT in the A733 UM nor in any
+    reference-doc, and ARM does not publish per-part numbers in
+    their public TRMs. They are software opinion, not silicon-firm.
+    Leaving them out keeps this patch anchored only to what we can
+    prove; an EAS-enablement patch can land them once measured or
+    sourced.
+
+  * cpu-supply (DCDC3 / DCDC5 rails). VDD-CPUB = DCDC3, VDD-CPUL =
+    DCDC5, both in the 0.8-1.0 V SoC-input range — silicon-firm via
+    board schematic page 4 (L11 + L37).
+    Live PMIC readback on the 6 GiB board
+    confirms both rails enabled (cpufreq-scaled, so voltage varies
+    with frequency — current reading not encoded). Not wired here
+    because the AXP318W DT (`arm64-dts-a733-enable-r-i2c0-axp318w-pmic`) only exposes
+    SWOUT1/SWOUT2; DCDC3 + DCDC5 regulator nodes need a PMIC-DT
+    extension patch first. Note: AXP8191 (vendor/silicon name) =
+    AXP318W (mainline name) — same chip.
+
+  * OPP tables + cpufreq. Max freqs observed on the 6 GiB board: policy0 (A55,
+    cpus 0-5) max 1794 MHz over 9 OPPs; policy6 (A76, cpus 6-7) max
+    2002 MHz over 12 OPPs. Per-OPP voltages need PMIC rails +
+    cpupll_ccu driver — separate patch, foundation range.
+
+  * PMU nodes (arm,cortex-a55-pmu + arm,cortex-a76-pmu),
+    idle-states, thermal-zones + cooling-cells. THS sensor map per
+    the UM (0=CPUB,
+    1=DDR, 2=NPU, 3=CPUL, 4=GPU) but the
+    cooling machinery + cpufreq interaction is its own subsystem
+    patch. NOTE: this line used to call that map "silicon-firm".
+    It was not -- it was UM-derived and never measured. The two
+    CPU entries were later measured the other way round (ths 0 =
+    A55, ths 3 = A76); `arm64-dts-a733-thermal-zones-and-cpu-throttling` carries the correction and the
+    evidence. Sensors 1/2/4 are unaffected.
+
+  * SID/OTP. Little is documented about the A733
+    SID so far. Per-chip
+    calibration constants (THS, leakage → dpc, OPP voltage offsets)
+    cannot be sourced from silicon yet;
+    not encoded here, deferred.
+
+  * cpupll_ccu node (CPU PLL block @ 0x08870000, separate from
+    main CCU). Silicon-firm
+    via the live DTB on the 6 GiB board. Belongs with
+    the cpufreq patch (foundation range); cpu@N `clocks=<>` will
+    need extending when that lands.
+
+  * cross-witness on a second 6 GiB board (kernel 6.6.98-vendor-sun60iw2): the
+    MIDR was read there as well, but that read was not
+    recorded, so no claim here rests on it.
+
+The DT `arm64-dts-allwinner-add-A733-minimal-boot-dt` single-cpu stub is the sole pre-existing cpu@N
+declaration; this patch replaces the cpus {} block and adds the
+L2_0..L2_7 + L3 cache nodes at the root level alongside
+psci/timer.
+
+VERIFIED THIS PASS:
+  * `patch -p1 --dry-run` clean against main (post `clk-sunxi-ng-add-A733-sun60iw2-minimal-ccu` to `arm64-dts-a733-add-pck600-power-controller` +
+    `mfd-axp20x-Constify-axp313-and-axp717-cells` to `arm64-dts-a733-pmic-nmi-irq`)
+  * `git apply --check` exit 0
+  * `git am` accepts the patch (mailbox-format compatible)
+  * HW: cpu@N identity matches MIDR_EL1 readback on the 6 GiB board byte-
+    for-byte. Cache topology matches UM Figure 5-1.
+
+PENDING (NOT YET VERIFIED):
+  * dtc 0-warn (W=1) — needs a full kernel tree build
+  * Boot-test on our chain (currently single-cpu only) to confirm
+    K1 + K5 symptoms actually clear
+  * Direct MPIDR_EL1 read via MRS to confirm the reg= 0x100-stride
+    is MPIDR-true, not just BSP-DT-convention
+
+Assisted-by: Claude
+---
+diff --git a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -37,12 +37,185 @@
+ 		#address-cells = <1>;
+ 		#size-cells = <0>;
+ 
++		/*
++		 * A55 little cluster (cluster0): cpu0..cpu5.
++		 * Silicon-firm via MIDR_EL1 read on the 6 GiB board (kernel 6.18.36):
++		 * cpu0..cpu5 = 0x412fd050 = ARM Cortex-A55 r2p0
++		 * (implementer=0x41 ARM, variant=2, partnum=0xd05, rev=0).
++		 * Matches A733 UM section 5.1 (hexa-core Cortex-A55 cluster)
++		 * and UM section 5.1.4.1 PLL Distribution:
++		 * core0..core5 take CPU_L_PLL as primary clock.
++		 *
++		 * reg follows the Allwinner MPIDR convention (AFF1<<8 | AFF0),
++		 * read back live on the 6 GiB board: 0x000..0x500.
++		 */
+ 		cpu0: cpu@0 {
+ 			device_type = "cpu";
+ 			compatible = "arm,cortex-a55";
+ 			reg = <0x000>;
+ 			enable-method = "psci";
++			next-level-cache = <&L2_0>;
+ 		};
++
++		cpu1: cpu@100 {
++			device_type = "cpu";
++			compatible = "arm,cortex-a55";
++			reg = <0x100>;
++			enable-method = "psci";
++			next-level-cache = <&L2_1>;
++		};
++
++		cpu2: cpu@200 {
++			device_type = "cpu";
++			compatible = "arm,cortex-a55";
++			reg = <0x200>;
++			enable-method = "psci";
++			next-level-cache = <&L2_2>;
++		};
++
++		cpu3: cpu@300 {
++			device_type = "cpu";
++			compatible = "arm,cortex-a55";
++			reg = <0x300>;
++			enable-method = "psci";
++			next-level-cache = <&L2_3>;
++		};
++
++		cpu4: cpu@400 {
++			device_type = "cpu";
++			compatible = "arm,cortex-a55";
++			reg = <0x400>;
++			enable-method = "psci";
++			next-level-cache = <&L2_4>;
++		};
++
++		cpu5: cpu@500 {
++			device_type = "cpu";
++			compatible = "arm,cortex-a55";
++			reg = <0x500>;
++			enable-method = "psci";
++			next-level-cache = <&L2_5>;
++		};
++
++		/*
++		 * A76 big cluster (cluster1): cpu6..cpu7.
++		 * Silicon-firm via MIDR_EL1 read on the 6 GiB board (kernel 6.18.36):
++		 * cpu6..cpu7 = 0x414fd0b1 = ARM Cortex-A76 r4p1
++		 * (implementer=0x41 ARM, variant=4, partnum=0xd0b, rev=1).
++		 * Matches A733 UM section 5.1 (dual-core Cortex-A76 cluster)
++		 * and UM section 5.1.4.1 PLL Distribution:
++		 * core6/core7 take CPU_B_PLL as primary clock.
++		 *
++		 * reg 0x600..0x700 from live DTB on the 6 GiB board (Allwinner 0x100 stride).
++		 */
++		cpu6: cpu@600 {
++			device_type = "cpu";
++			compatible = "arm,cortex-a76";
++			reg = <0x600>;
++			enable-method = "psci";
++			next-level-cache = <&L2_6>;
++		};
++
++		cpu7: cpu@700 {
++			device_type = "cpu";
++			compatible = "arm,cortex-a76";
++			reg = <0x700>;
++			enable-method = "psci";
++			next-level-cache = <&L2_7>;
++		};
++
++		cpu-map {
++			cluster0 {
++				core0 { cpu = <&cpu0>; };
++				core1 { cpu = <&cpu1>; };
++				core2 { cpu = <&cpu2>; };
++				core3 { cpu = <&cpu3>; };
++				core4 { cpu = <&cpu4>; };
++				core5 { cpu = <&cpu5>; };
++			};
++
++			cluster1 {
++				core0 { cpu = <&cpu6>; };
++				core1 { cpu = <&cpu7>; };
++			};
++		};
++	};
++
++	/*
++	 * DynamIQ Shared Unit (DSU) cache topology, per A733 UM section 5.1
++	 * Figure 5-1 and section 5.1.1 cache-feature
++	 * descriptions:
++	 *   - Each core has PRIVATE L1 I + L1 D caches (A733 user manual;
++	 *     L1 is implicit in cpu@N — kernel reads it from CLIDR_EL1).
++	 *   - Each core has a PRIVATE unified L2 (the A733 user manual A55
++	 *     features call it optional; the A76 features call it
++	 *     private and unified for data and instructions).
++	 *   - The DSU has ONE shared unified L3, 16-way set-associative
++	 *     (A733 user manual), 64-byte lines.
++	 *
++	 * Encoded here as 8 private L2 nodes (one per cpu@N) + 1 shared L3.
++	 * Sizes deliberately omitted — the kernel reads them from CCSIDR_EL1
++	 * at boot.
++	 *
++	 * NOTE on the prior cross-witness on the 6 GiB board + a second 6 GiB board (both kernels
++	 * reported L2 shared_cpu_list=0-7 across all 8 cpus): the BSP DT
++	 * has NO L2/L3 cache nodes at all, so the kernel's cacheinfo
++	 * defaulted to "shared L2 across socket" in the absence of DT
++	 * guidance. That kernel view is a fallback artefact, not silicon
++	 * truth. The UM Figure 5-1 (vendor block diagram) is authoritative
++	 * and shows per-core L2.
++	 */
++	L2_0: l2-cache-0 {
++		compatible = "cache";
++		cache-level = <2>;
++		next-level-cache = <&L3>;
++	};
++
++	L2_1: l2-cache-1 {
++		compatible = "cache";
++		cache-level = <2>;
++		next-level-cache = <&L3>;
++	};
++
++	L2_2: l2-cache-2 {
++		compatible = "cache";
++		cache-level = <2>;
++		next-level-cache = <&L3>;
++	};
++
++	L2_3: l2-cache-3 {
++		compatible = "cache";
++		cache-level = <2>;
++		next-level-cache = <&L3>;
++	};
++
++	L2_4: l2-cache-4 {
++		compatible = "cache";
++		cache-level = <2>;
++		next-level-cache = <&L3>;
++	};
++
++	L2_5: l2-cache-5 {
++		compatible = "cache";
++		cache-level = <2>;
++		next-level-cache = <&L3>;
++	};
++
++	L2_6: l2-cache-6 {
++		compatible = "cache";
++		cache-level = <2>;
++		next-level-cache = <&L3>;
++	};
++
++	L2_7: l2-cache-7 {
++		compatible = "cache";
++		cache-level = <2>;
++		next-level-cache = <&L3>;
++	};
++
++	L3: l3-cache {
++		compatible = "cache";
++		cache-level = <3>;
+ 	};
+ 
+ 	psci {
+
+-- 
+2.45.0

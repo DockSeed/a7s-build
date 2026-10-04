@@ -1,0 +1,65 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] aic8800_fdrv: print the mgmt tx status through dynamic debug, not trace_printk
+
+Measured on the board, 2026-09-17, a normal boot: the kernel prints
+the 13-line "trace_printk() being used ... This means that this is a DEBUG
+kernel and it is unsafe for production use" notice on every boot, right
+after aic8800_fdrv loads.
+
+Why this module: its .ko carries a __trace_printk_fmt section (readelf on
+the image's module: 16 bytes, two relocations to the same format string),
+and no other shipped module does. Loading a module with such a section runs
+hold_module_trace_bprintk_format() -> trace_printk_init_buffers()
+(kernel/trace/trace_printk.c:52-60 in 6.18.36), which allocates the per-CPU
+trace_printk buffers and prints the notice. The one call site is in
+rwnx_txdatacfm(), for every confirmed management frame:
+done / retry_required / sw_retry_required / acknowledged.
+
+The cause: trace_printk() is a developer-only tool.
+include/linux/trace_printk.h:69-72 says so ("Please refrain from leaving
+trace_printks scattered around in your code. (Extra memory is used ...)"),
+and scripts/checkpatch.pl:4907-4910 warns on it ("Do not use trace_printk()
+in production code").
+
+What changes: the line becomes pr_debug() with the same format and
+arguments. It is a diagnostic, so it stays in the driver (a diagnostic is never
+deleted, only quieter). CONFIG_DYNAMIC_DEBUG=y is pinned in A733_CONFIGS,
+so it can be switched on at runtime, scoped by function, with no rebuild:
+  echo 'module aic8800_fdrv func rwnx_txdatacfm +p' \
+    > /sys/kernel/debug/dynamic_debug/control
+or on the kernel command line: aic8800_fdrv.dyndbg="func rwnx_txdatacfm +p".
+Output goes to the kernel log at KERN_DEBUG instead of the ftrace ring
+buffer. Only management frames reach this line, not data frames.
+
+The acknowledgement itself is also in the in-tree cfg80211 tracepoint
+cfg80211_mgmt_tx_status, which the same branch calls two lines further down.
+The vendor's own trace_mgmt_cfm tracepoint stays under CREATE_TRACE_POINTS,
+which this build leaves off (aic8800_fdrv/Makefile:93).
+
+Falsifier, on the board:
+1. `dmesg | grep -c 'trace_printk() being used'` = 0 after a boot with
+   aic8800_fdrv loaded; `readelf -S aic8800_fdrv.ko` has no
+   __trace_printk_fmt section.
+2. With the dyndbg line above and an association under NetworkManager, the
+   `done=... acknowledged=...` lines appear in `journalctl -k -b`.
+3. WLAN associates and passes traffic as before.
+
+Assisted-by: Claude
+
+diff --git a/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/rwnx_tx.c b/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/rwnx_tx.c
+index 8d2ab4a..211e352 100644
+--- a/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/rwnx_tx.c
++++ b/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/rwnx_tx.c
+@@ -2376,9 +2376,9 @@ int rwnx_txdatacfm(void *pthis, void *host_id)
+ 
+     /* Update txq and HW queue credits */
+     if (sw_txhdr->desc.host.flags & TXU_CNTRL_MGMT) {
+-        trace_printk("done=%d retry_required=%d sw_retry_required=%d acknowledged=%d\n",
+-                     rwnx_txst.tx_done, rwnx_txst.retry_required,
+-                     rwnx_txst.sw_retry_required, rwnx_txst.acknowledged);
++        pr_debug("done=%d retry_required=%d sw_retry_required=%d acknowledged=%d\n",
++                 rwnx_txst.tx_done, rwnx_txst.retry_required,
++                 rwnx_txst.sw_retry_required, rwnx_txst.acknowledged);
+ #ifdef CREATE_TRACE_POINTS
+         trace_mgmt_cfm(sw_txhdr->rwnx_vif->vif_index,
+                        (sw_txhdr->rwnx_sta) ? sw_txhdr->rwnx_sta->sta_idx : 0xFF,

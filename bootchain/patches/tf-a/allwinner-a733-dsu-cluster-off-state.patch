@@ -1,0 +1,493 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Sat, 3 Oct 2026 17:18:41 +0200
+Subject: [PATCH] feat(allwinner): A733: DSU cluster OFF at PSCI power level 1
+
+Second step of the A733 cluster idle state, on top of "every core
+requires DSU cluster power" (every core sets its CLUSTERPWRDN_EL1
+"cluster power required" bit whenever it comes up).
+
+WHAT. At cold boot the DSU PPU (0x07051000) policy floor comes down from
+ON to OFF: PWR_POLICY [3:0] = 0, PWR_DYN_EN and OP_POLICY kept (Arm
+DEN0051E 5.2.1, read-modify-write of the nibble, read back and printed).
+CPU_SUSPEND then also accepts 0x01010000 (POWERDOWN, level 1, StateID
+0), while the PPU still reads policy OFF with dynamic transitions on. A
+core that asks for level 1, and a core on CPU_OFF, writes
+CLUSTERPWRDN_EL1 = 0; every core writes 1 again when it comes up. The
+DSU powers the cluster down only when all eight cores are down and every
+bit is 0 (DSU TRM 100453 B1.14/B1.15); the requested level decides the
+bit, not the coordinated one, because the DSU combines the bits itself.
+
+THE GIC. A cluster power-down on this SoC resets every core's GIC-600
+redistributor SGI/PPI configuration (A733 UM V1.00 5.1.9.17, C0_RST_CTRL
+bit 4 GIC_RST, the cluster's internal GIC reset), while GICR_PWRR still
+reads the redistributor powered. Writing the saved configuration back
+alone leaves PPI 26 pending and enabled and never delivered: Linux loses
+its tick on the first power-down. It takes a GICR_PWRR power transition
+around the loss, done here in the GIC-600 TRM (100336 r1p6) order: after
+gicv3_cpuif_disable() (3.6.2: ProcessorSleep set, ChildrenAsleep polled;
+the generic GIC driver runs it before pwr_domain_suspend) a core that
+asked for level 1 saves its SGI/PPI frame and writes GICR_PWRR.RDPD = 1
+(3.6.1; Table 4-26: only accepted with ProcessorSleep = 1); at wake, in
+pwr_domain_suspend_finish and so before the generic driver re-enables
+the CPU interface, RDPD = 0 and the frame is written back if it reads
+different, in the order of TF-A's gicv3_rdistif_init_restore() (SGIs and
+PPIs disabled, RWP, configuration, enables). gicv3_rdistif_init() is not
+needed. Measured on the A733: init alone hangs on the first power-down;
+this order ran 3235 cluster power-downs in 120 s with one core, and with
+the cluster held ON the same power-off keeps the frame and every wake
+works. TF-A's FVP comment warns against this order ("can potentially
+prevent wake up events"); measured, it does not here.
+
+The redistributor frames are the ones the generic GIC driver found
+(gicv3_rdistif_get_base()). Each core checks once that its frame is
+where the GIC-600 register map puts it (TRM Table 4-1:
+SUNXI_GICR_BASE + core * 128 KiB) and ends in ERROR and panic if not:
+the boot core at cold boot, every other core after CPU_ON, in
+pwr_domain_on_finish_late, once the driver has probed its frame. The
+GICR_CTLR.RWP waits poll without a bound, as the GIC driver's own
+gicr_wait_for_pending_write(): the GICv3 architecture gives RWP no time
+bound (IHI 0069H.b 12.11.2), and a deadline from timeout_init_us() is
+not available there. It reads CNTFRQ_EL0, which the core's power-down
+reset and which the PSCI library programs again only after
+pwr_domain_suspend_finish (lib/psci/psci_suspend.c).
+
+THE L3. No software maintenance: the DSU cleans the L3 when the cluster
+is asked to power down (DSU TRM A4.9, A5.1). Measured: 512 KiB of dirty
+lines read back complete through a non-cacheable alias after every
+window with a cluster power-down, while a control without one still read
+them dirty.
+
+WHAT THE VENDOR DOES. Nothing to port: the vendor ARISC firmware takes
+the cluster down only for system suspend and never writes the DSU
+policy, CLUSTERPWRDN or the GIC; its BL31 is a blob. Its device tree
+offers cluster-sleep-0 (0x1010000) on all cores with its own latencies,
+which are not used.
+
+Build switch SUNXI_DSU_CLUSTER_OFF, default 0, 1 for the A733. Without a
+level-1 idle state in the device tree nothing asks for it, and the
+cluster cannot power down: a core in the core-level state keeps its bit
+at 1.
+
+Assisted-by: Claude
+---
+ plat/allwinner/common/allwinner-common.mk     |  13 ++
+ plat/allwinner/common/include/sunxi_private.h |  26 +++
+ plat/allwinner/common/sunxi_native_pm.c       |  52 ++++-
+ plat/allwinner/sun60i_a733/platform.mk        |   4 +
+ .../allwinner/sun60i_a733/sunxi_dsu_cluster.c | 194 ++++++++++++++++++
+ 5 files changed, 279 insertions(+), 10 deletions(-)
+
+diff --git a/plat/allwinner/common/allwinner-common.mk b/plat/allwinner/common/allwinner-common.mk
+index 8ac7b2475..1bd9591dc 100644
+--- a/plat/allwinner/common/allwinner-common.mk
++++ b/plat/allwinner/common/allwinner-common.mk
+@@ -92,6 +92,19 @@ ifeq (${SUNXI_DSU_CLUSTER_ADVISORY},1)
+ BL31_SOURCES		+=	${AW_PLAT}/${PLAT}/sunxi_dsu_cluster.c
+ endif
+ 
++# SUNXI_DSU_CLUSTER_OFF=1: the DSU cluster OFF state at PSCI power level 1:
++# the DSU PPU policy floor lowered to OFF at cold boot, level-1 CPU_SUSPEND
++# accepted, the redistributor powered down around it. Needs
++# SUNXI_DSU_CLUSTER_ADVISORY and SUNXI_PSCI_NATIVE_SUSPEND.
++SUNXI_DSU_CLUSTER_OFF		?=	0
++$(call assert_boolean,SUNXI_DSU_CLUSTER_OFF)
++$(eval $(call add_define,SUNXI_DSU_CLUSTER_OFF))
++ifeq (${SUNXI_DSU_CLUSTER_OFF},1)
++ifneq (${SUNXI_DSU_CLUSTER_ADVISORY}${SUNXI_PSCI_NATIVE_SUSPEND},11)
++$(error "SUNXI_DSU_CLUSTER_OFF needs SUNXI_DSU_CLUSTER_ADVISORY and SUNXI_PSCI_NATIVE_SUSPEND")
++endif
++endif
++
+ # EL3 stack per core in bytes, 0 = the default 0x1000 / PLATFORM_CORE_COUNT.
+ SUNXI_PLAT_STACK_SIZE		?=	0
+ $(call assert_numeric,SUNXI_PLAT_STACK_SIZE)
+diff --git a/plat/allwinner/common/include/sunxi_private.h b/plat/allwinner/common/include/sunxi_private.h
+index 9e634df42..725ac465a 100644
+--- a/plat/allwinner/common/include/sunxi_private.h
++++ b/plat/allwinner/common/include/sunxi_private.h
+@@ -51,6 +51,32 @@ static inline void sunxi_dsu_cluster_core_up(void)
+ }
+ #endif
+ 
++#if SUNXI_DSU_CLUSTER_OFF
++/* Per SoC: the DSU cluster OFF state (PSCI power level 1). */
++bool sunxi_dsu_cluster_state_ok(void);
++void sunxi_dsu_cluster_core_off(void);
++void sunxi_dsu_cluster_core_down(bool cluster);
++void sunxi_dsu_cluster_core_resume(void);
++void sunxi_dsu_cluster_gicr_check(void);
++#else
++static inline bool sunxi_dsu_cluster_state_ok(void)
++{
++	return false;
++}
++static inline void sunxi_dsu_cluster_core_off(void)
++{
++}
++static inline void sunxi_dsu_cluster_core_down(bool cluster)
++{
++}
++static inline void sunxi_dsu_cluster_core_resume(void)
++{
++}
++static inline void sunxi_dsu_cluster_gicr_check(void)
++{
++}
++#endif
++
+ #if SUNXI_PSCI_USE_NATIVE
+ void sunxi_set_native_psci_ops(const plat_psci_ops_t **psci_ops);
+ #else
+diff --git a/plat/allwinner/common/sunxi_native_pm.c b/plat/allwinner/common/sunxi_native_pm.c
+index edc430f86..c92b02512 100644
+--- a/plat/allwinner/common/sunxi_native_pm.c
++++ b/plat/allwinner/common/sunxi_native_pm.c
+@@ -39,6 +39,7 @@ static void sunxi_pwr_domain_off(const psci_power_state_t *target_state)
+ #if !USE_GIC_DRIVER
+ 	gicv2_cpuif_disable();
+ #endif
++	sunxi_dsu_cluster_core_off();
+ 
+ 	sunxi_cpu_power_off_self();
+ }
+@@ -52,6 +53,15 @@ static void sunxi_pwr_domain_on_finish(const psci_power_state_t *target_state)
+ #endif
+ }
+ 
++#if SUNXI_DSU_CLUSTER_OFF
++/* After gic_pcpu_init(), which finds this core's redistributor frame. */
++static void sunxi_pwr_domain_on_finish_late(
++		const psci_power_state_t *target_state)
++{
++	sunxi_dsu_cluster_gicr_check();
++}
++#endif
++
+ #if SUNXI_PSCI_NATIVE_SUSPEND
+ /*
+  * The only StateID this platform defines. The device tree encodes core
+@@ -61,7 +71,17 @@ static void sunxi_pwr_domain_on_finish(const psci_power_state_t *target_state)
+ #define SUNXI_STATEID_PWRDN		U(0)
+ 
+ /*
+- * Native CPU_SUSPEND, core level.
++ * Cluster OFF (SUNXI_DSU_CLUSTER_OFF): 0x01010000 = POWERDOWN, level 1,
++ * StateID 0. Which level this core asked for, kept from validate to suspend
++ * (both run on the calling core, in that order, inside one CPU_SUSPEND):
++ * the cluster advisory is dropped for the requested level, not only for the
++ * coordinated one, since the DSU combines the per-core bits itself.
++ */
++static bool req_cluster[PLATFORM_CORE_COUNT];
++
++/*
++ * Native CPU_SUSPEND, core level, and the cluster level where the platform
++ * offers it (sunxi_dsu_cluster_state_ok()).
+  *
+  * The state carries StateID 0 -- its meaning is in the power-level field,
+  * bits [25:24] -- so this decodes the level and NOT the StateID. A StateID
+@@ -89,13 +109,15 @@ static int sunxi_validate_power_state(unsigned int power_state,
+ 	}
+ 
+ 	/*
+-	 * Level 1 (the cluster) and level 2 (the system) are not
+-	 * implemented. PLAT_MAX_PWR_LVL is 2 and the topology is root / one
+-	 * cluster / the cores (sunxi_topology.c), so a level-1 request is
+-	 * well-formed -- it is refused for what it asks, not for how it is
+-	 * encoded.
++	 * Level 1 (the cluster) only while the platform offers it; level 2
++	 * (the system) is not implemented. PLAT_MAX_PWR_LVL is 2 and the
++	 * topology is root / one cluster / the cores (sunxi_topology.c), so a
++	 * refused request is well-formed -- it is refused for what it asks,
++	 * not for how it is encoded.
+ 	 */
+-	if (pwr_lvl != PSCI_CPU_PWR_LVL) {
++	if ((pwr_lvl != PSCI_CPU_PWR_LVL) &&
++	    ((pwr_lvl != (PSCI_CPU_PWR_LVL + 1U)) ||
++	     !sunxi_dsu_cluster_state_ok())) {
+ 		return PSCI_E_INVALID_PARAMS;
+ 	}
+ 
+@@ -118,6 +140,7 @@ static int sunxi_validate_power_state(unsigned int power_state,
+ 		req_state->pwr_domain_state[i] = (i <= pwr_lvl) ?
+ 			PLAT_MAX_OFF_STATE : PSCI_LOCAL_STATE_RUN;
+ 	}
++	req_cluster[plat_my_core_pos()] = (pwr_lvl > PSCI_CPU_PWR_LVL);
+ 
+ 	return PSCI_E_SUCCESS;
+ }
+@@ -134,14 +157,19 @@ static int sunxi_validate_power_state(unsigned int power_state,
+  *
+  * No power-controller write: PWR_POLICY is OFF since setup and re-checked
+  * in sunxi_validate_power_state(). The core gates at the WFI that follows,
+- * which drops its P-Channel ON request.
++ * which drops its P-Channel ON request. A core that asked for the cluster
++ * level also powers its redistributor down and withdraws its cluster power
++ * advisory (sunxi_dsu_cluster_core_down()).
+  */
+ static void sunxi_pwr_domain_suspend(const psci_power_state_t *target_state)
+ {
+ 	assert(is_local_state_off(
+ 		target_state->pwr_domain_state[PSCI_CPU_PWR_LVL]) != 0);
+-	assert(is_local_state_run(
+-		target_state->pwr_domain_state[PSCI_CPU_PWR_LVL + 1U]) != 0);
++	/* Level 1 is OFF only for the last of the cores that all asked for it. */
++	assert(req_cluster[plat_my_core_pos()] || (is_local_state_run(
++		target_state->pwr_domain_state[PSCI_CPU_PWR_LVL + 1U]) != 0));
++
++	sunxi_dsu_cluster_core_down(req_cluster[plat_my_core_pos()]);
+ }
+ 
+ /*
+@@ -154,6 +182,7 @@ static void sunxi_pwr_domain_suspend_finish(
+ 		const psci_power_state_t *target_state)
+ {
+ 	sunxi_dsu_cluster_core_up();
++	sunxi_dsu_cluster_core_resume();
+ }
+ #endif /* SUNXI_PSCI_NATIVE_SUSPEND */
+ 
+@@ -248,6 +277,9 @@ static const plat_psci_ops_t sunxi_native_psci_ops = {
+ 	.pwr_domain_on			= sunxi_pwr_domain_on,
+ 	.pwr_domain_off			= sunxi_pwr_domain_off,
+ 	.pwr_domain_on_finish		= sunxi_pwr_domain_on_finish,
++#if SUNXI_DSU_CLUSTER_OFF
++	.pwr_domain_on_finish_late	= sunxi_pwr_domain_on_finish_late,
++#endif
+ #if SUNXI_PSCI_NATIVE_SUSPEND
+ 	/*
+ 	 * psci_setup.c grants PSCI_CPU_SUSPEND_AARCH64 only when all three of
+diff --git a/plat/allwinner/sun60i_a733/platform.mk b/plat/allwinner/sun60i_a733/platform.mk
+index a93995f99..3900b5f84 100644
+--- a/plat/allwinner/sun60i_a733/platform.mk
++++ b/plat/allwinner/sun60i_a733/platform.mk
+@@ -42,6 +42,10 @@ SUNXI_PSCI_NATIVE_SUSPEND := 1
+ # CLUSTERPWRSTAT_EL1 at cold boot (sunxi_dsu_cluster.c).
+ SUNXI_DSU_CLUSTER_ADVISORY := 1
+ 
++# DSU cluster OFF at PSCI power level 1 (sunxi_dsu_cluster.c). Without a
++# level-1 idle state in the device tree nothing asks for it.
++SUNXI_DSU_CLUSTER_OFF := 1
++
+ # EL3 stack per core. The common default, 0x1000 shared by eight cores =
+ # 512 B each, is not enough for the CPU_SUSPEND path as soon as anything on
+ # it prints (gcc -fcallgraph-info=su on the link-time optimised release
+diff --git a/plat/allwinner/sun60i_a733/sunxi_dsu_cluster.c b/plat/allwinner/sun60i_a733/sunxi_dsu_cluster.c
+index 5e2a3ee2f..3bd84844b 100644
+--- a/plat/allwinner/sun60i_a733/sunxi_dsu_cluster.c
++++ b/plat/allwinner/sun60i_a733/sunxi_dsu_cluster.c
+@@ -43,8 +43,10 @@
+  * so it reaches the UART only with a runtime console at NOTICE level.
+  */
+ 
++#include <assert.h>
+ #include <stdbool.h>
+ #include <stdint.h>
++#include <string.h>
+ 
+ #include <arch.h>
+ #include <arch_helpers.h>
+@@ -94,6 +96,194 @@ void sunxi_dsu_cluster_core_up(void)
+ 	}
+ }
+ 
++#if SUNXI_DSU_CLUSTER_OFF
++/*
++ * The cluster OFF state. With every core's advisory at 1 (above), the
++ * DSU PPU policy floor comes down to OFF once, here: PWR_POLICY [3:0] = OFF
++ * (0), PWR_DYN_EN (bit 8) and OP_POLICY left as found (DEN0051E 5.2.1, a
++ * read-modify-write of the policy nibble only). From then on the cluster
++ * powers down when all eight cores are down AND every core's CLUSTERPWRDN
++ * bit 0 is 0 (DSU TRM B1.14/B1.15), and only a core that asked for the
++ * cluster state (PSCI power level 1) or went through CPU_OFF clears its bit.
++ *
++ * What a cluster power-down takes with it, measured on this SoC: every
++ * core's GIC-600
++ * redistributor SGI/PPI configuration is reset (UM V1.00 5.1.9.17,
++ * C0_RST_CTRL bit 4 GIC_RST, the cluster's internal GIC reset), while GICR_PWRR still reads
++ * it powered. Writing the frame back is not enough -- PPI 26 then stays
++ * pending and enabled and never reaches the core, and Linux loses its tick
++ * on the first cluster power-down. What makes it work is a GICR_PWRR power
++ * transition around the loss, and the one taken here is the GIC-600 TRM
++ * (100336 r1p6) order: a core that asks for the cluster state powers its
++ * redistributor down through GICR_PWRR before it goes (3.6.1; RDPD = 1 is
++ * only accepted with GICR_WAKER.ProcessorSleep = 1, Table 4-26, which the
++ * 3.6.2 core power-down sequence in gicv3_cpuif_disable() has set), and
++ * powers it up at wake before the CPU interface is re-enabled; then the
++ * frame, saved before the power-down, is written back if it reads different
++ * (TF-A's gicv3_rdistif_init_restore() order: SGIs/PPIs disabled, RWP,
++ * configuration, enables). Measured: 3235 cluster power-downs in 120 s with
++ * cpu0 alone, and the same power-off with the cluster held ON keeps the
++ * frame and wakes normally.
++ * The L3 is written back by the DSU on the way down (DSU TRM A4.9/A5.1;
++ * measured: 512 KiB of dirty lines read back complete through a
++ * non-cacheable alias after a cluster power-down).
++ */
++#include <drivers/arm/gicv3.h>
++
++#define PPU_PWR_POLICY_MASK		U(0xF)
++#define PPU_PWR_POLICY_OFF		U(0x0)
++#define PPU_PWR_DYN_EN			BIT_32(8)
++
++/*
++ * The redistributor frames as the GIC-600 lays them out (TRM 100336 r1p6,
++ * Table 4-1): 64 KiB pages counted from GICD, the RD_base page of
++ * redistributor n at 4 + 2 * ITScount + 2 * n, SGI_base right after it. At
++ * SUNXI_GICR_BASE = GICD + 6 pages (one ITS) frame n is SUNXI_GICR_BASE +
++ * n * 128 KiB, inside the UM V1.00 GIC window 0x03400000-0x0358FFFF. The
++ * code below uses the frame the generic GIC driver found (it walks
++ * GICR_TYPER), and every core checks once that the two agree for it.
++ */
++#define A733_GICR_STRIDE		U(0x20000)
++
++struct rd_frame {
++	uint32_t igroupr0, igrpmodr0, isenabler0, icfgr1, nsacr;
++	uint32_t ipriorityr[8];
++};
++
++static struct rd_frame rd_saved[PLATFORM_CORE_COUNT];
++static bool rd_down[PLATFORM_CORE_COUNT];
++
++static void rd_read(uintptr_t b, struct rd_frame *f)
++{
++	unsigned int i;
++
++	f->igroupr0 = mmio_read_32(b + GICR_IGROUPR0);
++	f->igrpmodr0 = mmio_read_32(b + GICR_IGRPMODR0);
++	f->isenabler0 = mmio_read_32(b + GICR_ISENABLER0);
++	f->icfgr1 = mmio_read_32(b + GICR_ICFGR1);
++	f->nsacr = mmio_read_32(b + GICR_NSACR);
++	for (i = 0U; i < 8U; ++i) {
++		f->ipriorityr[i] = mmio_read_32(b + GICR_IPRIORITYR + 4U * i);
++	}
++}
++
++/*
++ * Unbounded, as the GIC driver's own gicr_wait_for_pending_write(): the
++ * architecture gives GICR_CTLR.RWP no time bound (IHI 0069H.b 12.11.2), and
++ * a bound here could not be timed anyway. This runs on the suspend wake
++ * path, inside pwr_domain_suspend_finish: the core's power-down reset
++ * CNTFRQ_EL0, the PSCI library programs it again only after this hook
++ * (lib/psci/psci_suspend.c), and timeout_init_us() derives its deadline
++ * from it.
++ */
++static void rd_wait_rwp(uintptr_t b)
++{
++	while ((mmio_read_32(b + GICR_CTLR) & GICR_CTLR_RWP_BIT) != 0U) {
++	}
++}
++
++/* This core's redistributor frame, as the GIC driver found it. */
++static uintptr_t rd_base(unsigned int core)
++{
++	uintptr_t b = gicv3_rdistif_get_base(core);
++
++	assert(b != 0U);
++	return b;
++}
++
++/*
++ * Once the GIC driver has found this core's frame: the boot core at cold
++ * boot, every other core after its CPU_ON. A frame that is not where the
++ * layout above puts it means the A733 is not the SoC this file describes.
++ */
++void sunxi_dsu_cluster_gicr_check(void)
++{
++	unsigned int core = plat_my_core_pos();
++	uintptr_t found = gicv3_rdistif_get_base(core);
++	uintptr_t expected = SUNXI_GICR_BASE + core * A733_GICR_STRIDE;
++
++	if (found != expected) {
++		ERROR("DSU: cpu%u redistributor found at 0x%lx, the A733 layout puts it at 0x%lx\n",
++		      core, found, expected);
++		panic();
++	}
++}
++
++bool sunxi_dsu_cluster_state_ok(void)
++{
++	uint32_t pwpr = mmio_read_32(A733_PPU_DSU + PPU_PWPR);
++
++	return ((pwpr & PPU_PWR_POLICY_MASK) == PPU_PWR_POLICY_OFF) &&
++	       ((pwpr & PPU_PWR_DYN_EN) != 0U);
++}
++
++/* CPU_OFF: the core's redistributor is powered off and re-initialised on
++ * CPU_ON (sunxi_gic_cpu_disable/enable), so it only withdraws its bit. */
++void sunxi_dsu_cluster_core_off(void)
++{
++	write_clusterpwrdn_el1(DSU_CLUSTER_PWR_OFF);
++	isb();
++}
++
++/* CPU_SUSPEND, after gicv3_cpuif_disable(): cluster = level 1 requested. */
++void sunxi_dsu_cluster_core_down(bool cluster)
++{
++	unsigned int core = plat_my_core_pos();
++
++	if (!cluster) {
++		return;
++	}
++	rd_read(rd_base(core), &rd_saved[core]);
++	rd_down[core] = true;
++	gicv3_rdistif_off(core);
++	write_clusterpwrdn_el1(DSU_CLUSTER_PWR_OFF);
++	isb();
++}
++
++/* CPU_SUSPEND return, after core_up and before the CPU interface. */
++void sunxi_dsu_cluster_core_resume(void)
++{
++	unsigned int core = plat_my_core_pos();
++	const struct rd_frame *s = &rd_saved[core];
++	struct rd_frame now;
++	uintptr_t b;
++	unsigned int i;
++
++	if (!rd_down[core]) {
++		return;
++	}
++	rd_down[core] = false;
++	gicv3_rdistif_on(core);
++	b = rd_base(core);
++	rd_read(b, &now);
++	if (memcmp(&now, s, sizeof(now)) == 0) {
++		return;
++	}
++	mmio_write_32(b + GICR_ICENABLER0, ~U(0));
++	rd_wait_rwp(b);
++	mmio_write_32(b + GICR_IGROUPR0, s->igroupr0);
++	mmio_write_32(b + GICR_IGRPMODR0, s->igrpmodr0);
++	for (i = 0U; i < 8U; ++i) {
++		mmio_write_32(b + GICR_IPRIORITYR + 4U * i, s->ipriorityr[i]);
++	}
++	mmio_write_32(b + GICR_ICFGR1, s->icfgr1);
++	mmio_write_32(b + GICR_NSACR, s->nsacr);
++	rd_wait_rwp(b);
++	mmio_write_32(b + GICR_ISENABLER0, s->isenabler0);
++	rd_wait_rwp(b);
++}
++
++static void policy_off(void)
++{
++	uint32_t pwpr = mmio_read_32(A733_PPU_DSU + PPU_PWPR);
++
++	mmio_write_32(A733_PPU_DSU + PPU_PWPR,
++		      (pwpr & ~PPU_PWR_POLICY_MASK) | PPU_PWR_POLICY_OFF);
++	NOTICE("DSU: PPU PWPR %08x -> %08x, cluster OFF state %s\n", pwpr,
++	       mmio_read_32(A733_PPU_DSU + PPU_PWPR),
++	       sunxi_dsu_cluster_state_ok() ? "offered" : "REFUSED");
++}
++#endif
+ 
+ /* Boot core, once, at cold boot, before any other core is released. */
+ void sunxi_dsu_cluster_setup(void)
+@@ -113,4 +303,8 @@ void sunxi_dsu_cluster_setup(void)
+ 	       mmio_read_32(A733_CLU_DSU_STATUS),
+ 	       (unsigned long long)pwrdn, (unsigned long long)stat,
+ 	       (unsigned long long)read_clusterpwrstat_el1());
++#if SUNXI_DSU_CLUSTER_OFF
++	sunxi_dsu_cluster_gicr_check();
++	policy_off();
++#endif
+ }

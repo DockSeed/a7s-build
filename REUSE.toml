@@ -1,0 +1,62 @@
+version = 1
+SPDX-PackageName = "a7s-build"
+SPDX-PackageDownloadLocation = "https://github.com/DockSeed/a7s-build"
+
+# Patches are licensed like the project they patch, whatever SPDX lines the
+# files they add carry inside the diff; hence "override".
+
+[[annotations]]
+path = "kernel/**"
+precedence = "override"
+SPDX-FileCopyrightText = "The Linux kernel contributors and the a7s-build contributors"
+SPDX-License-Identifier = "GPL-2.0-only"
+
+[[annotations]]
+path = "bootchain/patches/tf-a/**"
+precedence = "override"
+SPDX-FileCopyrightText = "Arm Limited and Contributors, and the a7s-build contributors"
+SPDX-License-Identifier = "BSD-3-Clause"
+
+[[annotations]]
+path = "bootchain/patches/u-boot/**"
+precedence = "override"
+SPDX-FileCopyrightText = "The U-Boot contributors and the a7s-build contributors"
+SPDX-License-Identifier = "GPL-2.0-or-later"
+
+[[annotations]]
+path = "userspace/orc/patches/**"
+precedence = "override"
+SPDX-FileCopyrightText = "David A. Schleef and the ORC contributors"
+SPDX-License-Identifier = "BSD-2-Clause"
+
+[[annotations]]
+path = "userspace/xfwm4/patches/**"
+precedence = "override"
+SPDX-FileCopyrightText = "The Xfce contributors"
+SPDX-License-Identifier = "GPL-2.0-or-later"
+
+[[annotations]]
+path = "out-of-tree/aic8800/patches/**"
+precedence = "override"
+SPDX-FileCopyrightText = "AICSemi and the a7s-build contributors"
+SPDX-License-Identifier = "GPL-2.0-only"
+
+# Everything else without an inline header: our own scripts, docs, pins and
+# build data.
+[[annotations]]
+path = ["README.md", "docs/**", "pins/**", "container/**", ".gitignore", "**/series", "out-of-tree/**/*.sha256", "out-of-tree/**/*.md", "bootchain/overlay/**/*.md"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "the a7s-build contributors"
+SPDX-License-Identifier = "GPL-2.0-only OR MIT"
+
+[[annotations]]
+path = "scripts/distro/debian/files/**"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "the a7s-build contributors"
+SPDX-License-Identifier = "GPL-2.0-only OR MIT"
+
+# Our own files that carry a licence header but no copyright line.
+[[annotations]]
+path = ["build.sh", "config/**", "scripts/*.sh", "scripts/lib/**", "scripts/stages/**", "scripts/distro/debian/*", "bootchain/overlay/apply.sh", "userspace/**/*.c"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "the a7s-build contributors"

@@ -1,0 +1,148 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] phy: allwinner: A733 combo-PHY -- register a Type-C mux so DP alt mode can be observed
+
+COMB0 carries either SuperSpeed or DisplayPort and never both, and the lane
+routing lives inside this PHY: there is no external mux and no select GPIO on
+this board. The driver already registers the
+Type-C *switch*, which is how TCPM tells it which way the plug went in. The
+*mux* is the other half: it is what the DisplayPort alt-mode driver drives, and
+without it nothing can ask for a DP pin assignment at all.
+
+This registers it, and implements exactly the half that can be honest today.
+
+What it does: accepts the state, records it, and names the pin assignment the
+partner asked for.
+
+What it deliberately does NOT do: touch the PMA. The vendor's DP configuration
+fork -- the DP-side functions of combo0_configure_usb_dp() and the board arrays
+lane_invert/lane_remap/typec_remap they consume -- has not been worked out
+and ported yet. Writing a guessed DP lane setup into a PHY that
+currently carries a proven 10 Gbps SuperSpeed link is exactly the trade this
+tree does not make. That work is its own patch, against silicon.
+
+Returning 0 rather than an error is also deliberate: an error aborts the
+alt-mode entry, and then nothing is learned about what the sink offers. The
+dev_warn() is the honest part -- it says the lanes stay in their USB
+configuration and that there is therefore no video, so the state is readable in
+the log instead of being discovered on a dark screen.
+
+Matching follows the same rule as the switch, with a different property:
+typec_mux_match() (drivers/usb/typec/mux.c) looks for "mode-switch" on the
+remote port parent's fwnode, so the property belongs on the PHY node. The DT
+side is patch `arm64-dts-a733-enable-dp-alt-mode-negotiation`.
+
+Compile-tested against 6.18.36 with the full series applied.
+
+Assisted-by: Claude
+
+diff --git a/drivers/phy/allwinner/phy-sun60i-a733-combophy.c b/drivers/phy/allwinner/phy-sun60i-a733-combophy.c
+--- a/drivers/phy/allwinner/phy-sun60i-a733-combophy.c
++++ b/drivers/phy/allwinner/phy-sun60i-a733-combophy.c
+@@ -36,6 +36,7 @@
+ #include <linux/platform_device.h>
+ #include <linux/mutex.h>
+ #include <linux/regulator/consumer.h>
++#include <linux/usb/typec_dp.h>
+ #include <linux/usb/typec_mux.h>
+ #include <linux/reset.h>
+ 
+@@ -109,6 +110,13 @@
+ 	struct mutex		lock;
+ 	struct typec_switch_dev	*sw;
+ 	enum typec_orientation	orientation;
++	/* The mux is the DP-alt half of the same story: the switch says which
++	 * way the plug went in, the mux says what the lanes should carry. Only
++	 * the USB personality is implemented, so this records the requested
++	 * state and says out loud what it did not do.
++	 */
++	struct typec_mux_dev	*mux;
++	unsigned long		mux_mode;
+ 	bool			inited;
+ };
+ 
+@@ -739,6 +747,54 @@
+ 	typec_switch_unregister(data);
+ }
+ 
++/* COMB0 carries either SuperSpeed or DP, never both, and the lane routing lives
++ * inside this PHY -- there is no external mux on this board. So the DisplayPort
++ * alt-mode driver reaches the lanes through here.
++ *
++ * What this implements is the *observation* half: it accepts the state, records
++ * it, and reports what the partner asked for. It deliberately does NOT touch the
++ * PMA, because the vendor's DP configuration fork has not been worked out
++ * and ported yet -- writing a guessed DP lane setup into a PHY that currently
++ * carries a working SuperSpeed link is exactly the trade this tree does not make.
++ *
++ * Returning 0 rather than an error is deliberate too: an error here aborts the
++ * alt-mode entry, and then nothing is learned about what the sink offers. The
++ * warning is the honest part -- the lanes stay in their USB configuration, so
++ * there is no video, and the log says so rather than leaving it to be discovered
++ * on a dark screen.
++ */
++static int a733_combophy_typec_mux_set(struct typec_mux_dev *mux,
++				       struct typec_mux_state *state)
++{
++	struct a733_combophy *cp = typec_mux_get_drvdata(mux);
++	unsigned long mode = state->mode;
++
++	mutex_lock(&cp->lock);
++	cp->mux_mode = mode;
++	mutex_unlock(&cp->lock);
++
++	if (mode == TYPEC_STATE_SAFE || mode == TYPEC_STATE_USB)
++		return 0;
++
++	if (state->alt && state->alt->svid == USB_TYPEC_DP_SID) {
++		/* TYPEC_DP_STATE_A..F are TYPEC_MODAL_STATE(0..5); the pin
++		 * assignment letter is the offset from TYPEC_STATE_MODAL.
++		 */
++		dev_warn(cp->dev,
++			 "DP alt mode entered, pin assignment %c requested: the PHY's DP personality is not implemented, lanes stay in USB configuration (no video)\n",
++			 (char)('A' + (mode - TYPEC_STATE_MODAL)));
++		return 0;
++	}
++
++	dev_warn(cp->dev, "unhandled Type-C mux state %lu requested\n", mode);
++	return 0;
++}
++
++static void a733_combophy_mux_unregister(void *data)
++{
++	typec_mux_unregister(data);
++}
++
+ static const struct phy_ops a733_combophy_ops = {
+ 	.init	= a733_combophy_init,
+ 	.exit	= a733_combophy_exit,
+@@ -850,6 +906,30 @@
+ 		if (ret)
+ 			return ret;
+ 	}
++
++	/* Same matching rule as the switch above, different property:
++	 * typec_mux_match() looks for "mode-switch" on the remote port parent's
++	 * fwnode (drivers/usb/typec/mux.c), so it belongs on this node.
++	 */
++	if (IS_ENABLED(CONFIG_TYPEC) &&
++	    device_property_present(dev, "mode-switch")) {
++		struct typec_mux_desc mux_desc = {
++			.fwnode  = dev_fwnode(dev),
++			.set     = a733_combophy_typec_mux_set,
++			.drvdata = cp,
++		};
++
++		cp->mux = typec_mux_register(dev, &mux_desc);
++		if (IS_ERR(cp->mux)) {
++			a733_combophy_teardown(cp);
++			return dev_err_probe(dev, PTR_ERR(cp->mux),
++					     "typec mux register\n");
++		}
++		ret = devm_add_action_or_reset(dev, a733_combophy_mux_unregister,
++					       cp->mux);
++		if (ret)
++			return ret;
++	}
+ 
+ 	return 0;
+ }

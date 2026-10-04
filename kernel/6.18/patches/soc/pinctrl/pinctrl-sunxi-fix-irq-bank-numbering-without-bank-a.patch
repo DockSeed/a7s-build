@@ -1,0 +1,113 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] pinctrl: sunxi: fix IRQ bank numbering on the A733 main PIO (no bank PA)
+
+prepare_function_table() numbers the IRQ banks by walking the pin table and
+counting bank changes, starting from irq_bank = 0 with last_bank = 0. Bank 0
+is a valid bank index, so on a SoC whose pin table does not start at bank A
+the very first pin already satisfies "bank > last_bank" and bumps the counter
+to 1. The A733 has no bank PA (nr_bank_pins[0] == 0), so every IRQ bank comes
+out one too high: pins in bank PB get IRQ bank 1, PK gets 10.
+
+That number then feeds two consumers which disagree about what it means:
+
+  - the irq_chip path (mask, unmask, ack, set_type) and the domain hwirq,
+    which take the bank from hwirq / IRQ_PER_BANK, i.e. the counter
+  - sunxi_pinctrl_irq_handler(), the probe-time mask/clear loop and the
+    debounce loop, which take it from the DT "interrupts" index, where 0 is
+    the first listed bank
+
+So a PB interrupt arrives on pctl->irq[0], is looked up in IRQ bank 0 and
+dispatched as hwirq 0..31, while the PB pins' own hwirqs sit at 32..63. The
+interrupt is never delivered.
+
+Bank PK is worse. sunxi_pinctrl_build_state() stores an entry for every pin
+carrying an "irq" function:
+
+	int irqnum = func->irqnum + func->irqbank * IRQ_PER_BANK;
+	pctl->irq_array[irqnum] = pin->pin.number;
+
+and irq_array is devm_kcalloc(IRQ_PER_BANK * desc->irq_banks), i.e. 32 * 10 =
+320 entries. With the off-by-one, PK's pins carry irqbank 10 and are stored at
+320 and up -- past the end of the allocation, on every probe. PK's hwirqs lie
+past the domain size, so PK never gets a mapping; the irq_bank_map read in the
+irq_chip path is never reached for it.
+
+For the A733 main PIO, start both counters at -1, so that the first IRQ capable
+bank becomes IRQ bank 0 in DT order -- which is what the handler and
+platform_get_irq() already assume. The opt-in is the existing
+SUNXI_PINCTRL_A733_REG_LAYOUT flag, which only the A733 main PIO passes;
+prepare_function_table() now receives the probe flags to see it. The A733 R_PIO
+(PL, PM) starts at bank 0, which is IRQ capable, so it numbers the same either
+way and does not need the flag.
+
+`pinctrl-sunxi-add-A733-sun60iw2-minimal-pio`'s map { 1, ..., 10 } is written for this numbering: IRQ bank 0 (PB) names
+hardware bank 1. On the A733 the numbering is not an inference. The A733
+Datasheet V0.93 starts its GPIO groups at Port B (section 4.1.5.1); there is no
+Port A. The A733 User Manual V0.92 spells the IRQ block out per bank (PB: EINT
+cfg 0x0140, ctl 0x0150, status 0x0154, banks 0x80 apart from 0x0100). A live
+A733 board running the vendor BSP confirms it in silicon: mmc0's card-detect
+EINT on PF6 is configured at 0x02000340 = 0xc0 + 5 * 0x80, i.e. hardware IRQ
+bank 5 == pin bank PF, reached from DT interrupt index 4 (GPIOF_NS, INTID 109 =
+GIC_SPI 77); and the eleven words at 0x02000000 read back as the bank bases,
+[0] = 0x0 for the absent PA and [1] = 0x100 for PB. The A733's EINT registers
+live inside each bank's own 0x80 block (irq_cfg_reg 0xc0 == bank base + 0x40),
+so the IRQ index there is the bank letter by construction.
+
+The A523 half has been dropped. Mainline's A523 main PIO (pinctrl-sun55i-a523.c)
+has the same off-by-one: no main-pio interrupt is delivered, and PK is written
+past irq_array on every probe. An earlier version of this patch fixed it here
+too, by applying the -1 start to every SoC and moving the A523 map from
+{ 0..9 } to { 1..10 }. That half rested on code review and the in-tree
+convention only -- no A523 board, manual or silicon readback -- and mainline has
+since fixed A523 delivery the other way (the DT lists the unimplemented first
+IRQ bank at index 0, counter and { 0..9 } map unchanged), with PK still open.
+Carrying an untestable A523 change that diverges from mainline's scheme buys
+nothing, so the A523 main PIO keeps mainline's numbering and map, byte for
+byte. Dropping only the map hunk would not have done that: with the -1 start
+applied to every SoC and the { 0..9 } map, A523's irq_chip path would move PB
+from the 0x220 block mainline uses to 0x200.
+
+Assisted-by: Claude
+---
+--- a/drivers/pinctrl/sunxi/pinctrl-sunxi-dt.c
++++ b/drivers/pinctrl/sunxi/pinctrl-sunxi-dt.c
+@@ -143,7 +143,8 @@
+  */
+ static int prepare_function_table(struct device *dev, struct device_node *pnode,
+ 				  struct sunxi_desc_pin *pins, int npins,
+-				  unsigned pin_base, const u8 *irq_bank_muxes)
++				  unsigned pin_base, const u8 *irq_bank_muxes,
++				  unsigned long flags)
+ {
+ 	struct device_node *node;
+ 	struct property *prop;
+@@ -206,9 +207,18 @@
+ 	/*
+ 	 * Assign the function's memory and fill in GPIOs, IRQ and a sentinel.
+ 	 * The extra functions will be filled in later.
++	 *
++	 * IRQ banks are numbered in DT "interrupts" order, so the first IRQ
++	 * capable bank has to come out as IRQ bank 0. Start below bank 0, or a
++	 * pin table that does not start at bank A (A523 and A733 have no bank
++	 * PA) loses a number on its very first pin.
++	 *
++	 * Only the A733 main PIO (SUNXI_PINCTRL_A733_REG_LAYOUT) opts in. The
++	 * A523 main PIO has the same off-by-one and keeps the old numbering
++	 * until a fix is tested on A523 hardware.
+ 	 */
+-	irq_bank = 0;
+-	last_bank = 0;
++	irq_bank = (flags & SUNXI_PINCTRL_A733_REG_LAYOUT) ? -1 : 0;
++	last_bank = irq_bank;
+ 	for (i = 0; i < npins; i++) {
+ 		struct sunxi_desc_pin *pin = &pins[i];
+ 		int bank = (pin->pin.number - pin_base) / PINS_PER_BANK;
+@@ -352,7 +362,7 @@
+ 		return PTR_ERR(pins);
+ 
+ 	ret = prepare_function_table(&pdev->dev, pnode, pins, desc->npins,
+-				     desc->pin_base, irq_bank_muxes);
++				     desc->pin_base, irq_bank_muxes, flags);
+ 	if (ret)
+ 		return ret;
+ 

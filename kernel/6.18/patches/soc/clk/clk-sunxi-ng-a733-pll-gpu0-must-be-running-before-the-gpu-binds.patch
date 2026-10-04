@@ -1,0 +1,92 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] clk: sunxi-ng: a733: PLL_GPU0 and its gpupll gate must run before the GPU binds
+
+Enabling PLL_GPU0 while the GPU's core clock gate is open stops the SoC, and
+drm/powervr's power-on sequence does exactly that.
+
+WHAT HAPPENS WITHOUT THIS (the 8 GiB board, 2026-09-07)
+--------------------------------------------------------------------------------
+pvr_power_on_sequence_manual() enables the clocks in the order core, sys, mem and
+then releases the reset (pvr_power.c:262-284). With `arm64-dts-a733-gpu-mem-clock-is-the-gpu-pll` the GPU node's "mem"
+clock is PLL_GPU0, so the PLL is enabled *third* -- after the core clock's gate
+is already open. ccu_nm_ops gates the PLL output across the whole relock, so the
+GPU core clock stops mid-flight, the interconnect wedges and the board dies
+without a panic, an oops or one word on the console. Two kernels showed it: the
+board stops at 10.7 s (first test kernel) and at 7.7 s (second), in both cases with
+no powervr line at all, while the same kernels booted with
+modprobe.blacklist=powervr reach graphical.target and stay up.
+
+WHAT SETTLED IT
+--------------------------------------------------------------------------------
+One register write, then nothing else by hand: with PLL_GPU0 enabled from
+userspace (0x020020e0 = 0xf9104500) before `modprobe powervr`, the driver brings
+up everything else on its own -- gate, reset, bus gate -- loads
+rogue_36.56.104.183_v1.fw, prints "Initialized powervr 1.0.0" and creates
+/dev/dri/renderD128. Read back afterwards: GPU0_CLK 0x82000000, GPU0_GATING
+0x00010001, and GPU_CORE PWSR 0x8, none of which this session wrote. The
+domain follows the block; only the PLL had to be out of the way.
+
+⚠ So the fix is not to power a domain, and not to reorder the driver: it is to
+make sure the relock has already happened by the time any consumer arrives.
+CLK_IS_CRITICAL enables the PLL at registration, while the GPU's gate is still
+closed and no transaction can be in flight, and keeps clk_disable_unused from
+taking it away again. It is the same mechanism `clk-sunxi-ng-a733-gpu-bus-matrix-gates-are-critical` uses for the two bus-matrix
+gates, and three other PLLs in this file already carry the pair
+(CLK_SET_RATE_UNGATE | CLK_IS_CRITICAL, lines 93, 114, 172).
+
+⚠ The cost is honest and small: PLL_GPU0 runs from boot even when nothing uses
+the GPU. The cost buys protection against a failure mode
+that cannot be debugged from the console when it goes wrong.
+
+VERIFICATION
+--------------------------------------------------------------------------------
+- applies: patch -p1 --fuzz=0 after `clk-sunxi-ng-a733-gpu-pll-module-clock-bus-gates-and-reset`.
+- builds: a test build with the first hunk and one with both hunks, compile-gate
+  and kernel build green in each.
+- HW: proven, and it took two rounds, which is why both hunks are here:
+  a test kernel with only the PLL marked critical came up with PLL_GPU0 = 0xC1104500
+  (bit 31 set, clk_summary enable_count 1, 1680 MHz VCO) -- the flag worked -- and
+  the board still stopped silently at 7.248 s, mid-word, with no powervr line.
+  The difference to the by-hand run that succeeds was one bit: 0x08000000, the
+  gpupll output gate. Setting it on that same boot (PLL_GPU0 = 0xC9104500) and
+  loading the module by hand gives, with nothing else touched:
+      powervr 1800000.gpu: [drm] loaded firmware powervr/rogue_36.56.104.183_v1.fw
+      powervr 1800000.gpu: [drm] FW version v1.1 (build 6976702 OS)
+      [drm] Initialized powervr 1.0.0 for 1800000.gpu on minor 1
+  and afterwards GPU_CORE PWSR 0x8, GPU0_CLK 0x82000000, GPU0_GATING 0x00010001,
+  none of them written by this session. The boot with both hunks in the kernel
+  followed with a test kernel, same board, same day, with no hand in it at all:
+  PLL_GPU0 = 0xC9104500 before any module loads, "[drm] Initialized powervr 1.0.0
+  for 1800000.gpu", /dev/dri/renderD128 present, GPU_CORE PWSR = 0x8. The
+  falsifier is met. Evidence: the readbacks quoted above.
+  Note: that boot's console log was captured; the register readback above was
+  noted separately, not taken from a captured log.
+
+⚠ The gpupll requirement is a hardware fact nobody would predict from the tree:
+the GPU core clock's mux is pinned to PERI0_600M (`arm64-dts-a733-enable-the-gpu-at-the-vendor-s-operating-point`), so gpupll is not in the
+active path at all -- and the block still will not come up unless its gate is
+open. It is recorded here rather than explained, because nothing in the UM
+explains it.
+
+Assisted-by: Claude
+---
+--- a/drivers/clk/sunxi-ng/ccu-sun60iw2.c
++++ b/drivers/clk/sunxi-ng/ccu-sun60iw2.c
+@@ -1599,7 +1599,7 @@
+ 		.reg		= SUN60IW2_PLL_GPU0_REG,
+ 		.hw.init	= CLK_HW_INIT_PARENTS_HW("pll-gpu0",
+ 				pll_ref_hws, &ccu_nm_ops,
+-				CLK_SET_RATE_UNGATE),
++				CLK_SET_RATE_UNGATE | CLK_IS_CRITICAL),
+ 	},
+ };
+ 
+@@ -1607,7 +1607,7 @@
+ 
+ static SUNXI_CCU_M_HWS_WITH_GATE(gpupll_clk, "gpupll", pll_gpu0_hws,
+ 				 SUN60IW2_PLL_GPU0_REG, 20, 3, BIT(27),
+-				 CLK_SET_RATE_PARENT);
++				 CLK_SET_RATE_PARENT | CLK_IS_CRITICAL);
+ 
+ static const struct clk_parent_data gpu0_parents[] = {
+ 	{ .hw = &gpupll_clk.common.hw },		/* 000 GPUPLL     */

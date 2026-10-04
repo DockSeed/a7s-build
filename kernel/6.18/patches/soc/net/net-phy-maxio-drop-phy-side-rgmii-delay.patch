@@ -1,0 +1,162 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] net: phy: maxio: drop the PHY-side RGMII delay programming (no such register)
+
+Patch `net-phy-add-maxio-mae0621a-driver` carries Maxio's own driver, whose config_init ORs TX_DELAY
+(bits 6,7) and RX_DELAY (bits 4,5) into page 0xd96 register 0 for the
+rgmii-*id* phy-modes. On 2026-07-21 that register was read back on silicon
+(Radxa Cubie A7S, 8 GiB, mainline 6.18.36) through a clause-22 transaction
+driven by hand over MAC_MDIO_Address/MAC_MDIO_Data, after the driver had run:
+
+	page 0xd96 reg 0x00 = 0x00001140
+
+Bits 6, 8 and 12 set; bit 7 clear and both alleged RX bits clear. The OR would
+have produced 0x11f0, so the write does not reach the PHY. It has never had an
+effect, on any boot of this board.
+
+The interesting question is not why the write is lost but whether it should be
+there at all, and the datasheet answers that: it should not.
+
+The MAE0621A has no RGMII delay register. Its register map is complete and
+short -- DS v1.1 Table 8-2 "Register Mapping and Definitions" plus the MMD map
+in Table 8-3 -- and lists page 0 (the IEEE clause-22 set), 0xA42 (INER), 0xA43
+(PHYCR1/2, PHYSR, INSR, PAGSR), 0xA46 (PHYSCR), 0xD04 (LCR, EEELCR), 0xD08
+(MIICR), 0xD40 (INTBCR) and MMD devices 3 and 7 (PCS control/status, EEE).
+Page 0xd96 does not appear anywhere in the document, and none of the registers
+that do appear controls a clock delay. The word "delay" occurs in the datasheet
+in exactly two places outside the AC timing tables, and both are the same
+thing: the hardware straps TXDLY (pin 24) and RXDLY (pin 25), sampled at reset,
+each adding a fixed 2 ns (DS Table 6-8 "Hardware Configuration Interface" and
+section 7.9 Table 7-3 "CONFIG Pins, Configuration Function Definition").
+
+So on this part the RGMII delay is board-set, not software-set, and on this
+board the straps are already known from the schematic (SCH rev V1.10 page 15):
+
+	RXDLY  = RXD0/pin25, R120 4.7k to VCCIO_PHY, R119 NC  ->  1, 2 ns on RXC
+	TXDLY  = RXD1/pin24, R121 4.7k pull-down, R122 NC     ->  0, no TX delay
+
+The silicon readback agrees with that reading and disagrees with the driver's:
+bit 6, which the driver calls half of TX_DELAY, is *set* although TXDLY is
+strapped 0, and both bits the driver calls RX_DELAY are *clear* although RXDLY
+is strapped 1. Whatever page 0xd96 register 0 is, its bits do not mean what the
+symbol names in `net-phy-add-maxio-mae0621a-driver` claim.
+
+Making that write land would therefore mean programming an undocumented
+register with guessed bit semantics, on a link that currently passes traffic.
+Delete the block instead. The switch statement, the two defines, the label and
+the two error paths go with it, as does the `dev` variable they used.
+
+This is a no-op on silicon by construction: the write never took effect, so
+removing it cannot change the RGMII timing. In particular it does NOT
+invalidate the delays measured in `arm64-dts-a733-gmac0-measured-rgmii-delays` -- those were measured with the PHY-side
+write already failing, i.e. under exactly the conditions this patch makes
+permanent. tx-internal-delay-ps = <700> / rx-internal-delay-ps = <1000> stay as
+they are and must not be recalculated.
+
+Also gone with the block: the `else if (ret == 0)` branch that reported "2ns
+delay was already enabled/disabled (by pin-strapping RXD1 or bootloader
+configuration)". ret there is the return of phy_write(), where 0 means the MDIO
+write completed -- the branch fired on success, not on "already set", and would
+have printed that message on every single config_init.
+
+phy-mode stays "rgmii-id" in the DT. It describes the delay the link needs, not
+which end inserts it; stmmac/dwmac-sun55i programs the MAC side from the DT
+properties, and the PHY side is whatever the straps say.
+
+Not touched, deliberately: config_init also writes page 0xd8f register 0
+(auto-speed-down) and maxio_mae0621a_clk_init() touches pages 0xa43, 0xd92 and
+0x0. Pages 0xd8f and 0xd92 are undocumented too, but unlike the delay block
+nothing in the datasheet contradicts them, no register readback disputes them,
+and no patch header of ours claims a specific effect for them. They are left
+for a separate look rather than folded into this fix.
+
+Anchors:
+  DS = MAE0621A Gigabit Ethernet Transceiver datasheet v1.1 (2024-08),
+       Table 6-8 (section 6.8), Table 7-3 (section 7.9), Table 8-2 (section 8.2),
+       Table 8-3 (section 8.3).
+  SCH = board schematic RS504 rev V1.10 page 15.
+  SI  = clause-22 readback 2026-07-21, quoted in `arm64-dts-a733-gmac0-measured-rgmii-delays`.
+
+Verified: applies clean on the full series over pristine 6.18.36, and
+drivers/net/phy/maxio.o builds with W=1 KCFLAGS=-Werror. NOT verified on
+hardware.
+
+Assisted-by: Claude
+---
+--- a/drivers/net/phy/maxio.c
++++ b/drivers/net/phy/maxio.c
+@@ -20,8 +20,6 @@
+ #define MAXIO_MAE0621A_INER				0x12
+ #define MAXIO_MAE0621A_INER_LINK_STATUS	BIT(4)
+ #define MAXIO_MAE0621A_INSR				0x1d
+-#define MAXIO_MAE0621A_TX_DELAY			(BIT(6)|BIT(7))
+-#define MAXIO_MAE0621A_RX_DELAY			(BIT(4)|BIT(5))
+ #define MAXIO_MAE0621A_LCR_PAGE			0xd04
+ #define MAXIO_MAE0621A_LCR			0x10
+ #define MAXIO_MAE0621A_LED1_LINK_1000		BIT(8)
+@@ -104,8 +102,6 @@
+ 
+ static int maxio_mae0621a_config_init(struct phy_device *phydev)
+ {
+-	struct device *dev = &phydev->mdio.dev;
+-	u16 val;
+ 	int ret;
+ 
+ 	maxio_mae0621a_clk_init(phydev);
+@@ -120,41 +116,23 @@
+ 
+ 	//enable auto_speed_down
+ 	ret = maxio_write_paged(phydev, 0xd8f, 0x0, 0x300 );
+- 
+-	//adjust TX/RX delay
+-	switch (phydev->interface) {
+-	case PHY_INTERFACE_MODE_RGMII:
+-		val = 0x0;
+-		break;
+-	case PHY_INTERFACE_MODE_RGMII_ID:
+-		val = MAXIO_MAE0621A_TX_DELAY | MAXIO_MAE0621A_RX_DELAY;
+-		break;
+-	case PHY_INTERFACE_MODE_RGMII_RXID:
+-		val = MAXIO_MAE0621A_RX_DELAY;
+-		break;
+-	case PHY_INTERFACE_MODE_RGMII_TXID:
+-		val = MAXIO_MAE0621A_TX_DELAY;
+-		break;
+-	default: /* the rest of the modes imply leaving delays as is. */
+-		goto delay_skip;
+-	}
+-
+-	ret = maxio_read_paged(phydev, 0xd96, 0x0);
+-	if (ret < 0) {
+-		dev_err(dev, "Failed to update the TX delay register\n");
+-		return ret;
+-	}
+ 
+-	ret =maxio_write_paged(phydev, 0xd96, 0x0, val|ret );
+-	if (ret < 0) {
+-		dev_err(dev, "Failed to update the TX delay register\n");
+-		return ret;
+-	} else if (ret == 0) {
+-		dev_dbg(dev,
+-			"2ns  delay was already %s (by pin-strapping RXD1 or bootloader configuration)\n",
+-			val ? "enabled" : "disabled");
+-	}
+-delay_skip:
++	/*
++	 * No PHY-side RGMII delay is programmed here, and that is deliberate.
++	 *
++	 * The MAE0621A has no RGMII delay register. Its complete register map --
++	 * DS v1.1 Table 8-2 "Register Mapping and Definitions" plus the MMD map
++	 * Table 8-3 -- covers pages 0, 0xA42, 0xA43, 0xA46, 0xD04, 0xD08, 0xD40
++	 * and MMD devices 3 and 7, and none of those registers controls a delay.
++	 * The only delay control the datasheet documents is a pair of hardware
++	 * straps sampled at reset: TXDLY on pin 24 and RXDLY on pin 25 (DS Table
++	 * 6-8 and section 7.9 Table 7-3), each adding a fixed 2 ns.
++	 *
++	 * On the Cubie A7S those straps are RXDLY = 1 (PHY delays RXC by 2 ns)
++	 * and TXDLY = 0 (no PHY TX delay), so the MAC has to supply the TX side.
++	 * It does: the board DT carries the measured
++	 * tx-internal-delay-ps / rx-internal-delay-ps in its gmac0 node.
++	 */
+ 
+ 	phy_write(phydev, MII_BMCR, BMCR_RESET | phy_read(phydev, MII_BMCR));
+ 	msleep(1);

@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000006 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Mon, 21 Sep 2026 00:00:00 +0000
+Subject: [PATCH] sunxi: cubie-a7s: PCIe control pins are on bank PD, not PE
+
+The SoC dtsi names the PCIe control GPIOs as <&pio 4 ...> -- bank PE, pins
+PE11 (pwr), PE13 (rst) and PE12 (wake) -- and the controller driver requests
+exactly those three by name (pwr-gpios, rst-gpios, wake-gpios). On this board
+they are the wrong pins. The schematic routes the nets on bank PD:
+
+  PD20  PCIE_PWR_EN    (schematic p. 7 and p. 14)
+  PD21  PCIE-WAKEn     (p. 7 and p. 14)
+  PD22  PCIE-PERSTn    (p. 7 and p. 14)
+  PD23  PCIE-CLKREQn   (p. 7 and p. 14)
+
+PE11-14 do offer those functions in their mux tables, which is presumably
+where the dtsi values come from, but on this PCB they carry other nets
+(PE14 is a DP-AUX net). The bank D pins are the wired ones.
+
+PD20 is the one that is easy to miss. The board has no 3.3 V slot rail and
+no load switch: the FPC connector feeds an adapter board that carries its own
+regulator, and PD20 is that regulator's enable. With PD20 untouched the
+device is unpowered, so the PHY sees no receiver and the link never leaves
+Detect -- which is what the driver reports as "Link up timeout", followed by
+a speed-change timeout against a link that was never up.
+
+Measured on the board, at the U-Boot prompt, before and after:
+
+  as shipped          PORT_DEBUG0 LTSSM 0x00 (Detect), Link Status 0x1011
+                      (Gen1, Data Link Layer inactive), `pci` lists the root
+                      complex alone, `nvme scan` finds nothing
+
+  with these pins     "pcie link up success", "PCIe speed of Gen3",
+                      `pci` lists 01.00.00 0x1c5c:0x1327 (mass storage), and
+                      `nvme device` reports the drive: 500118192 x 512
+
+The three properties are all that changes; the driver's own sequence (power
+cycle, LTSSM off, PERST low, 100 ms, PERST high, establish link, speed
+change) is correct as written and needs no edit. The link comes up on the
+first enumeration pass, so no rescan and no retry loop is required either.
+
+Proven by rewriting the three properties in the live control FDT at the
+U-Boot prompt (`fdt set`) and running `pci enum` against them, which exercises
+the same probe path this patch feeds from flash, without writing to the card.
+
+CLKREQn (PD23) is deliberately not wired up here: the driver does not use it,
+and L1 substates are out of scope for the boot loader. It belongs to the
+kernel side of this bring-up.
+
+The properties go into the board file rather than the SoC dtsi because they
+are board facts. Other A733 boards may well route these nets on PE, and this
+overlay has no way to know.
+
+Assisted-by: Claude
+---
+--- a/src/arch/arm/dts/sun60i-a733-cubie-a7s.dts
++++ b/src/arch/arm/dts/sun60i-a733-cubie-a7s.dts
+@@ -272,6 +272,21 @@
+ 	status = "okay";
+ 	pcie1v8-supply = <&reg_bldo1>;
+ 	pcie3v3-supply = <&reg_dcdc1>;
++
++	/*
++	 * This board routes the PCIe control nets on bank PD, not on the
++	 * bank PE pins the SoC dtsi names: PD20 carries PCIE_PWR_EN, PD22
++	 * PCIE-PERSTn and PD21 PCIE-WAKEn (schematic p7, p14). PE11-14 only
++	 * offer those functions in their mux tables; they are not wired.
++	 *
++	 * PD20 is not optional: there is no slot rail and no load switch on
++	 * the PCB, so that pin gates the regulator on the adapter board the
++	 * FPC connector feeds. Left alone, the device never powers up and
++	 * the link stays in Detect.
++	 */
++	pwr-gpios = <&pio 3 20 GPIO_ACTIVE_HIGH>;
++	rst-gpios = <&pio 3 22 GPIO_ACTIVE_HIGH>;
++	wake-gpios = <&pio 3 21 GPIO_ACTIVE_HIGH>;
+ };
+ 
+ /*

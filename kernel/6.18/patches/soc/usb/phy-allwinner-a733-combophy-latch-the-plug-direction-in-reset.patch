@@ -1,0 +1,400 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] phy: allwinner: A733 combo-PHY -- latch the Type-C plug direction in reset
+
+COMB0's plug direction is LINK_CTRL0 bit12 TYPEC_CONN_DIR, and the UM
+lets it change only with the PHY in reset: the field has to stay static
+while phy0_reset_n is de-asserted (UM V1.00 18.2.6.6, PDF p. 1175;
+phy0_reset_n is bit0 of the same register, PDF p. 1176). The Type-C
+switch callback changed it on a running PHY on every orientation change
+after phy_init().
+
+WHERE IT CHANGED LIVE, READ IN THE CODE
+---------------------------------------
+
+  - a733_combophy_typec_set() re-ran a733_combophy_param_config()
+    whenever dwc3 held the PHY, and param_config() writes bit12 by
+    read-modify-write in the middle of the PMA table. On the USB side no
+    reset followed. dwc3 calls phy_init() at probe, before TCPM attaches,
+    and the probe default is NORMAL, so every reversed plug after boot
+    took this path, and every change of direction after that.
+  - With DP active the callback re-latched the direction through the DP
+    staircase, but only after the same live table write.
+  - A re-init after phy_exit() finds phy0_reset_n still released,
+    because phy_exit() only powers the PHY down, and param_config()
+    rewrites bit12 before reset_seq() pulses the reset. That is a change
+    only if the plug was turned while nobody held the PHY; in the same
+    orientation the write repeats the value.
+
+WHAT SILICON SAYS SO FAR, AND WHAT IT DOES NOT
+----------------------------------------------
+
+The live flip works. SuperSpeed came up at 10000 after it on the 8 GiB
+board (2026-08-19, normal -> reverse, LINK_CTRL0 0x00001111) and
+on the 6 GiB board (2026-09-24, reverse -> normal).
+
+It does not say which write carried the flip. The same param_config()
+call also rewrites the orientation forks of the PMA table, the lane
+blocks mirrored n -> 3-n (^0x600): 82 PMA words differ between the two
+directions, and they move the transmit and receive setup from lanes 0/1
+to 3/2. The UM names the two USB lane candidates -- "COMB0 PHY Lane0 or
+Lane3 PIPE CLK" (0x6100) and "Lane1 or Lane2 PIPE RX_DATA" (0x6104), PDF
+p. 1197 -- but not what picks between them; bit12 is the only
+orientation field in the wrapper. Three readings fit the two live flips:
+
+  - bit12 acts on a running PHY;
+  - bit12 does not pick the USB lanes, and the forks carry the flip;
+  - bit12 is taken at a power-state change -- the P3 -> P0 of a connect
+    -- rather than only at reset release.
+
+Nothing measured separates them. A script that toggles the direction
+tests the first against a standing U0 link.
+
+WHAT THIS DOES
+--------------
+
+  - a733_combophy_hold_reset(): LINK_CTRL0, DP_RAWS_TXDW_CONV_CTRL and
+    LINK_CTRL3 back to their reset value 0 (UM V1.00 18.2.6.6, 18.2.6.9,
+    18.2.6.25), with power and clocks left on. LINK_CTRL0 goes down in
+    two writes, every reset first with the direction kept, then the
+    direction: one write of 0 from a reversed plug would drop bit0 and
+    bit12 on the same edge. LINK_CTRL3 goes too because a new
+    power-state request needs the old one returned to 0, and the first
+    request after reset release has to be A0 or A2 (18.2.6.9, PDF p. 1180).
+    a733_combophy_dp_teardown() now calls it.
+  - Switch callback, USB holds the PHY: a733_combophy_usb_relatch() --
+    the hold, param_config() under it, reset_seq(). That is phy_init()'s
+    register sequence without its IDDQ and clock steps. It prints
+    LINK_CTRL0 before and after, LINK_STUS0 and PMA_CMN_READY.
+  - Switch callback, DP holds the PHY: the hold moves in front of the
+    table write. The DP staircase after it is unchanged; it began with
+    every reset low anyway.
+  - Both branches of the callback now need cp->inited. phy_exit() clears
+    it and leaves dp_active standing, and the DP branch wrote the PMA and
+    ran the staircase with or without the clocks.
+  - bringup(): the hold before IDDQ is cleared, so a re-init starts where
+    the first init starts. On the first init the three registers already
+    read 0.
+  - param_config() warns if it is ever asked to change the direction
+    with phy0_reset_n released.
+
+One more UM rule is met on the way. param_config() writes LINK_CTRL1
+absolutely, and REFCLK_DIG_SEL and the other reference-clock fields
+have to be set before apb_preset_n/phy_reset_n are de-asserted (UM
+V1.00 18.2.6.7, PDF pp. 1177-1178). The switch callback used to write it
+into a running PHY, with the same value; it now lands under the hold.
+
+WHY A RESET AND NOT THE EXIT/INIT CYCLE OF THE DP RETURN
+--------------------------------------------------------
+
+The UM asks for phy0_reset_n low while the bit changes, and for nothing
+else. The exit/init cycle that
+phy-allwinner-a733-combophy-hand-comb0-back-to-usb3-after-dp runs when
+DP leaves adds IDDQ and a clock cycle, and does not assert the reset by
+itself: phy_exit()'s body leaves LINK_CTRL0 alone, and on that path the
+DP teardown is what holds it. The reset is the part of that cycle the UM
+requires. The DP return is left as it is.
+
+UPSTREAM
+--------
+
+The three mainline drivers read for this write their Type-C lane select
+only under reset. qmp_combo_com_init() writes DP_COM_TYPEC_CTRL with
+SW_USB3PHY_RESET held, and qmp_combo_typec_switch_set() reaches it
+through com_exit()/com_init() with dwc3 left running
+(drivers/phy/qualcomm/phy-qcom-qmp-combo.c). rk_udphy_init() writes the
+lane mux after rk_udphy_reset_assert_all(), and a live orientation
+change only records the mapping for the next init
+(drivers/phy/rockchip/phy-rockchip-usbdp.c). wiz_phy_reset_deassert()
+sets the lane swap of TI's wrapper around a Cadence PHY right before
+phy_reset_n (drivers/phy/ti/phy-j721e-wiz.c). Code pattern only; no
+value comes from them.
+
+WHAT DWC3 SEES
+--------------
+
+tcpm_src_attach() switches VBUS on and only then sets the orientation
+(tcpm_set_vbus(), then tcpm_set_roles() -> tcpm_mux_set() ->
+typec_set_orientation()). A bus-powered device is still starting, and
+the SuperSpeed port has no link to lose. A self-powered device can
+present its SuperSpeed terminations before VBUS and before TCPM's
+debounce, so its link may start training in the old direction; the
+relatch takes it down and it trains again. The live write had the same
+race, so this is not a regression, but it is a case the bus-powered
+enclosure does not exercise.
+
+The PHY, its PIPE side included, is in reset for the few milliseconds of
+the handshake, and dwc3 keeps running. That is where this can fall
+short, and the UM says why. For bit 0 of the same register the UM
+requires all PHY inputs to follow the PIPE specification's PIPE-reset
+levels when reset is released (UM V1.00 18.2.6.6, PDF p. 1176). A
+dwc3 rebind meets that, because the controller is reset before the PHY
+leaves reset; this release does not, dwc3 drives the PIPE inputs from
+whatever state its port is in. And with PIPE_LINK_RESET_N_USB3P1_MASK =
+0 and PIPE_LINK_RESET_N_SOFT = 1, as reset_seq() leaves them, the PIPE
+link reset is the one USB3P1 outputs to PHY0 (bit 5, same
+page), a line the controller drives and this driver cannot pulse. The DP
+return of phy-allwinner-a733-combophy-hand-comb0-back-to-usb3-after-dp
+carries the same limit. Hence the first falsifier below.
+
+THE VENDOR
+----------
+
+Read as a hint (bsp/drivers/phy/sunxi-cadence-combophy.c,
+the radxa/allwinner-bsp tree): sunxi_cadence_combo0_usb_phy_set_mode() re-runs
+combo0_usb_param_config() on an orientation change with no reset
+handshake, and combo0_configure_usb_dp() writes TYPEC_CONN_DIR by
+read-modify-write inside it. This callback had ported that; the UM rule
+is what the vendor leaves out. Nothing here is taken from it.
+
+THE PROOF THIS OWES
+-------------------
+
+Test kernel with this patch, localversion -861conndir, an RTL9210 Gen 2
+enclosure on the Type-C port, instrumented by a script:
+
+  1. Plug turned over after boot: the new line with PMA_CMN_READY set
+     and LINK_CTRL0 at its want value, the device at 10000 on the
+     SuperSpeed bus, PORTSC2 in U0, forks and bit12 agree.
+  2. dwc3 rebind in the same orientation: the same, no param_config()
+     warning.
+  3. Transaction errors of the enclosure in the states of 1 and 2 no
+     worse than on the default kernel.
+  4. With the DP return patch in the same kernel: DP sink in orientation
+     X, unplug, the enclosure plugged in X, then in the other
+     orientation. 10000 both times. X gives the DP return's line alone;
+     the other orientation gives the DP return's line and then this
+     patch's relatch line. That second case no longer proves the DP
+     return on its own, because the relatch releases PHY_RESET_N on the
+     same path; the DP return is proven on a kernel without this patch.
+  5. If a self-powered SuperSpeed device is at hand: 1 with it.
+
+Falsifiers: 480M with PMA_CMN_READY set (the controller does not follow
+a PHY reset under it and needs its own), PMA_CMN_READY NOT set (the hold
+lacks something the first init has), or a param_config() warning (a
+caller writes the direction outside the hold). On the first, unbind and
+bind xhci-hcd.1.auto alone before anything else -- an HCRST with no
+CSFTRST and no PHY cycle -- and only then dwc3, the same separation the
+DP return names.
+
+Assisted-by: Claude
+---
+diff -u a/drivers/phy/allwinner/phy-sun60i-a733-combophy.c b/drivers/phy/allwinner/phy-sun60i-a733-combophy.c
+--- a/drivers/phy/allwinner/phy-sun60i-a733-combophy.c
++++ b/drivers/phy/allwinner/phy-sun60i-a733-combophy.c
+@@ -607,16 +607,51 @@
+ }
+ 
+ /*
++ * Hold COMB0 in reset with its power and clocks left on: the three link
++ * control registers the release handshakes drive, back at their reset value
++ * 0x00000000 (UM V1.00 18.2.6.6, 18.2.6.9 and 18.2.6.25, PDF pp. 1175, 1179 and
++ * 1196).
++ *
++ * This is the only state in which TYPEC_CONN_DIR may change. LINK_CTRL0 bit12
++ * has to stay static while phy0_reset_n is de-asserted (18.2.6.6, PDF
++ * p. 1175), and phy0_reset_n is bit0 of the same register (PDF p. 1176).
++ * LINK_CTRL0 is lowered in two writes: first every reset with the direction
++ * kept, then the direction. A single write of 0 from a reversed plug
++ * (0x00001111) would drop bit0 and bit12 on the same edge, and the UM does
++ * not say which side of that edge the direction is sampled on.
++ * LINK_CTRL3 goes back to 0 with it: pma_xcvr_power_state_req has to be
++ * acknowledged and set back to 0 before the next state is requested, and
++ * the first request after reset
++ * release has to be A0 or A2 (18.2.6.9, PDF p. 1180). Both release
++ * paths request A0 again: a733_combophy_reset_seq() for USB,
++ * a733_combophy_dp_reset_seq() for DP. Caller holds cp->lock.
++ */
++static void a733_combophy_hold_reset(struct a733_combophy *cp)
++{
++	u32 dir = readl(cp->link + COMB0_LINK_CTRL0) & PHY0_TYPEC_CONN_DIR;
++
++	writel(dir, cp->link + COMB0_LINK_CTRL0);
++	writel(0, cp->link + COMB0_LINK_CTRL0);
++	writel(0, cp->top2 + DP_RAWS_TXDW_CONV_CTRL);
++	writel(0, cp->link + COMB0_LINK_CTRL3);
++	usleep_range(DP_RESET_STEP_MIN_US, DP_RESET_STEP_MAX_US);
++}
++
++/*
+  * combo0_usb_param_config() -> combo0_configure_usb_dp(), orientation NORMAL,
+  * ssc_en = 0. The three PMA blocks are split by the two non-PMA writes the
+  * vendor performs in the middle of the sequence, and the order is load-bearing:
+  * LINK_CTRL1 is written as an absolute value after the CMN/lane-0-1 block, and
+  * TYPEC_CONN_DIR is cleared before the lane-2/3 block, not at the end.
++ *
++ * Every caller holds the PHY in reset across this -- a733_combophy_hold_reset()
++ * -- and releases it afterwards; see the direction write below.
+  */
+ static void a733_combophy_param_config(struct a733_combophy *cp)
+ {
+ 	bool flip = cp->orientation == TYPEC_ORIENTATION_REVERSE;
+ 	u16 m = flip ? PMA_LANE_MIRROR : 0;
++	u32 ctrl0;
+ 
+ 	a733_pma_write_all(cp, a733_pma_a_common, ARRAY_SIZE(a733_pma_a_common), 0);
+ 	a733_pma_write_all(cp, a733_pma_fork1, ARRAY_SIZE(a733_pma_fork1), m);
+@@ -629,8 +664,17 @@
+ 	a733_pma_write_all(cp, a733_pma_b_post, ARRAY_SIZE(a733_pma_b_post), 0);
+ 
+ 	/* LINK_CTRL0 bit12 TYPEC_CONN_DIR: 1 = flipped plug. UM-derived field,
+-	 * (A733 user manual).
++	 * (A733 user manual). It may change only while
++	 * phy0_reset_n is low (UM V1.00 18.2.6.6, PDF p. 1175); the callers see
++	 * to that. A caller that ever reaches this with the PHY out of reset
++	 * and the direction about to change is named here, not left silent.
+ 	 */
++	ctrl0 = readl(cp->link + COMB0_LINK_CTRL0);
++	if ((ctrl0 & PHY0_RESET_N) &&
++	    !!(ctrl0 & PHY0_TYPEC_CONN_DIR) != flip)
++		dev_warn(cp->dev,
++			 "TYPEC_CONN_DIR changes while PHY_RESET_N is released (LINK_CTRL0 0x%08x); UM 18.2.6.6 wants it static\n",
++			 ctrl0);
+ 	a733_rmw(cp->link, COMB0_LINK_CTRL0, PHY0_TYPEC_CONN_DIR,
+ 		 flip ? PHY0_TYPEC_CONN_DIR : 0);
+ 
+@@ -1542,17 +1586,15 @@
+ 
+ /*
+  * combo0_dp_phy_reset(deassert = false). Three absolute zeroes, in the vendor's
+- * order. Returning POWER_STATE_REQ to 0 is not housekeeping: UM 18.2.6.8 says
+- * pma_xcvr_power_state_req has to be acknowledged and set back to 0 before the
+- * next state is requested, so leaving
+- * A0 standing would block the next entry.
++ * order. Returning POWER_STATE_REQ to 0 is not housekeeping: UM V1.00 18.2.6.9
++ * (PDF p. 1180) wants pma_xcvr_power_state_req acknowledged and set back
++ * to 0 before the next state is requested, so leaving A0 standing would
++ * block the next entry. The
++ * writes are a733_combophy_hold_reset(), the hold the USB side uses as well.
+  */
+ static void a733_combophy_dp_teardown(struct a733_combophy *cp)
+ {
+-	writel(0, cp->link + COMB0_LINK_CTRL0);
+-	writel(0, cp->top2 + DP_RAWS_TXDW_CONV_CTRL);
+-	writel(0, cp->link + COMB0_LINK_CTRL3);
+-	usleep_range(DP_RESET_STEP_MIN_US, DP_RESET_STEP_MAX_US);
++	a733_combophy_hold_reset(cp);
+ }
+ 
+ static void a733_combophy_assert_reset(void *data)
+@@ -1655,6 +1697,13 @@
+ 	if (ret)
+ 		goto err_dcxo;
+ 
++	/* In reset before the PHY leaves IDDQ, as on the first init, where the
++	 * three registers still hold their reset values and this rewrites them.
++	 * A re-init after phy_exit() finds phy0_reset_n released -- exit only
++	 * powers down -- and param_config() below writes the direction, a
++	 * change if the plug was turned while nobody held the PHY.
++	 */
++	a733_combophy_hold_reset(cp);
+ 	a733_combophy_power_up(cp);
+ 	a733_combophy_clk_route(cp);
+ 	a733_combophy_param_config(cp);
+@@ -1715,15 +1764,77 @@
+ }
+ 
+ /*
++ * A new plug direction on a PHY that USB3 holds: hold it in reset, write the
++ * direction and the orientation forks of the PMA table under the reset, and
++ * release it through the handshake phy_init() ends with. That is phy_init()'s
++ * register sequence without its power and clock steps; the UM asks for the
++ * reset, not for those, and they stay as they are. dwc3 is not reset.
++ *
++ * The line it prints carries LINK_CTRL0 before and after and PMA_CMN_READY, so
++ * a session can tell a PHY that did not come back from a controller that did
++ * not follow it. Caller holds cp->lock and has checked cp->inited.
++ */
++static void a733_combophy_usb_relatch(struct a733_combophy *cp)
++{
++	bool flip = cp->orientation == TYPEC_ORIENTATION_REVERSE;
++	u32 before, want, stus;
++
++	before = readl(cp->link + COMB0_LINK_CTRL0);
++	a733_combophy_hold_reset(cp);
++	a733_combophy_param_config(cp);
++	/* reports its own stalls; it has no failure to hand back */
++	a733_combophy_reset_seq(cp);
++
++	want = PHY0_RESET_N | PHY0_PIPE_LINK_RESET_N_SOFT |
++	       PHY0_DP_LINK_RESET_N_SOFT | (flip ? PHY0_TYPEC_CONN_DIR : 0);
++	stus = readl(cp->link + COMB0_LINK_STUS0);
++	dev_info(cp->dev,
++		 "orientation %s: TYPEC_CONN_DIR re-latched through PHY_RESET_N: LINK_CTRL0 0x%08x -> 0x%08x LINK_STUS0 0x%08x (want 0x%08x, PMA_CMN_READY %s)\n",
++		 flip ? "reverse" : "normal", before,
++		 readl(cp->link + COMB0_LINK_CTRL0), stus, want,
++		 stus & PHY0_PMA_CMN_READY ? "set" : "NOT set");
++}
++
++/*
+  * TCPM hands us the plug orientation through the Type-C switch framework. The
+  * ordering is fixed and awkward: combophy0 probes, dwc3 probes and calls
+  * phy_init(), and only then does the TCPC attach and report which way round the
+  * cable is. dwc3 never re-inits the PHY, so caching the value is not enough --
+  * a port that is already up has to be reprogrammed in place.
+  *
+- * That is safe here: the vendor does exactly this on an orientation change and
+- * nothing more -- combo0_usb_param_config() alone, no reset pulse, no clock
+- * cycle (sunxi-cadence-combophy.c:3197).
++ * In place means through reset. The direction is LINK_CTRL0 bit12, which has to
++ * stay static while phy0_reset_n is de-asserted (UM V1.00 18.2.6.6, PDF
++ * p. 1175). The vendor ignores that: on an orientation change it re-runs
++ * combo0_usb_param_config() on the running PHY, and the direction is a plain
++ * read-modify-write inside it, with no reset around it
++ * (sunxi_cadence_combo0_usb_phy_set_mode(), combo0_configure_usb_dp()). This
++ * callback used to port exactly that. Now:
++ *
++ *  - USB owns the lanes: a733_combophy_usb_relatch() -- hold, direction and
++ *    PMA forks, release.
++ *  - DP owns them: the same hold, the same table, then the DP staircase as
++ *    before. The staircase begins with every reset low anyway; the hold moves
++ *    that point in front of the direction write instead of behind it.
++ *  - Nobody holds the PHY: only the cache moves, and the next phy_init()
++ *    writes the direction inside its own hold.
++ *
++ * The three mainline drivers read for this write their lane select only under
++ * reset, never into a running PHY: qmp_combo_com_init() writes
++ * DP_COM_TYPEC_CTRL with SW_USB3PHY_RESET held, and qmp_combo_typec_switch_set()
++ * gets there through a com_exit()/com_init() cycle with dwc3 left running;
++ * rk_udphy_init() writes the lane mux after rk_udphy_reset_assert_all();
++ * wiz_phy_reset_deassert() sets the lane swap of TI's wrapper around a Cadence
++ * PHY right before it releases phy_reset_n.
++ *
++ * What dwc3 sees: TCPM switches VBUS on and then sets the orientation
++ * (tcpm_src_attach(): tcpm_set_vbus(), then tcpm_set_roles() -> tcpm_mux_set()
++ * -> typec_set_orientation()), so a bus-powered device is still starting and
++ * the SuperSpeed port has no link to lose. A self-powered device can present
++ * its SuperSpeed terminations before VBUS and before TCPM's debounce, so the
++ * link may start training in the old direction; the relatch then takes it
++ * down and it trains again. The live write had the same race. The PHY, its
++ * PIPE side included, is in reset for the few milliseconds of the handshake;
++ * the controller is not.
+  */
+ static int a733_combophy_typec_set(struct typec_switch_dev *sw,
+ 				   enum typec_orientation orientation)
+@@ -1741,15 +1852,18 @@
+ 
+ 	mutex_lock(&cp->lock);
+ 	cp->orientation = orientation;
+-	if (cp->inited)
+-		a733_combophy_param_config(cp);
+-	/* param_config() updates TYPEC_CONN_DIR with a plain read-modify-write,
+-	 * which UM 18.2.6.5 forbids while phy0_reset_n is de-asserted. With DP
+-	 * running the direction therefore has to be re-latched through the reset
+-	 * staircase. Guarded by dp_active, so a USB-only port never gets here.
++	/* Both branches need the clocks phy_init() took. dp_active alone does
++	 * not say so: phy_exit() clears inited and leaves dp_active standing.
+ 	 */
+-	if (cp->dp_active)
+-		cp->dp_handshake_ok = !a733_combophy_dp_reset_seq(cp);
++	if (cp->inited) {
++		if (cp->dp_active) {
++			a733_combophy_hold_reset(cp);
++			a733_combophy_param_config(cp);
++			cp->dp_handshake_ok = !a733_combophy_dp_reset_seq(cp);
++		} else {
++			a733_combophy_usb_relatch(cp);
++		}
++	}
+ 	mutex_unlock(&cp->lock);
+ 
+ 	/* A non-zero return here aborts TCPM's attach, so failures are logged,

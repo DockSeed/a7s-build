@@ -1,0 +1,356 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] thermal: sun8i: filter the trend the A733 hands to step_wise
+
+The driver supplies no .get_trend, so the core derives one from two
+consecutive samples (thermal_helpers.c, get_tz_trend()). On the A733 that
+input cannot carry the decision, and the governor built on it has never
+converged on this part.
+
+WHAT THE SENSOR DELIVERS AS THIS DRIVER PROGRAMS IT
+
+Cadence. The period is our programming, not a property of the sensor.
+sun50i_h6_thermal_init(), which the A733 entry reuses unchanged, writes
+THS_PER (the driver's SUN50I_H6_THS_PC, offset 0x08) = 365 at 24 MHz -- the
+H6 value, carried over, never chosen for this part -- so a conversion takes
+4096 * 366 / 24e6 = 62.464 ms (A733 UM V0.92, THS_PER THERMAL_PER[31:12];
+the 24 MHz is set by clk_set_rate() in this driver). THS_FILTER is written FILTER_EN | FILTER_TYPE(1)
+= average of four, and the part has five sensors
+(A733 user manual), so a new word lands in each THSn_DATA every
+4096 * 366 * 4 * 5 / 24e6 = 1.2493 s.
+
+Neither reference programs it that slowly. The UM's own init sequence
+writes 0x3A = 58 (UM V1.00 7.1.6.1 Step 5, p. 344 / PDF p. 365; also the
+register's reset default, "10ms", p. 346 / PDF p. 367), which by the same
+arithmetic is 4096 * 59 * 4 * 5 / 24e6 = 0.201 s per sensor. The vendor
+driver writes 28 (sunxi_thermal.c, sun60iw2_thermal_init()), 0.099 s.
+Whether a shorter period changes the noise figures below has not been
+measured; this patch does not touch THS_PER.
+
+Measured on the board, two independent ways, 2026-08-15: every reported
+value holds for 1.22..1.26 s on all five sensors across three runs, and the
+shared data interrupt counts 4.00 /s -- five sensors at 0.8 Hz. The zone
+polls at 500 ms, so at THS_PER = 365 two out of three governor cycles carry
+no new sensor data at all. Shortening polling-delay-passive therefore cannot
+help at this period; below 1.25 s the extra cycles are empty, not merely
+noisier.
+
+Noise. Detrended inside sliding 10 s windows -- one board thermal time
+constant -- and pooled over six full-load runs, the residual is 0.93 K RMS
+on ths 0 and 1.23 K RMS on ths 3, with 90th-percentile peak-to-peak of 4.9 K
+and 6.3 K. (Quoted by SENSOR INDEX on purpose. These runs predate the
+sensor-to-cluster correction in `arm64-dts-a733-thermal-zones-and-cpu-throttling`, so the logs label ths 0 "cpub" and ths 3
+"cpul"; after `arm64-dts-a733-thermal-zones-and-cpu-throttling` the same two sensors carry the opposite names. The index is
+the invariant, so the numbers are anchored to it.) The same magnitude appears on the DDR, NPU
+and GPU sensors under a CPU-only constant load, which those dies cannot be
+following, and the residuals are essentially uncorrelated between sensors
+(pairwise r 0.02..0.29), so it is not a shared reference either. It is about
+twenty times the 59 mC quantum of the conversion, so quantisation is not the
+thing to filter. The physical origin is not established; the control
+conclusion does not depend on it.
+
+WHAT step_wise DOES WITH THAT
+
+It steps the cooling device up on a noise peak, and on the first sample that
+falls below the trip's hysteresis it returns instance->lower -- the whole way
+back, in one poll, not one step down. Measured consequence: every throttling
+episode ever recorded on this part ended that way, 8 of 8 in a 300 s run and
+78 of 78 in a 15 min run, and under degraded airflow cooling states of 4 and
+6 were discarded in a single poll with the die at 92 and 93 C. The
+controller has never once settled on a state; it oscillates between full
+clock and one OPP down, and the die peaks 2.0 K above the 90 C trip.
+
+THE FILTER
+
+Track the highest reading seen. Report RAISING on every new maximum,
+DROPPING once the reading has fallen trend_hyst below that maximum, STABLE
+in between.
+
+The shape is chosen for two properties an average or a slope cannot give:
+
+  - The first sample at any temperature is always a new maximum, so RAISING
+    is reported there. Mitigation at a temperature the loop has not answered
+    yet is never delayed -- by construction, at any ramp rate. The measured
+    worst-case ramp on this board is 4715 mC/s; a low-pass with a 4 s time
+    constant would be blind to 19 K of it.
+  - The samples that report DROPPING are a subset of those the core's own
+    comparison reports. (If T <= ref - hyst then T < ref; and if the previous
+    sample did not report DROPPING then T_prev > ref - hyst >= T, so
+    T < T_prev and the unfiltered code reports DROPPING too.) Cooling is
+    never given back in a cycle where the unfiltered code would have kept it.
+
+The 110 C critical trip is untouched either way: step_wise skips
+THERMAL_TRIP_CRITICAL, and the core acts on it directly. No .get_trend can
+delay a shutdown.
+
+trend_hyst = 6000 mC IS DERIVED, NOT PICKED
+
+The rule: the hysteresis has to exceed the excursion the sensor's own noise
+produces within one plant time constant, or noise alone fakes a DROPPING.
+Measured, pooled over six full-load runs, 10 s windows, detrended:
+
+    sensor      RMS      p2p median   p2p p90    p2p p95
+    ths 0       0.93 K      3141 mC    4926 mC    5655 mC
+    ths 3       1.23 K      4226 mC    6268 mC    6988 mC
+
+6000 mC sits at the ths 3 p90 and above the ths 0 p95. ⚠ Both figures are
+per SENSOR, and by index, for the reason given above: the zone NAMES attached
+to these two sensors are swapped by `arm64-dts-a733-thermal-zones-and-cpu-throttling`. The constant itself is unaffected --
+it is one value chosen to cover the worse of the two, and the pair of sensors
+is the same pair whichever names they wear. Do not re-derive it from the
+renaming. Replayed
+against the recorded traces it takes the rate of DROPPING reported while the
+local regression slope is non-negative -- noise-only releases -- from 68.3
+and 64.1 per 300 s to 1.1 and 0.1: factors of 62 and 640. 7000 mC (the p95)
+buys 1.1 -> 0.5 and pushes the release level to 7 K below the peak, which
+starts to read as never releasing. The knee is at 6000.
+
+One constant for the chip rather than one per zone, and sized on the worse
+zone as that requires. The two differ by 1.27x; three of the five zones
+carry only a critical trip and never reach this callback at all; and
+over-damping the quieter zone costs at most one ladder step on a zone that
+throttles for about 1 s in 300. Five numbers where one suffices, four of
+them unprovable, is not a refinement.
+
+Two sanity bounds the number also has to clear, and does: it is three times
+the 2000 mC hysteresis the device tree gives the trip, so the filter can only
+tighten that hysteresis and never widen it; and it is 60 % of the 10 K gap
+between the cpufreq trip at 90 C and the idle-injection trip at 100 C, so the
+two passive stages stay distinguishable.
+
+THE PRICE, STATED
+
+A larger hysteresis holds the cooling state longer, and that costs clock.
+
+  - Steady state: bounded by one ladder step held where today's controller
+    would have thrown it away -- 1794 -> 1716 MHz on CPU-little (-4.3 %),
+    2002 -> 1950 MHz on CPU-big (-2.6 %).
+  - Release latency on a genuine cool-down: trend_hyst / |dT/dt|, so 12 s at
+    the measured end-of-load rate in the worst case. In all six recorded
+    cool-downs it was one poll, because the first update after the load ends
+    is already more than 6 K down.
+  - An open-loop replay of the recorded traces puts the mean frequency
+    100..150 MHz lower and, notably, that figure does not change between
+    3000 and 8000 mC: the cost is incurred by having a filter at all, not by
+    its size. That replay cannot be trusted for an equilibrium -- it feeds a
+    fixed temperature to a controller whose whole job is to change it -- so
+    the number to watch on hardware is the run-average frequency, not this.
+
+Some of that cost is not a loss. Today's run-average includes time at full
+clock that the controller had decided to throttle and then discarded on a
+noise sample.
+
+MECHANICS
+
+get_tz_trend() is called once per non-critical trip per governor cycle, and
+the A733 CPU zones carry two of them. A callback that advanced its state per
+call would hand the second trip a STABLE the first one consumed, which would
+silently disable the 100 C idle-injection stage while passing every build and
+every review. The state machine is therefore keyed on a sequence number
+bumped by ->get_temp, so it advances at most once per sample.
+
+->get_temp only publishes the sample; it does not advance the filter. sysfs
+and hwmon reads reach ->get_temp too, and a reader must not be able to change
+what the governor sees -- least of all the 4 Hz debug instrumentation used to measure this
+patch. A sysfs read cannot steal a transition either: the whole update cycle
+and every sysfs read take the same zone mutex, so no read can interleave
+between the two ->get_trend calls of one cycle.
+
+trend_hyst = 0 -- every chip in this driver except the A733 -- returns
+-EOPNOTSUPP, and get_tz_trend() falls back to the comparison it has always
+used. The other nine parts are unaffected by construction, not by review.
+
+VERIFIED / NOT VERIFIED
+
+Applies clean at fuzz 0 on pristine 6.18.36 with `mfd-axp20x-Constify-axp313-and-axp717-cells` to `arm64-dts-a733-bank-pc-io-supply`.
+Builds: drivers/thermal/sun8i_thermal.o, native aarch64, W=1, no warnings;
+checkpatch 0 errors. Artifact checked rather than the exit code -- the object
+carries sun8i_ths_get_trend.
+
+NOT verified on hardware. The pending observable, in one line: the number of
+one-poll transitions of cpufreq-cpu0/cur_state from non-zero to 0 while the
+zone was still at or above 88000 mC on the previous sample must fall by at
+least half, with no rise in peak die temperature and no fall in the
+run-average CPU frequency beyond the one-OPP bound above. The A/B pair is one
+test run with two kernel variants: with and without this patch.
+
+The 6000 mC itself rests on an open-loop replay of traces produced by a
+different controller. It bounds the direction of the change, not its
+equilibrium. If the test boot shows residual chatter, the next knob is the
+hardware filter depth (FILTER_TYPE 01 -> 10, four to eight samples), not a
+larger trend_hyst.
+
+Assisted-by: Claude
+---
+diff -uNr a/drivers/thermal/sun8i_thermal.c b/drivers/thermal/sun8i_thermal.c
+--- a/drivers/thermal/sun8i_thermal.c
++++ b/drivers/thermal/sun8i_thermal.c
+@@ -63,6 +63,16 @@
+ 	struct ths_device		*tmdev;
+ 	struct thermal_zone_device	*tzd;
+ 	int				id;
++	/*
++	 * Trend filter state, see sun8i_ths_get_trend().  Touched only from
++	 * ->get_temp and ->get_trend, both of which the thermal core calls
++	 * with the zone mutex held, so no further serialisation is needed.
++	 */
++	int				last_temp;
++	int				trend_ref;
++	unsigned int			temp_seq;
++	unsigned int			trend_seq;
++	enum thermal_trend		trend;
+ };
+ 
+ struct ths_thermal_chip {
+@@ -74,6 +84,14 @@
+ 	int		scale;
+ 	int		ft_deviation;
+ 	int		temp_data_base;
++	/*
++	 * Millidegrees the reading has to fall below the highest value seen
++	 * before ->get_trend reports DROPPING.  Zero -- the default, and what
++	 * every chip but the A733 uses -- disables the callback, so the core
++	 * keeps deriving the trend from two consecutive samples exactly as it
++	 * did before this existed.
++	 */
++	int		trend_hyst;
+ 	int		(*calibrate)(struct ths_device *tmdev,
+ 				     u16 *caldata, int callen);
+ 	int		(*init)(struct ths_device *tmdev);
+@@ -170,11 +188,106 @@
+ 	 */
+ 	*temp += tmdev->chip->ft_deviation;
+ 
++	/*
++	 * Publish the sample for ->get_trend.  This deliberately does not
++	 * advance the filter: sysfs and hwmon reads land here too, and a
++	 * reader must not be able to change what the governor sees.
++	 */
++	s->last_temp = *temp;
++	s->temp_seq++;
++
++	return 0;
++}
++
++/*
++ * Trend filtering.
++ *
++ * Without a ->get_trend the core derives the trend from two consecutive
++ * samples.  On this part that is a one-bit differentiator fed a signal it
++ * cannot resolve, for two measured reasons.
++ *
++ * The sensors are slow as this driver programs them -- a choice, not a
++ * property of the part.  sun50i_h6_thermal_init() writes THS_PER = 365 (the
++ * H6 value; the UM's init sequence writes 0x3A = 58, the vendor driver 28)
++ * at 24 MHz, so one conversion takes 4096 * 366 / 24e6 = 62.5 ms; THS_FILTER
++ * averages four of them and the five sensors share the block, which puts a
++ * new word in each THSn_DATA every 4096 * 366 * 4 * 5 / 24e6 = 1.2493 s.
++ * Measured on a Cubie A7S: every reported value holds for 1.22..1.26 s, and
++ * the shared data interrupt fires at 4.00 /s, i.e. 0.8 Hz per sensor.  A CPU
++ * zone polls at 500 ms, so at this period two out of three governor cycles see
++ * no new sensor data at all -- shortening the poll cannot help, and
++ * lengthening it costs response.
++ *
++ * The sensors are noisy.  Detrended inside sliding 10 s windows, pooled over
++ * six full-load runs, the residual on the two CPU zones is 0.93 K and
++ * 1.23 K RMS, with a 90th-percentile peak-to-peak of 4.9 K and 6.3 K.  The
++ * same magnitude appears on the DDR, NPU and GPU sensors under a CPU-only load,
++ * and the residuals are uncorrelated between sensors, so this is not the die
++ * following the workload.  It is roughly twenty times the 59 mC quantum of
++ * the conversion above, which is why quantisation is not the thing to filter.
++ *
++ * step_wise turns that into a controller that never converges: it steps the
++ * cooling device up on a noise peak, and on the first sample that falls below
++ * the trip's hysteresis it takes the device all the way back to
++ * instance->lower in one poll rather than one step down.  Measured on the
++ * same part: every throttling episode ever recorded ended that way -- 8 of 8
++ * in one 300 s run, 78 of 78 in a 15 min run -- and under degraded airflow
++ * cooling states of 4 and 6 were discarded in a single poll with the die at
++ * 92 and 93 degrees.
++ *
++ * So track the highest reading seen and report RAISING on every new maximum,
++ * DROPPING only once the reading has fallen trend_hyst below it, STABLE
++ * otherwise.  Two properties follow, and both are the reason for this shape
++ * rather than an average or a slope:
++ *
++ *  - the first sample at any given temperature is always a new maximum, so
++ *    RAISING is reported there and mitigation at a temperature the loop has
++ *    not answered yet is never delayed.  A filter with a time constant
++ *    cannot say that;
++ *  - the samples that report DROPPING are a subset of those the core's own
++ *    comparison would report, so cooling is never given back in a cycle
++ *    where the unfiltered code would have kept it.
++ *
++ * get_tz_trend() is called once per non-critical trip per governor cycle and
++ * the CPU zones here carry two of them, so the state machine must not run
++ * twice on one sample; it is keyed on the ->get_temp sequence number instead.
++ * A concurrent sysfs read cannot steal a transition, because the whole update
++ * cycle and every sysfs read take the same zone mutex.
++ */
++static int sun8i_ths_get_trend(struct thermal_zone_device *tz,
++			       const struct thermal_trip *trip,
++			       enum thermal_trend *trend)
++{
++	struct tsensor *s = thermal_zone_device_priv(tz);
++	int hyst = s->tmdev->chip->trend_hyst;
++
++	if (!hyst)
++		return -EOPNOTSUPP;
++
++	if (s->trend_seq != s->temp_seq) {
++		int temp = s->last_temp;
++
++		s->trend_seq = s->temp_seq;
++
++		if (temp > s->trend_ref) {
++			s->trend_ref = temp;
++			s->trend = THERMAL_TREND_RAISING;
++		} else if (temp <= s->trend_ref - hyst) {
++			s->trend_ref = temp;
++			s->trend = THERMAL_TREND_DROPPING;
++		} else {
++			s->trend = THERMAL_TREND_STABLE;
++		}
++	}
++
++	*trend = s->trend;
++
+ 	return 0;
+ }
+ 
+ static const struct thermal_zone_device_ops ths_ops = {
+ 	.get_temp = sun8i_ths_get_temp,
++	.get_trend = sun8i_ths_get_trend,
+ };
+ 
+ static const struct regmap_config config = {
+@@ -560,6 +673,13 @@
+ 	for (i = 0; i < tmdev->chip->sensor_num; i++) {
+ 		tmdev->sensor[i].tmdev = tmdev;
+ 		tmdev->sensor[i].id = i;
++		/*
++		 * Below any real reading, so the first call reports RAISING.
++		 * That call cannot matter: on the first governor cycle every
++		 * instance is still uninitialised and step_wise ignores the
++		 * trend.
++		 */
++		tmdev->sensor[i].trend_ref = THERMAL_TEMP_INVALID;
+ 		tmdev->sensor[i].tzd =
+ 			devm_thermal_of_zone_register(tmdev->dev,
+ 						      i,
+@@ -774,6 +894,16 @@
+ 	.sensor_num = 5,
+ 	.has_bus_clk_reset = true,
+ 	.has_mod_clk = true,
++	/*
++	 * 6000 mC is the 90th percentile of the peak-to-peak sensor residual
++	 * measured inside 10 s windows on the noisier of the two CPU zones
++	 * (6268 mC; the quieter one is 4926 mC), pooled over six full-load
++	 * runs.  Sized on the worse zone because one number has to cover
++	 * both.  It leaves the two passive stages 10 K apart distinguishable
++	 * and is three times the hysteresis the device tree gives the trip,
++	 * so the filter can only tighten that hysteresis, never widen it.
++	 */
++	.trend_hyst = 6000,
+ 	.temp_data_base = SUN50I_H6_THS_TEMP_DATA,
+ 	.calibrate = sun50i_h6_ths_calibrate,
+ 	.init = sun50i_h6_thermal_init,

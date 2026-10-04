@@ -1,0 +1,961 @@
+From 9f1c4e7a2b6d8035c1a9e4f7b02d6c8a5e3f1907 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Wed, 22 Jul 2026 15:20:00 +0200
+Subject: [PATCH] arm64: dts: a733: cpu opp tables + cpu-supply (M9)
+
+Give both CPU clusters an operating-points-v2 table and wire the two PMIC
+rails that feed them, so cpufreq-dt can scale frequency AND voltage
+instead of leaving both cluster PLLs on boot0's 1014 MHz forever.
+
+  cluster0 (6x Cortex-A55, cpu0..cpu5) -> DCDC5 = VDD-CPUL (+ VDD-DSU)
+  cluster1 (2x Cortex-A76, cpu6..cpu7) -> DCDC3 = VDD-CPUB
+
+This is the patch of the series that can damage the board, so the
+reasoning is written out in full rather than summarised.
+
+WHY A DT WINDOW IS A WRITE, AND WHY IT IS ALLOWED HERE
+======================================================
+
+`regulator-min-microvolt` plus `regulator-max-microvolt` is not a
+statement about the hardware. Both present => `constraints->apply_uV`
+(of_regulator.c:99-111), and `machine_constraints_voltage()`
+(core.c:1202-1262) then drives the rail into that window at probe,
+logging "Bringing NuV into A-BuV". A ceiling without a floor is not a
+weaker form of the same thing, it is rejected outright with -EINVAL
+(core.c:1291). There is no describe-only shape.
+
+This project already paid for that lesson. An earlier PMIC-constraints patch gave 16 rails
+datasheet windows; on the 8 GiB board, 2026-07-21 18:44, the kernel pulled ELDO1 =
+the LPDDR5 die rail VDD2L from 1.1 V down to 0.95 V at t=1.79 s against
+DRAM that boot0 had trained and that was in use, and late cleanup
+switched two more rails off at t=31.8 s. That patch was dropped, not fixed,
+and the conclusion was: a window may
+come back only together with the consumer that owns the rail, where the
+write is the whole point.
+
+That is this patch, and it is the only rail pair that qualifies today:
+the OPP core is the owner of VDD-CPUL/VDD-CPUB, changing them is its job,
+and every value it may write is enumerated below.
+
+Two consequences of the same mechanism are used deliberately here:
+
+ - the floor is 800000 on both rails, which is exactly what both rails
+   measure at boot, so `current_uV` is inside the window and probe writes
+   nothing. The log line from that incident must not appear for either rail.
+
+ - `regulator-always-on` is not decoration. Without it the node carries
+   REGULATOR_CHANGE_STATUS (of_regulator.c:133) and
+   `regulator_late_cleanup()` (core.c:6492-6534) disables any rail whose
+   `use_count` is still 0 roughly 30 s after boot. The OPP core does take
+   a reference (`regulator_enable()` in `_opp_config_regulator_single()`,
+   opp/core.c:1140), but only on the first OPP transition. If cpufreq-dt
+   does not probe -- unreadable speed bin, missing CPU clock, driver not
+   built -- nothing holds the reference and the kernel would switch off
+   the rail that the CPU running it is powered from. Both rails are
+   measured on (reg 0x10 = 0xff), so the enable itself is a no-op.
+
+WHAT ACTUALLY BREAKS, IN BOTH DIRECTIONS
+========================================
+
+A CMOS gate switches by charging its load through a channel whose current
+rises with the gate overdrive, so a higher rail voltage means a shorter
+propagation delay; heat lowers carrier mobility and lengthens it again;
+and a die that came out of the line better reaches the same delay at a
+lower voltage, which is what the speed bin records. The PMIC turns a
+7-bit register code into millivolts on the rail (500 mV + n * 10 mV), and
+the OPP table is the contract that says which frequency is allowed to
+demand which code.
+
+Too little voltage for the requested frequency: the critical path no
+longer completes inside one clock period, a flip-flop latches a value
+that is still settling, and the machine takes a wrong branch, an
+exception at a nonsense address, or corrupts a memory write. It does not
+harm the silicon and it is not reliably reproducible -- it appears under
+load, at temperature, on one chip out of a batch. The dangerous property
+is that it looks like a software bug.
+
+Too much voltage: dynamic power goes with V^2 and leakage worse than
+linearly, so the die heats, which is merely inefficient; the real cost is
+the oxide field. Time-dependent dielectric breakdown, hot-carrier
+injection and NBTI all accelerate steeply with voltage, and they are
+cumulative and invisible -- the part keeps working until it does not,
+months later, with no error counter to read. Above the datasheet absolute
+maximum (VDD-CPUB / VDD-CPUL: 1.2 V, DS Tab. 5-1) the damage is immediate
+rather than gradual.
+
+Hence the asymmetry that shapes this patch: an unidentified chip gets the
+HIGHEST voltage any characterised bin needs, never the average and never
+an interpolation. Guessing high costs efficiency, guessing low costs
+stability, and both are recoverable; only exceeding the datasheet is not.
+No OPP here goes beyond 1050 mV, which is 150 mV under the absolute
+maximum and is the highest value that occurs in any of the nine vendor
+bins.
+
+WHERE EVERY NUMBER COMES FROM
+=============================
+
+Frequencies (spec + silicon, both boards identical). f = 26 MHz * N with
+N read from CPU_L/B_PLL_CTRL_REG bits[15:8] (N is raw, no +1; UM field
+table). 416 MHz is the only step using EXT_DIVP = /2, because 26*16 would
+put the VCO under the documented 480 MHz floor:
+
+  MHz  416  780 1014 1196 1404 1508 1612 1716 1794 1898 1950 2002
+  N     32   30   39   46   54   58   62   66   69   73   75   77
+
+The 26 MHz reference is silicon, not the 24 MHz our DT modelled before
+`arm64-dts-a733-model-the-26mhz-dcxo`: XO_CTRL0 @0x07090160 reads 0x983FB0F7 byte-identical on the 6 GiB board and
+the 8 GiB board, DCXO_ST[15:14] = 0b10 = 26 MHz.
+
+Voltages, MEASURED (PMIC register readback taken while the PLL register
+showed the matching N):
+
+  bin 0x05: the 8 GiB board, the one pristine vendor image. Fully trustworthy.
+  bin 0x04: the 6 GiB board, running OUR OWN rebuild, not a vendor image. It is a
+            real measurement of what our build drives on bin-0x04
+            silicon; it is not an independent confirmation of the vendor
+            table, because our build carries that table.
+
+Both columns match the vendor vf tables step for step. That is recorded
+here as an observation made AFTER the registers were read, not as the
+reason to trust them: the vendor tables were a hint until the PMIC
+confirmed them, and they stay a hint everywhere the PMIC did not.
+
+  MHz   | A55 0x04 | A55 0x05 | A76 0x04 | A76 0x05
+  ------+----------+----------+----------+---------
+   416  |   800    |   800    |   800    |   800
+   780  |   800    |   800    |   800    |   800
+  1014  |   800    |   800    |   800    |   800
+  1196  |   800    |   800    |   800    |   800
+  1404  |   840    |   800    |   800    |   800
+  1508  |   880    |   820    |   820    |   800
+  1612  |   920    |   860    |   840    |   820
+  1716  |   960    |   900    |   870    |   850
+  1794  |  1000    |   950    |   920    |   900
+  1898  |    -     |    -     |   970    |   940
+  1950  |    -     |    -     |  1000    |   970
+  2002  |    -     |    -     |  1050    |  1000
+
+Voltages, CARRIED OVER AND NOT SILICON-VERIFIED: the entire worst-case
+column, i.e. every unnamed `opp-microvolt` above 800000. Those come from
+the seven vendor bins we own no chip of. Nobody has read a PMIC register
+on a 0x00/0x01/0x02/0x03/0x06/0x11/0x12/0x14/0x15 part, here or anywhere
+else in this project.
+
+Coding check for the values that end up on the wire (from the AXP323 V1.1 datasheet,
+and matched against silicon):
+
+  800 mV -> n = (800-500)/10 = 30 = 0x1e, +DVM bit7 -> 0x9e
+  1000 mV -> n = 50 = 0x32 -> 0xb2
+  1050 mV -> n = 55 = 0x37 -> 0xb7
+
+0x9e is exactly what registers 0x14 and 0x16 read on the 6 GiB board on 2026-07-22
+(i2cget -f -y 1 0x36) and what a register readout on the pristine vendor image shows for the 8 GiB board. Every
+voltage in this patch is a multiple of 10 mV inside 500..1200 mV, so each
+one is an exact PMIC code and nothing is rounded on the way down.
+
+SPEED BIN: THE CONTRACT WITH PATCH `nvmem-cpufreq-a733-speed-bin-from-efuse`
+=======================================
+
+`nvmem-cpufreq-a733-speed-bin-from-efuse` has landed; this table is written against its code, not against an
+assumption. Three columns per operating point:
+
+    opp-microvolt-speed4   bin 0x04, measured
+    opp-microvolt-speed5   bin 0x05, measured
+    opp-microvolt          worst case, unnamed
+
+  opp-supported-hw = <0x31> = BIT(0) | BIT(4) | BIT(5)
+
+The bit position IS the raw fuse value: `nvmem-cpufreq-a733-speed-bin-from-efuse` takes bits[15:8] of the
+32-bit word at SID fuse offset 0x4c (ARM 0x0300624c) and uses it directly
+as the speed index, `supported_hw = BIT(bin)`, `prop_name = "speed<bin>"`.
+So bin 0x04 -> BIT(4) -> `opp-microvolt-speed4`. No mapping table exists
+anywhere; DT alone decides which bins are described.
+
+Bit 0 is the worst-case column and it is not a bin. `nvmem-cpufreq-a733-speed-bin-from-efuse` returns index 0
+deterministically for every die it cannot act on: fuse bits[15:8] read 0
+(an unprogrammed fuse and a part graded 0 are indistinguishable from
+outside), bin >= 32, the second fuse copy in bits[23:16] is programmed
+(its meaning is unverified and all three of our dies read zero there), or
+no OPP in DT claims that bin. Index 0 then means `prop_name = "speed0"`,
+no `opp-microvolt-speed0` property exists, and `_parse_named_prop()`
+(opp/of.c:551-573) falls back to the unnamed `opp-microvolt`. That
+fallback is also why every operating point carries the unnamed property:
+a column forgotten in a future edit degrades to the worst case, never to
+a wrong voltage.
+
+Every operating point carries BIT(0), so the worst-case path yields the
+complete ladder rather than a crippled machine. And both cluster tables
+declare the same bin set {0, 4, 5}: `nvmem-cpufreq-a733-speed-bin-from-efuse`'s `sunxi_cpufreq_dt_speed_mask()`
+ORs the masks within a CPU and ANDs across CPUs, so a bin described on
+only one cluster would demote the whole machine to the worst case. Any
+edit that adds a bin has to add it to both tables.
+
+The eFuse itself is silicon-proven: 0x0300624c reads 0x00000598 on the 8 GiB board,
+0x00000496 on the 6 GiB board, 0x00000596 on a second 6 GiB board -> bins 0x05 / 0x04 / 0x05, three
+chips, read out of the fuse block on each.
+
+If `nvmem-cpufreq-a733-speed-bin-from-efuse` is absent or fails, `_opp_is_supported()` (opp/of.c:497-548)
+disables every OPP carrying `opp-supported-hw`, cpufreq-dt finds an empty
+table and refuses to probe: boot frequency, no DVFS, no rail movement.
+Safe, and visible in the log.
+
+The table node also carries `compatible =
+"allwinner,sun60i-a733-operating-points"` (`nvmem-cpufreq-a733-speed-bin-from-efuse` matches on it in
+`cpu_opp_match_list` and added it to the binding) and `nvmem-cells =
+<&cpu_speed_grade>`, the cell `nvmem-cpufreq-a733-speed-bin-from-efuse`'s own `sid: efuse@3006000` node
+defines. No second SID node is added here.
+
+THE WORST-CASE COLUMN
+=====================
+
+Per frequency, the maximum over all nine vendor bins, made monotonic by
+running maximum:
+
+  A55: 416/780/1014 @800, 1196 @850, 1404 @950, 1508 @1000,
+       1612/1716/1794 @1050
+  A76: 416/780/1014/1196 @800, 1404 @850, 1508 @900, 1612 @950,
+       1716 @1000, 1794/1898/1950/2002 @1050
+
+Running maximum rather than raw maximum because the raw one is not
+monotonic (A55 1612 needs 1050 in bin 0x01 while 1716 needs 1000 in bin
+0x02, the only bin that has it), and a table where a higher frequency
+asks for less voltage is a table that undervolts something.
+
+780 MHz needs one note: bin 0x00 has no 780 MHz entry, it uses 728 MHz.
+Its neighbours in that column, 728 and 1014, are both 800 mV, so 780 MHz
+at 800 mV is bracketed on both sides rather than extrapolated. Same for
+the A76 1612 MHz entry: bin 0x00 skips it, but its 1586 MHz point is
+850 mV and its 1690 MHz point is 900 mV, both under the 950 mV shipped
+here.
+
+KNOWN RESIDUAL RISK, deliberately not mitigated in this patch. The
+worst-case column covers voltage completely and frequency only partly.
+Bins 0x03 and 0x06 stop at 1404 MHz (A55) and 1612 MHz (A76) in the
+vendor table, so an unidentified die that is in fact a 0x03 would be
+offered 1794/2002 MHz -- at the highest voltage any bin uses, but at a
+frequency its own bin never validated. Capping the worst-case ladder
+there was written and dropped: `nvmem-cpufreq-a733-speed-bin-from-efuse` requires every OPP to be reachable
+through BIT(0), and splitting that decision across two patches is worse
+than the risk. The honest fix is a measured column for such a die if one
+ever turns up, not an interpolation. Recorded here so the next person
+finds it named rather than discovers it.
+
+THE REGULATOR WINDOWS, WITH THE ARITHMETIC
+==========================================
+
+Not copied from a ceiling-only list of datasheet limits: such a list has no
+floor precisely because it must never become a DT node unchanged, and
+a ceiling-only node does not even register (-EINVAL).
+
+Derived instead as: floor = the measured boot voltage, ceiling = the
+highest voltage any OPP in this patch can request.
+
+  DCDC5 / VDD-CPUL + VDD-DSU:
+    floor   800000  = boot value, the 6 GiB board reg 0x16 = 0x9e, the 8 GiB board identical
+    ceiling 1050000 = max over {A55 bin 0x04 top 1000, bin 0x05 top 950,
+                                worst case 1050 at 1612..1794}
+  DCDC3 / VDD-CPUB:
+    floor   800000  = boot value, the 6 GiB board reg 0x14 = 0x9e, the 8 GiB board identical
+    ceiling 1050000 = max over {A76 bin 0x04 top 1050, bin 0x05 top 1000,
+                                worst case 1050 at 1794..2002}
+
+1050 mV is 150 mV (12.5 %) under the 1.2 V DS Tab. 5-1 absolute maximum
+for both pins, and it is the largest value that appears in any of the
+nine vendor bins for either cluster. It is 50 mV above the 0.8..1.0 V
+range the schematic annotates; that annotation is a nominal operating
+range, not a rating, and DS Tab. 5-1 is the rating.
+
+One asymmetry worth flagging rather than hiding: on DCDC3 the 1050 mV
+ceiling is a value we have measured (bin 0x04 A76 at 2002 MHz on the 6 GiB board).
+On DCDC5 it is not -- our A55 measurements top out at 1000 mV -- and it
+becomes reachable only through the worst-case column, i.e. only on a die
+we cannot identify. It is a vendor-table number inside the datasheet
+limit, and the alternative (an 1000000 ceiling) would silently drop the
+worst-case entries at 1612..1794 MHz via
+`_opp_supported_by_regulators()`, leaving an unidentified die with a
+1508 MHz cap and no explanation in the log. Bounded at 1050 mV is the
+better of the two.
+
+Both endpoints are exact PMIC codes (n = 30 and n = 55), so the clamp
+loop at the end of `machine_constraints_voltage()` narrows nothing.
+
+The window is also a second gate on the table itself:
+`_opp_supported_by_regulators()` (opp/core.c:1930) marks any OPP outside
+the constraints unavailable at parse time rather than driving the rail
+out of the window. If a future edit adds an entry above the ceiling, it
+is dropped with a warning instead of applied.
+
+min != max, so REGULATOR_CHANGE_VOLTAGE is set (of_regulator.c:108) and
+DVFS is permitted at all. A single-value window would have made the rail
+read-only.
+
+Expect two "supply vin23 not found, using dummy regulator" /
+"supply vin45 not found" warnings (core.c:2235): the AXP318W descriptors
+name an input supply for the DCDCs and we do not model the PMIC input
+rails. Harmless, and giving them nodes would mean more rail nodes, and a
+rail gets a DT node only together with its consumer.
+
+RAMP DELAY, AND WHAT clock-latency-ns CAN HONESTLY SAY
+======================================================
+
+`regulator-ramp-delay = <1280>` (uV/us) = 10 mV per 7.8125 us. The step
+size is the DCDC2..5 coding (10 mV below 1.2 V) and the 7.8125 us is the
+default slew rate of REG 0x1B bit5, read as 0 on the 6 GiB board on 2026-07-22
+(0x1b = 0x00). DVM is enabled on both rails (bit7 of 0x14/0x16), so the
+PMIC really does walk the codes instead of stepping.
+
+This is not a nicety. `_regulator_set_voltage_time()` (core.c:3653)
+returns 0 when neither the constraint nor the descriptor carries a ramp
+delay -- and axp20x_ops_range sets no `.ramp_delay` -- so
+`_regulator_do_set_voltage()` would `fsleep(0)` after commanding the new
+code. The i2c write returns as soon as the register is written, not when
+the rail arrives. The OPP core raises voltage BEFORE frequency when
+scaling up (`_set_opp()`, opp/core.c:1326-1360), and without the delay
+that ordering guarantees nothing: the PLL would go to 2002 MHz up to
+195 us before the rail reaches 1050 mV. That is the undervolt failure
+mode above, built in by omission.
+
+The property never programs the chip: `set_machine_constraints()` calls
+`ops->set_ramp_delay` only if the op exists (core.c:1506), and
+axp20x_ops_range has none.
+
+`clock-latency-ns` is deliberately NOT set, although this binding allows
+it. The vendor writes 244144 on every entry; 244144 ns is 1/4096 s, a
+constant that appears verbatim in DTs for unrelated SoCs. It is not a
+measurement of this PLL and we cannot turn it into one. The A733 UM
+documents PLL_UPDATE, LOCK and the glitch-free mux, and its Table 4-2
+gives a lock time of 1.5 ms for CPU_L_PLL, CPU_B_PLL and CPU_DSU_PLL
+(UM V1.00 p. 20 / PDF p. 41; same value in V0.92 p. 20 / PDF p. 40; the
+column `clk-sunxi-ng-a733-ve-plls-module-clocks-gates-and-resets` cites for the VE PLLs). That is a specification bound, not a
+measured relock time for an N change on a running PLL, and it is not
+244144 either. Measuring it needs the `clk-sunxi-ng-a733-add-cpu-pll-ccu` and `arm64-dts-a733-cpu-clocks-from-cpu-ccu` CPU-PLL driver on a board,
+and has not been done.
+
+What is left is exact rather than invented: with the ramp delay set,
+`dev_pm_opp_get_max_transition_latency()` = volt latency + clock latency
+(opp/core.c:396) = 250 mV / 1280 uV/us = 196 us + 0. So the number the
+governor sees is the voltage component only, every nanosecond of it
+traceable to a register we read, and it is a lower bound on the true
+transition cost -- same order as the vendor's 244 us, so no governor
+behaves differently. When the CPU-PLL driver can be asked for a real
+relock time, `clock-latency-ns` is one line and it is then a measurement.
+
+THE DSU SHARES DCDC5
+====================
+
+DCDC5 is one rail feeding VDD-CPUL and VDD-DSU together, so every A55
+voltage request is also the DSU's voltage. The DSU is not scaled by
+anything in this tree and has no DT representation at all, which makes
+this the one constraint nothing else in the kernel can enforce.
+
+It runs at 780 MHz, and that is register-read, not assumed:
+
+  CPU_DSU_PLL_CTRL @0x08873000 = 0xF8801E00
+    -> N = 0x1E = 30, P = 0+1, M0 = 0+1  ->  26 MHz * 30 = 780.000 MHz
+  CPU_DSU_PLL_CLK  @0x0887301c = 0x03000105
+    -> mux bits[26:24] = 0b011 = own PLL / P, EXT_DIVP = 00 = /1
+    -> DSU core 780 MHz, AXI/GIC/APB dividers /2 = 390 MHz
+
+Two witnesses, byte-identical: the 6 GiB board read on 2026-07-22 for this patch,
+the 8 GiB board in a readout on the vendor image. Nothing in our tree writes 0x08873000 -- `arm64-dts-a733-cpu-clocks-from-cpu-ccu`
+exposes CLK_CPU_L and CLK_CPU_B, not the DSU PLL -- so it stays where
+boot0 put it for the life of the boot.
+
+Why 800 mV is enough at 780 MHz: because both boards are doing it right
+now. DCDC5 measures 800 mV (0x16 = 0x9e) while the DSU PLL measures
+780 MHz, on both chips. That is the operating point itself, not a model
+of it. Corroboration only, not evidence: the vendor's own DSU vf table
+lists 780 MHz at 800 mV in all nine bins.
+
+Both layers of this patch respect it. The lowest voltage in every A55
+column -- speed4, speed5 and worst case alike -- is 800 mV, and
+`regulator-min-microvolt = <800000>` makes anything lower fail with
+-EINVAL in the regulator core rather than reach the rail. A future patch
+that scales the DSU has to raise this floor to the DSU's requirement at
+its highest frequency; it cannot simply add an OPP.
+
+cpu-supply PLACEMENT
+====================
+
+On cpu@0 and cpu@600 only. cpufreq-dt calls `dt_cpufreq_early_init()` per
+CPU ascending (cpufreq-dt.c:287) and every CPU already covered by a
+policy returns immediately via `cpufreq_dt_find_data()`, so
+`find_supply_name()` (cpufreq-dt.c:63) only ever looks at cpu0 and cpu6.
+The regulator then belongs to the shared OPP table, not to the cpu node
+(`_opp_set_regulators()`, opp/core.c:2241).
+
+What groups the CPUs is `opp-shared`, not `cpu-map`:
+`dev_pm_opp_of_get_sharing_cpus()` (opp/of.c) puts every CPU whose
+`operating-points-v2` phandle is the same node into one policy. The
+`cpu-map` from patch `arm64-dts-a733-cpu-topology` feeds the scheduler's topology and has no say
+here. The same function is why all EIGHT cpu nodes get
+`operating-points-v2`: it walks every possible CPU and returns -ENOENT if
+one of them has no OPP node.
+
+The properties are attached through label references at the end of the
+file rather than edited into the cpu@N nodes, which `arm64-dts-a733-cpu-clocks-from-cpu-ccu` has just changed
+in place to add the CPU-PLL mux clocks. Two patches inserting a few lines
+apart into one node is how a series stops applying. This is also the
+shape a board file uses when the cpu nodes live in a .dtsi.
+
+PRIOR ART
+=========
+
+An OPP-v2 patch in this project's earlier Armbian-based port of this board
+did this first
+and is where the worst-case column comes from: per-frequency cumulative
+maximum of the 26 MHz vf columns, monotonic by construction. It is
+running on a second 6 GiB board today. Its weakness is measured, not theoretical: it has
+no bin filtering at all, so it ships the union of every bin's frequency
+ladder. On that second 6 GiB board it was caught running 1300 MHz (CPU PLL N=50) at 800 mV, a step
+its own bin 0x05 has no voltage entry for. In the vendor kernel that
+filtering happens only as a side effect of
+`_opp_supported_by_regulators()` rejecting the zero-voltage entries,
+which needs `cpu-supply` wired first. This patch does it deliberately
+instead, and ships only the steps its own bin characterised.
+
+The other half of the price was efficiency: one table for all bins means
+every chip pays the worst bin. Against that table, this one saves 190 mV
+at 1612 MHz on a bin-0x05 A55 (860 vs 1050 mV, about a third of the
+dynamic power on that rail at that step) and 50 mV at the A76 top step
+(1000 vs 1050 mV, about 9 %).
+
+NO EXTRA OPERATING POINTS
+=========================
+
+None are added, and that is a decision rather than an oversight. The
+clock side would take them: N is a free 8-bit field, so 26 MHz steps
+between 1014 and 2002 MHz are all reachable with the VCO inside its
+480..2260 MHz window. The voltage side would not. The UM contains no
+V/f curve, the datasheet contains only the 1.2 V rating, and a voltage
+interpolated between two measured points is exactly the class of number
+this repo does not put into a DT node. For bins 0x04 and 0x05 the vendor
+characterised precisely the steps shipped here; there is nothing extra to
+enable.
+
+For the same reason no OPP is marked `opp-turbo`, so the top A76 step
+needs no `boost` knob to be reachable.
+
+`opp-microwatt` (Energy Model, EAS) is left out: those numbers have to be
+measured on a rail, not derived, and that belongs with the thermal patches.
+
+WHAT THIS PATCH DEPENDS ON, AND WHAT IS STILL UNPROVEN
+======================================================
+
+Depends on `arm64-dts-a733-cpu-topology` (cpu nodes + cpu-map), `arm64-dts-a733-enable-r-i2c0-axp318w-pmic` (AXP318W PMIC node), `clk-sunxi-ng-a733-rtc-ccu-add-dcxo` +
+`arm64-dts-a733-model-the-26mhz-dcxo` (26 MHz DCXO), `arm64-dts-a733-cpu-clocks-from-cpu-ccu` (CLK_CPU_L / CLK_CPU_B on the cpu nodes --
+without a `clocks` property `cpufreq_init()` cannot get the CPU clock and
+the policy never comes up) and `nvmem-cpufreq-a733-speed-bin-from-efuse` (speed bin driver, SID node,
+`cpu_speed_grade` cell, binding compatible). DT-only.
+
+Verified for this patch: applies to the tree with `clk-sunxi-ng-a733-rtc-ccu-add-dcxo`, `arm64-dts-a733-model-the-26mhz-dcxo`, `nvmem-cpufreq-a733-speed-bin-from-efuse` and `arm64-dts-a733-cpu-clocks-from-cpu-ccu` in
+place; dtc compiles the result with zero warnings; the resulting dtb was
+decompiled and checked property by property -- both cpu-supply phandles
+resolve to the intended regulator nodes, both `nvmem-cells` resolve to
+`cpu-speed-grade@4c`, all eight CPUs carry the right table phandle, and
+every voltage lands as intended (spot-checked at the A76 2002 MHz entry:
+worst case and speed4 = 1050000, speed5 = 1000000).
+
+The register reads quoted above are reads of the CURRENT state; they do
+not prove that this description produces it.
+
+The one observable that decides it, on the 6 GiB board (bin 0x04):
+
+  boot with the series up to and including this patch, set the A55 policy to 1794000, then read, with
+  the kernel out of the loop:
+      i2cget -f -y <bus> 0x36 0x16   must be 0xb2 (DVM + n=50 = 1000 mV)
+      CPU_L_PLL_CTRL @0x08871000 bits[15:8] must be 0x45 (N=69, 1794 MHz)
+  Both at the same time. If 0x16 still reads 0x9e (800 mV) while the PLL
+  shows N=69, the OPP voltage is not reaching the rail and this patch is
+  wrong in the dangerous direction; if the PLL never leaves N=39, the
+  table was never accepted.
+
+Second acceptance criterion, and the reason for that check: the boot log
+must contain no "vdd-cpub: Bringing ..." or "vdd-cpul-dsu: Bringing ..."
+line, and neither rail may be logged as "disabling". Both rails sit at
+800 mV, both windows start at 800 mV, so probe has nothing to do.
+
+Third, cheap and worth doing in the same session: the log must say
+"A733: speed bin 4 (fuse word 0x00000496)" on the 6 GiB board. If it says
+"using the worst-case OPP column" instead, the bin path is broken and
+every voltage above is the worst case rather than the measured one.
+
+By consumer this is a CPU patch and would belong with the early CPU patches. It cannot
+sit there. Hunk 1 adds the two CPU rails inside the `regulators` node that patch
+`arm64-dts-a733-enable-r-i2c0-axp318w-pmic` creates, and `arm64-dts-a733-enable-r-i2c0-axp318w-pmic` applies later. Applying only the early CPU patches
+shows no PMIC node at all, so this is a real dependency and not a diff artefact.
+
+Splitting it was considered and rejected as unsafe. The half without cpu-supply
+would leave a bootable intermediate state that offers every operating point up
+to 2002 MHz while the rails still hold the 800 mV boot0 leaves behind -- an
+undervolt on exactly the steps that need the most. One patch, ordered after its
+dependency, has no such window.
+
+Assisted-by: Claude
+---
+ .../sun60i-a733-cubie-a7s-minimal.dts         | 371 ++++++++++++++++++
+ 1 file changed, 371 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -1699,6 +1699,69 @@
+ 
+ 				regulators {
+ 					/*
++					 * The two CPU DVFS rails. They get a DT node --
++					 * and therefore a window, and therefore the right
++					 * to be written -- only because this patch also
++					 * brings their consumer: cpu-supply + an OPP
++					 * table. The patch header gives the full reasoning.
++					 *
++					 * DCDC3 = VDD-CPUB (A76), volt register 0x14.
++					 * DCDC5 = VDD-CPUL + VDD-DSU, register 0x16.
++					 * Coding: BIT(7) = DVM enable, bits[6:0] =
++					 * 500 mV + n * 10 mV (n <= 70).
++					 *
++					 * Read on the 6 GiB board 2026-07-22 (i2cget -f -y 1 0x36):
++					 *   0x10 = 0xff -> DCDC1..8 all enabled, so
++					 *                  BIT(2)/BIT(4) = DCDC3/DCDC5 on
++					 *   0x14 = 0x9e -> DVM on, n=30 -> 800 mV
++					 *   0x16 = 0x9e -> DVM on, n=30 -> 800 mV
++					 *   0x1b = 0x00 -> slew bit5=0 -> 7.8125 us per
++					 *                  10 mV step; poly-phase bits
++					 *                  [6]/[7] clear, so DCDC2+3 and
++					 *                  DCDC4+5 are NOT paralleled.
++					 * The 8 GiB board shows 800 mV on both rails as well
++					 * (readout on the pristine vendor image).
++					 *
++					 * The floor is 800000 on both rails, which is the
++					 * value measured above, so machine_constraints_
++					 * voltage() finds current == min and writes
++					 * nothing at probe. The ceiling is the highest
++					 * voltage any OPP below can ask for, not the
++					 * datasheet limit: DS Tab. 5-1 rates VDD-CPUB and
++					 * VDD-CPUL at 1.2 V absolute maximum, and 1050 mV
++					 * stays 150 mV under it.
++					 *
++					 * regulator-ramp-delay = 10000 uV / 7.8125 us =
++					 * 1280 uV/us. Without it the core computes a zero
++					 * settling time and lets the OPP core raise the
++					 * PLL while the PMIC is still ramping.
++					 * axp20x_ops_range has no .set_ramp_delay, so the
++					 * property is used for timing only and never
++					 * programs the chip (core.c:1506).
++					 *
++					 * regulator-always-on: both rails are already on
++					 * (0x10 = 0xff), so the enable call is a no-op --
++					 * but without it regulator_late_cleanup() would
++					 * switch the running CPU rail off ~30 s after
++					 * boot whenever cpufreq-dt has not claimed it.
++					 */
++					reg_dcdc3: dcdc3 {
++						regulator-name = "vdd-cpub";
++						regulator-min-microvolt = <800000>;
++						regulator-max-microvolt = <1050000>;
++						regulator-ramp-delay = <1280>;
++						regulator-always-on;
++					};
++
++					reg_dcdc5: dcdc5 {
++						regulator-name = "vdd-cpul-dsu";
++						regulator-min-microvolt = <800000>;
++						regulator-max-microvolt = <1050000>;
++						regulator-ramp-delay = <1280>;
++						regulator-always-on;
++					};
++
++					/*
+ 					 * SWOUT1 = reg 0x11 BIT(3) = Maxio PHY
+ 					 * 3v3 (board net VCC33-LCD). SWOUT2 =
+ 					 * reg 0x11 BIT(4) = VCC-PH bank I/O.
+@@ -1877,3 +1940,387 @@
+ 		};
+ 	};
+ };
++
++/ {
++	/*
++	 * A55 cluster (cpu0..cpu5), supplied by DCDC5 = VDD-CPUL.
++	 *
++	 * Frequencies are 26 MHz * N with the N values read out of
++	 * CPU_L_PLL_CTRL_REG bits[15:8] (register readout, both boards identical):
++	 *
++	 *   MHz  416  780 1014 1196 1404 1508 1612 1716 1794
++	 *   N     32   30   39   46   54   58   62   66   69
++	 *
++	 * 416 MHz is the only step using EXT_DIVP = /2; 26*16 would put
++	 * the VCO under the documented 480 MHz floor.
++	 *
++	 * Three voltage columns per operating point:
++	 *   opp-microvolt-speed4  bin 0x04, PMIC readback on the 6 GiB board
++	 *   opp-microvolt-speed5  bin 0x05, PMIC readback on the 8 GiB board
++	 *   opp-microvolt         worst case = per-frequency maximum over
++	 *                         all nine vendor bins, monotonic by
++	 *                         running max. NOT silicon-verified: no
++	 *                         chip outside 0x04/0x05 has ever been
++	 *                         measured here. Patch `nvmem-cpufreq-a733-speed-bin-from-efuse` selects it
++	 *                         (speed index 0) for every die it cannot
++	 *                         identify, and _parse_named_prop()
++	 *                         (opp/of.c:551-573) also falls back to it
++	 *                         if a named column is ever missing.
++	 *
++	 * opp-supported-hw = 0x31 = BIT(0) | BIT(4) | BIT(5): worst case,
++	 * bin 0x04, bin 0x05. The bit position is the raw fuse value
++	 * (0x0300624c bits[15:8]); bit 0 is reserved for the worst case.
++	 * Both cluster tables declare the same bin set on purpose --
++	 * `nvmem-cpufreq-a733-speed-bin-from-efuse` ANDs the per-CPU masks.
++	 *
++	 * DCDC5 is one rail feeding VDD-CPUL and VDD-DSU together, so
++	 * these are also the DSU's voltages. The DSU runs at a fixed
++	 * 780 MHz and has no DT representation; the lowest entry here is
++	 * 800 mV, which is what it is measurably running on today.
++	 */
++	cluster0_opp: opp-table-cluster0 {
++		compatible = "allwinner,sun60i-a733-operating-points";
++		nvmem-cells = <&cpu_speed_grade>;
++		opp-shared;
++
++		/*
++		 * Two points below the vendor's floor. The vendor's lowest is
++		 * 416 MHz; these are ours, and they exist because the whole
++		 * ladder from 416 MHz down to 1196 MHz already runs at the same
++		 * 800 mV in every one of the nine bins -- so going lower asks
++		 * for no voltage that is not already being supplied, and buys
++		 * idle power. Nothing above 2002 MHz is proposed: that would
++		 * need a voltage no bin documents.
++		 *
++		 * 494 MHz = 26 MHz x N=19 with EXT_DIVP /1; its VCO is 494 MHz,
++		 * inside the 480-2260 MHz window UM 5.1.10.6 documents, with
++		 * 14 MHz to spare at the bottom.
++		 * 247 MHz = the same N=19 with EXT_DIVP /2. UM 5.1.10.13 names
++		 * exactly this case for the post-divider: below 288 MHz output
++		 * the factor P may be used to divide the clock down to the
++		 * frequency that is wanted.
++		 *
++		 * Both are unvalidated by the vendor at any frequency, which is
++		 * why they are called out here rather than buried in the table.
++		 * DCDC5 also feeds the DSU at 780 MHz; these points change no
++		 * voltage, so they cannot starve it.
++		 */
++		opp-247000000 {
++			opp-hz = /bits/ 64 <247000000>;
++			opp-supported-hw = <0x31>;
++			opp-microvolt = <800000 800000 1050000>;
++			opp-microvolt-speed4 = <800000 800000 1050000>;
++			opp-microvolt-speed5 = <800000 800000 1050000>;
++		};
++
++		opp-494000000 {
++			opp-hz = /bits/ 64 <494000000>;
++			opp-supported-hw = <0x31>;
++			opp-microvolt = <800000 800000 1050000>;
++			opp-microvolt-speed4 = <800000 800000 1050000>;
++			opp-microvolt-speed5 = <800000 800000 1050000>;
++		};
++
++		opp-416000000 {
++			opp-hz = /bits/ 64 <416000000>;
++			opp-supported-hw = <0x31>;
++			opp-microvolt = <800000 800000 1050000>;
++			opp-microvolt-speed4 = <800000 800000 1050000>;
++			opp-microvolt-speed5 = <800000 800000 1050000>;
++		};
++
++		opp-780000000 {
++			opp-hz = /bits/ 64 <780000000>;
++			opp-supported-hw = <0x31>;
++			opp-microvolt = <800000 800000 1050000>;
++			opp-microvolt-speed4 = <800000 800000 1050000>;
++			opp-microvolt-speed5 = <800000 800000 1050000>;
++		};
++
++		opp-1014000000 {
++			opp-hz = /bits/ 64 <1014000000>;
++			opp-supported-hw = <0x31>;
++			opp-microvolt = <800000 800000 1050000>;
++			opp-microvolt-speed4 = <800000 800000 1050000>;
++			opp-microvolt-speed5 = <800000 800000 1050000>;
++		};
++
++		opp-1196000000 {
++			opp-hz = /bits/ 64 <1196000000>;
++			opp-supported-hw = <0x31>;
++			opp-microvolt = <850000 850000 1050000>;
++			opp-microvolt-speed4 = <800000 800000 1050000>;
++			opp-microvolt-speed5 = <800000 800000 1050000>;
++		};
++
++		opp-1404000000 {
++			opp-hz = /bits/ 64 <1404000000>;
++			opp-supported-hw = <0x31>;
++			opp-microvolt = <950000 950000 1050000>;
++			opp-microvolt-speed4 = <840000 840000 1050000>;
++			opp-microvolt-speed5 = <800000 800000 1050000>;
++		};
++
++		opp-1508000000 {
++			opp-hz = /bits/ 64 <1508000000>;
++			opp-supported-hw = <0x31>;
++			opp-microvolt = <1000000 1000000 1050000>;
++			opp-microvolt-speed4 = <880000 880000 1050000>;
++			opp-microvolt-speed5 = <820000 820000 1050000>;
++		};
++
++		opp-1612000000 {
++			opp-hz = /bits/ 64 <1612000000>;
++			opp-supported-hw = <0x31>;
++			opp-microvolt = <1050000 1050000 1050000>;
++			opp-microvolt-speed4 = <920000 920000 1050000>;
++			opp-microvolt-speed5 = <860000 860000 1050000>;
++		};
++
++		opp-1716000000 {
++			opp-hz = /bits/ 64 <1716000000>;
++			opp-supported-hw = <0x31>;
++			opp-microvolt = <1050000 1050000 1050000>;
++			opp-microvolt-speed4 = <960000 960000 1050000>;
++			opp-microvolt-speed5 = <900000 900000 1050000>;
++		};
++
++		opp-1794000000 {
++			opp-hz = /bits/ 64 <1794000000>;
++			opp-supported-hw = <0x31>;
++			opp-microvolt = <1050000 1050000 1050000>;
++			opp-microvolt-speed4 = <1000000 1000000 1050000>;
++			opp-microvolt-speed5 = <950000 950000 1050000>;
++		};
++
++	};
++
++	/*
++	 * A76 cluster (cpu6..cpu7), supplied by DCDC3 = VDD-CPUB.
++	 *
++	 * Frequencies are 26 MHz * N with the N values read out of
++	 * CPU_B_PLL_CTRL_REG bits[15:8] (register readout, both boards identical):
++	 *
++	 *   MHz  416  780 1014 1196 1404 1508 1612 1716 1794 1898 1950 2002
++	 *   N     32   30   39   46   54   58   62   66   69   73   75   77
++	 *
++	 * 416 MHz is the only step using EXT_DIVP = /2; 26*16 would put
++	 * the VCO under the documented 480 MHz floor.
++	 *
++	 * Three voltage columns per operating point:
++	 *   opp-microvolt-speed4  bin 0x04, PMIC readback on the 6 GiB board
++	 *   opp-microvolt-speed5  bin 0x05, PMIC readback on the 8 GiB board
++	 *   opp-microvolt         worst case = per-frequency maximum over
++	 *                         all nine vendor bins, monotonic by
++	 *                         running max. NOT silicon-verified: no
++	 *                         chip outside 0x04/0x05 has ever been
++	 *                         measured here. Patch `nvmem-cpufreq-a733-speed-bin-from-efuse` selects it
++	 *                         (speed index 0) for every die it cannot
++	 *                         identify, and _parse_named_prop()
++	 *                         (opp/of.c:551-573) also falls back to it
++	 *                         if a named column is ever missing.
++	 *
++	 * opp-supported-hw = 0x31 = BIT(0) | BIT(4) | BIT(5): worst case,
++	 * bin 0x04, bin 0x05. The bit position is the raw fuse value
++	 * (0x0300624c bits[15:8]); bit 0 is reserved for the worst case.
++	 * Both cluster tables declare the same bin set on purpose --
++	 * `nvmem-cpufreq-a733-speed-bin-from-efuse` ANDs the per-CPU masks.
++	 */
++	cluster1_opp: opp-table-cluster1 {
++		compatible = "allwinner,sun60i-a733-operating-points";
++		nvmem-cells = <&cpu_speed_grade>;
++		opp-shared;
++
++		/*
++		 * Two points below the vendor's floor. The vendor's lowest is
++		 * 416 MHz; these are ours, and they exist because the whole
++		 * ladder from 416 MHz down to 1196 MHz already runs at the same
++		 * 800 mV in every one of the nine bins -- so going lower asks
++		 * for no voltage that is not already being supplied, and buys
++		 * idle power. Nothing above 2002 MHz is proposed: that would
++		 * need a voltage no bin documents.
++		 *
++		 * 494 MHz = 26 MHz x N=19 with EXT_DIVP /1; its VCO is 494 MHz,
++		 * inside the 480-2260 MHz window UM 5.1.10.6 documents, with
++		 * 14 MHz to spare at the bottom.
++		 * 247 MHz = the same N=19 with EXT_DIVP /2. UM 5.1.10.13 names
++		 * exactly this case for the post-divider: below 288 MHz output
++		 * the factor P may be used to divide the clock down to the
++		 * frequency that is wanted.
++		 *
++		 * Both are unvalidated by the vendor at any frequency, which is
++		 * why they are called out here rather than buried in the table.
++		 * DCDC5 also feeds the DSU at 780 MHz; these points change no
++		 * voltage, so they cannot starve it.
++		 */
++		opp-247000000 {
++			opp-hz = /bits/ 64 <247000000>;
++			opp-supported-hw = <0x31>;
++			opp-microvolt = <800000 800000 1050000>;
++			opp-microvolt-speed4 = <800000 800000 1050000>;
++			opp-microvolt-speed5 = <800000 800000 1050000>;
++		};
++
++		opp-494000000 {
++			opp-hz = /bits/ 64 <494000000>;
++			opp-supported-hw = <0x31>;
++			opp-microvolt = <800000 800000 1050000>;
++			opp-microvolt-speed4 = <800000 800000 1050000>;
++			opp-microvolt-speed5 = <800000 800000 1050000>;
++		};
++
++		opp-416000000 {
++			opp-hz = /bits/ 64 <416000000>;
++			opp-supported-hw = <0x31>;
++			opp-microvolt = <800000 800000 1050000>;
++			opp-microvolt-speed4 = <800000 800000 1050000>;
++			opp-microvolt-speed5 = <800000 800000 1050000>;
++		};
++
++		opp-780000000 {
++			opp-hz = /bits/ 64 <780000000>;
++			opp-supported-hw = <0x31>;
++			opp-microvolt = <800000 800000 1050000>;
++			opp-microvolt-speed4 = <800000 800000 1050000>;
++			opp-microvolt-speed5 = <800000 800000 1050000>;
++		};
++
++		opp-1014000000 {
++			opp-hz = /bits/ 64 <1014000000>;
++			opp-supported-hw = <0x31>;
++			opp-microvolt = <800000 800000 1050000>;
++			opp-microvolt-speed4 = <800000 800000 1050000>;
++			opp-microvolt-speed5 = <800000 800000 1050000>;
++		};
++
++		opp-1196000000 {
++			opp-hz = /bits/ 64 <1196000000>;
++			opp-supported-hw = <0x31>;
++			opp-microvolt = <800000 800000 1050000>;
++			opp-microvolt-speed4 = <800000 800000 1050000>;
++			opp-microvolt-speed5 = <800000 800000 1050000>;
++		};
++
++		opp-1404000000 {
++			opp-hz = /bits/ 64 <1404000000>;
++			opp-supported-hw = <0x31>;
++			opp-microvolt = <850000 850000 1050000>;
++			opp-microvolt-speed4 = <800000 800000 1050000>;
++			opp-microvolt-speed5 = <800000 800000 1050000>;
++		};
++
++		opp-1508000000 {
++			opp-hz = /bits/ 64 <1508000000>;
++			opp-supported-hw = <0x31>;
++			opp-microvolt = <900000 900000 1050000>;
++			opp-microvolt-speed4 = <820000 820000 1050000>;
++			opp-microvolt-speed5 = <800000 800000 1050000>;
++		};
++
++		opp-1612000000 {
++			opp-hz = /bits/ 64 <1612000000>;
++			opp-supported-hw = <0x31>;
++			opp-microvolt = <950000 950000 1050000>;
++			opp-microvolt-speed4 = <840000 840000 1050000>;
++			opp-microvolt-speed5 = <820000 820000 1050000>;
++		};
++
++		opp-1716000000 {
++			opp-hz = /bits/ 64 <1716000000>;
++			opp-supported-hw = <0x31>;
++			opp-microvolt = <1000000 1000000 1050000>;
++			opp-microvolt-speed4 = <870000 870000 1050000>;
++			opp-microvolt-speed5 = <850000 850000 1050000>;
++		};
++
++		opp-1794000000 {
++			opp-hz = /bits/ 64 <1794000000>;
++			opp-supported-hw = <0x31>;
++			opp-microvolt = <1050000 1050000 1050000>;
++			opp-microvolt-speed4 = <920000 920000 1050000>;
++			opp-microvolt-speed5 = <900000 900000 1050000>;
++		};
++
++		opp-1898000000 {
++			opp-hz = /bits/ 64 <1898000000>;
++			opp-supported-hw = <0x31>;
++			opp-microvolt = <1050000 1050000 1050000>;
++			opp-microvolt-speed4 = <970000 970000 1050000>;
++			opp-microvolt-speed5 = <940000 940000 1050000>;
++		};
++
++		opp-1950000000 {
++			opp-hz = /bits/ 64 <1950000000>;
++			opp-supported-hw = <0x31>;
++			opp-microvolt = <1050000 1050000 1050000>;
++			opp-microvolt-speed4 = <1000000 1000000 1050000>;
++			opp-microvolt-speed5 = <970000 970000 1050000>;
++		};
++
++		opp-2002000000 {
++			opp-hz = /bits/ 64 <2002000000>;
++			opp-supported-hw = <0x31>;
++			opp-microvolt = <1050000 1050000 1050000>;
++			opp-microvolt-speed4 = <1050000 1050000 1050000>;
++			opp-microvolt-speed5 = <1000000 1000000 1050000>;
++		};
++
++	};
++};
++
++/*
++ * CPU DVFS: OPP tables + cpu-supply.
++ *
++ * Attached by label instead of edited into the cpu@N nodes, which patch `arm64-dts-a733-cpu-clocks-from-cpu-ccu`
++ * has just changed in place to add the CPU-PLL mux clocks. Two patches
++ * inserting a few lines apart into one node is how a series stops applying.
++ * This is also the shape a board file would use if the cpu nodes lived in a
++ * .dtsi, so nothing here is unusual to read.
++ *
++ * cpu-supply sits on cpu@0 and cpu@600 only, and that is not an omission:
++ * cpufreq-dt calls dt_cpufreq_early_init() per CPU ascending
++ * (cpufreq-dt.c:287) and every CPU already covered by a policy returns
++ * immediately via cpufreq_dt_find_data(), so find_supply_name()
++ * (cpufreq-dt.c:63) only ever looks at cpu0 and cpu6. opp-shared is what puts
++ * cpu1..cpu5 into cpu0's policy (dev_pm_opp_of_get_sharing_cpus(), opp/of.c)
++ * -- cpu-map does not, it feeds the scheduler topology. The regulator then
++ * belongs to the shared OPP table, not to the cpu node (_opp_set_regulators(),
++ * opp/core.c:2241).
++ *
++ * operating-points-v2 has to be on ALL eight CPUs even so:
++ * dev_pm_opp_of_get_sharing_cpus() iterates every possible CPU and bails out
++ * with -ENOENT ("Couldn't find opp node") if one of them lacks the phandle.
++ */
++&cpu0 {
++	operating-points-v2 = <&cluster0_opp>;
++	cpu-supply = <&reg_dcdc5>;
++};
++
++&cpu1 {
++	operating-points-v2 = <&cluster0_opp>;
++};
++
++&cpu2 {
++	operating-points-v2 = <&cluster0_opp>;
++};
++
++&cpu3 {
++	operating-points-v2 = <&cluster0_opp>;
++};
++
++&cpu4 {
++	operating-points-v2 = <&cluster0_opp>;
++};
++
++&cpu5 {
++	operating-points-v2 = <&cluster0_opp>;
++};
++
++&cpu6 {
++	operating-points-v2 = <&cluster1_opp>;
++	cpu-supply = <&reg_dcdc3>;
++};
++
++&cpu7 {
++	operating-points-v2 = <&cluster1_opp>;
++};
+-- 
+2.45.0

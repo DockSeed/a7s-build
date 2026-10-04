@@ -1,0 +1,493 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] PCI: sun60i-a733: deliver the root port's AER, PME and bwctrl interrupt
+
+The root port binds three port services -- PME, AER and bwctrl -- and all
+three sat on one MSI vector that never fired. Measured on the 6 GB board on
+2026-09-21 (Gen3 x1 NVMe under load): Root Status shows
+CERcvd+ MultCERcvd+, Error Source ERR_COR 0100, Root Command reports every
+class, and the vector stayed at 0 on every CPU with aer_dev_correctable at 0.
+
+WHY THE MSI NEVER COMES
+
+The DesignWare core does not send its own root port's events as an MSI. It
+raises them on sideband outputs, each in two flavours (UM V1.00 18.3.8.62,
+SII_INT_0, printed pages 1229-1236):
+
+  cfg_aer_rc_err_msi / _int     bit 2 / bit 1
+  cfg_pme_msi / _int            bit 4 / bit 3
+  hp_msi / hp_int               bit 15 / bit 14
+  cfg_link_auto_bw_msi / _int   bit 17 / bit 16
+  cfg_bw_mgt_msi / _int         bit 19 / bit 18
+
+The _msi output is a one-cycle pulse while the port's MSI is enabled; it
+fires regardless of the vector's mask bit, and honouring that mask is the
+application's job. The _int output is a level while INTx is enabled;
+for AER the UM says outright that it is for use with MSI/MSI-X disabled,
+and points to cfg_aer_rc_err_msi otherwise. Either way the SoC has to turn
+the output into an interrupt, and the A733 has one path for it: SII_INT_0,
+unmasked through SII_INT_MASK_0 (18.3.8.60, 1 = not masked, reset 0), onto
+PCIE0_SII, INTID 184 = SPI 152 (chapter 12).
+The MSI receiver terminates inbound MSI that arrives over the link (Table
+18-4); the port's own pulse never goes there, which is what the silicon
+showed.
+
+Another DesignWare integration in the tree records the same fact:
+drivers/pci/quirks.c turns MSI off on the Tegra194 root ports ("Tegra's PCIe
+Root Ports don't generate MSI interrupts for PME and AER events; instead only
+INTx interrupts are generated").
+
+THE FIX
+
+The root port runs on INTx, and the SoC's SII line is its INTx:
+
+ - The DT gains the PCIE0_SII interrupt, a legacy-interrupt-controller
+   child, and a node for the root port itself (pcie@0,0, reg 00:00.0) whose
+   interrupts-extended names hwirq 0 of that controller. of_irq_parse_pci()
+   takes a device's own node first (drivers/pci/of.c, of_irq_parse_one()),
+   so the root port resolves there. The two "of_irq_parse_pci: failed with
+   rc=-22" lines came from the root port and the NVMe walking up to the GIC
+   with a one-cell PCI pin; the root port's is gone.
+ - There is deliberately no host-level interrupt-map. With one, the
+   endpoint's INTA resolved to the same hwirq -- of_irq_parse_pci() builds
+   the lookup address from the root port's devfn -- and an INTx-only
+   endpoint or pci=nomsi would have received an interrupt that fires only on
+   root-port events. Without it an endpoint's lookup fails as before and
+   dev->irq stays 0: a clean failure instead of a hang.
+ - The driver chains the SII line into a one-entry domain. Unmasking hwirq 0
+   opens the five _int bits above. The handler clears the latch, then
+   dispatches, and after each pass re-reads the root port's own status and
+   enable pairs through the DBI -- AER Root Error Status against Root Error
+   Command, Root Status PME against Root Control, Link Status LBMS/LABS
+   against Link Control -- and dispatches again while one is pending, at
+   most four passes. The UM does not say whether an SII_INT_0 bit follows
+   its output's level or latches only a rising edge. If edge-only, two
+   overlapping events keep the level high with no second edge (AER writes
+   back only the Root Error Status bits it read), and a handler that trusts
+   the latch alone would go deaf until reboot. The re-read makes it correct
+   under both; which one the silicon has is measured on the board.
+ - The port's MSI and MSI-X capabilities are unlinked from its capability
+   list with dw_pcie_remove_capability(). portdrv puts any port that offers
+   MSI on MSI, and then the core only pulses outputs nobody listens to.
+   Doing it in the driver scopes it to this compatible; a PCI quirk would
+   have to key on the port's ID, 1f6d:abcd, which is a placeholder.
+
+PREMISE, MEASURED
+
+On the current image (without this patch), 2026-09-21:
+SII_INT_0 (0x06400e08) = 0x200A0004 with SII_INT_MASK_0 = 0: bit 2
+(cfg_aer_rc_err_msi) and bits 17/19 (the bandwidth _msi pulses) latched while
+masked, and AER Root Error Status = 0x3. The outputs reach the SII latch;
+nothing had opened the mask or claimed the line.
+
+WHAT THIS DOES NOT DO
+
+Downstream INTx stays unserved, as before. SII_INT_0 latches Assert_INTx and
+Deassert_INTx as separate pulses (bits 5-12), so with both latched in one
+read the state of the wire is unknowable. MSI and MSI-X endpoints -- the NVMe
+included -- are untouched: they stay on the DWC MSI receiver, SPI 153.
+
+VENDOR
+
+The vendor BSP (pcie-sunxi-rc.c / pcie-sunxi-plat.c, read as a hint) requests
+the same SII line but unmasks only the Assert_INTx pulses and treats each as
+an edge, ignoring Deassert, so a second interrupt raised before the first is
+acknowledged is lost. It unmasks no root-port event bit and leaves MSI on the
+port, so its AER and PME are as deaf as ours were. Its DT carries a four-pin
+host-level interrupt-map, which this patch leaves out on purpose (above); the
+register semantics come from the UM, not from it. A running vendor 6.6 kernel on an A733 board holds the same line as
+"pcie-sii" on SPI 152 -- a hint that the wiring matches, not a source.
+
+VERIFIED
+
+Applies at fuzz 0 and builds (compile-check, driver and dtb). The dtb carries
+interrupts SPI 152 + 153 named "sii", "msi", no interrupt-map or
+#interrupt-cells on the host node, and pcie@0,0 with interrupts-extended to
+the legacy-interrupt-controller, hwirq 0. NOT hardware-proven. The
+observables that prove or falsify it, on the board with the NVMe:
+/proc/interrupts shows "A733-PCIe-INTx 0 Level ... PCIe PME, aerdrv, PCIe
+bwctrl"; SII_INT_MASK_0 reads 0x5400a; after clearing the root port's
+Correctable Error Status and generating read load, that line's count and
+aer_dev_correctable both rise.
+
+Assisted-by: Claude
+
+diff --git a/drivers/pci/controller/dwc/pcie-sun60i-a733.c b/drivers/pci/controller/dwc/pcie-sun60i-a733.c
+--- a/drivers/pci/controller/dwc/pcie-sun60i-a733.c
++++ b/drivers/pci/controller/dwc/pcie-sun60i-a733.c
+@@ -12,9 +12,11 @@
+  *
+  *   UDS + 0x0c00  PCIE_LTSSM_ENABLE   bit0 starts link training,
+  *                                     [7:4] device type, reset value 4 = RC
++ *   UDS + 0x0e00  SII_INT_MASK_0      1 passes an SII_INT_0 bit to the SII line
++ *   UDS + 0x0e08  SII_INT_0           the root port's own event outputs, W1C
+  *   UDS + 0x0e0c  SII_INT_1           bit0 SMLH link up, bit1 RDLH link up
+  *
+- * Both documented in the A733 UM V1.00, PCIe chapter 18.3, which tabulates the
++ * All documented in the A733 UM V1.00, PCIe chapter 18.3, which tabulates the
+  * whole User Defined Space. The DBI base itself is NOT where the UM prints it:
+  * the module base in the memory map is the UDS at 0x06400000, and the DBI sits
+  * 0x400000 below at 0x06000000 -- measured on hardware,
+@@ -36,6 +38,8 @@
+ #include <linux/delay.h>
+ #include <linux/gpio/consumer.h>
+ #include <linux/io.h>
++#include <linux/irqchip/chained_irq.h>
++#include <linux/irqdomain.h>
+ #include <linux/module.h>
+ #include <linux/moduleparam.h>
+ #include <linux/of.h>
+@@ -56,6 +60,44 @@
+ #define  SUN60I_A733_PCIE_RDLH_LINK_UP		BIT(1)
+ 
+ /*
++ * The System Information Interface: the DesignWare core's sideband outputs,
++ * latched by Allwinner's glue into write-1-to-clear status registers and ORed
++ * onto one GIC line, PCIE0_SII (UM V1.00 18.3.8.60-18.3.8.67; INTID 184 =
++ * SPI 152 in chapter 12). A mask bit of 1 passes its status bit to that line,
++ * 0 blocks it, and every mask resets to 0.
++ */
++#define SUN60I_A733_PCIE_SII_INT_MASK_0		0x0e00
++#define SUN60I_A733_PCIE_SII_INT_MASK_1		0x0e04
++#define SUN60I_A733_PCIE_SII_INT_0		0x0e08
++#define SUN60I_A733_PCIE_SII_INT_MASK_2		0x0e10
++#define SUN60I_A733_PCIE_SII_INT_MASK_3		0x0e14
++
++/*
++ * The root port's own interrupt, in its INTx form: the level outputs the core
++ * asserts while the port's Command register has INTx enabled and the event's
++ * status and enable bits are both set -- AER (Root Error Status), PME (Root
++ * Status), hot-plug (Slot Status) and the two link-bandwidth notifications
++ * (Link Status). SII_INT_0 bits 1, 3, 14, 16 and 18, UM V1.00 18.3.8.62.
++ */
++#define  SUN60I_A733_PCIE_SII_AER_RC_ERR_INT	BIT(1)
++#define  SUN60I_A733_PCIE_SII_PME_INT		BIT(3)
++#define  SUN60I_A733_PCIE_SII_HP_INT		BIT(14)
++#define  SUN60I_A733_PCIE_SII_LINK_AUTO_BW_INT	BIT(16)
++#define  SUN60I_A733_PCIE_SII_BW_MGT_INT		BIT(18)
++/*
++ * Passes through the root port's services per SII interrupt before the handler
++ * gives up; see sun60i_a733_pcie_rp_pending().
++ */
++#define SUN60I_A733_PCIE_SII_MAX_PASSES		4
++
++#define  SUN60I_A733_PCIE_SII_RP_EVENTS				\
++	(SUN60I_A733_PCIE_SII_AER_RC_ERR_INT |			\
++	 SUN60I_A733_PCIE_SII_PME_INT |				\
++	 SUN60I_A733_PCIE_SII_HP_INT |				\
++	 SUN60I_A733_PCIE_SII_LINK_AUTO_BW_INT |		\
++	 SUN60I_A733_PCIE_SII_BW_MGT_INT)
++
++/*
+  * PCIe CEM 3.0: at least 100 ms between the reference clock being valid and
+  * PERST# being released, and the spec's T_RRS before the first config request.
+  * dw_pcie_wait_for_link() covers the second; this covers the first.
+@@ -90,6 +132,11 @@
+ 	struct phy		*phy;
+ 	struct gpio_desc	*perst;
+ 	struct regulator	*vpcie3v3;
++	struct irq_domain	*rp_domain;
++	raw_spinlock_t		sii_lock;
++	int			sii_irq;
++	u8			exp_cap;
++	u16			aer_cap;
+ };
+ 
+ static struct sun60i_a733_pcie *to_sun60i_a733_pcie(struct dw_pcie *pci)
+@@ -144,12 +191,225 @@
+ }
+ 
+ /*
+- * Empty, and required: dw_pcie_host_init() dereferences pp->ops without
+- * checking it (pcie-designware-host.c, `if (pp->ops->init)`), so a NULL here is
+- * an oops during probe rather than a default. Nothing in this controller needs
+- * a host callback -- the core's own init path does everything.
++ * The root port's event interrupt.
++ *
++ * The DesignWare core does not deliver its own root port's AER, PME or
++ * link-bandwidth events as an MSI. It signals them on sideband outputs, in two
++ * flavours: a one-cycle "_msi" pulse while the port's MSI capability is
++ * enabled, and a level "_int" while INTx is enabled (UM V1.00 18.3.8.62, and
++ * for the AER output the UM says it is for use with MSI/MSI-X
++ * disabled, else cfg_aer_rc_err_msi is used). Turning either flavour into
++ * an interrupt is left to the SoC, and on the A733 the only path is SII_INT_0
++ * onto the PCIE0_SII line. Nothing turns the pulse into a write to the MSI
++ * receiver: measured on 2026-09-21, with the port's AER, PME and bwctrl
++ * services on an MSI vector, Root Status recorded correctable errors and the
++ * vector never fired.
++ *
++ * So the root port runs on INTx. Its Interrupt Pin is INTA (dw_pcie_setup_rc()
++ * writes 1), and the root port's own DT node names hwirq 0 of the one-entry
++ * domain below as its interrupt; the SII handler feeds that hwirq from the
++ * five level outputs. The port's MSI and MSI-X capabilities are unlinked from
++ * its capability list, because a port that advertises MSI is put on MSI by
++ * portdrv, and the core then only pulses outputs nobody listens to.
++ *
++ * Downstream INTx is deliberately not served. SII_INT_0 latches the
++ * Assert_INTx and Deassert_INTx messages as separate one-cycle pulses; with
++ * both latched in one read, their order -- whether the line is up or down --
++ * is lost. There is no host-level interrupt-map, so an INTx-only endpoint gets
++ * no IRQ rather than one that never fires. MSI and MSI-X endpoints are
++ * unaffected.
++ */
++
++/*
++ * Whether the root port still has an event its services have not taken: the
++ * same status-and-enable pairs that drive the core's _int outputs, read back
++ * from the port's own config space.
++ *
++ * Why this is needed: the UM does not say whether an SII_INT_0 bit follows its
++ * output's level or latches only its rising edge. If it is edge-only, a level
++ * that stays high produces no second edge. That happens as soon as two events
++ * overlap -- AER, for one, writes back only the Root Error Status bits it read,
++ * so an error class arriving in between keeps cfg_aer_rc_err_int high -- and
++ * the port would go deaf until reboot. Re-reading the source after each pass
++ * makes the handler correct under both behaviours; which one the silicon has
++ * is still to be measured.
+  */
++static bool sun60i_a733_pcie_rp_pending(struct sun60i_a733_pcie *pcie)
++{
++	struct dw_pcie *pci = &pcie->pci;
++	u32 cmd, sta, lnk;
++
++	if (pcie->aer_cap) {
++		cmd = dw_pcie_readl_dbi(pci, pcie->aer_cap + PCI_ERR_ROOT_COMMAND);
++		sta = dw_pcie_readl_dbi(pci, pcie->aer_cap + PCI_ERR_ROOT_STATUS);
++		if ((sta & PCI_ERR_ROOT_COR_RCV) &&
++		    (cmd & PCI_ERR_ROOT_CMD_COR_EN))
++			return true;
++		if ((sta & PCI_ERR_ROOT_UNCOR_RCV) &&
++		    (cmd & (PCI_ERR_ROOT_CMD_NONFATAL_EN |
++			    PCI_ERR_ROOT_CMD_FATAL_EN)))
++			return true;
++	}
++
++	if (pcie->exp_cap) {
++		cmd = dw_pcie_readw_dbi(pci, pcie->exp_cap + PCI_EXP_RTCTL);
++		sta = dw_pcie_readl_dbi(pci, pcie->exp_cap + PCI_EXP_RTSTA);
++		if ((sta & PCI_EXP_RTSTA_PME) && (cmd & PCI_EXP_RTCTL_PMEIE))
++			return true;
++
++		/* Link Control in the low half, Link Status in the high. */
++		lnk = dw_pcie_readl_dbi(pci, pcie->exp_cap + PCI_EXP_LNKCTL);
++		if (((lnk >> 16) & PCI_EXP_LNKSTA_LBMS) &&
++		    (lnk & PCI_EXP_LNKCTL_LBMIE))
++			return true;
++		if (((lnk >> 16) & PCI_EXP_LNKSTA_LABS) &&
++		    (lnk & PCI_EXP_LNKCTL_LABIE))
++			return true;
++	}
++
++	return false;
++}
++
++static void sun60i_a733_pcie_sii_handler(struct irq_desc *desc)
++{
++	struct sun60i_a733_pcie *pcie = irq_desc_get_handler_data(desc);
++	struct irq_chip *chip = irq_desc_get_chip(desc);
++	int pass;
++
++	chained_irq_enter(chip, desc);
++
++	if (readl(pcie->app + SUN60I_A733_PCIE_SII_INT_0) &
++	    readl(pcie->app + SUN60I_A733_PCIE_SII_INT_MASK_0) &
++	    SUN60I_A733_PCIE_SII_RP_EVENTS) {
++		for (pass = 0; pass < SUN60I_A733_PCIE_SII_MAX_PASSES; pass++) {
++			/*
++			 * Clear the latch, then look at the source, then
++			 * dispatch: an event that arrives after the look
++			 * latches anew and raises the line again, so none
++			 * falls between the two.
++			 */
++			writel(SUN60I_A733_PCIE_SII_RP_EVENTS,
++			       pcie->app + SUN60I_A733_PCIE_SII_INT_0);
++			if (pass && !sun60i_a733_pcie_rp_pending(pcie))
++				break;
++			generic_handle_domain_irq(pcie->rp_domain, 0);
++		}
++		if (pass == SUN60I_A733_PCIE_SII_MAX_PASSES &&
++		    sun60i_a733_pcie_rp_pending(pcie))
++			dev_warn_ratelimited(pcie->pci.dev,
++					     "root port event still pending after %d passes\n",
++					     pass);
++	}
++
++	chained_irq_exit(chip, desc);
++}
++
++static void sun60i_a733_pcie_sii_update(struct sun60i_a733_pcie *pcie,
++					bool enable)
++{
++	unsigned long flags;
++	u32 val;
++
++	raw_spin_lock_irqsave(&pcie->sii_lock, flags);
++	val = readl(pcie->app + SUN60I_A733_PCIE_SII_INT_MASK_0);
++	if (enable)
++		val |= SUN60I_A733_PCIE_SII_RP_EVENTS;
++	else
++		val &= ~SUN60I_A733_PCIE_SII_RP_EVENTS;
++	writel(val, pcie->app + SUN60I_A733_PCIE_SII_INT_MASK_0);
++	raw_spin_unlock_irqrestore(&pcie->sii_lock, flags);
++}
++
++static void sun60i_a733_pcie_intx_mask(struct irq_data *d)
++{
++	sun60i_a733_pcie_sii_update(irq_data_get_irq_chip_data(d), false);
++}
++
++static void sun60i_a733_pcie_intx_unmask(struct irq_data *d)
++{
++	sun60i_a733_pcie_sii_update(irq_data_get_irq_chip_data(d), true);
++}
++
++static struct irq_chip sun60i_a733_pcie_intx_chip = {
++	.name		= "A733-PCIe-INTx",
++	.irq_mask	= sun60i_a733_pcie_intx_mask,
++	.irq_unmask	= sun60i_a733_pcie_intx_unmask,
++	.flags		= IRQCHIP_SKIP_SET_WAKE | IRQCHIP_MASK_ON_SUSPEND,
++};
++
++static int sun60i_a733_pcie_intx_map(struct irq_domain *domain,
++				     unsigned int irq, irq_hw_number_t hwirq)
++{
++	irq_set_chip_and_handler(irq, &sun60i_a733_pcie_intx_chip,
++				 handle_level_irq);
++	irq_set_chip_data(irq, domain->host_data);
++
++	return 0;
++}
++
++static const struct irq_domain_ops sun60i_a733_pcie_intx_domain_ops = {
++	.map = sun60i_a733_pcie_intx_map,
++	.xlate = irq_domain_xlate_onecell,
++};
++
++static int sun60i_a733_pcie_host_init(struct dw_pcie_rp *pp)
++{
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
++	struct sun60i_a733_pcie *pcie = to_sun60i_a733_pcie(pci);
++	struct device *dev = pci->dev;
++	struct device_node *intc;
++
++	/*
++	 * Every mask closed and every root-port status cleared before the
++	 * line is live: the masks reset to 0, but a warm start finds whatever
++	 * the boot loader left behind.
++	 */
++	writel(0, pcie->app + SUN60I_A733_PCIE_SII_INT_MASK_0);
++	writel(0, pcie->app + SUN60I_A733_PCIE_SII_INT_MASK_1);
++	writel(0, pcie->app + SUN60I_A733_PCIE_SII_INT_MASK_2);
++	writel(0, pcie->app + SUN60I_A733_PCIE_SII_INT_MASK_3);
++	writel(SUN60I_A733_PCIE_SII_RP_EVENTS,
++	       pcie->app + SUN60I_A733_PCIE_SII_INT_0);
++
++	/* See the root port's event interrupt above: it runs on INTx. */
++	dw_pcie_remove_capability(pci, PCI_CAP_ID_MSI);
++	dw_pcie_remove_capability(pci, PCI_CAP_ID_MSIX);
++
++	pcie->exp_cap = dw_pcie_find_capability(pci, PCI_CAP_ID_EXP);
++	pcie->aer_cap = dw_pcie_find_ext_capability(pci, PCI_EXT_CAP_ID_ERR);
++
++	intc = of_get_child_by_name(dev->of_node, "legacy-interrupt-controller");
++	if (!intc)
++		return dev_err_probe(dev, -EINVAL,
++				     "no legacy-interrupt-controller node\n");
++
++	/* One source, the root port: hwirq 0, and nothing else can map. */
++	pcie->rp_domain = irq_domain_create_linear(of_fwnode_handle(intc), 1,
++						   &sun60i_a733_pcie_intx_domain_ops,
++						   pcie);
++	of_node_put(intc);
++	if (!pcie->rp_domain)
++		return dev_err_probe(dev, -ENOMEM, "INTx domain\n");
++
++	irq_set_chained_handler_and_data(pcie->sii_irq,
++					 sun60i_a733_pcie_sii_handler, pcie);
++
++	return 0;
++}
++
++static void sun60i_a733_pcie_host_deinit(struct dw_pcie_rp *pp)
++{
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
++	struct sun60i_a733_pcie *pcie = to_sun60i_a733_pcie(pci);
++
++	writel(0, pcie->app + SUN60I_A733_PCIE_SII_INT_MASK_0);
++	irq_set_chained_handler_and_data(pcie->sii_irq, NULL, NULL);
++	irq_domain_remove(pcie->rp_domain);
++}
++
+ static const struct dw_pcie_host_ops sun60i_a733_pcie_host_ops = {
++	.init	= sun60i_a733_pcie_host_init,
++	.deinit	= sun60i_a733_pcie_host_deinit,
+ };
+ 
+ static const struct dw_pcie_ops sun60i_a733_dw_pcie_ops = {
+@@ -274,6 +534,11 @@
+ 	if (IS_ERR(pcie->app))
+ 		return PTR_ERR(pcie->app);
+ 
++	raw_spin_lock_init(&pcie->sii_lock);
++	pcie->sii_irq = platform_get_irq_byname(pdev, "sii");
++	if (pcie->sii_irq < 0)
++		return pcie->sii_irq;
++
+ 	for (i = 0; i < ARRAY_SIZE(pcie->clks); i++)
+ 		pcie->clks[i].id = sun60i_a733_pcie_clks[i];
+ 	ret = devm_clk_bulk_get(dev, ARRAY_SIZE(pcie->clks), pcie->clks);
+diff --git a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -2015,8 +2015,14 @@
+ 			 */
+ 			ranges = <0x81000000 0x0 0x21000000 0x0 0x21000000 0x0 0x01000000>,
+ 				 <0x82000000 0x0 0x22000000 0x0 0x22000000 0x0 0x06000000>;
+-			interrupts = <GIC_SPI 153 IRQ_TYPE_LEVEL_HIGH>;
+-			interrupt-names = "msi";
++			/*
++			 * PCIE0_SII (INTID 184) carries the root port's own AER,
++			 * PME and link events; PCIE0_MSI (INTID 185) is the DWC
++			 * MSI receiver for the endpoints. UM V1.00 chapter 12.
++			 */
++			interrupts = <GIC_SPI 152 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SPI 153 IRQ_TYPE_LEVEL_HIGH>;
++			interrupt-names = "sii", "msi";
+ 			clocks = <&ccu CLK_PCIE_AUX>,
+ 				 <&ccu CLK_PCIE_AXI_SLV>,
+ 				 <&ccu CLK_BUS_ITS_PCIE0_ACLK>,
+@@ -2041,6 +2047,35 @@
+ 			vpcie3v3-supply = <&reg_pcie_pwr>;
+ 			power-domains = <&pck600 PD_PCIE>;
+ 			status = "okay";
++
++			/*
++			 * The SII demultiplexer. Its only source is the root
++			 * port's own event interrupt (AER, PME, link bandwidth),
++			 * hwirq 0; the driver says why that runs on INTx.
++			 */
++			pcie_intc: legacy-interrupt-controller {
++				interrupt-controller;
++				#address-cells = <0>;
++				#interrupt-cells = <1>;
++			};
++
++			/*
++			 * The root port, 00:00.0, named so its interrupt comes
++			 * from its own node rather than from a host-level
++			 * interrupt-map. There is deliberately no such map:
++			 * with one, an endpoint's INTA resolved to this same
++			 * hwirq, which only root-port events ever raise. Without
++			 * one an INTx-only endpoint fails to get an IRQ, loudly,
++			 * because downstream INTx has no source on this SoC.
++			 */
++			pcie@0,0 {
++				device_type = "pci";
++				reg = <0x0 0x0 0x0 0x0 0x0>;
++				#address-cells = <3>;
++				#size-cells = <2>;
++				ranges;
++				interrupts-extended = <&pcie_intc 0>;
++			};
+ 		};
+ 
+ 		/*

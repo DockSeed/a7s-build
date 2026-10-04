@@ -1,0 +1,3 @@
+# a7s-build: Debian ships nftables.service disabled, and so does the image
+# (its reload flushes every ruleset).
+disable nftables.service

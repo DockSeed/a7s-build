@@ -1,0 +1,3 @@
+# A DRM connector changed state: let a7s-greeter-outputs light it if the
+# LightDM greeter is on screen -- see /usr/libexec/a7s-greeter-outputs.
+ACTION=="change", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", TAG+="systemd", ENV{SYSTEMD_WANTS}+="a7s-greeter-outputs.service"

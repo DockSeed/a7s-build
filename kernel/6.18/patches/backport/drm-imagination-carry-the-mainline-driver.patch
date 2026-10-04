@@ -1,0 +1,3160 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] drm/imagination: carry the mainline driver instead of 6.18.36's
+
+The code is mainline's (Imagination Technologies and the drm/imagination
+contributors, see the mainline history of drivers/gpu/drm/imagination/); this
+patch only carries it.
+
+Replaces drivers/gpu/drm/imagination/ wholesale with the current mainline
+directory (79 files; mainline 551c722f4080, v7.3-rc5-37, read 2026-09-30).
+60 commits were ahead of what 6.18.36 ships at the read of 2026-09-08; three
+more have merged since:
+
+    7b824c293a6b drm/imagination: Propagate map failures correctly from
+                 pvr_mmu_map_sgl()
+    0a8224058a58 drm/imagination: Fix page count for page table for map()
+                 interface (Cc stable: the page-table demand was computed
+                 without the GPU VA, so map() fails at page-table boundaries)
+    45585c3aa285 drm/imagination: clamp freelist reconstruction requests
+
+They touch pvr_free_list.c, pvr_mmu.c, pvr_mmu.h and pvr_vm.c and nothing
+else; include/uapi/drm/pvr_drm.h is byte-identical to 6.18.54's, and no
+commit to it has merged since the read of 2026-09-08. Nothing else merged to
+drivers/gpu/drm/imagination/ in that window.
+
+Regenerated against 6.18.53 (3-way rebase). Stable 6.18.42 and 6.18.53
+backported eight of the mainline commits this directory already carries
+(6253bb56bb2e, c45fafa69fe3, b983a35dad37, c88fdbf3da26, e2c29d51c0f6,
+943fa73ea0ef, 6d40846b8aa3, 2d607646909a), so that diff shrank to 2952 lines
+over 42 files. The one conflict, pvr_queue.c, resolved to the carry copy: it
+holds every line stable adds to pvr_queue.c between 6.18.36 and 6.18.53,
+except one comment that mainline itself rewrote later.
+
+Regenerated on 2026-09-30 against 6.18.54 with the three commits above: the
+directory is now the mainline one byte for byte, and the diff is 3070 lines
+over 43 files (pvr_mmu.h joins the set; the rest of the change is the three
+commits). The kernel-side shims (`kernel-compat-shims-for-the-mainline-powervr-driver`) did not change.
+
+WHY THE WHOLE DRIVER AND NOT A HANDFUL OF FIXES. Seven were carried first
+and that was the wrong size of answer. This project's earlier Armbian-based port
+of this board had already found the gaps in this driver, and the driver
+states them itself -- in the tree we were shipping:
+
+    /* @FIXME - hardcoding of numbers here is intended as an intermediate step
+     * so the UAPI can be fixed, but requires a refactor in the future to store
+     * them in a more appropriate location */
+    static const u32 umd_quirks_musthave[] = { 47217, 49927, ...
+
+pvr_drv.c says that twice, for quirks and for enhancements, and pvr_fw.c:388
+marks the counter-dump path "Currently unsupported". Those are not defects to
+be patched around one at a time; they are an unfinished driver saying so, and
+upstream has since done the work -- pvr_check.h, the reordered
+pvr_device_features, the BXM-4-64 MC1 promotion, "Warn or error on unsupported
+hardware", the gpuid parameter and its KUnit test.
+
+WHAT ARRIVES THAT WE DID NOT HAVE. Beyond the seven already carried: context
+reset notification handling and the missing rogue reset reasons -- the recovery
+path that was never seen running on this board -- "Don't timeout job if its
+fence has been signaled", the FW-initialised state accessors, the power-off and
+suspend-path fixes, and TRACE POINTS. That last one is not a nicety here: the
+main obstacle in investigating the load hang was that it could not see what the
+GPU was doing.
+
+WHAT IT COSTS, measured rather than asserted. Three things mainline uses do not
+exist here in the expected form, and all three are handled in `kernel-compat-shims-for-the-mainline-powervr-driver`, which is a
+separate patch precisely so this one stays a clean import: an optional GFP
+argument in slab.h, a pwrseq rename, and a 26-line drm_gpuvm function built on
+primitives already present. An earlier estimate framed that cost as "core
+kernel surgery in three subsystems" -- wrong, and corrected by measuring it.
+`kernel-compat-shims-for-the-mainline-powervr-driver` carries the honest version, including which of its hunks is actually
+risky.
+
+⚠ WHAT THIS IS NOT. It is not proven better than what it replaces, and it
+cannot be yet: both drivers pass every test this tree can run today, because the
+load hang has never been reproduced here. It is not a fix for that hang. And it
+is a 3070-line diff over 43 files -- reviewable as an import, not as a change
+set, which is the honest way to read it.
+
+⚠ AND OUR SERIES NOW DEPENDS ON IT. The seven fixes carried before (six of
+these commits plus one from mainline) are redundant by construction with the
+full driver in place and are dropped in the same series. Keeping both would mean
+applying the same change twice.
+
+VERIFIED: applies at --fuzz=0 (whole series, the apply-patches build stage),
+compile-check green with
+drivers/gpu/drm/imagination/ added to the gate -- and that gate extension is not
+optional here, because without it the cheap gate does not compile this driver at
+all. ⚠ NOT hardware-proven.
+
+Assisted-by: Claude
+---
+diff --git a/drivers/gpu/drm/imagination/Kconfig b/drivers/gpu/drm/imagination/Kconfig
+index 0482bfc..1fd4c63 100644
+--- a/drivers/gpu/drm/imagination/Kconfig
++++ b/drivers/gpu/drm/imagination/Kconfig
+@@ -18,3 +18,15 @@ config DRM_POWERVR
+ 	  Technologies PowerVR (Series 6 or later) or IMG GPU.
+ 
+ 	  If "M" is selected, the module will be called powervr.
++
++config DRM_POWERVR_KUNIT_TEST
++	tristate "KUnit tests for the drm powervr driver" if !KUNIT_ALL_TESTS
++	depends on DRM_POWERVR && KUNIT
++	default KUNIT_ALL_TESTS
++	help
++	  Choose this option to allow the driver to perform selftests under
++	  the kunit framework
++
++	  Recommended for driver developers only.
++
++	  If in doubt, say "N".
+diff --git a/drivers/gpu/drm/imagination/Makefile b/drivers/gpu/drm/imagination/Makefile
+index 7cca66f..a5c5e38 100644
+--- a/drivers/gpu/drm/imagination/Makefile
++++ b/drivers/gpu/drm/imagination/Makefile
+@@ -8,6 +8,7 @@ powervr-y := \
+ 	pvr_device.o \
+ 	pvr_device_info.o \
+ 	pvr_drv.o \
++	pvr_dump.o \
+ 	pvr_free_list.o \
+ 	pvr_fw.o \
+ 	pvr_fw_meta.o \
+@@ -20,7 +21,6 @@ powervr-y := \
+ 	pvr_hwrt.o \
+ 	pvr_job.o \
+ 	pvr_mmu.o \
+-	pvr_params.o \
+ 	pvr_power.o \
+ 	pvr_queue.o \
+ 	pvr_stream.o \
+@@ -32,4 +32,9 @@ powervr-y := \
+ powervr-$(CONFIG_DEBUG_FS) += \
+ 	pvr_debugfs.o
+ 
++powervr-$(CONFIG_TRACEPOINTS) += \
++	pvr_trace_points.o
++
+ obj-$(CONFIG_DRM_POWERVR) += powervr.o
++
++obj-$(CONFIG_DRM_POWERVR_KUNIT_TEST) += pvr_test.o
+diff --git a/drivers/gpu/drm/imagination/pvr_ccb.c b/drivers/gpu/drm/imagination/pvr_ccb.c
+index 2bbdc05..b702d12 100644
+--- a/drivers/gpu/drm/imagination/pvr_ccb.c
++++ b/drivers/gpu/drm/imagination/pvr_ccb.c
+@@ -4,12 +4,14 @@
+ #include "pvr_ccb.h"
+ #include "pvr_device.h"
+ #include "pvr_drv.h"
++#include "pvr_dump.h"
+ #include "pvr_free_list.h"
+ #include "pvr_fw.h"
+ #include "pvr_gem.h"
+ #include "pvr_power.h"
+ 
+ #include <drm/drm_managed.h>
++#include <drm/drm_print.h>
+ #include <linux/compiler.h>
+ #include <linux/delay.h>
+ #include <linux/jiffies.h>
+@@ -135,6 +137,14 @@ pvr_ccb_slot_available_locked(struct pvr_ccb *pvr_ccb, u32 *write_offset)
+ static void
+ process_fwccb_command(struct pvr_device *pvr_dev, struct rogue_fwif_fwccb_cmd *cmd)
+ {
++	struct drm_device *drm_dev = from_pvr_device(pvr_dev);
++
++	if ((cmd->cmd_type & ROGUE_CMD_MAGIC_DWORD_MASK) != ROGUE_CMD_MAGIC_DWORD_SHIFTED) {
++		drm_warn_once(drm_dev, "Received FWCCB command with bad magic value; ignoring (type=0x%08x)\n",
++			      cmd->cmd_type);
++		return;
++	}
++
+ 	switch (cmd->cmd_type) {
+ 	case ROGUE_FWIF_FWCCB_CMD_REQUEST_GPU_RESTART:
+ 		pvr_power_reset(pvr_dev, false);
+@@ -149,9 +159,21 @@ process_fwccb_command(struct pvr_device *pvr_dev, struct rogue_fwif_fwccb_cmd *c
+ 		pvr_free_list_process_grow_req(pvr_dev, &cmd->cmd_data.cmd_free_list_gs);
+ 		break;
+ 
++	case ROGUE_FWIF_FWCCB_CMD_UPDATE_STATS:
++		/*
++		 * We currently have no infrastructure for processing these
++		 * stats. It may be added in the future, but for now just
++		 * suppress the "unknown" warning when receiving this command.
++		 */
++		break;
++	case ROGUE_FWIF_FWCCB_CMD_CONTEXT_RESET_NOTIFICATION:
++		pvr_dump_context_reset_notification(pvr_dev,
++						    &cmd->cmd_data.cmd_context_reset_notification);
++		break;
++
+ 	default:
+-		drm_info(from_pvr_device(pvr_dev), "Received unknown FWCCB command %x\n",
+-			 cmd->cmd_type);
++		drm_info(drm_dev, "Received unknown FWCCB command (type=%d)\n",
++			 cmd->cmd_type & ~ROGUE_CMD_MAGIC_DWORD_MASK);
+ 		break;
+ 	}
+ }
+@@ -233,7 +255,7 @@ pvr_kccb_used_slot_count_locked(struct pvr_device *pvr_dev)
+  * pvr_kccb_send_cmd_reserved_powered() - Send command to the KCCB, with the PM ref
+  * held and a slot pre-reserved
+  * @pvr_dev: Device pointer.
+- * @cmd: Command to sent.
++ * @cmd: Command to send.
+  * @kccb_slot: Address to store the KCCB slot for this command. May be %NULL.
+  */
+ void
+@@ -339,7 +361,7 @@ static int pvr_kccb_reserve_slot_sync(struct pvr_device *pvr_dev)
+ /**
+  * pvr_kccb_send_cmd_powered() - Send command to the KCCB, with a PM ref held
+  * @pvr_dev: Device pointer.
+- * @cmd: Command to sent.
++ * @cmd: Command to send.
+  * @kccb_slot: Address to store the KCCB slot for this command. May be %NULL.
+  *
+  * Returns:
+@@ -363,7 +385,7 @@ pvr_kccb_send_cmd_powered(struct pvr_device *pvr_dev, struct rogue_fwif_kccb_cmd
+ /**
+  * pvr_kccb_send_cmd() - Send command to the KCCB
+  * @pvr_dev: Device pointer.
+- * @cmd: Command to sent.
++ * @cmd: Command to send.
+  * @kccb_slot: Address to store the KCCB slot for this command. May be %NULL.
+  *
+  * Returns:
+@@ -542,7 +564,7 @@ struct dma_fence *pvr_kccb_fence_alloc(void)
+ {
+ 	struct pvr_kccb_fence *kccb_fence;
+ 
+-	kccb_fence = kzalloc(sizeof(*kccb_fence), GFP_KERNEL);
++	kccb_fence = kzalloc_obj(*kccb_fence);
+ 	if (!kccb_fence)
+ 		return NULL;
+ 
+diff --git a/drivers/gpu/drm/imagination/pvr_check.h b/drivers/gpu/drm/imagination/pvr_check.h
+new file mode 100644
+index 0000000..94764ce
+--- /dev/null
++++ b/drivers/gpu/drm/imagination/pvr_check.h
+@@ -0,0 +1,36 @@
++/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
++/* Copyright (c) 2026 Imagination Technologies Ltd. */
++
++#ifndef PVR_CHECK_H
++#define PVR_CHECK_H
++
++#include <linux/build_bug.h>
++#include <linux/overflow.h>
++#include <linux/stddef.h>
++
++#define OFFSET_CHECK(type, member, offset) \
++	static_assert(offsetof(type, member) == (offset), \
++	"offsetof(" #type ", " #member ") incorrect")
++
++#define SIZE_CHECK(type, size) \
++	static_assert(sizeof(type) == (size), #type " is incorrect size")
++
++#define ALIGN_CHECK(type, align) \
++	static_assert(__alignof__(type) <= (align), #type " has incorrect alignment")
++
++/*
++ * Where the last member of a struct is a flexible array member, using
++ * SIZE_CHECK() is pointless. If the structure is not already padded to
++ * alignment without the flexible array member, sizeof() will not match the
++ * offset of the flexible array member and the "correct" sizeof() value is
++ * completely meaningless.
++ *
++ * In those instances, use FLEX_ARRAY_CHECK() instead to assert that the final
++ * field is a flexible array member and that it behaves as expected.
++ */
++#define FLEX_ARRAY_CHECK(type, member)                               \
++	static_assert(flex_array_size((type *)NULL, member, 1) ==    \
++				      sizeof_field(type, member[0]), \
++		      #type "->" #member " is incorrect size")
++
++#endif /* PVR_CHECK_H */
+diff --git a/drivers/gpu/drm/imagination/pvr_context.c b/drivers/gpu/drm/imagination/pvr_context.c
+index 5befaed..406e075 100644
+--- a/drivers/gpu/drm/imagination/pvr_context.c
++++ b/drivers/gpu/drm/imagination/pvr_context.c
+@@ -294,7 +294,7 @@ int pvr_context_create(struct pvr_file *pvr_file, struct drm_pvr_ioctl_create_co
+ 	if (ctx_size < 0)
+ 		return ctx_size;
+ 
+-	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
++	ctx = kzalloc_obj(*ctx);
+ 	if (!ctx)
+ 		return -ENOMEM;
+ 
+diff --git a/drivers/gpu/drm/imagination/pvr_debugfs.c b/drivers/gpu/drm/imagination/pvr_debugfs.c
+index c7ce7da..ebdb05d 100644
+--- a/drivers/gpu/drm/imagination/pvr_debugfs.c
++++ b/drivers/gpu/drm/imagination/pvr_debugfs.c
+@@ -5,7 +5,6 @@
+ 
+ #include "pvr_device.h"
+ #include "pvr_fw_trace.h"
+-#include "pvr_params.h"
+ 
+ #include <linux/dcache.h>
+ #include <linux/debugfs.h>
+@@ -18,7 +17,6 @@
+ #include <drm/drm_print.h>
+ 
+ static const struct pvr_debugfs_entry pvr_debugfs_entries[] = {
+-	{"pvr_params", pvr_params_debugfs_init},
+ 	{"pvr_fw", pvr_fw_trace_debugfs_init},
+ };
+ 
+diff --git a/drivers/gpu/drm/imagination/pvr_device.c b/drivers/gpu/drm/imagination/pvr_device.c
+index b2275cb..54fe418 100644
+--- a/drivers/gpu/drm/imagination/pvr_device.c
++++ b/drivers/gpu/drm/imagination/pvr_device.c
+@@ -5,7 +5,6 @@
+ #include "pvr_device_info.h"
+ 
+ #include "pvr_fw.h"
+-#include "pvr_params.h"
+ #include "pvr_power.h"
+ #include "pvr_queue.h"
+ #include "pvr_rogue_cr_defs.h"
+@@ -32,6 +31,8 @@
+ #include <linux/types.h>
+ #include <linux/workqueue.h>
+ 
++#include <kunit/visibility.h>
++
+ /* Major number for the supported version of the firmware. */
+ #define PVR_FW_VERSION_MAJOR 1
+ 
+@@ -212,7 +213,7 @@ static irqreturn_t pvr_device_irq_thread_handler(int irq, void *data)
+ 	while (pvr_fw_irq_pending(pvr_dev)) {
+ 		pvr_fw_irq_clear(pvr_dev);
+ 
+-		if (pvr_dev->fw_dev.booted) {
++		if (READ_ONCE(pvr_dev->fw_dev.initialised)) {
+ 			pvr_fwccb_process(pvr_dev);
+ 			pvr_kccb_wake_up_waiters(pvr_dev);
+ 			pvr_device_process_active_queues(pvr_dev);
+@@ -405,23 +406,21 @@ err_free_filename:
+ }
+ 
+ /**
+- * pvr_load_gpu_id() - Load a PowerVR device's GPU ID (BVNC) from control registers.
++ * pvr_gpuid_decode_reg() - Decode the GPU ID from GPU register
+  *
+- * Sets struct pvr_dev.gpu_id.
++ * Sets the b, v, n, c fields of struct pvr_dev.gpu_id.
+  *
+  * @pvr_dev: Target PowerVR device.
++ * @gpu_id: Output to be updated with the GPU ID.
+  */
+ static void
+-pvr_load_gpu_id(struct pvr_device *pvr_dev)
++pvr_gpuid_decode_reg(const struct pvr_device *pvr_dev, struct pvr_gpu_id *gpu_id)
+ {
+-	struct pvr_gpu_id *gpu_id = &pvr_dev->gpu_id;
+-	u64 bvnc;
+-
+ 	/*
+ 	 * Try reading the BVNC using the newer (cleaner) method first. If the
+ 	 * B value is zero, fall back to the older method.
+ 	 */
+-	bvnc = pvr_cr_read64(pvr_dev, ROGUE_CR_CORE_ID__PBVNC);
++	u64 bvnc = pvr_cr_read64(pvr_dev, ROGUE_CR_CORE_ID__PBVNC);
+ 
+ 	gpu_id->b = PVR_CR_FIELD_GET(bvnc, CORE_ID__PBVNC__BRANCH_ID);
+ 	if (gpu_id->b != 0) {
+@@ -440,6 +439,177 @@ pvr_load_gpu_id(struct pvr_device *pvr_dev)
+ 	}
+ }
+ 
++/**
++ * pvr_gpuid_decode_string() - Decode the GPU ID from a module input string
++ *
++ * Sets the b, v, n, c fields of struct pvr_dev.gpu_id.
++ *
++ * @pvr_dev: Target PowerVR device.
++ * @param_bvnc: GPU ID (BVNC) module parameter.
++ * @gpu_id: Output to be updated with the GPU ID.
++ */
++VISIBLE_IF_KUNIT int
++pvr_gpuid_decode_string(const struct pvr_device *pvr_dev,
++			const char *param_bvnc, struct pvr_gpu_id *gpu_id)
++{
++	const struct drm_device *drm_dev = &pvr_dev->base;
++	char str_cpy[PVR_GPUID_STRING_MAX_LENGTH];
++	char *pos, *tkn;
++	int ret, idx = 0;
++	u16 user_bvnc_u16[4];
++	u8 dot_cnt = 0;
++
++	ret = strscpy(str_cpy, param_bvnc);
++
++	/*
++	 * strscpy() should return at least a size 7 for the input to be valid.
++	 * Returns -E2BIG for the case when the string is empty or too long.
++	 */
++	if (ret < PVR_GPUID_STRING_MIN_LENGTH) {
++		drm_info(drm_dev,
++			 "Invalid size of the input GPU ID (BVNC): %s",
++			 str_cpy);
++		return -EINVAL;
++	}
++
++	while (*param_bvnc) {
++		if (*param_bvnc == '.')
++			dot_cnt++;
++		param_bvnc++;
++	}
++
++	if (dot_cnt != 3) {
++		drm_info(drm_dev,
++			 "Invalid format of the input GPU ID (BVNC): %s",
++			 str_cpy);
++		return -EINVAL;
++	}
++
++	pos = str_cpy;
++
++	while ((tkn = strsep(&pos, ".")) != NULL && idx < 4) {
++		/* kstrtou16() will also handle the case of consecutive dots */
++		ret = kstrtou16(tkn, 10, &user_bvnc_u16[idx]);
++		if (ret) {
++			drm_info(drm_dev,
++				 "Invalid format of the input GPU ID (BVNC): %s",
++				 str_cpy);
++			return -EINVAL;
++		}
++		idx++;
++	}
++
++	gpu_id->b = user_bvnc_u16[0];
++	gpu_id->v = user_bvnc_u16[1];
++	gpu_id->n = user_bvnc_u16[2];
++	gpu_id->c = user_bvnc_u16[3];
++
++	return 0;
++}
++EXPORT_SYMBOL_IF_KUNIT(pvr_gpuid_decode_string);
++
++static bool pvr_exp_hw_support;
++module_param_named(exp_hw_support, pvr_exp_hw_support, bool, 0600);
++MODULE_PARM_DESC(exp_hw_support, "Bypass runtime checks for fully supported GPU cores. WARNING: enabling this option may result in a buggy, insecure, or otherwise unusable driver.");
++
++/**
++ * enum pvr_gpu_support_level - The level of support for a gpu_id in the current
++ * version of the driver.
++ *
++ * @PVR_GPU_UNKNOWN: Cores that are unknown to the driver. These may not even exist.
++ * @PVR_GPU_EXPERIMENTAL: Cores that have experimental support.
++ * @PVR_GPU_SUPPORTED: Cores that are supported and maintained.
++ */
++enum pvr_gpu_support_level {
++	PVR_GPU_UNKNOWN,
++	PVR_GPU_EXPERIMENTAL,
++	PVR_GPU_SUPPORTED,
++};
++
++static enum pvr_gpu_support_level
++pvr_gpu_support_level(const struct pvr_gpu_id *gpu_id)
++{
++	switch (pvr_gpu_id_to_packed_bvnc(gpu_id)) {
++	case PVR_PACKED_BVNC(33, 15, 11, 3):
++	case PVR_PACKED_BVNC(36, 52, 104, 182):
++	case PVR_PACKED_BVNC(36, 53, 104, 796):
++		return PVR_GPU_SUPPORTED;
++
++	default:
++		return PVR_GPU_UNKNOWN;
++	}
++}
++
++static int
++pvr_check_gpu_supported(struct pvr_device *pvr_dev,
++			const struct pvr_gpu_id *gpu_id)
++{
++	struct drm_device *drm_dev = from_pvr_device(pvr_dev);
++
++	switch (pvr_gpu_support_level(gpu_id)) {
++	case PVR_GPU_SUPPORTED:
++		if (pvr_exp_hw_support)
++			drm_info(drm_dev, "Module parameter 'exp_hw_support' was set, but this hardware is fully supported by the current driver.");
++
++		break;
++
++	case PVR_GPU_EXPERIMENTAL:
++		if (!pvr_exp_hw_support) {
++			drm_err(drm_dev, "Unsupported GPU! Set 'exp_hw_support' to bypass this check.");
++			return -ENODEV;
++		}
++
++		drm_warn(drm_dev, "Running on unsupported hardware; you may encounter bugs!");
++		break;
++
++	/* NOTE: This code path may indicate misbehaving hardware. */
++	case PVR_GPU_UNKNOWN:
++	default:
++		if (!pvr_exp_hw_support) {
++			drm_err(drm_dev, "Unknown GPU! Set 'exp_hw_support' to bypass this check.");
++			return -ENODEV;
++		}
++
++		drm_warn(drm_dev, "Running on unknown hardware; expect issues.");
++		break;
++	}
++
++	return 0;
++}
++
++static char *pvr_gpuid_override;
++module_param_named(gpuid, pvr_gpuid_override, charp, 0400);
++MODULE_PARM_DESC(gpuid, "GPU ID (BVNC) to be used instead of the value read from hardware.");
++
++/**
++ * pvr_load_gpu_id() - Load a PowerVR device's GPU ID (BVNC) from control
++ * registers or input parameter. The input parameter is processed instead
++ * of the GPU register if provided.
++ *
++ * Sets the arch field of struct pvr_dev.gpu_id.
++ *
++ * @pvr_dev: Target PowerVR device.
++ */
++static int
++pvr_load_gpu_id(struct pvr_device *pvr_dev)
++{
++	struct pvr_gpu_id *gpu_id = &pvr_dev->gpu_id;
++
++	if (!pvr_gpuid_override || !pvr_gpuid_override[0]) {
++		pvr_gpuid_decode_reg(pvr_dev, gpu_id);
++	} else {
++		drm_warn(from_pvr_device(pvr_dev),
++			 "Using custom GPU ID (BVNC) provided by the user!");
++
++		int err = pvr_gpuid_decode_string(pvr_dev, pvr_gpuid_override,
++						  gpu_id);
++		if (err)
++			return err;
++	}
++
++	return pvr_check_gpu_supported(pvr_dev, gpu_id);
++}
++
+ /**
+  * pvr_set_dma_info() - Set PowerVR device DMA information
+  * @pvr_dev: Target PowerVR device.
+@@ -500,7 +670,9 @@ pvr_device_gpu_init(struct pvr_device *pvr_dev)
+ {
+ 	int err;
+ 
+-	pvr_load_gpu_id(pvr_dev);
++	err = pvr_load_gpu_id(pvr_dev);
++	if (err)
++		return err;
+ 
+ 	err = pvr_request_firmware(pvr_dev);
+ 	if (err)
+@@ -590,14 +762,6 @@ pvr_device_init(struct pvr_device *pvr_dev)
+ 	/* Get the platform-specific data based on the compatible string. */
+ 	pvr_dev->device_data = of_device_get_match_data(dev);
+ 
+-	/*
+-	 * Setup device parameters. We do this first in case other steps
+-	 * depend on them.
+-	 */
+-	err = pvr_device_params_init(&pvr_dev->params);
+-	if (err)
+-		return err;
+-
+ 	/* Enable and initialize clocks required for the device to operate. */
+ 	err = pvr_device_clk_init(pvr_dev);
+ 	if (err)
+diff --git a/drivers/gpu/drm/imagination/pvr_device.h b/drivers/gpu/drm/imagination/pvr_device.h
+index ec53ff2..d51c57c 100644
+--- a/drivers/gpu/drm/imagination/pvr_device.h
++++ b/drivers/gpu/drm/imagination/pvr_device.h
+@@ -7,7 +7,6 @@
+ #include "pvr_ccb.h"
+ #include "pvr_device_info.h"
+ #include "pvr_fw.h"
+-#include "pvr_params.h"
+ #include "pvr_rogue_fwif_stream.h"
+ #include "pvr_stream.h"
+ 
+@@ -40,6 +39,9 @@ struct firmware;
+ /* Forward declaration from <linux/pwrseq/consumer.h> */
+ struct pwrseq_desc;
+ 
++#define PVR_GPUID_STRING_MIN_LENGTH 7U
++#define PVR_GPUID_STRING_MAX_LENGTH 32U
++
+ /**
+  * struct pvr_gpu_id - Hardware GPU ID information for a PowerVR device
+  * @b: Branch ID.
+@@ -150,15 +152,13 @@ struct pvr_device {
+ 	 * @power: Optional power domain devices.
+ 	 *
+ 	 * On platforms with more than one power domain for the GPU, they are
+-	 * stored here in @domain_devs, along with links between them in
+-	 * @domain_links. The size of @domain_devs is given by @domain_count,
+-	 * while the size of @domain_links is (2 * @domain_count) - 1.
++	 * stored here in @domains, along with links between them in
++	 * @domain_links. The size of @domain_links is one less than
++	 * struct dev_pm_domain_list->num_pds in @domains.
+ 	 */
+ 	struct pvr_device_power {
+-		struct device **domain_devs;
++		struct dev_pm_domain_list *domains;
+ 		struct device_link **domain_links;
+-
+-		u32 domain_count;
+ 	} power;
+ 
+ 	/**
+@@ -192,15 +192,6 @@ struct pvr_device {
+ 	/** @fw_dev: Firmware related data. */
+ 	struct pvr_fw_device fw_dev;
+ 
+-	/**
+-	 * @params: Device-specific parameters.
+-	 *
+-	 *          The values of these parameters are initialized from the
+-	 *          defaults specified as module parameters. They may be
+-	 *          modified at runtime via debugfs (if enabled).
+-	 */
+-	struct pvr_device_params params;
+-
+ 	/** @stream_musthave_quirks: Bit array of "must-have" quirks for stream commands. */
+ 	u32 stream_musthave_quirks[PVR_STREAM_TYPE_MAX][PVR_STREAM_EXTHDR_TYPE_MAX];
+ 
+@@ -526,7 +517,7 @@ struct pvr_file {
+  * Return: Packed BVNC.
+  */
+ static __always_inline u64
+-pvr_gpu_id_to_packed_bvnc(struct pvr_gpu_id *gpu_id)
++pvr_gpu_id_to_packed_bvnc(const struct pvr_gpu_id *gpu_id)
+ {
+ 	return PVR_PACKED_BVNC(gpu_id->b, gpu_id->v, gpu_id->n, gpu_id->c);
+ }
+@@ -551,6 +542,11 @@ pvr_device_has_uapi_enhancement(struct pvr_device *pvr_dev, u32 enhancement);
+ bool
+ pvr_device_has_feature(struct pvr_device *pvr_dev, u32 feature);
+ 
++#if IS_ENABLED(CONFIG_KUNIT)
++int pvr_gpuid_decode_string(const struct pvr_device *pvr_dev,
++			    const char *param_bvnc, struct pvr_gpu_id *gpu_id);
++#endif
++
+ /**
+  * PVR_CR_FIELD_GET() - Extract a single field from a PowerVR control register
+  * @val: Value of the target register.
+@@ -568,7 +564,7 @@ pvr_device_has_feature(struct pvr_device *pvr_dev, u32 feature);
+  * Return: The value of the requested register.
+  */
+ static __always_inline u32
+-pvr_cr_read32(struct pvr_device *pvr_dev, u32 reg)
++pvr_cr_read32(const struct pvr_device *pvr_dev, u32 reg)
+ {
+ 	return ioread32(pvr_dev->regs + reg);
+ }
+@@ -581,7 +577,7 @@ pvr_cr_read32(struct pvr_device *pvr_dev, u32 reg)
+  * Return: The value of the requested register.
+  */
+ static __always_inline u64
+-pvr_cr_read64(struct pvr_device *pvr_dev, u32 reg)
++pvr_cr_read64(const struct pvr_device *pvr_dev, u32 reg)
+ {
+ 	return ioread64(pvr_dev->regs + reg);
+ }
+diff --git a/drivers/gpu/drm/imagination/pvr_device_info.h b/drivers/gpu/drm/imagination/pvr_device_info.h
+index f61fb98..f6c2845 100644
+--- a/drivers/gpu/drm/imagination/pvr_device_info.h
++++ b/drivers/gpu/drm/imagination/pvr_device_info.h
+@@ -22,12 +22,12 @@ struct pvr_device_features {
+ 	bool has_coreid_per_os;
+ 	bool has_dynamic_dust_power;
+ 	bool has_ecc_rams;
+-	bool has_fb_cdc_v4;
+-	bool has_fbc_max_default_descriptors;
+-	bool has_fbc_max_large_descriptors;
+ 	bool has_fbcdc;
+ 	bool has_fbcdc_algorithm;
+ 	bool has_fbcdc_architecture;
++	bool has_fbc_max_default_descriptors;
++	bool has_fbc_max_large_descriptors;
++	bool has_fb_cdc_v4;
+ 	bool has_gpu_multicore_support;
+ 	bool has_gpu_virtualisation;
+ 	bool has_gs_rta_support;
+diff --git a/drivers/gpu/drm/imagination/pvr_drv.c b/drivers/gpu/drm/imagination/pvr_drv.c
+index e403411..5c965ef 100644
+--- a/drivers/gpu/drm/imagination/pvr_drv.c
++++ b/drivers/gpu/drm/imagination/pvr_drv.c
+@@ -14,6 +14,7 @@
+ #include "pvr_rogue_defs.h"
+ #include "pvr_rogue_fwif_client.h"
+ #include "pvr_rogue_fwif_shared.h"
++#include "pvr_trace.h"
+ #include "pvr_vm.h"
+ 
+ #include <uapi/drm/pvr_drm.h>
+@@ -29,7 +30,6 @@
+ #include <linux/fs.h>
+ #include <linux/kernel.h>
+ #include <linux/list.h>
+-#include <linux/mod_devicetable.h>
+ #include <linux/module.h>
+ #include <linux/moduleparam.h>
+ #include <linux/of_device.h>
+@@ -43,8 +43,9 @@
+  *
+  * This driver supports the following PowerVR/IMG graphics cores from Imagination Technologies:
+  *
+- * * AXE-1-16M (found in Texas Instruments AM62)
+- * * BXS-4-64 MC1 (found in Texas Instruments J721S2/AM68)
++ * * AXE-1-16M (33.15.11.3)
++ * * BXM-4-64 MC1 (36.52.104.182)
++ * * BXS-4-64 MC1 (36.53.104.796)
+  */
+ 
+ /**
+@@ -514,7 +515,8 @@ copy_out:
+ 	if (err < 0)
+ 		return err;
+ 
+-	args->size = sizeof(query);
++	if (args->size > sizeof(query))
++		args->size = sizeof(query);
+ 	return 0;
+ }
+ 
+@@ -595,7 +597,8 @@ copy_out:
+ 	if (err < 0)
+ 		return err;
+ 
+-	args->size = sizeof(query);
++	if (args->size > sizeof(query))
++		args->size = sizeof(query);
+ 	return 0;
+ }
+ 
+@@ -1150,6 +1153,8 @@ pvr_ioctl_submit_jobs(struct drm_device *drm_dev, void *raw_args,
+ 	int idx;
+ 	int err;
+ 
++	trace_pvr_job_submit_ioctl(pvr_dev, args->jobs.count);
++
+ 	if (!drm_dev_enter(drm_dev, &idx))
+ 		return -EIO;
+ 
+@@ -1311,7 +1316,7 @@ pvr_drm_driver_open(struct drm_device *drm_dev, struct drm_file *file)
+ 	struct pvr_device *pvr_dev = to_pvr_device(drm_dev);
+ 	struct pvr_file *pvr_file;
+ 
+-	pvr_file = kzalloc(sizeof(*pvr_file), GFP_KERNEL);
++	pvr_file = kzalloc_obj(*pvr_file);
+ 	if (!pvr_file)
+ 		return -ENOMEM;
+ 
+@@ -1374,7 +1379,7 @@ pvr_drm_driver_postclose(__always_unused struct drm_device *drm_dev,
+ DEFINE_DRM_GEM_FOPS(pvr_drm_driver_fops);
+ 
+ static struct drm_driver pvr_drm_driver = {
+-	.driver_features = DRIVER_GEM | DRIVER_GEM_GPUVA | DRIVER_RENDER |
++	.driver_features = DRIVER_GEM | DRIVER_RENDER |
+ 			   DRIVER_SYNCOBJ | DRIVER_SYNCOBJ_TIMELINE,
+ 	.open = pvr_drm_driver_open,
+ 	.postclose = pvr_drm_driver_postclose,
+diff --git a/drivers/gpu/drm/imagination/pvr_dump.c b/drivers/gpu/drm/imagination/pvr_dump.c
+new file mode 100644
+index 0000000..52e95fc
+--- /dev/null
++++ b/drivers/gpu/drm/imagination/pvr_dump.c
+@@ -0,0 +1,113 @@
++// SPDX-License-Identifier: GPL-2.0 OR MIT
++/* Copyright (c) 2026 Imagination Technologies Ltd. */
++
++#include "pvr_device.h"
++#include "pvr_dump.h"
++#include "pvr_rogue_fwif.h"
++
++#include <drm/drm_print.h>
++#include <linux/types.h>
++
++static const char *
++get_reset_reason_desc(enum rogue_context_reset_reason reason)
++{
++	switch (reason) {
++	case ROGUE_CONTEXT_RESET_REASON_NONE:
++		return "None";
++	case ROGUE_CONTEXT_RESET_REASON_GUILTY_LOCKUP:
++		return "Guilty lockup";
++	case ROGUE_CONTEXT_RESET_REASON_INNOCENT_LOCKUP:
++		return "Innocent lockup";
++	case ROGUE_CONTEXT_RESET_REASON_GUILTY_OVERRUNING:
++		return "Guilty overrunning";
++	case ROGUE_CONTEXT_RESET_REASON_INNOCENT_OVERRUNING:
++		return "Innocent overrunning";
++	case ROGUE_CONTEXT_RESET_REASON_HARD_CONTEXT_SWITCH:
++		return "Hard context switch";
++	case ROGUE_CONTEXT_RESET_REASON_WGP_CHECKSUM:
++		return "CDM Mission/safety checksum mismatch";
++	case ROGUE_CONTEXT_RESET_REASON_TRP_CHECKSUM:
++		return "TRP checksum mismatch";
++	case ROGUE_CONTEXT_RESET_REASON_GPU_ECC_OK:
++		return "GPU ECC error (corrected, OK)";
++	case ROGUE_CONTEXT_RESET_REASON_GPU_ECC_HWR:
++		return "GPU ECC error (uncorrected, HWR)";
++	case ROGUE_CONTEXT_RESET_REASON_FW_ECC_OK:
++		return "Firmware ECC error (corrected, OK)";
++	case ROGUE_CONTEXT_RESET_REASON_FW_ECC_ERR:
++		return "Firmware ECC error (uncorrected, ERR)";
++	case ROGUE_CONTEXT_RESET_REASON_FW_WATCHDOG:
++		return "Firmware watchdog";
++	case ROGUE_CONTEXT_RESET_REASON_FW_PAGEFAULT:
++		return "Firmware pagefault";
++	case ROGUE_CONTEXT_RESET_REASON_FW_EXEC_ERR:
++		return "Firmware execution error";
++	case ROGUE_CONTEXT_RESET_REASON_HOST_WDG_FW_ERR:
++		return "Host watchdog";
++	case ROGUE_CONTEXT_GEOM_OOM_DISABLED:
++		return "Geometry OOM disabled";
++
++	default:
++		return "Unknown";
++	}
++}
++
++static const char *
++get_dm_name(u32 dm)
++{
++	switch (dm) {
++	case PVR_FWIF_DM_GP:
++		return "General purpose";
++	/* PVR_FWIF_DM_TDM has the same index, but is discriminated by a device feature */
++	case PVR_FWIF_DM_2D:
++		return "2D or TDM";
++	case PVR_FWIF_DM_GEOM:
++		return "Geometry";
++	case PVR_FWIF_DM_FRAG:
++		return "Fragment";
++	case PVR_FWIF_DM_CDM:
++		return "Compute";
++	case PVR_FWIF_DM_RAY:
++		return "Raytracing";
++	case PVR_FWIF_DM_GEOM2:
++		return "Geometry 2";
++	case PVR_FWIF_DM_GEOM3:
++		return "Geometry 3";
++	case PVR_FWIF_DM_GEOM4:
++		return "Geometry 4";
++
++	default:
++		return "Unknown";
++	}
++}
++
++/**
++ * pvr_dump_context_reset_notification() - Handle context reset notification from FW
++ * @pvr_dev: Device pointer.
++ * @data: Data provided by FW.
++ *
++ * This will decode the data structure provided by FW and print the results via drm_info().
++ */
++void
++pvr_dump_context_reset_notification(struct pvr_device *pvr_dev,
++				    struct rogue_fwif_fwccb_cmd_context_reset_data *data)
++{
++	struct drm_device *drm_dev = from_pvr_device(pvr_dev);
++
++	if (data->flags & ROGUE_FWIF_FWCCB_CMD_CONTEXT_RESET_FLAG_ALL_CTXS) {
++		drm_info(drm_dev, "Received context reset notification for all contexts\n");
++	} else {
++		drm_info(drm_dev, "Received context reset notification on context %u\n",
++			 data->server_common_context_id);
++	}
++
++	drm_info(drm_dev, "  Reset reason=%u (%s)\n", data->reset_reason,
++		 get_reset_reason_desc((enum rogue_context_reset_reason)data->reset_reason));
++	drm_info(drm_dev, "  Data Master=%u (%s)\n", data->dm, get_dm_name(data->dm));
++	drm_info(drm_dev, "  Job ref=%u\n", data->reset_job_ref);
++
++	if (data->flags & ROGUE_FWIF_FWCCB_CMD_CONTEXT_RESET_FLAG_PF) {
++		drm_info(drm_dev, "  Page fault occurred, fault address=%llx\n",
++			 data->fault_address);
++	}
++}
+diff --git a/drivers/gpu/drm/imagination/pvr_dump.h b/drivers/gpu/drm/imagination/pvr_dump.h
+new file mode 100644
+index 0000000..3c0728c
+--- /dev/null
++++ b/drivers/gpu/drm/imagination/pvr_dump.h
+@@ -0,0 +1,17 @@
++/* SPDX-License-Identifier: GPL-2.0 OR MIT */
++/* Copyright (c) 2026 Imagination Technologies Ltd. */
++
++#ifndef PVR_DUMP_H
++#define PVR_DUMP_H
++
++/* Forward declaration from pvr_device.h. */
++struct pvr_device;
++
++/* Forward declaration from pvr_rogue_fwif.h. */
++struct rogue_fwif_fwccb_cmd_context_reset_data;
++
++void
++pvr_dump_context_reset_notification(struct pvr_device *pvr_dev,
++				    struct rogue_fwif_fwccb_cmd_context_reset_data *data);
++
++#endif /* PVR_DUMP_H */
+diff --git a/drivers/gpu/drm/imagination/pvr_free_list.c b/drivers/gpu/drm/imagination/pvr_free_list.c
+index 5228e21..faf5e58 100644
+--- a/drivers/gpu/drm/imagination/pvr_free_list.c
++++ b/drivers/gpu/drm/imagination/pvr_free_list.c
+@@ -8,6 +8,7 @@
+ #include "pvr_vm.h"
+ 
+ #include <drm/drm_gem.h>
++#include <drm/drm_print.h>
+ #include <linux/slab.h>
+ #include <linux/xarray.h>
+ #include <uapi/drm/pvr_drm.h>
+@@ -307,7 +308,7 @@ pvr_free_list_grow(struct pvr_free_list *free_list, u32 num_pages)
+ 		goto err_unlock;
+ 	}
+ 
+-	free_list_node = kzalloc(sizeof(*free_list_node), GFP_KERNEL);
++	free_list_node = kzalloc_obj(*free_list_node);
+ 	if (!free_list_node) {
+ 		err = -ENOMEM;
+ 		goto err_unlock;
+@@ -415,7 +416,7 @@ pvr_free_list_create(struct pvr_file *pvr_file,
+ 	int err;
+ 
+ 	/* Create and fill out the kernel structure */
+-	free_list = kzalloc(sizeof(*free_list), GFP_KERNEL);
++	free_list = kzalloc_obj(*free_list);
+ 
+ 	if (!free_list)
+ 		return ERR_PTR(-ENOMEM);
+@@ -612,13 +613,21 @@ pvr_free_list_process_reconstruct_req(struct pvr_device *pvr_dev,
+ 	};
+ 	struct rogue_fwif_freelists_reconstruction_data *resp =
+ 		&resp_cmd.cmd_data.free_lists_reconstruction_data;
++	u32 count = min_t(u32, req->freelist_count,
++			  ARRAY_SIZE(req->freelist_ids));
+ 
+-	for (u32 i = 0; i < req->freelist_count; i++)
++	if (count != req->freelist_count) {
++		drm_warn_once(from_pvr_device(pvr_dev),
++			      "Requested reconstruction of %u freelists, limiting to %u\n",
++			      req->freelist_count, count);
++	}
++
++	for (u32 i = 0; i < count; i++)
+ 		pvr_free_list_reconstruct(pvr_dev, req->freelist_ids[i]);
+ 
+-	resp->freelist_count = req->freelist_count;
++	resp->freelist_count = count;
+ 	memcpy(resp->freelist_ids, req->freelist_ids,
+-	       req->freelist_count * sizeof(resp->freelist_ids[0]));
++	       count * sizeof(resp->freelist_ids[0]));
+ 
+ 	WARN_ON(pvr_kccb_send_cmd(pvr_dev, &resp_cmd, NULL));
+ }
+diff --git a/drivers/gpu/drm/imagination/pvr_fw.c b/drivers/gpu/drm/imagination/pvr_fw.c
+index b2f8cba..850a3ec 100644
+--- a/drivers/gpu/drm/imagination/pvr_fw.c
++++ b/drivers/gpu/drm/imagination/pvr_fw.c
+@@ -17,6 +17,7 @@
+ #include <drm/drm_drv.h>
+ #include <drm/drm_managed.h>
+ #include <drm/drm_mm.h>
++#include <drm/drm_print.h>
+ #include <linux/clk.h>
+ #include <linux/firmware.h>
+ #include <linux/math.h>
+@@ -1003,7 +1004,7 @@ pvr_fw_init(struct pvr_device *pvr_dev)
+ 		goto err_fw_stop;
+ 	}
+ 
+-	fw_dev->booted = true;
++	WRITE_ONCE(fw_dev->initialised, true);
+ 
+ 	return 0;
+ 
+@@ -1043,7 +1044,7 @@ pvr_fw_fini(struct pvr_device *pvr_dev)
+ {
+ 	struct pvr_fw_device *fw_dev = &pvr_dev->fw_dev;
+ 
+-	fw_dev->booted = false;
++	WRITE_ONCE(fw_dev->initialised, false);
+ 
+ 	pvr_fw_destroy_structures(pvr_dev);
+ 	pvr_fw_object_unmap_and_destroy(pvr_dev->kccb.rtn_obj);
+@@ -1271,7 +1272,7 @@ pvr_fw_object_create_and_map_common(struct pvr_device *pvr_dev, size_t size,
+ 	/* %DRM_PVR_BO_PM_FW_PROTECT is implicit for FW objects. */
+ 	flags |= DRM_PVR_BO_PM_FW_PROTECT;
+ 
+-	fw_obj = kzalloc(sizeof(*fw_obj), GFP_KERNEL);
++	fw_obj = kzalloc_obj(*fw_obj);
+ 	if (!fw_obj)
+ 		return ERR_PTR(-ENOMEM);
+ 
+diff --git a/drivers/gpu/drm/imagination/pvr_fw.h b/drivers/gpu/drm/imagination/pvr_fw.h
+index 1404dd4..3390c84 100644
+--- a/drivers/gpu/drm/imagination/pvr_fw.h
++++ b/drivers/gpu/drm/imagination/pvr_fw.h
+@@ -295,8 +295,11 @@ struct pvr_fw_device {
+ 	/** @mem: Structure containing objects representing firmware memory allocations. */
+ 	struct pvr_fw_mem mem;
+ 
+-	/** @booted: %true if the firmware has been booted, %false otherwise. */
+-	bool booted;
++	/**
++	 * @initialised: %true if the firmware has been successfully initialised,
++	 *               %false otherwise.
++	 */
++	bool initialised;
+ 
+ 	/**
+ 	 * @processor_type: FW processor type for this device. Must be one of
+diff --git a/drivers/gpu/drm/imagination/pvr_fw_meta.c b/drivers/gpu/drm/imagination/pvr_fw_meta.c
+index 60db366..9ff03bc 100644
+--- a/drivers/gpu/drm/imagination/pvr_fw_meta.c
++++ b/drivers/gpu/drm/imagination/pvr_fw_meta.c
+@@ -16,6 +16,8 @@
+ #include <linux/ktime.h>
+ #include <linux/types.h>
+ 
++#include <drm/drm_print.h>
++
+ #define ROGUE_FW_HEAP_META_SHIFT 25 /* 32 MB */
+ 
+ #define POLL_TIMEOUT_USEC 1000000
+diff --git a/drivers/gpu/drm/imagination/pvr_fw_startstop.c b/drivers/gpu/drm/imagination/pvr_fw_startstop.c
+index dcbb990..e24ed6f 100644
+--- a/drivers/gpu/drm/imagination/pvr_fw_startstop.c
++++ b/drivers/gpu/drm/imagination/pvr_fw_startstop.c
+@@ -209,18 +209,32 @@ pvr_fw_stop(struct pvr_device *pvr_dev)
+ 					 ROGUE_CR_SIDEKICK_IDLE_SOCIF_EN |
+ 					 ROGUE_CR_SIDEKICK_IDLE_HOSTIF_EN);
+ 	bool skip_garten_idle = false;
++	u64 layout_mars_value = 0;
++	bool layout_mars = false;
++	bool meta_fw = pvr_dev->fw_dev.processor_type == PVR_FW_PROCESSOR_TYPE_META;
+ 	u32 reg_value;
+ 	int err;
+ 
++	if (PVR_FEATURE_VALUE(pvr_dev, layout_mars, &layout_mars_value) == 0)
++		layout_mars = layout_mars_value > 0;
++
+ 	/*
+-	 * Wait for Sidekick/Jones to signal IDLE except for the Garten Wrapper.
+-	 * For cores with the LAYOUT_MARS feature, SIDEKICK would have been
++	 * For cores with the LAYOUT_MARS feature, SIDEKICK and SLC would have been
+ 	 * powered down by the FW.
+ 	 */
+-	err = pvr_cr_poll_reg32(pvr_dev, ROGUE_CR_SIDEKICK_IDLE, sidekick_idle_mask,
+-				sidekick_idle_mask, POLL_TIMEOUT_USEC);
+-	if (err)
+-		return err;
++	if (!layout_mars) {
++		/* Wait for Sidekick/Jones to signal IDLE except for the Garten Wrapper. */
++		err = pvr_cr_poll_reg32(pvr_dev, ROGUE_CR_SIDEKICK_IDLE, sidekick_idle_mask,
++					sidekick_idle_mask, POLL_TIMEOUT_USEC);
++		if (err)
++			return err;
++
++		/* Wait for SLC to signal IDLE. */
++		err = pvr_cr_poll_reg32(pvr_dev, ROGUE_CR_SLC_IDLE, ROGUE_CR_SLC_IDLE_MASKFULL,
++					ROGUE_CR_SLC_IDLE_MASKFULL, POLL_TIMEOUT_USEC);
++		if (err)
++			return err;
++	}
+ 
+ 	/* Unset MTS DM association with threads. */
+ 	pvr_cr_write32(pvr_dev, ROGUE_CR_MTS_INTCTX_THREAD0_DM_ASSOC,
+@@ -229,12 +243,15 @@ pvr_fw_stop(struct pvr_device *pvr_dev)
+ 	pvr_cr_write32(pvr_dev, ROGUE_CR_MTS_BGCTX_THREAD0_DM_ASSOC,
+ 		       ROGUE_CR_MTS_BGCTX_THREAD0_DM_ASSOC_MASKFULL &
+ 		       ROGUE_CR_MTS_BGCTX_THREAD0_DM_ASSOC_DM_ASSOC_CLRMSK);
+-	pvr_cr_write32(pvr_dev, ROGUE_CR_MTS_INTCTX_THREAD1_DM_ASSOC,
+-		       ROGUE_CR_MTS_INTCTX_THREAD1_DM_ASSOC_MASKFULL &
+-		       ROGUE_CR_MTS_INTCTX_THREAD1_DM_ASSOC_DM_ASSOC_CLRMSK);
+-	pvr_cr_write32(pvr_dev, ROGUE_CR_MTS_BGCTX_THREAD1_DM_ASSOC,
+-		       ROGUE_CR_MTS_BGCTX_THREAD1_DM_ASSOC_MASKFULL &
+-		       ROGUE_CR_MTS_BGCTX_THREAD1_DM_ASSOC_DM_ASSOC_CLRMSK);
++
++	if (meta_fw) {
++		pvr_cr_write32(pvr_dev, ROGUE_CR_MTS_INTCTX_THREAD1_DM_ASSOC,
++			       ROGUE_CR_MTS_INTCTX_THREAD1_DM_ASSOC_MASKFULL &
++			       ROGUE_CR_MTS_INTCTX_THREAD1_DM_ASSOC_DM_ASSOC_CLRMSK);
++		pvr_cr_write32(pvr_dev, ROGUE_CR_MTS_BGCTX_THREAD1_DM_ASSOC,
++			       ROGUE_CR_MTS_BGCTX_THREAD1_DM_ASSOC_MASKFULL &
++			       ROGUE_CR_MTS_BGCTX_THREAD1_DM_ASSOC_DM_ASSOC_CLRMSK);
++	}
+ 
+ 	/* Extra Idle checks. */
+ 	err = pvr_cr_poll_reg32(pvr_dev, ROGUE_CR_BIF_STATUS_MMU, 0,
+@@ -270,27 +287,25 @@ pvr_fw_stop(struct pvr_device *pvr_dev)
+ 		return err;
+ 
+ 	/*
+-	 * Wait for SLC to signal IDLE.
+-	 * For cores with the LAYOUT_MARS feature, SLC would have been powered
+-	 * down by the FW.
++	 * For cores with the LAYOUT_MARS feature, SIDEKICK and SLC would have been
++	 * powered down by the FW.
+ 	 */
+-	err = pvr_cr_poll_reg32(pvr_dev, ROGUE_CR_SLC_IDLE,
+-				ROGUE_CR_SLC_IDLE_MASKFULL,
+-				ROGUE_CR_SLC_IDLE_MASKFULL, POLL_TIMEOUT_USEC);
+-	if (err)
+-		return err;
++	if (!layout_mars) {
++		/* Wait for SLC to signal IDLE. */
++		err = pvr_cr_poll_reg32(pvr_dev, ROGUE_CR_SLC_IDLE,
++					ROGUE_CR_SLC_IDLE_MASKFULL,
++					ROGUE_CR_SLC_IDLE_MASKFULL, POLL_TIMEOUT_USEC);
++		if (err)
++			return err;
+ 
+-	/*
+-	 * Wait for Sidekick/Jones to signal IDLE except for the Garten Wrapper.
+-	 * For cores with the LAYOUT_MARS feature, SIDEKICK would have been powered
+-	 * down by the FW.
+-	 */
+-	err = pvr_cr_poll_reg32(pvr_dev, ROGUE_CR_SIDEKICK_IDLE, sidekick_idle_mask,
+-				sidekick_idle_mask, POLL_TIMEOUT_USEC);
+-	if (err)
+-		return err;
++		/* Wait for Sidekick/Jones to signal IDLE except for the Garten Wrapper. */
++		err = pvr_cr_poll_reg32(pvr_dev, ROGUE_CR_SIDEKICK_IDLE, sidekick_idle_mask,
++					sidekick_idle_mask, POLL_TIMEOUT_USEC);
++		if (err)
++			return err;
++	}
+ 
+-	if (pvr_dev->fw_dev.processor_type == PVR_FW_PROCESSOR_TYPE_META) {
++	if (meta_fw) {
+ 		err = pvr_meta_cr_read32(pvr_dev, META_CR_TxVECINT_BHALT, &reg_value);
+ 		if (err)
+ 			return err;
+@@ -304,11 +319,28 @@ pvr_fw_stop(struct pvr_device *pvr_dev)
+ 			skip_garten_idle = true;
+ 	}
+ 
+-	if (!skip_garten_idle) {
+-		err = pvr_cr_poll_reg32(pvr_dev, ROGUE_CR_SIDEKICK_IDLE,
+-					ROGUE_CR_SIDEKICK_IDLE_GARTEN_EN,
+-					ROGUE_CR_SIDEKICK_IDLE_GARTEN_EN,
++	if (meta_fw || !layout_mars) {
++		if (!skip_garten_idle) {
++			err = pvr_cr_poll_reg32(pvr_dev, ROGUE_CR_SIDEKICK_IDLE,
++						ROGUE_CR_SIDEKICK_IDLE_GARTEN_EN,
++						ROGUE_CR_SIDEKICK_IDLE_GARTEN_EN,
++						POLL_TIMEOUT_USEC);
++			if (err)
++				return err;
++		}
++	} else {
++		/*
++		 * As FW core has been moved from SIDEKICK to the new MARS domain, checking
++		 * idle bits for CPU & System Arbiter excluding SOCIF which will never be
++		 * idle if Host polling on this register
++		 */
++		err = pvr_cr_poll_reg32(pvr_dev, ROGUE_CR_MARS_IDLE,
++					ROGUE_CR_MARS_IDLE_CPU_EN |
++					ROGUE_CR_MARS_IDLE_MH_SYSARB0_EN,
++					ROGUE_CR_MARS_IDLE_CPU_EN |
++					ROGUE_CR_MARS_IDLE_MH_SYSARB0_EN,
+ 					POLL_TIMEOUT_USEC);
++
+ 		if (err)
+ 			return err;
+ 	}
+diff --git a/drivers/gpu/drm/imagination/pvr_fw_trace.c b/drivers/gpu/drm/imagination/pvr_fw_trace.c
+index e7f4554..805d9f9 100644
+--- a/drivers/gpu/drm/imagination/pvr_fw_trace.c
++++ b/drivers/gpu/drm/imagination/pvr_fw_trace.c
+@@ -9,13 +9,80 @@
+ 
+ #include <drm/drm_drv.h>
+ #include <drm/drm_file.h>
++#include <drm/drm_print.h>
+ 
+ #include <linux/build_bug.h>
++#include <linux/compiler_attributes.h>
+ #include <linux/dcache.h>
+ #include <linux/debugfs.h>
++#include <linux/moduleparam.h>
+ #include <linux/sysfs.h>
+ #include <linux/types.h>
+ 
++static int
++validate_group_mask(struct pvr_device *pvr_dev, const u32 group_mask)
++{
++	if (group_mask & ~ROGUE_FWIF_LOG_TYPE_GROUP_MASK) {
++		drm_warn(from_pvr_device(pvr_dev),
++			 "Invalid fw_trace group mask 0x%08x (must be a subset of 0x%08x)",
++			 group_mask, ROGUE_FWIF_LOG_TYPE_GROUP_MASK);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static inline u32
++build_log_type(const u32 group_mask)
++{
++	if (!group_mask)
++		return ROGUE_FWIF_LOG_TYPE_NONE;
++
++	return group_mask | ROGUE_FWIF_LOG_TYPE_TRACE;
++}
++
++/*
++ * Don't gate this behind CONFIG_DEBUG_FS so that it can be used as an initial
++ * value without further conditional code...
++ */
++static u32 pvr_fw_trace_init_mask;
++
++/*
++ * ...but do only expose the module parameter if debugfs is enabled, since
++ * there's no reason to turn on fw_trace without it.
++ */
++#if IS_ENABLED(CONFIG_DEBUG_FS)
++static int
++pvr_fw_trace_init_mask_set(const char *val, const struct kernel_param *kp)
++{
++	u32 mask = 0;
++	int err;
++
++	err = kstrtouint(val, 0, &mask);
++	if (err)
++		return err;
++
++	err = validate_group_mask(NULL, mask);
++	if (err)
++		return err;
++
++	*(unsigned int *)kp->arg = mask;
++
++	return 0;
++}
++
++static const struct kernel_param_ops pvr_fw_trace_init_mask_ops = {
++	.set = pvr_fw_trace_init_mask_set,
++	.get = param_get_hexint,
++};
++
++param_check_hexint(init_fw_trace_mask, &pvr_fw_trace_init_mask);
++module_param_cb(init_fw_trace_mask, &pvr_fw_trace_init_mask_ops, &pvr_fw_trace_init_mask, 0400);
++__MODULE_PARM_TYPE(init_fw_trace_mask, "hexint");
++MODULE_PARM_DESC(init_fw_trace_mask,
++		 "Enable FW trace for the specified groups at device init time");
++#endif
++
+ static void
+ tracebuf_ctrl_init(void *cpu_ptr, void *priv)
+ {
+@@ -24,11 +91,7 @@ tracebuf_ctrl_init(void *cpu_ptr, void *priv)
+ 
+ 	tracebuf_ctrl->tracebuf_size_in_dwords = ROGUE_FW_TRACE_BUF_DEFAULT_SIZE_IN_DWORDS;
+ 	tracebuf_ctrl->tracebuf_flags = 0;
+-
+-	if (fw_trace->group_mask)
+-		tracebuf_ctrl->log_type = fw_trace->group_mask | ROGUE_FWIF_LOG_TYPE_TRACE;
+-	else
+-		tracebuf_ctrl->log_type = ROGUE_FWIF_LOG_TYPE_NONE;
++	tracebuf_ctrl->log_type = build_log_type(fw_trace->group_mask);
+ 
+ 	for (u32 thread_nr = 0; thread_nr < ARRAY_SIZE(fw_trace->buffers); thread_nr++) {
+ 		struct rogue_fwif_tracebuf_space *tracebuf_space =
+@@ -67,8 +130,13 @@ int pvr_fw_trace_init(struct pvr_device *pvr_dev)
+ 		}
+ 	}
+ 
+-	/* TODO: Provide control of group mask. */
+-	fw_trace->group_mask = 0;
++	/*
++	 * Load the initial group_mask from the init_fw_trace_mask module
++	 * parameter. This allows early tracing before the user can write to
++	 * debugfs. Unlike update_logtype(), we don't set log_type here as that
++	 * is initialised by tracebuf_ctrl_init().
++	 */
++	fw_trace->group_mask = pvr_fw_trace_init_mask;
+ 
+ 	fw_trace->tracebuf_ctrl =
+ 		pvr_fw_object_create_and_map(pvr_dev,
+@@ -122,9 +190,11 @@ void pvr_fw_trace_fini(struct pvr_device *pvr_dev)
+ /**
+  * update_logtype() - Send KCCB command to trigger FW to update logtype
+  * @pvr_dev: Target PowerVR device
+- * @group_mask: New log group mask.
++ * @group_mask: New log group mask; must pass validate_group_mask().
+  *
+  * Returns:
++ *  * 0 if the provided @group_mask is the same as the current value (this is a
++ *    short-circuit evaluation),
+  *  * 0 on success,
+  *  * Any error returned by pvr_kccb_send_cmd(), or
+  *  * -%EIO if the device is lost.
+@@ -133,20 +203,21 @@ static int
+ update_logtype(struct pvr_device *pvr_dev, u32 group_mask)
+ {
+ 	struct pvr_fw_trace *fw_trace = &pvr_dev->fw_dev.fw_trace;
++	struct drm_device *drm_dev = from_pvr_device(pvr_dev);
+ 	struct rogue_fwif_kccb_cmd cmd;
+ 	int idx;
+ 	int err;
+ 	int slot;
+ 
+-	if (group_mask)
+-		fw_trace->tracebuf_ctrl->log_type = ROGUE_FWIF_LOG_TYPE_TRACE | group_mask;
+-	else
+-		fw_trace->tracebuf_ctrl->log_type = ROGUE_FWIF_LOG_TYPE_NONE;
++	/* No change in group_mask => nothing to update. */
++	if (fw_trace->group_mask == group_mask)
++		return 0;
+ 
+ 	fw_trace->group_mask = group_mask;
++	fw_trace->tracebuf_ctrl->log_type = build_log_type(group_mask);
+ 
+ 	down_read(&pvr_dev->reset_sem);
+-	if (!drm_dev_enter(from_pvr_device(pvr_dev), &idx)) {
++	if (!drm_dev_enter(drm_dev, &idx)) {
+ 		err = -EIO;
+ 		goto err_up_read;
+ 	}
+@@ -384,7 +455,7 @@ static int fw_trace_open(struct inode *inode, struct file *file)
+ 	struct pvr_fw_trace_seq_data *trace_seq_data;
+ 	int err;
+ 
+-	trace_seq_data = kzalloc(sizeof(*trace_seq_data), GFP_KERNEL);
++	trace_seq_data = kzalloc_obj(*trace_seq_data);
+ 	if (!trace_seq_data)
+ 		return -ENOMEM;
+ 
+@@ -442,13 +513,31 @@ static const struct file_operations pvr_fw_trace_fops = {
+ 	.release = fw_trace_release,
+ };
+ 
+-void
+-pvr_fw_trace_mask_update(struct pvr_device *pvr_dev, u32 old_mask, u32 new_mask)
++static int pvr_fw_trace_mask_get(void *data, u64 *value)
+ {
+-	if (IS_ENABLED(CONFIG_DEBUG_FS) && old_mask != new_mask)
+-		update_logtype(pvr_dev, new_mask);
++	struct pvr_device *pvr_dev = data;
++
++	*value = pvr_dev->fw_dev.fw_trace.group_mask;
++
++	return 0;
+ }
+ 
++static int pvr_fw_trace_mask_set(void *data, u64 value)
++{
++	struct pvr_device *pvr_dev = data;
++	const u32 group_mask = (u32)value;
++	int err;
++
++	err = validate_group_mask(pvr_dev, group_mask);
++	if (err)
++		return err;
++
++	return update_logtype(pvr_dev, group_mask);
++}
++
++DEFINE_DEBUGFS_ATTRIBUTE(pvr_fw_trace_mask_fops, pvr_fw_trace_mask_get,
++			 pvr_fw_trace_mask_set, "0x%08llx\n");
++
+ void
+ pvr_fw_trace_debugfs_init(struct pvr_device *pvr_dev, struct dentry *dir)
+ {
+@@ -468,4 +557,7 @@ pvr_fw_trace_debugfs_init(struct pvr_device *pvr_dev, struct dentry *dir)
+ 				    &fw_trace->buffers[thread_nr],
+ 				    &pvr_fw_trace_fops);
+ 	}
++
++	debugfs_create_file("trace_mask", 0600, dir, pvr_dev,
++			    &pvr_fw_trace_mask_fops);
+ }
+diff --git a/drivers/gpu/drm/imagination/pvr_fw_trace.h b/drivers/gpu/drm/imagination/pvr_fw_trace.h
+index 1d0ef93..0cc57f6 100644
+--- a/drivers/gpu/drm/imagination/pvr_fw_trace.h
++++ b/drivers/gpu/drm/imagination/pvr_fw_trace.h
+@@ -68,9 +68,6 @@ void pvr_fw_trace_fini(struct pvr_device *pvr_dev);
+ /* Forward declaration from <linux/dcache.h>. */
+ struct dentry;
+ 
+-void pvr_fw_trace_mask_update(struct pvr_device *pvr_dev, u32 old_mask,
+-			      u32 new_mask);
+-
+ void pvr_fw_trace_debugfs_init(struct pvr_device *pvr_dev, struct dentry *dir);
+ 
+ #endif /* PVR_FW_TRACE_H */
+diff --git a/drivers/gpu/drm/imagination/pvr_gem.c b/drivers/gpu/drm/imagination/pvr_gem.c
+index c07c9a9..d8660d6 100644
+--- a/drivers/gpu/drm/imagination/pvr_gem.c
++++ b/drivers/gpu/drm/imagination/pvr_gem.c
+@@ -25,7 +25,10 @@
+ 
+ static void pvr_gem_object_free(struct drm_gem_object *obj)
+ {
+-	drm_gem_shmem_object_free(obj);
++	struct drm_gem_shmem_object *shmem_obj = to_drm_gem_shmem_obj(obj);
++
++	shmem_obj->pages_mark_dirty_on_put = true;
++	drm_gem_shmem_free(shmem_obj);
+ }
+ 
+ static struct dma_buf *pvr_gem_export(struct drm_gem_object *obj, int flags)
+@@ -314,7 +317,7 @@ struct drm_gem_object *pvr_gem_create_object(struct drm_device *drm_dev, size_t
+ 	struct drm_gem_object *gem_obj;
+ 	struct pvr_gem_object *pvr_obj;
+ 
+-	pvr_obj = kzalloc(sizeof(*pvr_obj), GFP_KERNEL);
++	pvr_obj = kzalloc_obj(*pvr_obj);
+ 	if (!pvr_obj)
+ 		return ERR_PTR(-ENOMEM);
+ 
+@@ -363,7 +366,6 @@ pvr_gem_object_create(struct pvr_device *pvr_dev, size_t size, u64 flags)
+ 	if (IS_ERR(shmem_obj))
+ 		return ERR_CAST(shmem_obj);
+ 
+-	shmem_obj->pages_mark_dirty_on_put = true;
+ 	shmem_obj->map_wc = !(flags & PVR_BO_CPU_CACHED);
+ 	pvr_obj = shmem_gem_to_pvr_gem(shmem_obj);
+ 	pvr_obj->flags = flags;
+diff --git a/drivers/gpu/drm/imagination/pvr_gem.h b/drivers/gpu/drm/imagination/pvr_gem.h
+index c99f30c..4286e04 100644
+--- a/drivers/gpu/drm/imagination/pvr_gem.h
++++ b/drivers/gpu/drm/imagination/pvr_gem.h
+@@ -84,8 +84,10 @@ struct pvr_gem_object {
+ 	/**
+ 	 * @base: The underlying &struct drm_gem_shmem_object.
+ 	 *
+-	 * Do not access this member directly, instead call
+-	 * shem_gem_from_pvr_gem().
++	 * .. note::
++	 *
++	 *    This member should not be accessed directly, but instead by
++	 *    calling shmem_gem_from_pvr_gem().
+ 	 */
+ 	struct drm_gem_shmem_object base;
+ 
+@@ -97,12 +99,6 @@ struct pvr_gem_object {
+ 	 * changed after creation.
+ 	 *
+ 	 * Must be a combination of DRM_PVR_BO_* and/or PVR_BO_* flags.
+-	 *
+-	 * .. note::
+-	 *
+-	 *    This member is declared const to indicate that none of these
+-	 *    options may change or be changed throughout the object's
+-	 *    lifetime.
+ 	 */
+ 	u64 flags;
+ 
+diff --git a/drivers/gpu/drm/imagination/pvr_hwrt.c b/drivers/gpu/drm/imagination/pvr_hwrt.c
+index dc0c25f..05c68c7 100644
+--- a/drivers/gpu/drm/imagination/pvr_hwrt.c
++++ b/drivers/gpu/drm/imagination/pvr_hwrt.c
+@@ -457,7 +457,7 @@ pvr_hwrt_dataset_create(struct pvr_file *pvr_file,
+ 	int err, i = 0;
+ 
+ 	/* Create and fill out the kernel structure */
+-	hwrt = kzalloc(sizeof(*hwrt), GFP_KERNEL);
++	hwrt = kzalloc_obj(*hwrt);
+ 
+ 	if (!hwrt)
+ 		return ERR_PTR(-ENOMEM);
+diff --git a/drivers/gpu/drm/imagination/pvr_job.c b/drivers/gpu/drm/imagination/pvr_job.c
+index 7564b0f..b8a58d8 100644
+--- a/drivers/gpu/drm/imagination/pvr_job.c
++++ b/drivers/gpu/drm/imagination/pvr_job.c
+@@ -14,6 +14,7 @@
+ #include "pvr_stream.h"
+ #include "pvr_stream_defs.h"
+ #include "pvr_sync.h"
++#include "pvr_trace.h"
+ 
+ #include <drm/drm_exec.h>
+ #include <drm/drm_gem.h>
+@@ -326,7 +327,7 @@ prepare_job_syncs(struct pvr_file *pvr_file,
+ 		  struct pvr_job_data *job_data,
+ 		  struct xarray *signal_array)
+ {
+-	struct dma_fence *done_fence;
++	struct dma_fence *finished_fence;
+ 	int err = pvr_sync_signal_array_collect_ops(signal_array,
+ 						    from_pvr_file(pvr_file),
+ 						    job_data->sync_op_count,
+@@ -359,13 +360,13 @@ prepare_job_syncs(struct pvr_file *pvr_file,
+ 			return err;
+ 	}
+ 
+-	/* We need to arm the job to get the job done fence. */
+-	done_fence = pvr_queue_job_arm(job_data->job);
++	/* We need to arm the job to get the job finished fence. */
++	finished_fence = pvr_queue_job_arm(job_data->job);
+ 
+ 	err = pvr_sync_signal_array_update_fences(signal_array,
+ 						  job_data->sync_op_count,
+ 						  job_data->sync_ops,
+-						  done_fence);
++						  finished_fence);
+ 	return err;
+ }
+ 
+@@ -415,7 +416,7 @@ create_job(struct pvr_device *pvr_dev,
+ 	    (args->hwrt.set_handle || args->hwrt.data_index))
+ 		return ERR_PTR(-EINVAL);
+ 
+-	job = kzalloc(sizeof(*job), GFP_KERNEL);
++	job = kzalloc_obj(*job);
+ 	if (!job)
+ 		return ERR_PTR(-ENOMEM);
+ 
+@@ -510,6 +511,8 @@ static int pvr_job_data_init(struct pvr_device *pvr_dev,
+ 		}
+ 
+ 		job_data_out[i].sync_op_count = job_args[i].sync_ops.count;
++
++		trace_pvr_job_create(pvr_dev, job_data_out[i].job, job_data_out[i].sync_op_count);
+ 	}
+ 
+ 	return 0;
+@@ -718,8 +721,8 @@ pvr_submit_jobs(struct pvr_device *pvr_dev, struct pvr_file *pvr_file,
+ 	if (err)
+ 		return err;
+ 
+-	job_data = kvmalloc_array(args->jobs.count, sizeof(*job_data),
+-				  GFP_KERNEL | __GFP_ZERO);
++	job_data = kvmalloc_objs(*job_data, args->jobs.count,
++				 GFP_KERNEL | __GFP_ZERO);
+ 	if (!job_data) {
+ 		err = -ENOMEM;
+ 		goto out_free;
+diff --git a/drivers/gpu/drm/imagination/pvr_mmu.c b/drivers/gpu/drm/imagination/pvr_mmu.c
+index 450d476..62eae7f 100644
+--- a/drivers/gpu/drm/imagination/pvr_mmu.c
++++ b/drivers/gpu/drm/imagination/pvr_mmu.c
+@@ -12,6 +12,7 @@
+ #include "pvr_rogue_mmu_defs.h"
+ 
+ #include <drm/drm_drv.h>
++#include <drm/drm_print.h>
+ #include <linux/atomic.h>
+ #include <linux/bitops.h>
+ #include <linux/dma-mapping.h>
+@@ -133,8 +134,8 @@ int pvr_mmu_flush_exec(struct pvr_device *pvr_dev, bool wait)
+ 	if (!drm_dev_enter(from_pvr_device(pvr_dev), &idx))
+ 		return -EIO;
+ 
+-	/* Can't flush MMU if the firmware hasn't booted yet. */
+-	if (!pvr_dev->fw_dev.booted)
++	/* Can't flush MMU if the firmware hasn't been initialised yet. */
++	if (!READ_ONCE(pvr_dev->fw_dev.initialised))
+ 		goto err_drm_dev_exit;
+ 
+ 	cmd_mmu_cache_data->cache_flags =
+@@ -1828,7 +1829,7 @@ pvr_page_table_l0_get_or_insert(struct pvr_mmu_op_context *op_ctx,
+  */
+ struct pvr_mmu_context *pvr_mmu_context_create(struct pvr_device *pvr_dev)
+ {
+-	struct pvr_mmu_context *ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
++	struct pvr_mmu_context *ctx = kzalloc_obj(*ctx);
+ 	int err;
+ 
+ 	if (!ctx)
+@@ -1877,8 +1878,7 @@ pvr_page_table_l1_alloc(struct pvr_mmu_context *ctx)
+ {
+ 	int err;
+ 
+-	struct pvr_page_table_l1 *table =
+-		kzalloc(sizeof(*table), GFP_KERNEL);
++	struct pvr_page_table_l1 *table = kzalloc_obj(*table);
+ 
+ 	if (!table)
+ 		return ERR_PTR(-ENOMEM);
+@@ -1906,8 +1906,7 @@ pvr_page_table_l0_alloc(struct pvr_mmu_context *ctx)
+ {
+ 	int err;
+ 
+-	struct pvr_page_table_l0 *table =
+-		kzalloc(sizeof(*table), GFP_KERNEL);
++	struct pvr_page_table_l0 *table = kzalloc_obj(*table);
+ 
+ 	if (!table)
+ 		return ERR_PTR(-ENOMEM);
+@@ -2337,6 +2336,7 @@ void pvr_mmu_op_context_destroy(struct pvr_mmu_op_context *op_ctx)
+  * pvr_mmu_op_context_create() - Create an MMU op context.
+  * @ctx: MMU context associated with owning VM context.
+  * @sgt: Scatter gather table containing pages pinned for use by this context.
++ * @device_addr: Virtual device address at the start of the requested mapping.
+  * @sgt_offset: Start offset of the requested device-virtual memory mapping.
+  * @size: Size in bytes of the requested device-virtual memory mapping. For an
+  * unmapping, this should be zero so that no page tables are allocated.
+@@ -2348,12 +2348,12 @@ void pvr_mmu_op_context_destroy(struct pvr_mmu_op_context *op_ctx)
+  */
+ struct pvr_mmu_op_context *
+ pvr_mmu_op_context_create(struct pvr_mmu_context *ctx, struct sg_table *sgt,
+-			  u64 sgt_offset, u64 size)
++			  u64 device_addr, u64 sgt_offset, u64 size)
+ {
++	u64 start_addr = device_addr + sgt_offset;
+ 	int err;
+ 
+-	struct pvr_mmu_op_context *op_ctx =
+-		kzalloc(sizeof(*op_ctx), GFP_KERNEL);
++	struct pvr_mmu_op_context *op_ctx = kzalloc_obj(*op_ctx);
+ 
+ 	if (!op_ctx)
+ 		return ERR_PTR(-ENOMEM);
+@@ -2366,16 +2366,16 @@ pvr_mmu_op_context_create(struct pvr_mmu_context *ctx, struct sg_table *sgt,
+ 	if (size) {
+ 		/*
+ 		 * The number of page table objects we need to prealloc is
+-		 * indicated by the mapping size, start offset and the sizes
++		 * indicated by the mapping size, start address and the sizes
+ 		 * of the areas mapped per PT or PD. The range calculation is
+ 		 * identical to that for the index into a table for a device
+ 		 * address, so we reuse those functions here.
+ 		 */
+-		const u32 l1_start_idx = pvr_page_table_l2_idx(sgt_offset);
+-		const u32 l1_end_idx = pvr_page_table_l2_idx(sgt_offset + size);
++		const u32 l1_start_idx = pvr_page_table_l2_idx(start_addr);
++		const u32 l1_end_idx = pvr_page_table_l2_idx(start_addr + size);
+ 		const u32 l1_count = l1_end_idx - l1_start_idx + 1;
+-		const u32 l0_start_idx = pvr_page_table_l1_idx(sgt_offset);
+-		const u32 l0_end_idx = pvr_page_table_l1_idx(sgt_offset + size);
++		const u32 l0_start_idx = pvr_page_table_l1_idx(start_addr);
++		const u32 l0_end_idx = pvr_page_table_l1_idx(start_addr + size);
+ 		const u32 l0_count = l0_end_idx - l0_start_idx + 1;
+ 
+ 		/*
+@@ -2556,7 +2556,9 @@ pvr_mmu_map_sgl(struct pvr_mmu_op_context *op_ctx, struct scatterlist *sgl,
+ 
+ err_destroy_pages:
+ 	memcpy(&op_ctx->curr_page, &ptr_copy, sizeof(op_ctx->curr_page));
+-	err = pvr_mmu_op_context_unmap_curr_page(op_ctx, page);
++	if (pvr_mmu_op_context_unmap_curr_page(op_ctx, page))
++		drm_err(from_pvr_device(op_ctx->mmu_ctx->pvr_dev),
++			"%s : Failure in unmapping pages\n", __func__);
+ 
+ 	return err;
+ }
+diff --git a/drivers/gpu/drm/imagination/pvr_mmu.h b/drivers/gpu/drm/imagination/pvr_mmu.h
+index a8ecd46..2c02d61 100644
+--- a/drivers/gpu/drm/imagination/pvr_mmu.h
++++ b/drivers/gpu/drm/imagination/pvr_mmu.h
+@@ -99,7 +99,7 @@ dma_addr_t pvr_mmu_get_root_table_dma_addr(struct pvr_mmu_context *ctx);
+ void pvr_mmu_op_context_destroy(struct pvr_mmu_op_context *op_ctx);
+ struct pvr_mmu_op_context *
+ pvr_mmu_op_context_create(struct pvr_mmu_context *ctx,
+-			  struct sg_table *sgt, u64 sgt_offset, u64 size);
++			  struct sg_table *sgt, u64 device_addr, u64 sgt_offset, u64 size);
+ 
+ int pvr_mmu_map(struct pvr_mmu_op_context *op_ctx, u64 size, u64 flags,
+ 		u64 device_addr);
+diff --git a/drivers/gpu/drm/imagination/pvr_params.c b/drivers/gpu/drm/imagination/pvr_params.c
+deleted file mode 100644
+index b91759f..0000000
+--- a/drivers/gpu/drm/imagination/pvr_params.c
++++ /dev/null
+@@ -1,147 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0-only OR MIT
+-/* Copyright (c) 2023 Imagination Technologies Ltd. */
+-
+-#include "pvr_params.h"
+-
+-#include <linux/cache.h>
+-#include <linux/moduleparam.h>
+-
+-static struct pvr_device_params pvr_device_param_defaults __read_mostly = {
+-#define X(type_, name_, value_, desc_, ...) .name_ = (value_),
+-	PVR_DEVICE_PARAMS
+-#undef X
+-};
+-
+-#define PVR_DEVICE_PARAM_NAMED(name_, type_, desc_) \
+-	module_param_named(name_, pvr_device_param_defaults.name_, type_, \
+-			   0400);                                         \
+-	MODULE_PARM_DESC(name_, desc_);
+-
+-/*
+- * This list of defines must contain every type specified in "pvr_params.h" as
+- * ``PVR_PARAM_TYPE_*_C``.
+- */
+-#define PVR_PARAM_TYPE_X32_MODPARAM uint
+-
+-#define X(type_, name_, value_, desc_, ...) \
+-	PVR_DEVICE_PARAM_NAMED(name_, PVR_PARAM_TYPE_##type_##_MODPARAM, desc_);
+-PVR_DEVICE_PARAMS
+-#undef X
+-
+-int
+-pvr_device_params_init(struct pvr_device_params *params)
+-{
+-	/*
+-	 * If heap-allocated parameters are added in the future (e.g.
+-	 * modparam's charp type), they must be handled specially here (via
+-	 * kstrdup() in the case of charp). Since that's not necessary yet,
+-	 * a straight copy will do for now. This change will also require a
+-	 * pvr_device_params_fini() function to free any heap-allocated copies.
+-	 */
+-
+-	*params = pvr_device_param_defaults;
+-
+-	return 0;
+-}
+-
+-#if defined(CONFIG_DEBUG_FS)
+-#include "pvr_device.h"
+-
+-#include <linux/dcache.h>
+-#include <linux/debugfs.h>
+-#include <linux/export.h>
+-#include <linux/fs.h>
+-#include <linux/stddef.h>
+-
+-/*
+- * This list of defines must contain every type specified in "pvr_params.h" as
+- * ``PVR_PARAM_TYPE_*_C``.
+- */
+-#define PVR_PARAM_TYPE_X32_FMT "0x%08llx"
+-
+-#define X_SET(name_, mode_) X_SET_##mode_(name_)
+-#define X_SET_DEF(name_, update_, mode_) X_SET_DEF_##mode_(name_, update_)
+-
+-#define X_SET_RO(name_) NULL
+-#define X_SET_RW(name_) __pvr_device_param_##name_##set
+-
+-#define X_SET_DEF_RO(name_, update_)
+-#define X_SET_DEF_RW(name_, update_)                                    \
+-	static int                                                      \
+-	X_SET_RW(name_)(void *data, u64 val)                            \
+-	{                                                               \
+-		struct pvr_device *pvr_dev = data;                      \
+-		/* This is not just (update_) to suppress -Waddress. */ \
+-		if ((void *)(update_) != NULL)                          \
+-			(update_)(pvr_dev, pvr_dev->params.name_, val); \
+-		pvr_dev->params.name_ = val;                            \
+-		return 0;                                               \
+-	}
+-
+-#define X(type_, name_, value_, desc_, mode_, update_)                     \
+-	static int                                                         \
+-	__pvr_device_param_##name_##_get(void *data, u64 *val)             \
+-	{                                                                  \
+-		struct pvr_device *pvr_dev = data;                         \
+-		*val = pvr_dev->params.name_;                              \
+-		return 0;                                                  \
+-	}                                                                  \
+-	X_SET_DEF(name_, update_, mode_)                                   \
+-	static int                                                         \
+-	__pvr_device_param_##name_##_open(struct inode *inode,             \
+-					  struct file *file)               \
+-	{                                                                  \
+-		__simple_attr_check_format(PVR_PARAM_TYPE_##type_##_FMT,   \
+-					   0ull);                          \
+-		return simple_attr_open(inode, file,                       \
+-					__pvr_device_param_##name_##_get,  \
+-					X_SET(name_, mode_),               \
+-					PVR_PARAM_TYPE_##type_##_FMT);     \
+-	}
+-PVR_DEVICE_PARAMS
+-#undef X
+-
+-#undef X_SET
+-#undef X_SET_RO
+-#undef X_SET_RW
+-#undef X_SET_DEF
+-#undef X_SET_DEF_RO
+-#undef X_SET_DEF_RW
+-
+-static struct {
+-#define X(type_, name_, value_, desc_, mode_, update_) \
+-	const struct file_operations name_;
+-	PVR_DEVICE_PARAMS
+-#undef X
+-} pvr_device_param_debugfs_fops = {
+-#define X(type_, name_, value_, desc_, mode_, update_)     \
+-	.name_ = {                                         \
+-		.owner = THIS_MODULE,                      \
+-		.open = __pvr_device_param_##name_##_open, \
+-		.release = simple_attr_release,            \
+-		.read = simple_attr_read,                  \
+-		.write = simple_attr_write,                \
+-		.llseek = generic_file_llseek,             \
+-	},
+-	PVR_DEVICE_PARAMS
+-#undef X
+-};
+-
+-void
+-pvr_params_debugfs_init(struct pvr_device *pvr_dev, struct dentry *dir)
+-{
+-#define X_MODE(mode_) X_MODE_##mode_
+-#define X_MODE_RO 0400
+-#define X_MODE_RW 0600
+-
+-#define X(type_, name_, value_, desc_, mode_, update_)             \
+-	debugfs_create_file(#name_, X_MODE(mode_), dir, pvr_dev,   \
+-			    &pvr_device_param_debugfs_fops.name_);
+-	PVR_DEVICE_PARAMS
+-#undef X
+-
+-#undef X_MODE
+-#undef X_MODE_RO
+-#undef X_MODE_RW
+-}
+-#endif
+diff --git a/drivers/gpu/drm/imagination/pvr_params.h b/drivers/gpu/drm/imagination/pvr_params.h
+deleted file mode 100644
+index 5807915..0000000
+--- a/drivers/gpu/drm/imagination/pvr_params.h
++++ /dev/null
+@@ -1,72 +0,0 @@
+-/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
+-/* Copyright (c) 2023 Imagination Technologies Ltd. */
+-
+-#ifndef PVR_PARAMS_H
+-#define PVR_PARAMS_H
+-
+-#include "pvr_rogue_fwif.h"
+-
+-#include <linux/cache.h>
+-#include <linux/compiler_attributes.h>
+-
+-/*
+- * This is the definitive list of types allowed in the definition of
+- * %PVR_DEVICE_PARAMS.
+- */
+-#define PVR_PARAM_TYPE_X32_C u32
+-
+-/*
+- * This macro defines all device-specific parameters; that is parameters which
+- * are set independently per device.
+- *
+- * The X-macro accepts the following arguments. Arguments marked with [debugfs]
+- * are ignored when debugfs is disabled; values used for these arguments may
+- * safely be gated behind CONFIG_DEBUG_FS.
+- *
+- * @type_: The definitive list of allowed values is PVR_PARAM_TYPE_*_C.
+- * @name_: Name of the parameter. This is used both as the field name in C and
+- *         stringified as the parameter name.
+- * @value_: Initial/default value.
+- * @desc_: String literal used as help text to describe the usage of this
+- *         parameter.
+- * @mode_: [debugfs] One of {RO,RW}. The access mode of the debugfs entry for
+- *         this parameter.
+- * @update_: [debugfs] When debugfs support is enabled, parameters may be
+- *           updated at runtime. When this happens, this function will be
+- *           called to allow changes to propagate. The signature of this
+- *           function is:
+- *
+- *              void (*)(struct pvr_device *pvr_dev, T old_val, T new_val)
+- *
+- *           Where T is the C type associated with @type_.
+- *
+- *           If @mode_ does not allow write access, this function will never be
+- *           called. In this case, or if no update callback is required, you
+- *           should specify NULL for this argument.
+- */
+-#define PVR_DEVICE_PARAMS                                                    \
+-	X(X32, fw_trace_mask, ROGUE_FWIF_LOG_TYPE_NONE,                      \
+-	  "Enable FW trace for the specified groups. Specifying 0 disables " \
+-	  "all FW tracing.",                                                 \
+-	  RW, pvr_fw_trace_mask_update)
+-
+-struct pvr_device_params {
+-#define X(type_, name_, value_, desc_, ...) \
+-	PVR_PARAM_TYPE_##type_##_C name_;
+-	PVR_DEVICE_PARAMS
+-#undef X
+-};
+-
+-int pvr_device_params_init(struct pvr_device_params *params);
+-
+-#if defined(CONFIG_DEBUG_FS)
+-/* Forward declaration from "pvr_device.h". */
+-struct pvr_device;
+-
+-/* Forward declaration from <linux/dcache.h>. */
+-struct dentry;
+-
+-void pvr_params_debugfs_init(struct pvr_device *pvr_dev, struct dentry *dir);
+-#endif /* defined(CONFIG_DEBUG_FS) */
+-
+-#endif /* PVR_PARAMS_H */
+diff --git a/drivers/gpu/drm/imagination/pvr_power.c b/drivers/gpu/drm/imagination/pvr_power.c
+index a799445..eb4b6ec 100644
+--- a/drivers/gpu/drm/imagination/pvr_power.c
++++ b/drivers/gpu/drm/imagination/pvr_power.c
+@@ -10,6 +10,7 @@
+ 
+ #include <drm/drm_drv.h>
+ #include <drm/drm_managed.h>
++#include <drm/drm_print.h>
+ #include <linux/cleanup.h>
+ #include <linux/clk.h>
+ #include <linux/interrupt.h>
+@@ -91,9 +92,9 @@ pvr_power_request_pwr_off(struct pvr_device *pvr_dev)
+ static int
+ pvr_power_fw_disable(struct pvr_device *pvr_dev, bool hard_reset, bool rpm_suspend)
+ {
+-	if (!hard_reset) {
+-		int err;
++	int err;
+ 
++	if (!hard_reset) {
+ 		cancel_delayed_work_sync(&pvr_dev->watchdog.work);
+ 
+ 		err = pvr_power_request_idle(pvr_dev);
+@@ -106,33 +107,46 @@ pvr_power_fw_disable(struct pvr_device *pvr_dev, bool hard_reset, bool rpm_suspe
+ 	}
+ 
+ 	if (rpm_suspend) {
+-		/* Wait for late processing of GPU or firmware IRQs in other cores */
+-		synchronize_irq(pvr_dev->irq);
++		/* This also waits for late processing of GPU or firmware IRQs in other cores */
++		disable_irq(pvr_dev->irq);
+ 	}
+ 
+-	return pvr_fw_stop(pvr_dev);
++	err = pvr_fw_stop(pvr_dev);
++	if (err && rpm_suspend)
++		enable_irq(pvr_dev->irq);
++
++	return err;
+ }
+ 
+ static int
+-pvr_power_fw_enable(struct pvr_device *pvr_dev)
++pvr_power_fw_enable(struct pvr_device *pvr_dev, bool rpm_resume)
+ {
+ 	int err;
+ 
++	if (rpm_resume)
++		enable_irq(pvr_dev->irq);
++
+ 	err = pvr_fw_start(pvr_dev);
+ 	if (err)
+-		return err;
++		goto out;
+ 
+ 	err = pvr_wait_for_fw_boot(pvr_dev);
+ 	if (err) {
+ 		drm_err(from_pvr_device(pvr_dev), "Firmware failed to boot\n");
+ 		pvr_fw_stop(pvr_dev);
+-		return err;
++		goto out;
+ 	}
+ 
+ 	queue_delayed_work(pvr_dev->sched_wq, &pvr_dev->watchdog.work,
+ 			   msecs_to_jiffies(WATCHDOG_TIME_MS));
+ 
+ 	return 0;
++
++out:
++	if (rpm_resume)
++		disable_irq(pvr_dev->irq);
++
++	return err;
+ }
+ 
+ bool
+@@ -202,7 +216,7 @@ pvr_watchdog_worker(struct work_struct *work)
+ 	if (pm_runtime_get_if_in_use(from_pvr_device(pvr_dev)->dev) <= 0)
+ 		goto out_requeue;
+ 
+-	if (!pvr_dev->fw_dev.booted)
++	if (!READ_ONCE(pvr_dev->fw_dev.initialised))
+ 		goto out_pm_runtime_put;
+ 
+ 	stalled = pvr_watchdog_kccb_stalled(pvr_dev);
+@@ -338,12 +352,12 @@ static int pvr_power_init_pwrseq(struct pvr_device *pvr_dev)
+ 
+ static int pvr_power_on_sequence_pwrseq(struct pvr_device *pvr_dev)
+ {
+-	return pwrseq_power_on(pvr_dev->pwrseq);
++	return pwrseq_enable(pvr_dev->pwrseq);
+ }
+ 
+ static int pvr_power_off_sequence_pwrseq(struct pvr_device *pvr_dev)
+ {
+-	return pwrseq_power_off(pvr_dev->pwrseq);
++	return pwrseq_disable(pvr_dev->pwrseq);
+ }
+ 
+ const struct pvr_power_sequence_ops pvr_power_sequence_ops_pwrseq = {
+@@ -364,7 +378,7 @@ pvr_power_device_suspend(struct device *dev)
+ 	if (!drm_dev_enter(drm_dev, &idx))
+ 		return -EIO;
+ 
+-	if (pvr_dev->fw_dev.booted) {
++	if (READ_ONCE(pvr_dev->fw_dev.initialised)) {
+ 		err = pvr_power_fw_disable(pvr_dev, false, true);
+ 		if (err)
+ 			goto err_drm_dev_exit;
+@@ -394,8 +408,8 @@ pvr_power_device_resume(struct device *dev)
+ 	if (err)
+ 		goto err_drm_dev_exit;
+ 
+-	if (pvr_dev->fw_dev.booted) {
+-		err = pvr_power_fw_enable(pvr_dev);
++	if (READ_ONCE(pvr_dev->fw_dev.initialised)) {
++		err = pvr_power_fw_enable(pvr_dev, true);
+ 		if (err)
+ 			goto err_power_off;
+ 	}
+@@ -534,7 +548,7 @@ pvr_power_reset(struct pvr_device *pvr_dev, bool hard_reset)
+ 		err = pvr_power_fw_disable(pvr_dev, hard_reset, false);
+ 		if (!err) {
+ 			if (hard_reset) {
+-				pvr_dev->fw_dev.booted = false;
++				WRITE_ONCE(pvr_dev->fw_dev.initialised, false);
+ 				WARN_ON(pvr_power_device_suspend(from_pvr_device(pvr_dev)->dev));
+ 
+ 				err = pvr_fw_hard_reset(pvr_dev);
+@@ -542,7 +556,7 @@ pvr_power_reset(struct pvr_device *pvr_dev, bool hard_reset)
+ 					goto err_device_lost;
+ 
+ 				err = pvr_power_device_resume(from_pvr_device(pvr_dev)->dev);
+-				pvr_dev->fw_dev.booted = true;
++				WRITE_ONCE(pvr_dev->fw_dev.initialised, true);
+ 				if (err)
+ 					goto err_device_lost;
+ 			} else {
+@@ -554,7 +568,7 @@ pvr_power_reset(struct pvr_device *pvr_dev, bool hard_reset)
+ 
+ 			pvr_fw_irq_clear(pvr_dev);
+ 
+-			err = pvr_power_fw_enable(pvr_dev);
++			err = pvr_power_fw_enable(pvr_dev, false);
+ 		}
+ 
+ 		if (err && hard_reset)
+@@ -606,65 +620,61 @@ pvr_watchdog_fini(struct pvr_device *pvr_dev)
+ 
+ int pvr_power_domains_init(struct pvr_device *pvr_dev)
+ {
+-	struct device *dev = from_pvr_device(pvr_dev)->dev;
++	static const char *const ROGUE_PD_NAMES[] = { "a", "b", "c", "d", "e" };
+ 
+-	struct device_link **domain_links __free(kfree) = NULL;
+-	struct device **domain_devs __free(kfree) = NULL;
++	struct drm_device *drm_dev = from_pvr_device(pvr_dev);
++	struct device *dev = drm_dev->dev;
++
++	struct dev_pm_domain_list *domains = NULL;
++	struct device_link **domain_links = NULL;
+ 	int domain_count;
+ 	int link_count;
+ 
+-	char dev_name[2] = "a";
+ 	int err;
+ 	int i;
+ 
+ 	domain_count = of_count_phandle_with_args(dev->of_node, "power-domains",
+ 						  "#power-domain-cells");
+-	if (domain_count < 0)
+-		return domain_count;
+-
+-	if (domain_count <= 1)
+-		return 0;
+-
+-	link_count = domain_count + (domain_count - 1);
+-
+-	domain_devs = kcalloc(domain_count, sizeof(*domain_devs), GFP_KERNEL);
+-	if (!domain_devs)
+-		return -ENOMEM;
+-
+-	domain_links = kcalloc(link_count, sizeof(*domain_links), GFP_KERNEL);
+-	if (!domain_links)
+-		return -ENOMEM;
+-
+-	for (i = 0; i < domain_count; i++) {
+-		struct device *domain_dev;
+-
+-		dev_name[0] = 'a' + i;
+-		domain_dev = dev_pm_domain_attach_by_name(dev, dev_name);
+-		if (IS_ERR_OR_NULL(domain_dev)) {
+-			err = domain_dev ? PTR_ERR(domain_dev) : -ENODEV;
+-			goto err_detach;
+-		}
+-
+-		domain_devs[i] = domain_dev;
++	if (domain_count < 0) {
++		err = domain_count;
++		goto out;
+ 	}
+ 
+-	for (i = 0; i < domain_count; i++) {
+-		struct device_link *link;
+-
+-		link = device_link_add(dev, domain_devs[i], DL_FLAG_STATELESS | DL_FLAG_PM_RUNTIME);
+-		if (!link) {
+-			err = -ENODEV;
+-			goto err_unlink;
+-		}
+-
+-		domain_links[i] = link;
++	if (domain_count <= 1) {
++		err = 0;
++		goto out;
+ 	}
+ 
+-	for (i = domain_count; i < link_count; i++) {
++	if (domain_count > ARRAY_SIZE(ROGUE_PD_NAMES)) {
++		drm_err(drm_dev, "%s() only supports %zu domains on Rogue",
++			__func__, ARRAY_SIZE(ROGUE_PD_NAMES));
++		err = -EOPNOTSUPP;
++		goto out;
++	}
++
++	link_count = domain_count - 1;
++
++	domain_links = kzalloc_objs(*domain_links, link_count);
++	if (!domain_links) {
++		err = -ENOMEM;
++		goto out;
++	}
++
++	const struct dev_pm_domain_attach_data pd_attach_data = {
++		.pd_names = ROGUE_PD_NAMES,
++		.num_pd_names = domain_count,
++		.pd_flags = 0,
++	};
++
++	err = dev_pm_domain_attach_list(dev, &pd_attach_data, &domains);
++	if (err < 0)
++		goto err_free_links;
++
++	for (i = 0; i < link_count; i++) {
+ 		struct device_link *link;
+ 
+-		link = device_link_add(domain_devs[i - domain_count + 1],
+-				       domain_devs[i - domain_count],
++		link = device_link_add(domains->pd_devs[i + 1],
++				       domains->pd_devs[i],
+ 				       DL_FLAG_STATELESS | DL_FLAG_PM_RUNTIME);
+ 		if (!link) {
+ 			err = -ENODEV;
+@@ -674,43 +684,43 @@ int pvr_power_domains_init(struct pvr_device *pvr_dev)
+ 		domain_links[i] = link;
+ 	}
+ 
+-	pvr_dev->power = (struct pvr_device_power){
+-		.domain_devs = no_free_ptr(domain_devs),
+-		.domain_links = no_free_ptr(domain_links),
+-		.domain_count = domain_count,
+-	};
+-
+-	return 0;
++	err = 0;
++	goto out;
+ 
+ err_unlink:
+ 	while (--i >= 0)
+ 		device_link_del(domain_links[i]);
+ 
+-	i = domain_count;
++	dev_pm_domain_detach_list(domains);
++	domains = NULL;
+ 
+-err_detach:
+-	while (--i >= 0)
+-		dev_pm_domain_detach(domain_devs[i], true);
++err_free_links:
++	kfree(domain_links);
++	domain_links = NULL;
++
++out:
++	pvr_dev->power = (struct pvr_device_power){
++		.domains = domains,
++		.domain_links = domain_links,
++	};
+ 
+ 	return err;
+ }
+ 
+ void pvr_power_domains_fini(struct pvr_device *pvr_dev)
+ {
+-	const int domain_count = pvr_dev->power.domain_count;
++	struct pvr_device_power *pvr_power = &pvr_dev->power;
+ 
+-	int i = domain_count + (domain_count - 1);
++	if (!pvr_power->domains)
++		goto out;
+ 
+-	while (--i >= 0)
+-		device_link_del(pvr_dev->power.domain_links[i]);
++	for (int i = (int)pvr_power->domains->num_pds - 2; i >= 0; --i)
++		device_link_del(pvr_power->domain_links[i]);
+ 
+-	i = domain_count;
++	dev_pm_domain_detach_list(pvr_power->domains);
+ 
+-	while (--i >= 0)
+-		dev_pm_domain_detach(pvr_dev->power.domain_devs[i], true);
++	kfree(pvr_power->domain_links);
+ 
+-	kfree(pvr_dev->power.domain_links);
+-	kfree(pvr_dev->power.domain_devs);
+-
+-	pvr_dev->power = (struct pvr_device_power){ 0 };
++out:
++	*pvr_power = (struct pvr_device_power){ 0 };
+ }
+diff --git a/drivers/gpu/drm/imagination/pvr_power.h b/drivers/gpu/drm/imagination/pvr_power.h
+index b853d09..c34252b 100644
+--- a/drivers/gpu/drm/imagination/pvr_power.h
++++ b/drivers/gpu/drm/imagination/pvr_power.h
+@@ -30,12 +30,12 @@ pvr_power_get(struct pvr_device *pvr_dev)
+ 	return pm_runtime_resume_and_get(drm_dev->dev);
+ }
+ 
+-static __always_inline int
++static __always_inline void
+ pvr_power_put(struct pvr_device *pvr_dev)
+ {
+ 	struct drm_device *drm_dev = from_pvr_device(pvr_dev);
+ 
+-	return pm_runtime_put(drm_dev->dev);
++	pm_runtime_put(drm_dev->dev);
+ }
+ 
+ int pvr_power_domains_init(struct pvr_device *pvr_dev);
+diff --git a/drivers/gpu/drm/imagination/pvr_queue.c b/drivers/gpu/drm/imagination/pvr_queue.c
+index 7497bca..24a8645 100644
+--- a/drivers/gpu/drm/imagination/pvr_queue.c
++++ b/drivers/gpu/drm/imagination/pvr_queue.c
+@@ -3,6 +3,7 @@
+ 
+ #include <drm/drm_managed.h>
+ #include <drm/gpu_scheduler.h>
++#include <linux/overflow.h>
+ 
+ #include "pvr_cccb.h"
+ #include "pvr_context.h"
+@@ -10,11 +11,13 @@
+ #include "pvr_drv.h"
+ #include "pvr_job.h"
+ #include "pvr_queue.h"
++#include "pvr_trace.h"
+ #include "pvr_vm.h"
+ 
+ #include "pvr_rogue_fwif_client.h"
+ 
+ #define MAX_DEADLINE_MS 30000
++#define SCHED_TIMEOUT_PERIOD (2 * MAX_DEADLINE_MS)
+ 
+ #define CTX_COMPUTE_CCCB_SIZE_LOG2 15
+ #define CTX_FRAG_CCCB_SIZE_LOG2 15
+@@ -35,9 +38,8 @@ static int get_xfer_ctx_state_size(struct pvr_device *pvr_dev)
+ 			return err;
+ 	}
+ 
+-	return sizeof(struct rogue_fwif_frag_ctx_state) +
+-	       (num_isp_store_registers *
+-		sizeof(((struct rogue_fwif_frag_ctx_state *)0)->frag_reg_isp_store[0]));
++	return struct_size_t(struct rogue_fwif_frag_ctx_state,
++			     frag_reg_isp_store, num_isp_store_registers);
+ }
+ 
+ static int get_frag_ctx_state_size(struct pvr_device *pvr_dev)
+@@ -65,9 +67,8 @@ static int get_frag_ctx_state_size(struct pvr_device *pvr_dev)
+ 			return err;
+ 	}
+ 
+-	return sizeof(struct rogue_fwif_frag_ctx_state) +
+-	       (num_isp_store_registers *
+-		sizeof(((struct rogue_fwif_frag_ctx_state *)0)->frag_reg_isp_store[0]));
++	return struct_size_t(struct rogue_fwif_frag_ctx_state,
++			     frag_reg_isp_store, num_isp_store_registers);
+ }
+ 
+ static int get_ctx_state_size(struct pvr_device *pvr_dev, enum drm_pvr_job_type type)
+@@ -177,11 +178,36 @@ static const struct dma_fence_ops pvr_queue_job_fence_ops = {
+ 	.release = pvr_queue_fence_release,
+ };
+ 
++/**
++ * pvr_queue_fence_is_ufo_backed() - Check if a dma_fence is backed by a UFO.
++ * @f: The dma_fence to check.
++ *
++ * Return:
++ * * true if the dma_fence is backed by a UFO, or
++ * * false otherwise.
++ */
++static inline bool
++pvr_queue_fence_is_ufo_backed(struct dma_fence *f)
++{
++	/*
++	 * Currently the only dma_fence backed by a UFO object is the job fence,
++	 * e.g. pvr_job::done_fence, wrapped by a pvr_queue_fence object.
++	 */
++	return f && f->ops == &pvr_queue_job_fence_ops;
++}
++
+ /**
+  * to_pvr_queue_job_fence() - Return a pvr_queue_fence object if the fence is
+  * already backed by a UFO.
+  * @f: The dma_fence to turn into a pvr_queue_fence.
+  *
++ * This could be called on:
++ * - a job fence directly, in which case it simply returns the containing pvr_queue_fence;
++ * - a drm_sched_fence's scheduled or finished fence, in which case it will first try to follow
++ *   the parent pointer to find the job fence (note that the parent pointer is initialized
++ *   only after the run_job() callback is called on the drm_sched_fence's owning job);
++ * - any other dma_fence, in which case it will return NULL.
++ *
+  * Return:
+  *  * A non-NULL pvr_queue_fence object if the dma_fence is backed by a UFO, or
+  *  * NULL otherwise.
+@@ -194,7 +220,7 @@ to_pvr_queue_job_fence(struct dma_fence *f)
+ 	if (sched_fence)
+ 		f = sched_fence->parent;
+ 
+-	if (f && f->ops == &pvr_queue_job_fence_ops)
++	if (pvr_queue_fence_is_ufo_backed(f))
+ 		return container_of(f, struct pvr_queue_fence, base);
+ 
+ 	return NULL;
+@@ -249,7 +275,7 @@ pvr_queue_fence_alloc(void)
+ {
+ 	struct pvr_queue_fence *fence;
+ 
+-	fence = kzalloc(sizeof(*fence), GFP_KERNEL);
++	fence = kzalloc_obj(*fence);
+ 	if (!fence)
+ 		return NULL;
+ 
+@@ -349,11 +375,14 @@ static u32 ufo_cmds_size(u32 elem_count)
+ 
+ static u32 job_cmds_size(struct pvr_job *job, u32 ufo_wait_count)
+ {
+-	/* One UFO cmd for the fence signaling, one UFO cmd per native fence native,
+-	 * and a command for the job itself.
++	/*
++	 * One UFO command per native fence this job will be waiting on (unless any are
++	 * signaled by the time the job is submitted), plus a command for the job itself,
++	 * plus one UFO command for the fence signaling.
+ 	 */
+-	return ufo_cmds_size(1) + ufo_cmds_size(ufo_wait_count) +
+-	       pvr_cccb_get_size_of_cmd_with_hdr(job->cmd_len);
++	return ufo_cmds_size(ufo_wait_count) +
++	       pvr_cccb_get_size_of_cmd_with_hdr(job->cmd_len) +
++	       ufo_cmds_size(1);
+ }
+ 
+ static bool
+@@ -499,12 +528,16 @@ pvr_queue_get_paired_frag_job_dep(struct pvr_job *job)
+ 	if (!frag_job)
+ 		return NULL;
+ 
++	/* Have the geometry job wait on the paired fragment job's dependencies as well. */
+ 	xa_for_each(&frag_job->base.dependencies, index, f) {
+ 		/* Skip already signaled fences. */
+ 		if (dma_fence_is_signaled(f))
+ 			continue;
+ 
+-		/* Skip our own fence. */
++		/*
++		 * The paired job fence won't be signaled until both jobs have
++		 * been submitted, so we can't wait on it to schedule them.
++		 */
+ 		if (f == &job->base.s_fence->scheduled)
+ 			continue;
+ 
+@@ -535,12 +568,13 @@ pvr_queue_prepare_job(struct drm_sched_job *sched_job,
+ 
+ 	if (job->type == DRM_PVR_JOB_TYPE_FRAGMENT && job->paired_job) {
+ 		/*
+-		 * This will be called on a paired fragment job after being
+-		 * submitted to firmware. We can tell if this is the case and
+-		 * bail early from whether run_job() has been called on the
+-		 * geometry job, which would issue a pm ref.
++		 * This will be called on a paired fragment job after being submitted
++		 * to the firmware as part of the paired geometry job's submission.
++		 * We can tell if this is the case and bail early from whether run_job()
++		 * has been called on the geometry job, which would issue a pm ref on
++		 * this job as well.
+ 		 */
+-		if (job->paired_job->has_pm_ref)
++		if (job->has_pm_ref)
+ 			return NULL;
+ 	}
+ 
+@@ -646,10 +680,7 @@ static void pvr_queue_submit_job_to_cccb(struct pvr_job *job)
+ 		if (!jfence)
+ 			continue;
+ 
+-		/* This fence will be placed last, as partial render fence. */
+-		if (is_paired_job_fence(fence, job))
+-			continue;
+-
++		/* Some dependencies might have been signaled since prepare_job() */
+ 		if (dma_fence_is_signaled(&jfence->base))
+ 			continue;
+ 
+@@ -664,8 +695,13 @@ static void pvr_queue_submit_job_to_cccb(struct pvr_job *job)
+ 		}
+ 	}
+ 
+-	/* Partial render fence goes last. */
+ 	if (job->type == DRM_PVR_JOB_TYPE_FRAGMENT && job->paired_job) {
++		/*
++		 * The loop above will only process dependencies backed by a UFO i.e. with
++		 * a valid parent fence assigned, but the paired job dependency won't have
++		 * one until both jobs have been submitted. Access the parent fence directly
++		 * here instead, submitting it last as partial render fence.
++		 */
+ 		jfence = to_pvr_queue_job_fence(job->paired_job->done_fence);
+ 		if (!WARN_ON(!jfence)) {
+ 			pvr_fw_object_get_fw_addr(jfence->queue->timeline_ufo.fw_obj,
+@@ -694,7 +730,7 @@ static void pvr_queue_submit_job_to_cccb(struct pvr_job *job)
+ 	pvr_cccb_write_command_with_header(cccb, job->fw_ccb_cmd_type, job->cmd_len, job->cmd,
+ 					   job->id, job->id);
+ 
+-	/* Signal the job fence. */
++	/* Update command to signal the job fence. */
+ 	pvr_fw_object_get_fw_addr(queue->timeline_ufo.fw_obj, &ufos[0].addr);
+ 	ufos[0].value = job->done_fence->seqno;
+ 	pvr_cccb_write_command_with_header(cccb, ROGUE_FWIF_CCB_CMD_TYPE_UPDATE,
+@@ -724,10 +760,8 @@ static struct dma_fence *pvr_queue_run_job(struct drm_sched_job *sched_job)
+ 	}
+ 
+ 	/* The only kind of jobs that can be paired are geometry and fragment, and
+-	 * we bail out early if we see a fragment job that's paired with a geomtry
+-	 * job.
+-	 * Paired jobs must also target the same context and point to the same
+-	 * HWRT.
++	 * we bail out early if we see a fragment job that's paired with a geometry job.
++	 * Paired jobs must also target the same context and point to the same HWRT.
+ 	 */
+ 	if (WARN_ON(job->paired_job &&
+ 		    (job->type != DRM_PVR_JOB_TYPE_GEOMETRY ||
+@@ -766,6 +800,9 @@ static struct dma_fence *pvr_queue_run_job(struct drm_sched_job *sched_job)
+ 						 job->hwrt,
+ 						 frag_job->fw_ccb_cmd_type ==
+ 						 ROGUE_FWIF_CCB_CMD_TYPE_FRAG_PR);
++
++		trace_pvr_job_submit_fw(geom_job);
++		trace_pvr_job_submit_fw(frag_job);
+ 	} else {
+ 		struct pvr_queue *queue = container_of(job->base.sched,
+ 						       struct pvr_queue, scheduler);
+@@ -773,6 +810,8 @@ static struct dma_fence *pvr_queue_run_job(struct drm_sched_job *sched_job)
+ 		pvr_cccb_send_kccb_kick(pvr_dev, &queue->cccb,
+ 					pvr_context_get_fw_addr(job->ctx) + queue->ctx_offset,
+ 					job->hwrt);
++
++		trace_pvr_job_submit_fw(job);
+ 	}
+ 
+ 	return dma_fence_get(job->done_fence);
+@@ -902,16 +941,16 @@ static const struct drm_sched_backend_ops pvr_queue_sched_ops = {
+ };
+ 
+ /**
+- * pvr_queue_fence_is_ufo_backed() - Check if a dma_fence is backed by a UFO object
++ * pvr_queue_fence_is_native() - Check if a dma_fence is native to this driver.
+  * @f: Fence to test.
+  *
+- * A UFO-backed fence is a fence that can be signaled or waited upon FW-side.
+- * pvr_job::done_fence objects are backed by the timeline UFO attached to the queue
+- * they are pushed to, but those fences are not directly exposed to the outside
+- * world, so we also need to check if the fence we're being passed is a
+- * drm_sched_fence that was coming from our driver.
++ * Check if the fence we're being passed is a drm_sched_fence that is coming from this driver.
++ *
++ * It may be a UFO-backed fence i.e. a fence that can be signaled or waited upon FW-side,
++ * such as pvr_job::done_fence objects that are backed by the timeline UFO attached to the queue
++ * they are pushed to.
+  */
+-bool pvr_queue_fence_is_ufo_backed(struct dma_fence *f)
++bool pvr_queue_fence_is_native(struct dma_fence *f)
+ {
+ 	struct drm_sched_fence *sched_fence = f ? to_drm_sched_fence(f) : NULL;
+ 
+@@ -919,10 +958,7 @@ bool pvr_queue_fence_is_ufo_backed(struct dma_fence *f)
+ 	    sched_fence->sched->ops == &pvr_queue_sched_ops)
+ 		return true;
+ 
+-	if (f && f->ops == &pvr_queue_job_fence_ops)
+-		return true;
+-
+-	return false;
++	return pvr_queue_fence_is_ufo_backed(f);
+ }
+ 
+ /**
+@@ -954,9 +990,8 @@ pvr_queue_signal_done_fences(struct pvr_queue *queue)
+ }
+ 
+ /**
+- * pvr_queue_check_job_waiting_for_cccb_space() - Check if the job waiting for CCCB space
+- * can be unblocked
+- * pushed to the CCCB
++ * pvr_queue_check_job_waiting_for_cccb_space() - Check if a job waiting for CCCB space
++ * can be unblocked and pushed to the CCCB.
+  * @queue: Queue to check
+  *
+  * If we have a job waiting for CCCB, and this job now fits in the CCCB, we signal
+@@ -1169,6 +1204,8 @@ void pvr_queue_job_cleanup(struct pvr_job *job)
+ 
+ 	if (job->base.s_fence)
+ 		drm_sched_job_cleanup(&job->base);
++
++	trace_pvr_job_done(job);
+ }
+ 
+ /**
+@@ -1251,7 +1288,7 @@ struct pvr_queue *pvr_queue_create(struct pvr_context *ctx,
+ 		.num_rqs = 1,
+ 		.credit_limit = 64 * 1024,
+ 		.hang_limit = 1,
+-		.timeout = msecs_to_jiffies(500),
++		.timeout = msecs_to_jiffies(SCHED_TIMEOUT_PERIOD),
+ 		.timeout_wq = pvr_dev->sched_wq,
+ 		.name = "pvr-queue",
+ 		.dev = pvr_dev->base.dev,
+@@ -1286,7 +1323,7 @@ struct pvr_queue *pvr_queue_create(struct pvr_context *ctx,
+ 	if (ctx_state_size < 0)
+ 		return ERR_PTR(ctx_state_size);
+ 
+-	queue = kzalloc(sizeof(*queue), GFP_KERNEL);
++	queue = kzalloc_obj(*queue);
+ 	if (!queue)
+ 		return ERR_PTR(-ENOMEM);
+ 
+diff --git a/drivers/gpu/drm/imagination/pvr_queue.h b/drivers/gpu/drm/imagination/pvr_queue.h
+index a205e29..149cc6d 100644
+--- a/drivers/gpu/drm/imagination/pvr_queue.h
++++ b/drivers/gpu/drm/imagination/pvr_queue.h
+@@ -141,7 +141,7 @@ struct pvr_queue {
+ 	u64 callstack_addr;
+ };
+ 
+-bool pvr_queue_fence_is_ufo_backed(struct dma_fence *f);
++bool pvr_queue_fence_is_native(struct dma_fence *f);
+ 
+ int pvr_queue_job_init(struct pvr_job *job, u64 drm_client_id);
+ 
+diff --git a/drivers/gpu/drm/imagination/pvr_rogue_fwif_check.h b/drivers/gpu/drm/imagination/pvr_rogue_fwif_check.h
+index 51dc37e..5048866 100644
+--- a/drivers/gpu/drm/imagination/pvr_rogue_fwif_check.h
++++ b/drivers/gpu/drm/imagination/pvr_rogue_fwif_check.h
+@@ -4,14 +4,7 @@
+ #ifndef PVR_ROGUE_FWIF_CHECK_H
+ #define PVR_ROGUE_FWIF_CHECK_H
+ 
+-#include <linux/build_bug.h>
+-
+-#define OFFSET_CHECK(type, member, offset) \
+-	static_assert(offsetof(type, member) == (offset), \
+-		      "offsetof(" #type ", " #member ") incorrect")
+-
+-#define SIZE_CHECK(type, size) \
+-	static_assert(sizeof(type) == (size), #type " is incorrect size")
++#include "pvr_check.h"
+ 
+ OFFSET_CHECK(struct rogue_fwif_file_info_buf, path, 0);
+ OFFSET_CHECK(struct rogue_fwif_file_info_buf, info, 200);
+@@ -157,7 +150,7 @@ OFFSET_CHECK(struct rogue_fwif_frag_ctx_state, frag_reg_pm_deallocated_mask_stat
+ OFFSET_CHECK(struct rogue_fwif_frag_ctx_state, frag_reg_dm_pds_mtilefree_status, 4);
+ OFFSET_CHECK(struct rogue_fwif_frag_ctx_state, ctx_state_flags, 8);
+ OFFSET_CHECK(struct rogue_fwif_frag_ctx_state, frag_reg_isp_store, 12);
+-SIZE_CHECK(struct rogue_fwif_frag_ctx_state, 16);
++FLEX_ARRAY_CHECK(struct rogue_fwif_frag_ctx_state, frag_reg_isp_store);
+ 
+ OFFSET_CHECK(struct rogue_fwif_compute_ctx_state, ctx_state_flags, 0);
+ SIZE_CHECK(struct rogue_fwif_compute_ctx_state, 4);
+diff --git a/drivers/gpu/drm/imagination/pvr_rogue_fwif_client_check.h b/drivers/gpu/drm/imagination/pvr_rogue_fwif_client_check.h
+index 54aa447..467d1d2 100644
+--- a/drivers/gpu/drm/imagination/pvr_rogue_fwif_client_check.h
++++ b/drivers/gpu/drm/imagination/pvr_rogue_fwif_client_check.h
+@@ -4,14 +4,7 @@
+ #ifndef PVR_ROGUE_FWIF_CLIENT_CHECK_H
+ #define PVR_ROGUE_FWIF_CLIENT_CHECK_H
+ 
+-#include <linux/build_bug.h>
+-
+-#define OFFSET_CHECK(type, member, offset) \
+-	static_assert(offsetof(type, member) == (offset), \
+-		      "offsetof(" #type ", " #member ") incorrect")
+-
+-#define SIZE_CHECK(type, size) \
+-	static_assert(sizeof(type) == (size), #type " is incorrect size")
++#include "pvr_check.h"
+ 
+ OFFSET_CHECK(struct rogue_fwif_geom_regs, vdm_ctrl_stream_base, 0);
+ OFFSET_CHECK(struct rogue_fwif_geom_regs, tpu_border_colour_table, 8);
+diff --git a/drivers/gpu/drm/imagination/pvr_rogue_fwif_shared.h b/drivers/gpu/drm/imagination/pvr_rogue_fwif_shared.h
+index f95acd5..fe54c1c 100644
+--- a/drivers/gpu/drm/imagination/pvr_rogue_fwif_shared.h
++++ b/drivers/gpu/drm/imagination/pvr_rogue_fwif_shared.h
+@@ -14,15 +14,7 @@
+ 
+ #define ROGUE_NUM_GEOM_CORES_SIZE 2U
+ 
+-/*
+- * Maximum number of UFOs in a CCB command.
+- * The number is based on having 32 sync prims (as originally), plus 32 sync
+- * checkpoints.
+- * Once the use of sync prims is no longer supported, we will retain
+- * the same total (64) as the number of sync checkpoints which may be
+- * supporting a fence is not visible to the client driver and has to
+- * allow for the number of different timelines involved in fence merges.
+- */
++/* Maximum number of UFOs in a CCB command. */
+ #define ROGUE_FWIF_CCB_CMD_MAX_UFOS (32U + 32U)
+ 
+ /*
+@@ -236,6 +228,18 @@ enum rogue_context_reset_reason {
+ 	ROGUE_CONTEXT_RESET_REASON_INNOCENT_OVERRUNING = 4,
+ 	/* Forced reset to ensure scheduling requirements */
+ 	ROGUE_CONTEXT_RESET_REASON_HARD_CONTEXT_SWITCH = 5,
++	/* CDM Mission/safety checksum mismatch */
++	ROGUE_CONTEXT_RESET_REASON_WGP_CHECKSUM = 6,
++	/* TRP checksum mismatch */
++	ROGUE_CONTEXT_RESET_REASON_TRP_CHECKSUM = 7,
++	/* GPU ECC error (corrected, OK) */
++	ROGUE_CONTEXT_RESET_REASON_GPU_ECC_OK = 8,
++	/* GPU ECC error (uncorrected, HWR) */
++	ROGUE_CONTEXT_RESET_REASON_GPU_ECC_HWR = 9,
++	/* FW ECC error (corrected, OK) */
++	ROGUE_CONTEXT_RESET_REASON_FW_ECC_OK = 10,
++	/* FW ECC error (uncorrected, ERR) */
++	ROGUE_CONTEXT_RESET_REASON_FW_ECC_ERR = 11,
+ 	/* FW Safety watchdog triggered */
+ 	ROGUE_CONTEXT_RESET_REASON_FW_WATCHDOG = 12,
+ 	/* FW page fault (no HWR) */
+diff --git a/drivers/gpu/drm/imagination/pvr_rogue_fwif_shared_check.h b/drivers/gpu/drm/imagination/pvr_rogue_fwif_shared_check.h
+index 597ed54..59ef0a9 100644
+--- a/drivers/gpu/drm/imagination/pvr_rogue_fwif_shared_check.h
++++ b/drivers/gpu/drm/imagination/pvr_rogue_fwif_shared_check.h
+@@ -4,14 +4,7 @@
+ #ifndef PVR_ROGUE_FWIF_SHARED_CHECK_H
+ #define PVR_ROGUE_FWIF_SHARED_CHECK_H
+ 
+-#include <linux/build_bug.h>
+-
+-#define OFFSET_CHECK(type, member, offset) \
+-	static_assert(offsetof(type, member) == (offset), \
+-		      "offsetof(" #type ", " #member ") incorrect")
+-
+-#define SIZE_CHECK(type, size) \
+-	static_assert(sizeof(type) == (size), #type " is incorrect size")
++#include "pvr_check.h"
+ 
+ OFFSET_CHECK(struct rogue_fwif_dma_addr, dev_addr, 0);
+ OFFSET_CHECK(struct rogue_fwif_dma_addr, fw_addr, 8);
+diff --git a/drivers/gpu/drm/imagination/pvr_rogue_heap_config.h b/drivers/gpu/drm/imagination/pvr_rogue_heap_config.h
+index 6847660..5c33b34 100644
+--- a/drivers/gpu/drm/imagination/pvr_rogue_heap_config.h
++++ b/drivers/gpu/drm/imagination/pvr_rogue_heap_config.h
+@@ -33,12 +33,12 @@
+ /* 0 MiB to 4 MiB, size of 4 MiB : RESERVED */
+ 
+ /* 0x00_0040_0000 - 0x7F_FFC0_0000 **/
+-/* 4 MiB to 512 GiB, size of 512 GiB less 4 MiB : RESERVED **/
++/* 4 MiB to 512 GiB, size of 512 GiB less 4 MiB : RESERVED */
+ 
+ /* 0x80_0000_0000 ************************************************************/
+ 
+ /* 0x80_0000_0000 - 0x9F_FFFF_FFFF **/
+-/* 512 GiB to 640 GiB, size of 128 GiB : GENERAL_HEAP **/
++/* 512 GiB to 640 GiB, size of 128 GiB : GENERAL_HEAP */
+ #define ROGUE_GENERAL_HEAP_BASE 0x8000000000ull
+ #define ROGUE_GENERAL_HEAP_SIZE SZ_128G
+ 
+@@ -62,7 +62,7 @@
+ #define ROGUE_PDSCODEDATA_HEAP_SIZE SZ_4G
+ 
+ /* 0xDB_0000_0000 - 0xDB_FFFF_FFFF */
+-/* 876 GiB to 880 GiB, size of 256 MiB (reserved 4GiB) : BRN **/
++/* 876 GiB to 880 GiB, size of 256 MiB (reserved 4GiB) : BRN */
+ /*
+  * The BRN63142 quirk workaround requires Region Header memory to be at the top
+  * of a 16GiB aligned range. This is so when masked with 0x03FFFFFFFF the
+@@ -82,7 +82,7 @@
+ /* 0xE1_0000_0000 - 0xE1_BFFF_FFFF */
+ /* 900 GiB to 903 GiB, size of 3 GiB : RESERVED */
+ 
+-/* 0xE1_C000_000 - 0xE1_FFFF_FFFF */
++/* 0xE1_C000_0000 - 0xE1_FFFF_FFFF */
+ /* 903 GiB to 904 GiB, reserved 1 GiB, : FIRMWARE_HEAP */
+ #define ROGUE_FW_HEAP_BASE 0xE1C0000000ull
+ 
+@@ -90,7 +90,7 @@
+ /* 904 GiB to 912 GiB, size of 8 GiB : FREE */
+ 
+ /* 0xE4_0000_0000 - 0xE7_FFFF_FFFF */
+-/* 912 GiB to 968 GiB, size of 16 GiB : TRANSFER_FRAG */
++/* 912 GiB to 928 GiB, size of 16 GiB : TRANSFER_FRAG */
+ #define ROGUE_TRANSFER_FRAG_HEAP_BASE 0xE400000000ull
+ #define ROGUE_TRANSFER_FRAG_HEAP_SIZE SZ_16G
+ 
+diff --git a/drivers/gpu/drm/imagination/pvr_rogue_mips_check.h b/drivers/gpu/drm/imagination/pvr_rogue_mips_check.h
+index 824b4bf..aebf231 100644
+--- a/drivers/gpu/drm/imagination/pvr_rogue_mips_check.h
++++ b/drivers/gpu/drm/imagination/pvr_rogue_mips_check.h
+@@ -4,55 +4,32 @@
+ #ifndef PVR_ROGUE_MIPS_CHECK_H
+ #define PVR_ROGUE_MIPS_CHECK_H
+ 
+-#include <linux/build_bug.h>
++#include "pvr_check.h"
+ 
+-static_assert(offsetof(struct rogue_mips_tlb_entry, tlb_page_mask) == 0,
+-	      "offsetof(struct rogue_mips_tlb_entry, tlb_page_mask) incorrect");
+-static_assert(offsetof(struct rogue_mips_tlb_entry, tlb_hi) == 4,
+-	      "offsetof(struct rogue_mips_tlb_entry, tlb_hi) incorrect");
+-static_assert(offsetof(struct rogue_mips_tlb_entry, tlb_lo0) == 8,
+-	      "offsetof(struct rogue_mips_tlb_entry, tlb_lo0) incorrect");
+-static_assert(offsetof(struct rogue_mips_tlb_entry, tlb_lo1) == 12,
+-	      "offsetof(struct rogue_mips_tlb_entry, tlb_lo1) incorrect");
+-static_assert(sizeof(struct rogue_mips_tlb_entry) == 16,
+-	      "struct rogue_mips_tlb_entry is incorrect size");
++OFFSET_CHECK(struct rogue_mips_tlb_entry, tlb_page_mask, 0);
++OFFSET_CHECK(struct rogue_mips_tlb_entry, tlb_hi, 4);
++OFFSET_CHECK(struct rogue_mips_tlb_entry, tlb_lo0, 8);
++OFFSET_CHECK(struct rogue_mips_tlb_entry, tlb_lo1, 12);
++SIZE_CHECK(struct rogue_mips_tlb_entry, 16);
+ 
+-static_assert(offsetof(struct rogue_mips_remap_entry, remap_addr_in) == 0,
+-	      "offsetof(struct rogue_mips_remap_entry, remap_addr_in) incorrect");
+-static_assert(offsetof(struct rogue_mips_remap_entry, remap_addr_out) == 4,
+-	      "offsetof(struct rogue_mips_remap_entry, remap_addr_out) incorrect");
+-static_assert(offsetof(struct rogue_mips_remap_entry, remap_region_size) == 8,
+-	      "offsetof(struct rogue_mips_remap_entry, remap_region_size) incorrect");
+-static_assert(sizeof(struct rogue_mips_remap_entry) == 12,
+-	      "struct rogue_mips_remap_entry is incorrect size");
++OFFSET_CHECK(struct rogue_mips_remap_entry, remap_addr_in, 0);
++OFFSET_CHECK(struct rogue_mips_remap_entry, remap_addr_out, 4);
++OFFSET_CHECK(struct rogue_mips_remap_entry, remap_region_size, 8);
++SIZE_CHECK(struct rogue_mips_remap_entry, 12);
+ 
+-static_assert(offsetof(struct rogue_mips_state, error_state) == 0,
+-	      "offsetof(struct rogue_mips_state, error_state) incorrect");
+-static_assert(offsetof(struct rogue_mips_state, error_epc) == 4,
+-	      "offsetof(struct rogue_mips_state, error_epc) incorrect");
+-static_assert(offsetof(struct rogue_mips_state, status_register) == 8,
+-	      "offsetof(struct rogue_mips_state, status_register) incorrect");
+-static_assert(offsetof(struct rogue_mips_state, cause_register) == 12,
+-	      "offsetof(struct rogue_mips_state, cause_register) incorrect");
+-static_assert(offsetof(struct rogue_mips_state, bad_register) == 16,
+-	      "offsetof(struct rogue_mips_state, bad_register) incorrect");
+-static_assert(offsetof(struct rogue_mips_state, epc) == 20,
+-	      "offsetof(struct rogue_mips_state, epc) incorrect");
+-static_assert(offsetof(struct rogue_mips_state, sp) == 24,
+-	      "offsetof(struct rogue_mips_state, sp) incorrect");
+-static_assert(offsetof(struct rogue_mips_state, debug) == 28,
+-	      "offsetof(struct rogue_mips_state, debug) incorrect");
+-static_assert(offsetof(struct rogue_mips_state, depc) == 32,
+-	      "offsetof(struct rogue_mips_state, depc) incorrect");
+-static_assert(offsetof(struct rogue_mips_state, bad_instr) == 36,
+-	      "offsetof(struct rogue_mips_state, bad_instr) incorrect");
+-static_assert(offsetof(struct rogue_mips_state, unmapped_address) == 40,
+-	      "offsetof(struct rogue_mips_state, unmapped_address) incorrect");
+-static_assert(offsetof(struct rogue_mips_state, tlb) == 44,
+-	      "offsetof(struct rogue_mips_state, tlb) incorrect");
+-static_assert(offsetof(struct rogue_mips_state, remap) == 300,
+-	      "offsetof(struct rogue_mips_state, remap) incorrect");
+-static_assert(sizeof(struct rogue_mips_state) == 684,
+-	      "struct rogue_mips_state is incorrect size");
++OFFSET_CHECK(struct rogue_mips_state, error_state, 0);
++OFFSET_CHECK(struct rogue_mips_state, error_epc, 4);
++OFFSET_CHECK(struct rogue_mips_state, status_register, 8);
++OFFSET_CHECK(struct rogue_mips_state, cause_register, 12);
++OFFSET_CHECK(struct rogue_mips_state, bad_register, 16);
++OFFSET_CHECK(struct rogue_mips_state, epc, 20);
++OFFSET_CHECK(struct rogue_mips_state, sp, 24);
++OFFSET_CHECK(struct rogue_mips_state, debug, 28);
++OFFSET_CHECK(struct rogue_mips_state, depc, 32);
++OFFSET_CHECK(struct rogue_mips_state, bad_instr, 36);
++OFFSET_CHECK(struct rogue_mips_state, unmapped_address, 40);
++OFFSET_CHECK(struct rogue_mips_state, tlb, 44);
++OFFSET_CHECK(struct rogue_mips_state, remap, 300);
++SIZE_CHECK(struct rogue_mips_state, 684);
+ 
+ #endif /* PVR_ROGUE_MIPS_CHECK_H */
+diff --git a/drivers/gpu/drm/imagination/pvr_sync.c b/drivers/gpu/drm/imagination/pvr_sync.c
+index 129f646..936f840 100644
+--- a/drivers/gpu/drm/imagination/pvr_sync.c
++++ b/drivers/gpu/drm/imagination/pvr_sync.c
+@@ -64,7 +64,7 @@ pvr_sync_signal_array_add(struct xarray *array, struct drm_file *file, u32 handl
+ 	int err;
+ 	u32 id;
+ 
+-	sig_sync = kzalloc(sizeof(*sig_sync), GFP_KERNEL);
++	sig_sync = kzalloc_obj(*sig_sync);
+ 	if (!sig_sync)
+ 		return ERR_PTR(-ENOMEM);
+ 
+@@ -160,7 +160,7 @@ int
+ pvr_sync_signal_array_update_fences(struct xarray *array,
+ 				    u32 sync_op_count,
+ 				    const struct drm_pvr_sync_op *sync_ops,
+-				    struct dma_fence *done_fence)
++				    struct dma_fence *finished_fence)
+ {
+ 	for (u32 i = 0; i < sync_op_count; i++) {
+ 		struct dma_fence *old_fence;
+@@ -175,7 +175,7 @@ pvr_sync_signal_array_update_fences(struct xarray *array,
+ 			return -EINVAL;
+ 
+ 		old_fence = sig_sync->fence;
+-		sig_sync->fence = dma_fence_get(done_fence);
++		sig_sync->fence = dma_fence_get(finished_fence);
+ 		dma_fence_put(old_fence);
+ 
+ 		if (WARN_ON(!sig_sync->fence))
+@@ -211,7 +211,7 @@ pvr_sync_add_dep_to_job(struct drm_sched_job *job, struct dma_fence *f)
+ 	int err = 0;
+ 
+ 	dma_fence_unwrap_for_each(uf, &iter, f) {
+-		if (pvr_queue_fence_is_ufo_backed(uf))
++		if (pvr_queue_fence_is_native(uf))
+ 			native_fence_count++;
+ 	}
+ 
+@@ -227,7 +227,7 @@ pvr_sync_add_dep_to_job(struct drm_sched_job *job, struct dma_fence *f)
+ 		if (err)
+ 			continue;
+ 
+-		if (pvr_queue_fence_is_ufo_backed(uf)) {
++		if (pvr_queue_fence_is_native(uf)) {
+ 			struct drm_sched_fence *s_fence = to_drm_sched_fence(uf);
+ 
+ 			/* If this is a native dependency, we wait for the scheduled fence,
+diff --git a/drivers/gpu/drm/imagination/pvr_sync.h b/drivers/gpu/drm/imagination/pvr_sync.h
+index db6ccfd..48501ad 100644
+--- a/drivers/gpu/drm/imagination/pvr_sync.h
++++ b/drivers/gpu/drm/imagination/pvr_sync.h
+@@ -70,7 +70,7 @@ int
+ pvr_sync_signal_array_update_fences(struct xarray *array,
+ 				    u32 sync_op_count,
+ 				    const struct drm_pvr_sync_op *sync_ops,
+-				    struct dma_fence *done_fence);
++				    struct dma_fence *finished_fence);
+ 
+ void
+ pvr_sync_signal_array_push_fences(struct xarray *array);
+diff --git a/drivers/gpu/drm/imagination/pvr_test.c b/drivers/gpu/drm/imagination/pvr_test.c
+new file mode 100644
+index 0000000..506cfa5
+--- /dev/null
++++ b/drivers/gpu/drm/imagination/pvr_test.c
+@@ -0,0 +1,73 @@
++// SPDX-License-Identifier: GPL-2.0-only OR MIT
++/* Copyright (c) 2025 Imagination Technologies Ltd. */
++
++#include "pvr_device.h"
++
++#include <linux/errno.h>
++#include <linux/stddef.h>
++#include <linux/string.h>
++#include <linux/types.h>
++
++#include <kunit/test.h>
++#include <kunit/visibility.h>
++
++static void decode_gpuid_string(struct kunit *test)
++{
++	const struct pvr_gpu_id bad_gpuid = { 0xdead, 0xbeef, 0xcafe, 0xface };
++	const u64 packed_bad_gpuid = pvr_gpu_id_to_packed_bvnc(&bad_gpuid);
++
++#define GPUID_TEST_CASE(str_, err_, value_)					\
++	do {									\
++		struct pvr_gpu_id _gpuid_out = bad_gpuid;			\
++		int _err;							\
++		_err = pvr_gpuid_decode_string(NULL, str_, &_gpuid_out);	\
++		KUNIT_EXPECT_EQ(test, _err, err_);				\
++		KUNIT_EXPECT_EQ(test,						\
++				pvr_gpu_id_to_packed_bvnc(&_gpuid_out),		\
++				value_);					\
++	} while (0)
++
++#define GPUID_TEST_CASE_OK(str_, b_, v_, n_, c_) \
++	GPUID_TEST_CASE(str_, 0, PVR_PACKED_BVNC(b_, v_, n_, c_))
++
++#define GPUID_TEST_CASE_INVAL(str_) \
++	GPUID_TEST_CASE(str_, -EINVAL, packed_bad_gpuid)
++
++	GPUID_TEST_CASE_OK("12.34.56.78", 12, 34, 56, 78);
++	GPUID_TEST_CASE_OK("0.0.0.0", 0, 0, 0, 0);
++
++	GPUID_TEST_CASE_INVAL("");
++	GPUID_TEST_CASE_INVAL("42.foobar-invalid.gpuid.bvnc");
++
++	/* String longer than PVR_GPUID_STRING_MAX_LENGTH. */
++	GPUID_TEST_CASE_INVAL("12.34.56.789012345678901234567890123456");
++
++	/* Single value overflowing u16. */
++	GPUID_TEST_CASE_INVAL("12.34.56.999999");
++
++	/* Wrong number of parts and/or dots. */
++	GPUID_TEST_CASE_INVAL("12.34.56.78.90");
++	GPUID_TEST_CASE_INVAL("12.34.56..78");
++	GPUID_TEST_CASE_INVAL("12.34..56");
++	GPUID_TEST_CASE_INVAL("12.34.56");
++
++#undef GPUID_TEST_CASE_INVAL
++#undef GPUID_TEST_CASE_OK
++#undef GPUID_TEST_CASE
++}
++
++static struct kunit_case pvr_tests_cases[] = {
++	KUNIT_CASE(decode_gpuid_string),
++	{},
++};
++
++static struct kunit_suite pvr_tests_suite = {
++	.name = "pvr_tests",
++	.test_cases = pvr_tests_cases,
++};
++kunit_test_suite(pvr_tests_suite);
++
++MODULE_AUTHOR("Imagination Technologies Ltd.");
++MODULE_LICENSE("Dual MIT/GPL");
++MODULE_DESCRIPTION("pvr kunit tests");
++MODULE_IMPORT_NS("EXPORTED_FOR_KUNIT_TESTING");
+diff --git a/drivers/gpu/drm/imagination/pvr_trace.h b/drivers/gpu/drm/imagination/pvr_trace.h
+new file mode 100644
+index 0000000..943d6b2
+--- /dev/null
++++ b/drivers/gpu/drm/imagination/pvr_trace.h
+@@ -0,0 +1,123 @@
++/* SPDX-License-Identifier: GPL-2.0 OR MIT */
++/* Copyright (c) 2026 Imagination Technologies Ltd. */
++
++#undef TRACE_SYSTEM
++#define TRACE_SYSTEM pvr
++
++#if !defined(PVR_TRACE_H) || defined(TRACE_HEADER_MULTI_READ)
++#define PVR_TRACE_H
++
++#include "pvr_context.h"
++#include "pvr_device.h"
++#include "pvr_fw.h"
++#include "pvr_hwrt.h"
++#include "pvr_job.h"
++#include "pvr_sync.h"
++
++#include <linux/stringify.h>
++#include <linux/types.h>
++#include <linux/tracepoint.h>
++
++/*
++ * NOTE:
++ * When adding trace points, or extra data to existing ones - you must capture
++ * all the data in the TP_fast_assign section that you wish to use in the
++ * TP_printk section. This is because the printk is performed on demand from the
++ * captured data when you `cat /sys/kernel/tracing/trace` and by the time this
++ * happens any pointers you captured will likely no longer point to valid data.
++ */
++
++/* Job submit */
++
++TRACE_EVENT(pvr_job_submit_ioctl,
++	    TP_PROTO(struct pvr_device *pvr_dev, u32 count),
++	    TP_ARGS(pvr_dev, count),
++	    TP_STRUCT__entry(__field(struct pvr_device *, pvr_dev)
++			     __field(u32, count)),
++	    TP_fast_assign(__entry->pvr_dev = pvr_dev;
++			   __entry->count = count;),
++	    TP_printk("pvr_dev=%p count=%u",
++		      __entry->pvr_dev,
++		      __entry->count)
++);
++
++#define PVR_JOB_GET_HWRT_FW_ADDR(job)                                                  \
++	({                                                                             \
++		struct pvr_job *_job = (job);                                          \
++		u32 _hwrt_fw_addr = 0;                                                 \
++										       \
++		if (_job && _job->hwrt)                                                \
++			pvr_fw_object_get_fw_addr(_job->hwrt->fw_obj, &_hwrt_fw_addr); \
++										       \
++		_hwrt_fw_addr;                                                         \
++	})
++
++#define PVR_JOB_TYPE_TO_STR(val)                                         \
++	__print_symbolic(val,                                            \
++			 { DRM_PVR_JOB_TYPE_GEOMETRY, "geometry" },      \
++			 { DRM_PVR_JOB_TYPE_FRAGMENT, "fragment" },      \
++			 { DRM_PVR_JOB_TYPE_COMPUTE, "compute" },        \
++			 { DRM_PVR_JOB_TYPE_TRANSFER_FRAG, "transfer" })
++
++TRACE_EVENT(pvr_job_create,
++	    TP_PROTO(struct pvr_device *pvr_dev, struct pvr_job *job,
++		     u32 sync_op_count),
++	    TP_ARGS(pvr_dev, job, sync_op_count),
++	    TP_STRUCT__entry(__field(struct pvr_device *, pvr_dev)
++			     __field(struct pvr_context *, ctx)
++			     __field(struct pvr_fw_object *, fw_obj)
++			     __field(u32, fw_addr)
++			     __field(u32, hwrt_addr)
++			     __field(struct pvr_job *, job)
++			     __field(enum drm_pvr_job_type, job_type)
++			     __field(u32, sync_op_count)),
++	    TP_fast_assign(__entry->pvr_dev = pvr_dev;
++			   __entry->ctx = job->ctx;
++			   __entry->fw_obj = job->ctx->fw_obj;
++			   pvr_fw_object_get_fw_addr(job->ctx->fw_obj, &__entry->fw_addr);
++			   __entry->hwrt_addr = PVR_JOB_GET_HWRT_FW_ADDR(job);
++			   __entry->job = job;
++			   __entry->job_type = job->type;
++			   __entry->sync_op_count = sync_op_count;),
++	    TP_printk("pvr_dev=%p ctx=%p fw_obj=%p fw_addr=0x%x hwrt_addr=0x%x job=%p job_type=%s sync_op_count=%u",
++		      __entry->pvr_dev,
++		      __entry->ctx,
++		      __entry->fw_obj,
++		      __entry->fw_addr,
++		      __entry->hwrt_addr,
++		      __entry->job,
++		      PVR_JOB_TYPE_TO_STR(__entry->job_type),
++		      __entry->sync_op_count)
++);
++
++#undef PVR_JOB_TYPE_TO_STR
++#undef PVR_JOB_GET_HWRT_FW_ADDR
++
++TRACE_EVENT(pvr_job_submit_fw,
++	    TP_PROTO(struct pvr_job *job),
++	    TP_ARGS(job),
++	    TP_STRUCT__entry(__field(struct pvr_job *, job)
++			     __field(u32, done_seqno)),
++	    TP_fast_assign(__entry->job = job;
++			   __entry->done_seqno = job->done_fence->seqno;),
++	    TP_printk("job=%p done_seqno=%u",
++		      __entry->job,
++		      __entry->done_seqno)
++);
++
++TRACE_EVENT(pvr_job_done,
++	    TP_PROTO(struct pvr_job *job),
++	    TP_ARGS(job),
++	    TP_STRUCT__entry(__field(struct pvr_job *, job)),
++	    TP_fast_assign(__entry->job = job;),
++	    TP_printk("job=%p", __entry->job)
++);
++
++#endif /* PVR_TRACE_H */
++
++/* This part must be outside protection */
++#undef TRACE_INCLUDE_PATH
++#undef TRACE_INCLUDE_FILE
++#define TRACE_INCLUDE_PATH ../../drivers/gpu/drm/imagination
++#define TRACE_INCLUDE_FILE pvr_trace
++#include <trace/define_trace.h>
+diff --git a/drivers/gpu/drm/imagination/pvr_trace_points.c b/drivers/gpu/drm/imagination/pvr_trace_points.c
+new file mode 100644
+index 0000000..71b53f2
+--- /dev/null
++++ b/drivers/gpu/drm/imagination/pvr_trace_points.c
+@@ -0,0 +1,7 @@
++// SPDX-License-Identifier: GPL-2.0 OR MIT
++/* Copyright (c) 2026 Imagination Technologies Ltd. */
++
++#ifndef __CHECKER__
++#define CREATE_TRACE_POINTS
++#include "pvr_trace.h"
++#endif
+diff --git a/drivers/gpu/drm/imagination/pvr_vm.c b/drivers/gpu/drm/imagination/pvr_vm.c
+index b2f8e89..55cc999 100644
+--- a/drivers/gpu/drm/imagination/pvr_vm.c
++++ b/drivers/gpu/drm/imagination/pvr_vm.c
+@@ -13,6 +13,7 @@
+ #include <drm/drm_exec.h>
+ #include <drm/drm_gem.h>
+ #include <drm/drm_gpuvm.h>
++#include <drm/drm_print.h>
+ 
+ #include <linux/bug.h>
+ #include <linux/container_of.h>
+@@ -255,14 +256,14 @@ pvr_vm_bind_op_map_init(struct pvr_vm_bind_op *bind_op,
+ 	bind_op->type = PVR_VM_BIND_TYPE_MAP;
+ 
+ 	dma_resv_lock(obj->resv, NULL);
+-	bind_op->gpuvm_bo = drm_gpuvm_bo_obtain(&vm_ctx->gpuvm_mgr, obj);
++	bind_op->gpuvm_bo = drm_gpuvm_bo_obtain_locked(&vm_ctx->gpuvm_mgr, obj);
+ 	dma_resv_unlock(obj->resv);
+ 	if (IS_ERR(bind_op->gpuvm_bo))
+ 		return PTR_ERR(bind_op->gpuvm_bo);
+ 
+-	bind_op->new_va = kzalloc(sizeof(*bind_op->new_va), GFP_KERNEL);
+-	bind_op->prev_va = kzalloc(sizeof(*bind_op->prev_va), GFP_KERNEL);
+-	bind_op->next_va = kzalloc(sizeof(*bind_op->next_va), GFP_KERNEL);
++	bind_op->new_va = kzalloc_obj(*bind_op->new_va);
++	bind_op->prev_va = kzalloc_obj(*bind_op->prev_va);
++	bind_op->next_va = kzalloc_obj(*bind_op->next_va);
+ 	if (!bind_op->new_va || !bind_op->prev_va || !bind_op->next_va) {
+ 		err = -ENOMEM;
+ 		goto err_bind_op_fini;
+@@ -275,7 +276,7 @@ pvr_vm_bind_op_map_init(struct pvr_vm_bind_op *bind_op,
+ 		goto err_bind_op_fini;
+ 
+ 	bind_op->mmu_op_ctx =
+-		pvr_mmu_op_context_create(vm_ctx->mmu_ctx, sgt, offset, size);
++		pvr_mmu_op_context_create(vm_ctx->mmu_ctx, sgt, device_addr, offset, size);
+ 	err = PTR_ERR_OR_ZERO(bind_op->mmu_op_ctx);
+ 	if (err) {
+ 		bind_op->mmu_op_ctx = NULL;
+@@ -309,15 +310,15 @@ pvr_vm_bind_op_unmap_init(struct pvr_vm_bind_op *bind_op,
+ 
+ 	bind_op->type = PVR_VM_BIND_TYPE_UNMAP;
+ 
+-	bind_op->prev_va = kzalloc(sizeof(*bind_op->prev_va), GFP_KERNEL);
+-	bind_op->next_va = kzalloc(sizeof(*bind_op->next_va), GFP_KERNEL);
++	bind_op->prev_va = kzalloc_obj(*bind_op->prev_va);
++	bind_op->next_va = kzalloc_obj(*bind_op->next_va);
+ 	if (!bind_op->prev_va || !bind_op->next_va) {
+ 		err = -ENOMEM;
+ 		goto err_bind_op_fini;
+ 	}
+ 
+ 	bind_op->mmu_op_ctx =
+-		pvr_mmu_op_context_create(vm_ctx->mmu_ctx, NULL, 0, 0);
++		pvr_mmu_op_context_create(vm_ctx->mmu_ctx, NULL, device_addr, 0, 0);
+ 	err = PTR_ERR_OR_ZERO(bind_op->mmu_op_ctx);
+ 	if (err) {
+ 		bind_op->mmu_op_ctx = NULL;
+@@ -564,7 +565,7 @@ pvr_vm_create_context(struct pvr_device *pvr_dev, bool is_userspace_context)
+ 		return ERR_PTR(-EINVAL);
+ 	}
+ 
+-	vm_ctx = kzalloc(sizeof(*vm_ctx), GFP_KERNEL);
++	vm_ctx = kzalloc_obj(*vm_ctx);
+ 	if (!vm_ctx)
+ 		return ERR_PTR(-ENOMEM);
+ 
+@@ -1020,7 +1021,8 @@ copy_out:
+ 	if (err < 0)
+ 		return err;
+ 
+-	args->size = sizeof(query);
++	if (args->size > sizeof(query))
++		args->size = sizeof(query);
+ 	return 0;
+ }
+ 
+@@ -1070,7 +1072,8 @@ copy_out:
+ 	if (err < 0)
+ 		return err;
+ 
+-	args->size = sizeof(query);
++	if (args->size > sizeof(query))
++		args->size = sizeof(query);
+ 	return 0;
+ }
+ 

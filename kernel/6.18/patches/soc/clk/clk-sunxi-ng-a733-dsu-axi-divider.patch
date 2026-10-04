@@ -1,0 +1,102 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] clk: sunxi-ng: a733: expose the DSU's AXI divider
+
+What. CLK_CPU_DSU_AXI (7): the DSU's AXI clock, DSU/M with
+M = CPU_DSU_PLL_CLK_REG[1:0] + 1, as a divider child of the DSU mux
+(table /1, /2, /4 -- factor 0, 1 and 3; 2 is not allowed).
+
+Why. UM V1.00 5.1.4.1 (page 244) gives the ratio of the cluster master clock
+to the cluster's external-access output clock as 1:1 or 2:1. Boot0 leaves 2:1 and nothing else
+changes it, so at the DSU's low operating points the path to DRAM runs at
+half the DSU clock: at DSU 312 MHz, AXI /1 instead of /2 cuts A76 latency
+by 8-10 % and adds 27-56 % memcpy bandwidth, with no difference in idle
+wall power. A consumer needs a clock to ask for it.
+
+Source: UM V1.00 5.1.10.37 CPU_DSU_PLL_CLK_REG, page 310: DSU_AXI_DIV_CFG
+[1:0]; the UM limits FACTOR_M to the values 0, 1 and 3, and states that the
+divider switches glitch-free and can be reconfigured while running. The field shares
+the register with the DSU mux [26:24] and EXT_DIVP [17:16]; ccu_div and
+this driver's ccu_a733_rmw() both write it read-modify-write under
+common->lock. GIC (M1, [3:2]) and APB (N, [9:8]) allow only /2 and /4
+and are not exposed. The vendor BSP (ccu-sun60iw2-cpupll.c) models none of
+the three.
+
+Binding id 7 is the next free one in clock/sun60i-a733-cpu-ccu.h.
+
+Verified: 251/251 at fuzz 0, compile-check green. On silicon, 6 GiB board
+(bin 4), 6.18.54-t896, 2026-09-29: the clk tree shows
+cpu-dsu-axi under cpu-dsu (910 -> 455 MHz); the DSU driver's policy proof
+reads CPU_DSU_PLL_CLK[1:0] = 0 (/1) at 312 and 598 MHz and 1 (/2) at every
+point above, 11/11.
+
+Assisted-by: Claude
+---
+
+diff --git a/drivers/clk/sunxi-ng/ccu-sun60i-a733-cpu.c b/drivers/clk/sunxi-ng/ccu-sun60i-a733-cpu.c
+index e9a6d3d..a15c489 100644
+--- a/drivers/clk/sunxi-ng/ccu-sun60i-a733-cpu.c
++++ b/drivers/clk/sunxi-ng/ccu-sun60i-a733-cpu.c
+@@ -79,6 +79,7 @@
+ #include <dt-bindings/clock/sun60i-a733-cpu-ccu.h>
+ 
+ #include "ccu_common.h"
++#include "ccu_div.h"
+ #include "ccu_gate.h"
+ #include "ccu_mux.h"
+ 
+@@ -580,6 +581,25 @@ A733_CPU_MUX(cpu_b_clk, "cpu-b", cpu_b_parents,
+ A733_CPU_MUX(cpu_dsu_clk, "cpu-dsu", cpu_dsu_parents,
+ 	     a733_cpu_dsu_mux_table, A733_CPU_DSU_CLK_REG);
+ 
++/*
++ * The DSU's AXI clock, DSU/M with M = CPU_DSU_PLL_CLK_REG[1:0] + 1, factor
++ * 0, 1 or 3 only (UM V1.00 5.1.10.37, page 310). 5.1.4.1 (page 244) allows
++ * a cluster-to-AXI ratio of 1:1 or 2:1; boot0 leaves 2:1. The divider is
++ * glitch-free and shares its register with the DSU mux and EXT_DIVP, which
++ * are written under the same lock. GIC (M1) and APB (N) can only divide by
++ * 2 or 4 and are left where boot0 puts them.
++ */
++static struct clk_div_table a733_cpu_dsu_axi_div_table[] = {
++	{ .val = 0, .div = 1 },
++	{ .val = 1, .div = 2 },
++	{ .val = 3, .div = 4 },
++	{ /* sentinel */ }
++};
++
++static SUNXI_CCU_DIV_TABLE_HW(cpu_dsu_axi_clk, "cpu-dsu-axi",
++			      &cpu_dsu_clk.common.hw, A733_CPU_DSU_CLK_REG,
++			      0, 2, a733_cpu_dsu_axi_div_table, 0);
++
+ static struct ccu_common *sun60i_a733_cpu_ccu_clks[] = {
+ 	&pll_cpu_back_clk,
+ 	&pll_cpu_l_clk.common,
+@@ -588,6 +608,7 @@ static struct ccu_common *sun60i_a733_cpu_ccu_clks[] = {
+ 	&cpu_l_clk.common,
+ 	&cpu_b_clk.common,
+ 	&cpu_dsu_clk.common,
++	&cpu_dsu_axi_clk.common,
+ };
+ 
+ static struct clk_hw_onecell_data sun60i_a733_cpu_ccu_hw_clks = {
+@@ -599,8 +620,9 @@ static struct clk_hw_onecell_data sun60i_a733_cpu_ccu_hw_clks = {
+ 		[CLK_CPU_L]		= &cpu_l_clk.common.hw,
+ 		[CLK_CPU_B]		= &cpu_b_clk.common.hw,
+ 		[CLK_CPU_DSU]		= &cpu_dsu_clk.common.hw,
++		[CLK_CPU_DSU_AXI]	= &cpu_dsu_axi_clk.common.hw,
+ 	},
+-	.num	= CLK_CPU_DSU + 1,
++	.num	= CLK_CPU_DSU_AXI + 1,
+ };
+ 
+ static const struct sunxi_ccu_desc sun60i_a733_cpu_ccu_desc = {
+diff --git a/include/dt-bindings/clock/sun60i-a733-cpu-ccu.h b/include/dt-bindings/clock/sun60i-a733-cpu-ccu.h
+index d6f41e7..08ca0d3 100644
+--- a/include/dt-bindings/clock/sun60i-a733-cpu-ccu.h
++++ b/include/dt-bindings/clock/sun60i-a733-cpu-ccu.h
+@@ -23,5 +23,6 @@
+ #define CLK_CPU_L		4
+ #define CLK_CPU_B		5
+ #define CLK_CPU_DSU		6
++#define CLK_CPU_DSU_AXI		7
+ 
+ #endif /* _DT_BINDINGS_CLK_SUN60I_A733_CPU_CCU_H_ */

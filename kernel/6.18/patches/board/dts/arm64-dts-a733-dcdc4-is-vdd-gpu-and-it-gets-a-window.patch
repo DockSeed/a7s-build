@@ -1,0 +1,135 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: a733: DCDC4 is VDD-GPU, and it gets a window because the GPU is pinned
+
+The GPU rail has had no device-tree node. That was correct while the GPU ran
+at the operating point the boot chain leaves behind -- 600 MHz off PERI0_600M
+at whatever DCDC4 was already set to, measured 800 mV. It stops being correct
+the moment the next patch pins the core to 1008 MHz, because 1008 MHz is the
+row of the vendor OPP table that reads 960 mV.
+
+The rule this repo applies to PMIC rails is that a rail gets a node -- and
+therefore a window, and therefore the right to be written -- only together with
+its consumer (the DCDC3/DCDC5 nodes above say the same in
+their own comment). The consumer here is not a driver: drm/powervr reads no
+regulator at all. Grepped in the tree we build rather than assumed -- zero hits
+for "regulator" and for "-supply" across drivers/gpu/drm/imagination/. The
+consumer is the pinned clock, which is why these two patches are one change.
+
+⚠ SPLIT THEM AND ONE HALF IS A HAZARD. This rail alone at 960 mV is merely
+wasteful. The clock alone at 1008 MHz runs the GPU under its voltage curve,
+which is the failure mode that does not announce itself.
+
+The ordering is right by construction and not by luck: the regulator core
+writes this rail when the PMIC probes, and the GPU's rate is applied when
+powervr probes, seconds later. Voltage up first, then clock.
+
+min == max is deliberate. This is a FIXED operating point, not a ladder: there
+is no OPP table, no devfreq, and no consumer that could ever narrow a wider
+window. A window here is enforcement, not a wish.
+
+SILICON (the 6 GiB board, i2cget -f -y 1 0x36; 0x15/0x1b first read 2026-07-22, re-read
+2026-09-08 and identical both times):
+
+  0x15 = 0x9e   DVM on, n = 30 -> 500 + 30*10 = 800 mV, which is exactly what
+                the regulator framework reports for this rail -- register
+                decode and sysfs agree, so the coding is confirmed rather than
+                assumed
+  0x1b = 0x00   poly-phase bits [6] and [7] both clear, so DCDC2+3 and DCDC4+5
+                are NOT paralleled. This is the load-bearing read: it is what
+                makes DCDC4 the GPU's rail alone, and therefore what makes
+                raising it unable to touch VDD-CPUL on DCDC5.
+
+WINDOWS. The schematic rates VDD-GPU at 0.8-0.96 V and DS Tab. 5-1 gives
+-0.3..1.2 V absolute, so 960 mV is the top of the design window and stays
+240 mV under the limit.
+
+⚠ AND 960 mV IS NOT DERIVED FROM ANY DOCUMENT -- said plainly, because the
+rest of this header is derivation and this line is not. No datasheet carries an
+OPP table for this SoC; freq<->voltage comes from
+DT/eFuse and is silicon-bin-dependent. The two device trees that do carry a
+ladder disagree with each other everywhere except this one pair (vendor:
+400/600/800/1008 at 800/800/840/960; an Armbian tree: 252/504/1008 at
+800/800/960). That disagreement is itself the evidence that these tables are
+opinion. 960 mV is adopted because it is the conservative end of the
+disagreement and inside the documented window.
+
+It is owed a measurement, and the instrument exists: a GPU render test
+fails on wrong PIXELS before a GPU hangs, so walking this rail down at 1008 MHz
+until the test starts failing measures the real margin on our own silicon instead of
+inheriting someone's table.
+
+Assisted-by: Claude
+---
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -2438,6 +2438,70 @@
+ 						regulator-always-on;
+ 					};
+ 
++					/*
++					 * DCDC4 = VDD-GPU, volt register 0x15, same
++					 * coding as the two CPU rails above. It gets a
++					 * node -- and therefore a window, and therefore
++					 * the right to be written -- because this series
++					 * also pins its consumer: the GPU node one file
++					 * away asks for 1008 MHz, and 1008 MHz is the row
++					 * of the vendor OPP table that reads 960 mV.
++					 *
++					 * ⚠ THIS PATCH AND THE 1008 MHz PIN ARE ONE
++					 * CHANGE. Split them and one half is a hazard:
++					 * this rail alone at 960 mV is merely wasteful,
++					 * but the clock alone at 1008 MHz runs the GPU
++					 * UNDER its voltage curve, which is the failure
++					 * mode that does not announce itself.
++					 *
++					 * Order is right by construction: the regulator
++					 * core writes this at PMIC probe, and the GPU's
++					 * rate is applied when powervr probes, seconds
++					 * later. Voltage up first, then clock.
++					 *
++					 * min == max on purpose. This is a FIXED
++					 * operating point, not a ladder: there is no OPP
++					 * table and no devfreq, and drm/powervr reads no
++					 * regulator at all (grepped in the tree we build:
++					 * zero hits for "regulator" and "-supply" under
++					 * drivers/gpu/drm/imagination/). A wider window
++					 * would therefore never be narrowed by anyone --
++					 * a window is enforcement, not a wish.
++					 *
++					 * Silicon, read on the 6 GiB board (i2cget -f -y 1 0x36):
++					 *   0x15 = 0x9e -> DVM on, n=30 -> 800 mV
++					 *   0x1b = 0x00 -> poly-phase bits [6]/[7] clear,
++					 *                  so DCDC4+5 are NOT paralleled
++					 *                  and this rail is the GPU's
++					 *                  alone. First measured
++					 *                  2026-07-22, re-read 2026-09-08.
++					 * Windows: schematic rates VDD-GPU 0.8-0.96 V and
++					 * DS Tab. 5-1 gives -0.3..1.2 V absolute, so 960
++					 * mV is the top of the design window and stays
++					 * 240 mV under the limit.
++					 *
++					 * ⚠ 960 mV itself is NOT derived from any
++					 * document. No datasheet carries an OPP table for
++					 * this SoC (freq<->voltage comes
++					 * from DT/eFuse and is bin-dependent), and the two
++					 * device trees that do carry one disagree with
++					 * each other everywhere except this pair. It is
++					 * the vendor's number, adopted because it is the
++					 * conservative end of the disagreement and inside
++					 * the documented window -- and it is owed a
++					 * measurement, which a GL render test can give:
++					 * that test fails on wrong PIXELS before the GPU
++					 * hangs, so walking this rail down until that test
++					 * breaks measures the real margin on our silicon.
++					 */
++					reg_dcdc4: dcdc4 {
++						regulator-name = "vdd-gpu";
++						regulator-min-microvolt = <960000>;
++						regulator-max-microvolt = <960000>;
++						regulator-ramp-delay = <1280>;
++						regulator-always-on;
++					};
++
+ 					reg_dcdc5: dcdc5 {
+ 						regulator-name = "vdd-cpul-dsu";
+ 						regulator-min-microvolt = <800000>;

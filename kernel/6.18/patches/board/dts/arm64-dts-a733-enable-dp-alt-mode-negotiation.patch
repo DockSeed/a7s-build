@@ -1,0 +1,182 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: a733: enable DP alt-mode negotiation, and run the TCPC bus at 400 kHz
+
+Three changes, one goal: let the port find out what a DisplayPort sink on J4
+offers. Nothing here carries video -- the PHY's DP personality is not implemented
+(`phy-allwinner-a733-combophy-register-a-typec-mux`) and no display driver exists for this family yet.
+
+1. mode-switch on the combo-PHY node. typec_mux_match() looks for exactly this
+   property on the remote port parent's fwnode, the same rule that makes the
+   existing "orientation-switch" work. Without it the DP alt-mode driver has no
+   mux and cannot request a pin assignment.
+
+2. USB-PD on the connector, replacing pd-disable. DP alt mode is negotiated with
+   structured VDMs and those need a PD contract, so the reason the property was
+   there is answered rather than avoided: tcpm_fw_get_caps() derives pd_supported
+   from its absence and then insists on source-pdos, failing probe with -EINVAL
+   (measured on the 8 GiB board, 2026-07-21). The PDO is sourced rather than invented:
+   `typec-power-opmode = "default"` already sets Rp to USB default, i.e. up to
+   900 mA on a USB3-capable port, and PDO_FIXED(5000, 900, USB_COMM) restates
+   that in PD terms.
+
+3. clock-frequency = <400000> on r_i2c1. The property was absent, so the
+   controller ran at the driver's 100 kHz default. The only device on that bus is
+   the Type-C controller, and every PD message body and every ALERT handshake
+   crosses it. The vendor DT sets 400 kHz on this same board.
+
+⚠ What this patch does NOT do, and why the record matters more than the tidy
+story: a first version of it made the port dual-role with sink-pdos, on the
+hypothesis that the monitor hard-resets because it wants to source power and a
+source-only port cannot take the sink role. That was built, flashed and
+measured -- and refuted. With dual role in place the trace is unchanged:
+
+    PD TX, header: 0x11a1        <- Source_Capabilities
+    PD TX complete, status: 2    <- TCPC_TX_FAILED
+    ... retried, one gets through with status: 0 ...
+    Requested 5000 mV, 900 mA for 900 / 900 mA
+    PD TX, header: 0x3a3         <- our Accept
+    PD TX complete, status: 2    <- FAILED again
+    Received hard reset
+
+So the partner is not refusing a policy; most of our PD transmissions never reach
+it. That is a transmit-path problem, which is what change 3 addresses and what
+the next measurement has to settle. The dual-role change was reverted rather than
+kept "because the vendor does it": a patch whose stated reason is known to be
+false does not belong in the tree.
+
+Also ruled out on the way, so nobody re-runs it: the TCPC driver is not the
+difference. Mainline's tcpci_rt1711h and the vendor kernel's copy differ by two
+lines (the vendor adds etekmicro,et7304), neither knows hynetek,husb311, and both
+bind this chip through the richtek,rt1711h fallback with identical init. Separately
+worth an upstream note: that init writes PHYCTRL1 0x80 and RTCTRL8/11/14/15/16 at
+0x9B/0x9E/0xA1/0xA2/0xA3, all above the highest address the HUSB311 datasheet
+defines (0x6F).
+
+dtb built and read back: mode-switch present, source-pdos = <0x0401905a>,
+power-role "source", i2c@7084000 clock-frequency = <0x61a80> = 400 kHz,
+pd-disable gone, no dual-role and no sink-pdos.
+
+4. altmodes/displayport on the connector, with vdo = <0x00000446>. Without it the
+   partner's DP mode is discovered and never entered: measured on the 8 GiB board, the
+   partner altmode read `svid=ff01 mode=1 active=no` and typec_mux_set() was never
+   called with a DP state, because the port never declared that it supports DP
+   itself. The VDO is DFP_D + DP v1.3 signalling + receptacle + **pin assignment C
+   only** -- C is the one configuration observed working on this board.
+
+⚠ Why this arrives late, recorded because it cost a measurement: the altmodes node
+was first added straight to a working tree that had just been reset for an
+apply-check, so the dtb built from it carried altmodes and had silently lost
+mode-switch and the 400 kHz property again. Everything measured on that dtb was
+measured on a regressed device tree. The lesson is the tree's own: check the
+artefact, not the intent.
+
+Assisted-by: Claude
+
+diff --git a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -25,6 +25,7 @@
+ #include <dt-bindings/reset/sun60i-a733-ccu.h>
+ #include <dt-bindings/reset/sun60i-a733-r-ccu.h>
+ #include <dt-bindings/reset/sun60i-a733-serdes-ccu.h>
++#include <dt-bindings/usb/pd.h>
+ 
+ / {
+ 	model = "Radxa Cubie A7S (A733 minimal M1)";
+@@ -1435,6 +1436,12 @@
+ 			 */
+ 			orientation-switch;
+ 
++			/* ...and the mux half, for DP alt mode: typec_mux_match()
++			 * looks for "mode-switch" on the remote port parent's
++			 * fwnode (drivers/usb/typec/mux.c).
++			 */
++			mode-switch;
++
+ 			status = "okay";
+ 
+ 			port {
+@@ -1946,6 +1953,13 @@
+ 		 * It exists for exactly one consumer: the Type-C port controller.
+ 		 */
+ 		r_i2c1: i2c@7084000 {
++			/* 400 kHz, Fast mode. The property was absent, so the
++			 * controller ran at the 100 kHz default -- and the only
++			 * device on this bus is the Type-C controller, whose PD
++			 * messages and ALERT handshakes all cross it. The vendor
++			 * DT sets 400 kHz here on this same board.
++			 */
++			clock-frequency = <400000>;
+ 			compatible = "allwinner,sun8i-v536-i2c",
+ 				     "allwinner,sun6i-a31-i2c";
+ 			reg = <0x0 0x07084000 0x0 0x400>;
+@@ -1998,18 +2012,23 @@
+ 					data-role = "host";
+ 					typec-power-opmode = "default";
+ 					/*
+-					 * No USB-PD policy here, and saying so
+-					 * is required rather than optional:
+-					 * tcpm_fw_get_caps() sets pd_supported
+-					 * from the absence of this property and
+-					 * then insists on source-pdos, failing
+-					 * probe with -EINVAL. Observed on the 8 GiB board,
+-					 * 2026-07-21. We only want Type-C
+-					 * attach/Rp so a device connects; PD
+-					 * would need a power policy this board
+-					 * does not have.
++					 * USB-PD, because DisplayPort alt mode is
++					 * negotiated with structured VDMs and those
++					 * need a PD contract. `pd-disable` was here
++					 * for a reason that is now answered rather
++					 * than avoided: tcpm_fw_get_caps() derives
++					 * pd_supported from its absence and then
++					 * insists on source-pdos, failing probe with
++					 * -EINVAL (the 8 GiB board, 2026-07-21).
++					 *
++					 * The PDO is sourced, not invented:
++					 * `typec-power-opmode = "default"` already sets
++					 * Rp to USB default, i.e. up to 900 mA on a
++					 * USB3-capable port, so this restates in PD
++					 * terms what a partner may draw anyway.
+ 					 */
+-					pd-disable;
++					source-pdos = <PDO_FIXED(5000, 900,
++								 PDO_FIXED_USB_COMM)>;
+ 
+ 					/* The SS lanes are orientation-mirrored
+ 					 * inside COMB0, so TCPM has to tell the
+@@ -2020,6 +2039,34 @@
+ 					 * dwc3 only builds a role switch when
+ 					 * usb-role-switch is set, which it is not.
+ 					 */
++					/*
++					 * Declare that this port itself supports
++					 * DisplayPort. Without it the partner's DP
++					 * mode is discovered and never entered:
++					 * measured on the 8 GiB board, 2026-08-17, the partner
++					 * altmode read `svid=ff01 mode=1 active=no`
++					 * and typec_mux_set() was never called with a
++					 * DP state.
++					 *
++					 * VDO 0x00000446: [1:0]=10 DFP_D, [5:2]=0001
++					 * DP v1.3 signalling, [6]=1 receptacle,
++					 * [15:8]=0x04 pin assignment C only.
++					 *
++					 * Only C, deliberately: it is the one
++					 * configuration observed working on this
++					 * board (the vendor's DP configure VDM read
++					 * conf 0x406 and the PHY answered with four
++					 * lanes enabled, DP_RAWS_TXDW 0x0FF1).
++					 * Advertising D or E would invite a 2-lane
++					 * split this tree has never exercised.
++					 */
++					altmodes {
++						displayport {
++							svid = /bits/ 16 <0xff01>;
++							vdo = <0x00000446>;
++						};
++					};
++
+ 					ports {
+ 						#address-cells = <1>;
+ 						#size-cells = <0>;

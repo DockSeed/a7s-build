@@ -1,0 +1,73 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] pmdomain: sunxi: sun55i-pck600: set pd->pck, or the error path oopses
+
+sunxi_pck600_pd_set_power() opens with
+
+	struct sunxi_pck600 *pck = pd->pck;
+
+and uses it once, in the failure branch:
+
+	if (ret)
+		dev_err(pck->dev, "failed to turn domain \"%s\" %s: %d\n", ...);
+
+but nothing ever assigns pd->pck. The field exists in struct
+sunxi_pck600_pd and the probe loop fills in genpd.name, the two callbacks
+and base, and skips it. So every failing power transition dereferences
+NULL in the very line that was meant to explain the failure.
+
+The dev_err is the only reader of pd->pck, so the NULL is only reached
+when a power transition actually fails. Nothing here claims anything about
+A523 hardware -- that part is not ours to assert. What is measured is this
+SoC: on the A733, PWPR moves a domain in both directions, verified on VI
+(index 0) on the 8 GiB board on 2026-09-07 with PWPR 0x8 -> PWSR 0x8 and PWPR
+0x0 -> PWSR 0x0, each following within the read latency; and GPU_CORE is
+the one domain where the identical write does nothing, so its PWSR poll
+runs the full 10 ms, returns -ETIMEDOUT, and the driver walks straight
+into the NULL.
+
+Found at silicon, the 8 GiB board, 2026-09-07, with the GPU node
+enabled and powervr binding:
+
+  Unable to handle kernel NULL pointer dereference at virtual address 0
+  Internal error: Oops: 0000000096000004 [#1] SMP
+  CPU: 7 PID: 250 Comm: (udev-worker)
+  pc : sunxi_pck600_pd_set_power+0xac/0xe8
+  lr : sunxi_pck600_power_on+0x14/0x20
+  Call trace:
+    sunxi_pck600_pd_set_power+0xac/0xe8 (P)
+    sunxi_pck600_power_on+0x14/0x20
+    _genpd_power_on / genpd_power_on / genpd_runtime_resume
+    rpm_get_suppliers
+    pvr_device_init+0x100/0x5b8 [powervr]
+    pvr_probe+0xd8/0x14c [powervr]
+
+One line. It also matters beyond the crash: with pd->pck NULL the driver
+could never have printed which domain failed, which is the whole content
+of that dev_err.
+
+Falsifier: on the same image, the GPU node enabled and powervr loaded,
+the probe fails with 'failed to turn domain "GPU_CORE" on: -110' on the
+console and no oops.
+
+Present unchanged in torvalds/master (df2908090cda, 7.3-rc2), in
+linux-next and in the pmdomain maintainer tree ulfh/linux-pm.git#next --
+all three byte-identical, two `pck =` matches in the file and neither of
+them assigning pd->pck. No fix and no report found in patchwork or in the
+git history (lore itself was not searched): patchwork q=pck600 returns only
+the three known series (A523, A733, flags), and the file's whole history is
+those three commits.
+
+Fixes: 76e4310115ca ("pmdomain: sunxi: add driver for Allwinner A523's PCK-600 power controller")
+Assisted-by: Claude
+
+diff --git a/drivers/pmdomain/sunxi/sun55i-pck600.c b/drivers/pmdomain/sunxi/sun55i-pck600.c
+--- a/drivers/pmdomain/sunxi/sun55i-pck600.c
++++ b/drivers/pmdomain/sunxi/sun55i-pck600.c
+@@ -194,6 +194,7 @@
+ 		struct sunxi_pck600_pd *pd = &pck->pds[i];
+ 		bool is_off;
+ 
++		pd->pck = pck;
+ 		pd->genpd.name = desc->pd_names[i];
+ 		pd->genpd.power_off = sunxi_pck600_power_off;
+ 		pd->genpd.power_on = sunxi_pck600_power_on;

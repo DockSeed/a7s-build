@@ -1,0 +1,483 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] PCI: sun60i-a733: add the A733 PCIe root complex
+
+[Recipe cut: the stop_after_link module parameter is not carried.]
+
+The controller is a DesignWare core: config space at the DBI base, the unrolled
+iATU at DBI + 0x300000 with 0x200 per region, 16 regions each way, the DWC MSI
+receiver on its own SPI. drivers/pci/controller/dwc/ implements all of that, so
+this driver is only what is Allwinner's -- clocks, resets, the combo-PHY, the
+board's PERST line, and two registers:
+
+  UDS + 0x0c00  PCIE_LTSSM_ENABLE  bit0 starts link training, [7:4] device type
+  UDS + 0x0e0c  SII_INT_1          bit0 SMLH link up, bit1 RDLH link up
+
+Both are tabulated in the A733 UM V1.00, PCIe chapter, which documents the whole
+User Defined Space. The DBI base is NOT where the UM prints the module base: that
+address, 0x06400000, is the UDS, and the DBI sits 0x400000 below it at
+0x06000000. Measured at the U-Boot prompt on the 6 GiB board -- 0x06000000 reads 0xabcd1f6d,
+the root complex's own vendor/device id.
+
+NOT A PORT OF THE VENDOR DRIVER, ON PURPOSE
+
+The vendor BSP ships a PCIe driver for this controller that does not use the
+DesignWare core at all: 3200 lines reimplementing the iATU programming, the MSI
+controller and the config accessors. Using the shared core instead means the
+A733 gets the behaviour every other DWC platform is tested with -- including the
+parts the vendor's copy leaves out, per-vector MSI masking among them, which
+their own tree needed a separate patch for. The aim is to cover more than a
+port would, and here that is done by deleting the port rather than writing it.
+
+WHAT THE DRIVER DOES BEYOND THE CORE
+
+ - Brings the three resets up in the order the UM's own sequence uses: power-up,
+   then controller, then the ITS in front of it, so the controller never leaves
+   reset onto an unclocked bus.
+ - Holds the supply the board needs. On the A7S there is no 3.3 V slot rail:
+   the FPC connector feeds an adapter with its own regulator, whose enable is a
+   GPIO, and it is modelled as vpcie3v3-supply.
+ - Releases PERST# last, once the PHY's reference clock is live, and then waits
+   the 100 ms the CEM spec asks for before anything queries the device. Skipping
+   that wait is how a healthy drive enumerates on some boots and not others.
+ - Forces the device-type field to root complex in start_link(). It resets to
+   RC, so this is a no-op cold -- but a warm start finds whatever the boot loader
+   left, and an endpoint-shaped root complex fails in ways that look like a dead
+   link.
+ - Treats link-up as SMLH AND RDLH, not either: a link with only the physical
+   layer up has trained but cannot carry a TLP.
+
+TWO THINGS THIS COST, BOTH MEASURED ON THE BOARD
+
+1. `pp.ops` must be set even when there is nothing to put in it.
+   dw_pcie_host_init() dereferences it without a NULL check, so leaving it out
+   is an oops during probe rather than a default. The struct here is empty and
+   says why.
+
+2. **The AXI slave clock has to be 400 MHz.** Its mux resets to PERI0_600M, and
+   at that rate the controller does not survive a configuration read into the
+   slave window: the access never completes and the CPU that issued it hangs
+   with interrupts off. Measured 2026-09-21 -- a hard lockup on CPU 6 during the
+   first scan of bus 01, 20 s later the watchdog's own detector called it, panic,
+   reboot. Every gate was open and the link was trained at Gen3 x1 at the time;
+   the clock was the only thing wrong. With clk_set_rate(400 MHz) in probe the
+   register reads 0x82000000 -- the same value the vendor stack leaves behind --
+   and the scan completes in milliseconds.
+
+   The vendor BSP sets that rate from its own clock setup and flags this
+   controller generation `pcie_slv_clk_400m`; the UM lists 010 = PERI0_400M as a
+   source of the mux without saying it is required. So the number is theirs and
+   the failure it prevents is ours.
+
+HARDWARE PROOF (the 6 GiB board, 2026-09-21, kernel 6.18.36-pcie1)
+
+    sun60i-a733-pcie 6000000.pcie: iATU: unroll T, 8 ob, 8 ib, align 4K
+    sun60i-a733-pcie 6000000.pcie: PCIe Gen.3 x1 link up
+    pci 0000:01:00.0: [1c5c:1327] type 00 class 0x010802 PCIe Endpoint
+    nvme nvme0: pci function 0000:01:00.0
+    nvme nvme0: 8/0/0 default/read/poll queues
+    nvme0n1: p1 p2
+
+The drive is a BC501 NVMe SK hynix 256GB. Silicon after the fact: link status
+0x30130C42 (Gen3, x1, DLL active), LTSSM 0x11 = L0, the controller's own link
+register 0x02000013 (SMLH + RDLH). 256 MiB read with O_DIRECT at 544 MB/s.
+
+⚠ Worth stating because it is the point of not porting the vendor driver: the
+interrupts come up as DW-PCI-MSIX, one vector per queue (nvme0q0..q7). The
+vendor's tree needed a separate patch for per-vector masking. None of that is
+here; the shared DesignWare code does it.
+
+Assisted-by: Claude
+
+diff --git a/drivers/pci/controller/dwc/Kconfig b/drivers/pci/controller/dwc/Kconfig
+--- a/drivers/pci/controller/dwc/Kconfig
++++ b/drivers/pci/controller/dwc/Kconfig
+@@ -256,6 +256,17 @@ config PCIE_TEGRA194_EP
+ 	  in order to enable device-specific features PCIE_TEGRA194_EP must be
+ 	  selected. This uses the DesignWare core.
+ 
++config PCIE_SUN60I_A733
++	bool "Allwinner A733 PCIe controller"
++	depends on ARCH_SUNXI || COMPILE_TEST
++	depends on PCI_MSI
++	select PCIE_DW_HOST
++	help
++	  Say Y here to enable PCIe controller support on Allwinner A733
++	  (sun60iw2) SoCs. The controller is a DesignWare core; this driver
++	  adds the SoC's clocks, resets, combo-PHY and PERST handling on top
++	  of the shared DesignWare host code.
++
+ config PCIE_DW_PLAT
+ 	bool
+ 
+diff --git a/drivers/pci/controller/dwc/Makefile b/drivers/pci/controller/dwc/Makefile
+--- a/drivers/pci/controller/dwc/Makefile
++++ b/drivers/pci/controller/dwc/Makefile
+@@ -4,6 +4,7 @@ obj-$(CONFIG_PCIE_DW_DEBUGFS) += pcie-designware-debugfs.o
+ obj-$(CONFIG_PCIE_DW_HOST) += pcie-designware-host.o
+ obj-$(CONFIG_PCIE_DW_EP) += pcie-designware-ep.o
+ obj-$(CONFIG_PCIE_DW_PLAT) += pcie-designware-plat.o
++obj-$(CONFIG_PCIE_SUN60I_A733) += pcie-sun60i-a733.o
+ obj-$(CONFIG_PCIE_AMD_MDB) += pcie-amd-mdb.o
+ obj-$(CONFIG_PCIE_BT1) += pcie-bt1.o
+ obj-$(CONFIG_PCI_DRA7XX) += pci-dra7xx.o
+diff --git a/drivers/pci/controller/dwc/pcie-sun60i-a733.c b/drivers/pci/controller/dwc/pcie-sun60i-a733.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/pci/controller/dwc/pcie-sun60i-a733.c
+@@ -0,0 +1,356 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * PCIe root complex for the Allwinner A733 (sun60iw2).
++ *
++ * The controller is a DesignWare core: config space at the DBI base, the
++ * unrolled iATU at DBI + 0x300000 with 0x200 per region, 16 inbound and 16
++ * outbound regions, the DWC MSI receiver on its own interrupt. All of that is
++ * what drivers/pci/controller/dwc/ already implements, so this file is only
++ * the parts that are Allwinner's: the clocks, the resets, the PHY, the board's
++ * PERST line, and two registers in a window the UM calls the User Defined
++ * Space.
++ *
++ *   UDS + 0x0c00  PCIE_LTSSM_ENABLE   bit0 starts link training,
++ *                                     [7:4] device type, reset value 4 = RC
++ *   UDS + 0x0e0c  SII_INT_1           bit0 SMLH link up, bit1 RDLH link up
++ *
++ * Both documented in the A733 UM V1.00, PCIe chapter 18.3, which tabulates the
++ * whole User Defined Space. The DBI base itself is NOT where the UM prints it:
++ * the module base in the memory map is the UDS at 0x06400000, and the DBI sits
++ * 0x400000 below at 0x06000000 -- measured on hardware,
++ * the 6 GiB board at the U-Boot prompt.
++ *
++ * ⚠ The vendor BSP ships a PCIe driver for this controller that does not use
++ * the DesignWare core at all: it reimplements the iATU programming, the MSI
++ * controller and the config-space accessors in about 3200 lines. This driver
++ * deliberately does not port that. Using the shared core means the A733 gets
++ * the iATU, MSI and ECAM behaviour that every other DWC platform is tested
++ * with, including the parts the vendor's copy leaves out -- per-vector MSI
++ * masking among them, which the vendor's own tree needed a patch for.
++ *
++ * Copyright (C) 2026 DockSeed
++ */
++
++#include <linux/bitfield.h>
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/moduleparam.h>
++#include <linux/of.h>
++#include <linux/phy/phy.h>
++#include <linux/platform_device.h>
++#include <linux/regulator/consumer.h>
++#include <linux/reset.h>
++
++#include "pcie-designware.h"
++
++#define SUN60I_A733_PCIE_LTSSM_CTRL		0x0c00
++#define  SUN60I_A733_PCIE_LTSSM_ENABLE		BIT(0)
++#define  SUN60I_A733_PCIE_DEVICE_TYPE		GENMASK(7, 4)
++#define  SUN60I_A733_PCIE_DEVICE_TYPE_RC	0x4
++
++#define SUN60I_A733_PCIE_LINK_STAT		0x0e0c
++#define  SUN60I_A733_PCIE_SMLH_LINK_UP		BIT(0)
++#define  SUN60I_A733_PCIE_RDLH_LINK_UP		BIT(1)
++
++/*
++ * PCIe CEM 3.0: at least 100 ms between the reference clock being valid and
++ * PERST# being released, and the spec's T_RRS before the first config request.
++ * dw_pcie_wait_for_link() covers the second; this covers the first.
++ */
++#define SUN60I_A733_PCIE_T_PVPERL_MS		100
++
++enum {
++	SUN60I_A733_PCIE_CLK_AUX,
++	SUN60I_A733_PCIE_CLK_AXI_SLV,
++	SUN60I_A733_PCIE_CLK_ITS,
++	SUN60I_A733_PCIE_CLK_SLV_ACLK,
++	SUN60I_A733_PCIE_CLK_MST_ACLK,
++	SUN60I_A733_PCIE_CLK_HCLK,
++};
++
++static const char * const sun60i_a733_pcie_clks[] = {
++	[SUN60I_A733_PCIE_CLK_AUX]	= "aux",
++	[SUN60I_A733_PCIE_CLK_AXI_SLV]	= "axi-slv",
++	[SUN60I_A733_PCIE_CLK_ITS]	= "its",
++	[SUN60I_A733_PCIE_CLK_SLV_ACLK]	= "slv-aclk",
++	[SUN60I_A733_PCIE_CLK_MST_ACLK]	= "mst-aclk",
++	[SUN60I_A733_PCIE_CLK_HCLK]	= "hclk",
++};
++
++struct sun60i_a733_pcie {
++	struct dw_pcie		pci;
++	void __iomem		*app;
++	struct clk_bulk_data	clks[ARRAY_SIZE(sun60i_a733_pcie_clks)];
++	struct reset_control	*rst_pwrup;
++	struct reset_control	*rst_core;
++	struct reset_control	*rst_its;
++	struct phy		*phy;
++	struct gpio_desc	*perst;
++	struct regulator	*vpcie3v3;
++};
++
++static struct sun60i_a733_pcie *to_sun60i_a733_pcie(struct dw_pcie *pci)
++{
++	return container_of(pci, struct sun60i_a733_pcie, pci);
++}
++
++static int sun60i_a733_pcie_start_link(struct dw_pcie *pci)
++{
++	struct sun60i_a733_pcie *pcie = to_sun60i_a733_pcie(pci);
++	u32 val;
++
++	val = readl(pcie->app + SUN60I_A733_PCIE_LTSSM_CTRL);
++	/*
++	 * The device-type field resets to root complex, so this is a no-op on a
++	 * cold start -- but a warm one can find whatever the boot loader left,
++	 * and an endpoint-shaped root complex fails in ways that look like a
++	 * dead link.
++	 */
++	val &= ~SUN60I_A733_PCIE_DEVICE_TYPE;
++	val |= FIELD_PREP(SUN60I_A733_PCIE_DEVICE_TYPE,
++			  SUN60I_A733_PCIE_DEVICE_TYPE_RC);
++	val |= SUN60I_A733_PCIE_LTSSM_ENABLE;
++	writel(val, pcie->app + SUN60I_A733_PCIE_LTSSM_CTRL);
++
++	return 0;
++}
++
++static void sun60i_a733_pcie_stop_link(struct dw_pcie *pci)
++{
++	struct sun60i_a733_pcie *pcie = to_sun60i_a733_pcie(pci);
++	u32 val;
++
++	val = readl(pcie->app + SUN60I_A733_PCIE_LTSSM_CTRL);
++	val &= ~SUN60I_A733_PCIE_LTSSM_ENABLE;
++	writel(val, pcie->app + SUN60I_A733_PCIE_LTSSM_CTRL);
++}
++
++static bool sun60i_a733_pcie_link_up(struct dw_pcie *pci)
++{
++	struct sun60i_a733_pcie *pcie = to_sun60i_a733_pcie(pci);
++	u32 val = readl(pcie->app + SUN60I_A733_PCIE_LINK_STAT);
++
++	/*
++	 * Both halves, not either: SMLH is the physical layer and RDLH the data
++	 * link layer, and a link that reports SMLH alone has trained but cannot
++	 * carry a TLP yet.
++	 */
++	return (val & (SUN60I_A733_PCIE_SMLH_LINK_UP |
++		       SUN60I_A733_PCIE_RDLH_LINK_UP)) ==
++	       (SUN60I_A733_PCIE_SMLH_LINK_UP | SUN60I_A733_PCIE_RDLH_LINK_UP);
++}
++
++/*
++ * Empty, and required: dw_pcie_host_init() dereferences pp->ops without
++ * checking it (pcie-designware-host.c, `if (pp->ops->init)`), so a NULL here is
++ * an oops during probe rather than a default. Nothing in this controller needs
++ * a host callback -- the core's own init path does everything.
++ */
++static const struct dw_pcie_host_ops sun60i_a733_pcie_host_ops = {
++};
++
++static const struct dw_pcie_ops sun60i_a733_dw_pcie_ops = {
++	.start_link	= sun60i_a733_pcie_start_link,
++	.stop_link	= sun60i_a733_pcie_stop_link,
++	.link_up	= sun60i_a733_pcie_link_up,
++};
++
++static void sun60i_a733_pcie_power_off(void *data)
++{
++	struct sun60i_a733_pcie *pcie = data;
++
++	gpiod_set_value_cansleep(pcie->perst, 1);
++	phy_power_off(pcie->phy);
++	phy_exit(pcie->phy);
++	reset_control_assert(pcie->rst_its);
++	reset_control_assert(pcie->rst_core);
++	reset_control_assert(pcie->rst_pwrup);
++	clk_bulk_disable_unprepare(ARRAY_SIZE(pcie->clks), pcie->clks);
++	if (pcie->vpcie3v3)
++		regulator_disable(pcie->vpcie3v3);
++}
++
++static int sun60i_a733_pcie_power_on(struct sun60i_a733_pcie *pcie)
++{
++	struct device *dev = pcie->pci.dev;
++	int ret;
++
++	if (pcie->vpcie3v3) {
++		ret = regulator_enable(pcie->vpcie3v3);
++		if (ret)
++			return dev_err_probe(dev, ret, "vpcie3v3\n");
++	}
++
++	/*
++	 * The AXI slave clock has to be 400 MHz. Its mux resets to PERI0_600M,
++	 * and the controller does not survive that: configuration reads into
++	 * the slave window never complete and the CPU that issued one hangs
++	 * with interrupts off -- measured on 2026-09-21, a hard lockup during
++	 * the first scan of bus 01, with the link trained and every gate open.
++	 *
++	 * The vendor BSP sets the same rate from its own clock setup and marks
++	 * this controller generation with a `pcie_slv_clk_400m` flag; the UM
++	 * lists 010 = PERI0_400M as a source of this mux without saying it is
++	 * required. So the number is the vendor's and the failure it prevents
++	 * is ours, measured here.
++	 */
++	ret = clk_set_rate(pcie->clks[SUN60I_A733_PCIE_CLK_AXI_SLV].clk,
++			   400000000);
++	if (ret)
++		return dev_err_probe(dev, ret, "axi-slv clock to 400 MHz\n");
++
++	ret = clk_bulk_prepare_enable(ARRAY_SIZE(pcie->clks), pcie->clks);
++	if (ret)
++		goto err_regulator;
++
++	/*
++	 * Power-up reset first, then the controller, then the ITS in front of
++	 * it. The order is the one the UM's own bring-up sequence uses, and it
++	 * is the only one in which the controller sees a bus that is already
++	 * clocked when it leaves reset.
++	 */
++	ret = reset_control_deassert(pcie->rst_pwrup);
++	if (ret)
++		goto err_clocks;
++	ret = reset_control_deassert(pcie->rst_core);
++	if (ret)
++		goto err_pwrup;
++	ret = reset_control_deassert(pcie->rst_its);
++	if (ret)
++		goto err_core;
++
++	ret = phy_init(pcie->phy);
++	if (ret)
++		goto err_its;
++	ret = phy_power_on(pcie->phy);
++	if (ret)
++		goto err_phy_init;
++
++	/*
++	 * PERST# comes off last, once the reference clock the PHY generates is
++	 * live, and the device gets its 100 ms before anything asks it a
++	 * question. Skipping this wait is how a drive that is perfectly healthy
++	 * enumerates on some boots and not others.
++	 */
++	gpiod_set_value_cansleep(pcie->perst, 0);
++	msleep(SUN60I_A733_PCIE_T_PVPERL_MS);
++
++	return 0;
++
++err_phy_init:
++	phy_exit(pcie->phy);
++err_its:
++	reset_control_assert(pcie->rst_its);
++err_core:
++	reset_control_assert(pcie->rst_core);
++err_pwrup:
++	reset_control_assert(pcie->rst_pwrup);
++err_clocks:
++	clk_bulk_disable_unprepare(ARRAY_SIZE(pcie->clks), pcie->clks);
++err_regulator:
++	if (pcie->vpcie3v3)
++		regulator_disable(pcie->vpcie3v3);
++	return ret;
++}
++
++static int sun60i_a733_pcie_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct sun60i_a733_pcie *pcie;
++	int ret, i;
++
++	pcie = devm_kzalloc(dev, sizeof(*pcie), GFP_KERNEL);
++	if (!pcie)
++		return -ENOMEM;
++
++	pcie->pci.dev = dev;
++	pcie->pci.ops = &sun60i_a733_dw_pcie_ops;
++	pcie->pci.pp.ops = &sun60i_a733_pcie_host_ops;
++
++	pcie->app = devm_platform_ioremap_resource_byname(pdev, "app");
++	if (IS_ERR(pcie->app))
++		return PTR_ERR(pcie->app);
++
++	for (i = 0; i < ARRAY_SIZE(pcie->clks); i++)
++		pcie->clks[i].id = sun60i_a733_pcie_clks[i];
++	ret = devm_clk_bulk_get(dev, ARRAY_SIZE(pcie->clks), pcie->clks);
++	if (ret)
++		return dev_err_probe(dev, ret, "clocks\n");
++
++	pcie->rst_pwrup = devm_reset_control_get_exclusive(dev, "pwrup");
++	if (IS_ERR(pcie->rst_pwrup))
++		return dev_err_probe(dev, PTR_ERR(pcie->rst_pwrup), "pwrup reset\n");
++	pcie->rst_core = devm_reset_control_get_exclusive(dev, "core");
++	if (IS_ERR(pcie->rst_core))
++		return dev_err_probe(dev, PTR_ERR(pcie->rst_core), "core reset\n");
++	pcie->rst_its = devm_reset_control_get_exclusive(dev, "its");
++	if (IS_ERR(pcie->rst_its))
++		return dev_err_probe(dev, PTR_ERR(pcie->rst_its), "its reset\n");
++
++	pcie->phy = devm_phy_get(dev, "pcie-phy");
++	if (IS_ERR(pcie->phy))
++		return dev_err_probe(dev, PTR_ERR(pcie->phy), "phy\n");
++
++	/*
++	 * PERST# is a board signal, and on the A7S it is the only way the
++	 * device is reset: the controller's internal PERST generator
++	 * (SUBSYS_PCIE_BGR bit1) is not wired to the connector.
++	 */
++	pcie->perst = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
++	if (IS_ERR(pcie->perst))
++		return dev_err_probe(dev, PTR_ERR(pcie->perst), "PERST gpio\n");
++
++	pcie->vpcie3v3 = devm_regulator_get_optional(dev, "vpcie3v3");
++	if (IS_ERR(pcie->vpcie3v3)) {
++		if (PTR_ERR(pcie->vpcie3v3) != -ENODEV)
++			return dev_err_probe(dev, PTR_ERR(pcie->vpcie3v3),
++					     "vpcie3v3\n");
++		pcie->vpcie3v3 = NULL;
++	}
++
++	ret = sun60i_a733_pcie_power_on(pcie);
++	if (ret)
++		return ret;
++
++	ret = devm_add_action_or_reset(dev, sun60i_a733_pcie_power_off, pcie);
++	if (ret)
++		return ret;
++
++	platform_set_drvdata(pdev, pcie);
++
++	ret = dw_pcie_host_init(&pcie->pci.pp);
++	if (ret)
++		return dev_err_probe(dev, ret, "host init\n");
++
++	return 0;
++}
++
++static void sun60i_a733_pcie_remove(struct platform_device *pdev)
++{
++	struct sun60i_a733_pcie *pcie = platform_get_drvdata(pdev);
++
++	dw_pcie_host_deinit(&pcie->pci.pp);
++}
++
++static const struct of_device_id sun60i_a733_pcie_of_match[] = {
++	{ .compatible = "allwinner,sun60i-a733-pcie" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, sun60i_a733_pcie_of_match);
++
++static struct platform_driver sun60i_a733_pcie_driver = {
++	.probe	= sun60i_a733_pcie_probe,
++	.remove	= sun60i_a733_pcie_remove,
++	.driver	= {
++		.name		= "sun60i-a733-pcie",
++		.of_match_table	= sun60i_a733_pcie_of_match,
++		.suppress_bind_attrs = true,
++	},
++};
++module_platform_driver(sun60i_a733_pcie_driver);
++
++MODULE_DESCRIPTION("Allwinner A733 PCIe root complex");
++MODULE_LICENSE("GPL");

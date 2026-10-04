@@ -1,0 +1,77 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] drm/imagination: ask for idle again when nobody holds the GPU
+
+The GPU on this board idles fine until a client exits at the wrong moment, and
+then it stays powered until the next client arrives. Measured on the test board,
+2026-09-10:
+
+  desktop running    206 suspends in a 30 s rpm trace, pll-gpu0 enable=2
+  desktop stopped    runtime_status active for 95 s, no client, until the
+                     next client started; 2 of 3 client exits stuck like this
+
+The mechanism, each step read in the tree and seen in the trace:
+
+  1. The last put of a client's exit goes through ->runtime_idle =
+     pvr_power_device_idle(), which returns -EBUSY while the firmware has not
+     yet reported POW_IDLE (pvr_power.c:437). The trace shows these refusals
+     in bursts at every client exit.
+  2. rpm_idle() arms no retry behind a refusal:
+     `return retval ? retval : rpm_suspend(dev, rpmflags | RPM_AUTO);`
+     (drivers/base/power/runtime.c:562).
+  3. The watchdog is the only periodic worker, and at usage count 0 it does
+     nothing: pm_runtime_get_if_in_use() is atomic_inc_not_zero()
+     (runtime.c:1243), so it jumps to out_requeue and never reaches its put.
+     The 60 s trace of a stuck window holds 117 events, all of them that
+     tick: `rpm_usage: 1800000.gpu flags-0 cnt-0`, every ~512 ms.
+
+So the first refused check is also the last one. This adds the missing retry
+where the watchdog already runs: when get_if_in_use() takes no reference, ask
+for an idle check with pm_request_idle(). The watchdog is only queued while the
+firmware runs (pvr_power_fw_enable() queues it, pvr_power_fw_disable() cancels
+it), so this fires only on a powered GPU, at most every WATCHDOG_TIME_MS.
+pvr_power_device_idle() still decides; nothing here bypasses its veto, and a
+busy GPU still refuses.
+
+Not taken: pm_runtime_put_autosuspend() in the watchdog (the one-hunk proposal
+considered earlier). In the stuck state the
+watchdog holds no reference and never reaches that put.
+
+The code is byte-identical to mainline master (compared 2026-09-10), so this
+is a mainline defect, not an import artefact.
+
+Verified: applies with --fuzz=0 after `drm-imagination-force-the-firmware-stop-on-hard-reset`; compile gate green. HW-proven on
+the test board 2026-09-10: 22 of 22 client exits suspended within 250-750 ms,
+while a kernel without this patch (the previous GPU idle fix present) left 10 of 20 of the same
+exits active.
+
+Falsifier on the test board, desktop image, with a client exit that used to stick
+(stop the desktop session, or a client that opens the device and exits):
+  - power/runtime_status reads `suspended` within 2 s, not `active`;
+  - the rpm trace shows rpm_idle from the watchdog's kworker while the device
+    is active with cnt-0;
+  - expected idle readings: gpu0 enable=0, pll-gpu0 enable=2,
+    GPU0_CLK 0x02002b20 bit 31 clear, GPU0_GATING 0x02002b24 = 0;
+  - a GL acceptance test still passes and the desktop still renders.
+
+Assisted-by: Claude
+
+--- a/drivers/gpu/drm/imagination/pvr_power.c
++++ b/drivers/gpu/drm/imagination/pvr_power.c
+@@ -242,8 +242,16 @@
+ 	if (pvr_dev->lost)
+ 		return;
+ 
+-	if (pm_runtime_get_if_in_use(from_pvr_device(pvr_dev)->dev) <= 0)
++	if (pm_runtime_get_if_in_use(from_pvr_device(pvr_dev)->dev) <= 0) {
++		/*
++		 * No reference is held, yet the watchdog runs, so the GPU is still
++		 * powered. The last put's idle check was refused by
++		 * pvr_power_device_idle() and rpm_idle() arms no retry, so nothing
++		 * would ask again. Ask on every tick; the idle callback still decides.
++		 */
++		pm_request_idle(from_pvr_device(pvr_dev)->dev);
+ 		goto out_requeue;
++	}
+ 
+ 	if (!READ_ONCE(pvr_dev->fw_dev.initialised))
+ 		goto out_pm_runtime_put;

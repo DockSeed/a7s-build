@@ -1,0 +1,786 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] clk: sunxi-ng: a733: model the video PLLs and the eDP/TV pixel clock
+
+This tree has never modelled a video PLL. `clk-sunxi-ng-a733-add-edp-bus-gate-and-reset` added the eDP *bus* gate and
+stated in its own header why it stopped there: "Its mux cannot be expressed by
+this tree yet. CLK_SRC_SEL [26:24] selects 000 VIDEO0PLL4X, 001 VIDEO1PLL4X,
+010 VIDEO2PLL4X, 011 PERI0PLL2X, and this CCU models none of the three video
+PLLs. [...] Modelling a four-way mux with three parents missing would be a
+guess, and guesses do not ship here." This patch is the answer to that
+sentence: all four sources, the pixel divider, and the two VIDEO_OUT1 bus
+gates the pixel path needs.
+
+    pll-ref 24 MHz -> PLL_VIDEOx (VCO) -> VIDEOxPLL4X -> EDP_TV_CLK -> TCON_TV1
+
+New clocks: pll-video0/1/2, video0/1/2-pll4x, edp-tv, bus-tcon-tv1,
+bus-dpss-top1. New resets: RST_BUS_TCON_TV1, RST_BUS_DPSS_TOP1. Nothing
+references them until `arm64-dts-a733-tcon-tv1-and-the-dp-phy-pad-window`'s device tree does, so on its own this patch changes
+no register except the two probe-time bits named below.
+
+The collision is concrete, not argued. This patch edits three files `clk-sunxi-ng-a733-add-edp-bus-gate-and-reset`
+already edits, and in all three the collision is in trailing context:
+
+  include/dt-bindings/clock/sun60i-a733-ccu.h   `clk-sunxi-ng-a733-add-edp-bus-gate-and-reset`'s hunk ends on
+      CLK_BUS_PWM1 / blank / #endif; ids appended before #endif earlier in the series move
+      that context and `clk-sunxi-ng-a733-add-edp-bus-gate-and-reset` no longer applies at fuzz 0.
+  include/dt-bindings/reset/sun60i-a733-ccu.h   same shape.
+  drivers/clk/sunxi-ng/ccu-sun60iw2.c           `clk-sunxi-ng-a733-add-edp-bus-gate-and-reset` changes
+      ".num = CLK_BUS_PWM1 + 1" to ".num = CLK_BUS_EDP + 1"; this patch changes
+      the same line again. Whichever applies second has to see what the first
+      one left.
+
+WHERE THE VALUES COME FROM
+--------------------------
+Register geometry: the CCU field tables of the A733 user manual (extracted from
+A733 UM V0.92 4.1.6), cross-read against the UM text, with
+the CCU base 0x02002000 from the memory map of the A733 user manual.
+
+  PLL_VIDEO0/1/2_CTRL_REG  0x0120 / 0x0140 / 0x0160
+    reset 0x40126200, one layout for all three
+    31 PLL_EN . 30 PLL_LDO_EN . 29 LOCK_ENABLE . 28 LOCK (RO)
+    27 PLL_OUTPUT0_GATE ("4X") . 26 PLL_OUTPUT1_GATE ("3X")
+    [22:20] PLL_OUTPUT0_DIV  P0 = field+1, 0..7
+    [18:16] PLL_OUTPUT1_DIV  P1 = field+1, 0..7
+    [15:8]  PLL_N            N  = field+1, field>=11
+    [1]     PLL_INPUT_DIV    M1 = field+1, 0..1
+    VIDEOxPLL4X = InputFreq * N / M1 / P0
+    VIDEOxPLL3X = InputFreq * N / M1 / P1
+    VCO 1.26G..2.52G, P0/P1 1..8   UM Table 4-2
+  EDP_TV_CLK_REG           0x1640
+    31 gate . [26:24] CLK_SRC_SEL . [12:8] FACTOR_N . [4:0] FACTOR_M
+    EDP_TV_CLK = Clock Source / M / N
+  TCONTV1_BGR_REG          0x160C  bit0 gate, bit16 reset
+  DPSS_TOP1_BGR_REG        0x16CC  bit0 gate, bit16 reset
+
+Silicon, three reads, none of them from code:
+  - the 8 GiB board at the U-Boot prompt, 2026-08-19: PLL_VIDEO1_CTRL = 0x41126200 --
+    PLL off, every configurable field at UM Table 4-3's documented default
+    (N 99, M1 1, P0 2, P1 3, VCO 2376), and all four display gate registers 0.
+  - the 6 GiB board under the vendor stack driving a live eDP link, 2026-07-18:
+    PLL_VIDEO1_CTRL = 0xfd126200 (the one live video PLL, VIDEO0/2 off),
+    EDP_TV_CLK = 0x81000000 -> CLK_SRC_SEL 001 = VIDEO1PLL4X.
+  - the 8 GiB board on our own 6.18.36 driving a picture by hand, 2026-08-18:
+    PLL_VIDEO1_CTRL = 0xFD524C00, EDP_TV_CLK = 0x81000001, TCONTV1_BGR and
+    DPSS_TOP1_BGR both 0x00010001.
+
+THE DECISION THIS PATCH HAD TO MAKE: REAL set_rate, OR ONE CONSTANT
+-------------------------------------------------------------------
+Whether PLL_VIDEO1 should be a real clk_ops with set_rate for an arbitrary
+mode, rather than the one constant 1920x1200 needs, was genuinely uncertain,
+and this PLL has never been asked for a second mode.
+
+Real clk_ops, and rate propagation ON. The argument, in order:
+
+ 1. A constant would describe hardware that does not exist. N, M1 and both post
+    dividers are R/W fields with documented ranges; a fixed-rate model would
+    force a display driver to poke CCU registers behind the clock framework,
+    which is the workaround shape this tree refuses.
+ 2. Propagation is what makes it usable: one clk_set_rate() on the pixel clock
+    configures PLL, tap and divider, which is the idiom every mainline sunxi
+    display driver uses (clk_set_rate(sclk, mode->crtc_clock * 1000)).
+ 3. It is the OPPOSITE of what the SMHC block in this same file does, and that
+    is deliberate. The SMHC comment records a measured bug: CLK_SET_RATE_PARENT
+    onto FIXED taps of a shared peripheral PLL, so the request could not be
+    honoured, the framework recorded a parent rate it never programmed, and an
+    eMMC bus ran at 800 MHz while sysfs said 200 (2026-07-25). Here every stage
+    is genuinely settable and owned by one consumer, so the request IS
+    honoured. Same flag, opposite conclusion, and the difference is the reason.
+ 4. The claim is checkable rather than promised. Walking the three mainline
+    routines by hand for the one mode that has run on silicon -- 154 MHz --
+    ccu_mp_find_best_with_parent_adj() tries m*p = 2, asks the tap for 308 MHz;
+    clk_divider_bestdiv() tries div 6, asks the PLL for 1848 MHz;
+    ccu_nm_find_best() returns N = 77, M1 = 1 exactly (24 * 77 = 1848, and n
+    ascending makes 77/1 win over the equally exact 154/2). Fields programmed:
+
+      PLL_VIDEO1_CTRL  [15:8] = 0x4C, [1] = 0, [22:20] = 5
+      EDP_TV_CLK       [12:8] = 0,    [4:0] = 1
+
+    which is field for field what was written by hand for the picture of
+    2026-08-18. For 154 MHz VCO 1848 is the unique solution anyway -- gcd(77,12) = 1
+    forces the combined divisor to 12 -- so there was no other landing site.
+ 5. What it owes, stated as one observable: a SECOND mode. Nothing has ever
+    asked this PLL for one. 154 MHz is exact; a mode whose pixel clock is not
+    an integer divisor of any reachable VCO will land on the nearest lower rate
+    and nothing in this patch reports how far off it is. The falsifier is a
+    modeset at, say, 1280x1024/108 MHz where SRC0_MVID does not compute back to
+    the requested clock.
+
+Two flags carry weight and are not decoration:
+  CLK_SET_RATE_NO_REPARENT on edp-tv. Which of the four sources drives the
+    panel is a pipeline decision. Without it ccu_mux_helper_determine_rate()
+    walks all four parents and can select one whose PLL is switched off --
+    ccu_nm_recalc_rate() reports a rate from the register fields regardless of
+    PLL_EN, so a dead PLL_VIDEO0 advertises 1188 MHz. The mux comes from the
+    device tree (`arm64-dts-a733-tcon-tv1-and-the-dp-phy-pad-window`, assigned-clock-parents) and never from a rate request.
+  CLK_SET_RATE_UNGATE on the PLLs, as on every other PLL in this file.
+
+WHY PLL_VIDEO0 AND PLL_VIDEO2 ARE HERE
+--------------------------------------
+Not for their own sake -- for the mux. ccu_mux_helper_get_parent() returns the
+raw register field as a parent index, so an incompletely populated mux does not
+fail loudly: it reports the wrong parent, or leaves the clock orphaned when the
+index exceeds num_parents. A mux table with one entry does not help either,
+because with num_parents == 1 the framework never calls .set_parent and the
+field is never written. The honest options were "all four" or "none", and `clk-sunxi-ng-a733-add-edp-bus-gate-and-reset`
+already took "none".
+
+They are not a guess. The UM documents all three PLL_VIDEOx registers
+field-for-field identically (reset 0x40126200 for
+each), and the 6 GiB board read all three on the same day with every set bit landing on a
+documented field. They cost nothing at runtime: both are off at reset, nothing
+enables them, and clk_disable_unused() finds bits that are already clear.
+PERI0PLL2X, the fourth input, is the pll-peri0-2x this driver already has.
+
+WHAT IS DELIBERATELY LEFT OUT
+-----------------------------
+The 3X taps (bit 26 / [18:16]). No consumer in this tree, so a clock for them
+would be dead code. Two consequences, both named rather than discovered later:
+
+  - Register dumps will differ from the by-hand picture by exactly one bit.
+    After this driver configures the pixel clock, PLL_VIDEO1_CTRL reads
+    0xF9524C00, not the 0xFD524C00 of the by-hand picture above. The
+    difference is bit 26 = PLL_OUTPUT1_GATE, which the by-hand write set only
+    because it wrote a whole word transcribed from a vendor live capture. The
+    UM asks for exactly what we do: with several outputs on a PLL, set the
+    output gate of each output actually used.
+    We use one. Every bit that carries the rate is identical.
+  - Retuning PLL_VIDEO1 still moves VIDEO1PLL3X (792 -> 616 MHz at our
+    factors), and the UM's PLL distribution figure puts CSI_MASTER on
+    PLL_VIDEO1. Nothing in this tree uses CSI; whoever adds
+    it inherits this.
+
+VIDEOPLL_GATE_EN_REG (0x1910) -- the SECOND gate stage, in series with each
+PLL's own OUTPUT0/1_GATE. Reset 0x00770077 has every tap enabled and the 6 GiB board read
+0x00770000 with the eDP link live, so the reset value is already permissive and
+the by-hand session never wrote it. Not modelled, named here so that a driver
+which one day clears it knows there is a second gate to reopen.
+
+CM_VO1_CFG_REG (0x1B38) MODULE_MODE. Not written, and that is measured: the 6 GiB board
+read the reset default 0x00020000 (STATUS = Power ON, MODULE_MODE = 0) while
+its eDP link was up, so MODULE_MODE is not the effective gate for a running VO1
+(and the same finding on USB).
+
+WHAT THE VENDOR DOES HERE, AND WHERE WE DIFFER
+----------------------------------------------
+This tree requires a comparison with the vendor implementation in the patch
+header, and the earlier eDP work covered the AUX and training paths but
+never the clock path. This is that list, read out of the vendor 6.6
+tree at the lines named -- bsp/drivers/clk/sunxi-ng/ccu-sun60iw2.c and its
+private sunxi-ng fork -- not inferred from behaviour.
+
+  vendor                                   ours
+  ---------------------------------------  ---------------------------------------
+  ccu-sun60iw2.c:195-289 -- the three      .m = _SUNXI_CCU_DIV(1, 1). The field is
+  video PLLs carry NO .m at all, so        read and written. If a boot chain ever
+  PLL_INPUT_DIV [1] is neither read nor    leaves it set, we report the rate the
+  written. ccu_nm_recalc_rate() finds      silicon actually makes
+  width 0, computes m = 0, and the
+  "if (!m) m++" fallback pins M1 to 1.
+  A boot chain that left the bit set
+  would have every rate under the PLL
+  reported twice too high
+  ---------------------------------------  ---------------------------------------
+  .output = BIT(26) | BIT(27) -- one       one gate per tap: PLL_OUTPUT0_GATE
+  enable opens BOTH output gates, so       belongs to the 4X clock. The UM asks for
+  the 3X tap runs whenever the PLL does,   exactly this: set the output
+  feeding CSI_MASTER for nobody            gate of each output clock that is
+                                           actually used
+  ---------------------------------------  ---------------------------------------
+  CLK_IGNORE_UNUSED on all three video     no CLK_IGNORE_UNUSED anywhere. An
+  PLLs, on edp-tv, on tcontv1, on edp,     unclaimed clock is an off clock, and a
+  on hdmi-tv and on essentially every VO   refcount bug shows up as a dark screen
+  clock (ccu-sun60iw2.c:1608-1710) --      instead of hiding
+  the framework may never switch any of
+  it off, which keeps a PLL running for
+  a disconnected output and hides
+  refcount bugs rather than exposing them
+  ---------------------------------------  ---------------------------------------
+  every bus gate is parented to "dcxo":    parented to ahb -- and for the
+  tcontv1 (0x160C:1686), edp               VIDEO_OUT1 gates that is no longer an
+  (0x164C:1701), vo0-tconlcd0-bus,         inference but the UM's own name
+  dsi0-bus, gmac1 ... all declared as      (VID_OUT1_AHB_GATE_SW_CFG) and its own
+  children of the 26 MHz crystal, so       rate (200 MHz), both cited above
+  clk_get_rate() on any peripheral's bus
+  clock answers 26 000 000
+  ---------------------------------------  ---------------------------------------
+
+That last one has a visible price, and finding it explains a defect
+the earlier eDP bring-up had already recorded without a cause.
+bsp/drivers/drm/sunxi_device/hardware/lowlevel_edp/trilinear_dp14/
+trilinear_dp14.c:257-258 programs the AUX clock divider from
+
+    // FIXME: 200 refer to raw code from SHC
+    u32 src_apb_clk = 200;
+
+200 is the AHB rate in MHz. The variable is even named src_apb_clk. The vendor
+hardcoded the one number its own clock model could not have told it: ask its
+"edp" gate for a rate and it answers 26 MHz. `drm-allwinner-a733-displayport-aux` computes that divider from
+clk_get_rate() with a range check that refuses rather than guesses, which only
+works because the bus gate is parented to something true.
+
+AND THE HALF THAT USUALLY GETS SKIPPED: WHERE THE VENDOR IS RIGHT
+-----------------------------------------------------------------
+The same comparison also lists agreement, and here it is a substantial list. These were reached
+from the UM and from the failure modes of the mainline primitives before the
+vendor tree was opened; the agreement is a cross-check, not a source.
+
+  - The four-way mux order (VIDEO0/1/2PLL4X, PERI0PLL2X) and both dividers
+    linear. Its private CCU_FEATURE_MP_NO_INDEX_MODE (ccu_mp.c:140, ccu_mp.h:55)
+    is mainline's CCU_FEATURE_DUAL_DIV under another name. Same conclusion the
+    UM states outright.
+  - CLK_SET_RATE_PARENT | CLK_SET_RATE_NO_REPARENT on edp-tv, and
+    CLK_SET_RATE_PARENT on the 4X taps (ccu-sun60iw2.c:216, 1689-1697) -- the
+    exact flag set this patch chose.
+  - min_rate 1272000000. Not a rounding accident: it is the lowest VCO that is
+    both inside Table 4-2's window and exactly reachable from 24 MHz, which is
+    what makes ccu_nm_determine_rate()'s clamp agree with what
+    ccu_nm_set_rate() can produce. Taken, with the reasoning written down.
+  - clk_set_rate() on the TCON module clock as the modeset mechanism
+    (bsp/drivers/drm/sunxi_device/sunxi_tcon.c:81, :802), which is what makes
+    propagation the right answer rather than a convenience.
+  - DISPLAY1_TOP as its own device with its own clock, gate and reset
+    (bsp/drivers/drm/sunxi_device/sunxi_tcon_top.c:32-99, asking for
+    "clk_bus_dpss_top", "rst_bus_dpss_top" and a clock it calls "clk_ahb") --
+    the same shape mainline uses for sun8i-tcon-top, and the reason this patch
+    adds DPSS_TOP1's ids without folding them into the TCON node.
+  - And the arithmetic: VCO 1848 / P0 6 / M 2 for 1920x1200. We land on the
+    same numbers from the UM formula. Two independent derivations agreeing is
+    the strongest thing this patch has short of the board.
+
+One near-miss worth recording so nobody else spends the time: its
+sunxi_tcon_lcd_set_clk() DOES compare the rate it got against the rate it asked
+for (sunxi_tcon.c:82-85) -- and then reports the mismatch at DRM_INFO and
+carries on. It notices and does not act.
+
+WHAT THE A523 SAYS, AND WHY NONE OF IT WAS TAKEN
+------------------------------------------------
+ccu-sun55i-a523.c is the nearest mainline part and the most dangerous source
+this tree uses, because an A523 value is plausible, it builds, and it looks right
+in a diff. Every
+number below was compared field by field before anything was written, and every
+one of them is wrong for the A733:
+
+  A523 (ccu-sun55i-a523.c)                 A733 (UM, cited above)
+  ---------------------------------------  ---------------------------------------
+  :180 pll-video0-8x .enable = BIT(27)     PLL_EN is bit 31; bit 27 is
+                                           PLL_OUTPUT0_GATE, one gate down the
+                                           chain. Inherited, "enable the PLL"
+                                           would open an output gate on a PLL
+                                           that is still off
+  ---------------------------------------  ---------------------------------------
+  :183 .n = _SUNXI_CCU_MULT_MIN(8, 8, 11)  the A733 UM's floor is on the FIELD --
+  -- minimum N of 11                       the minimum for PLL_N is 11
+                                           (A733 user manual) -- and N = field + 1,
+                                           so N >= 12. Inherited, it is off by
+                                           one at the low end
+  ---------------------------------------  ---------------------------------------
+  :180-190 no min_rate, no max_rate, so    Table 4-2 gives 1.26G..2.52G and both
+  ccu_nm_determine_rate() never clamps     are set, with the 1272 subtlety above
+  ---------------------------------------  ---------------------------------------
+  :188 parent osc24M (the SoC 24 MHz net)  pll-ref, per UM Table 4-3's REF_SEL 0
+                                           column, the same column PLL_PERI0/1
+                                           sit in and the same parent this
+                                           driver already gives them. Same rate,
+                                           different net, and this SoC has cost
+                                           this tree three bugs over exactly that
+                                           distinction
+  ---------------------------------------  ---------------------------------------
+  :196 the 4x tap is a 1-bit divider at    PLL_OUTPUT0_DIV is 3 bits at [22:20],
+  bits [0:0] with no gate, and :198 the    P0 = field + 1, 1..8, gated by bit 27;
+  3x tap is a FIXED /3 of an "8x" PLL      the 3x tap is an independent 3-bit
+                                           divider at [18:16]. Different
+                                           topology, not just different numbers:
+                                           on the A733 neither tap is a fixed
+                                           factor of the other
+  ---------------------------------------  ---------------------------------------
+  :1026 edp clock at 0xbb0, a 4-bit M      EDP_TV_CLK is at 0x1640 with a 5-bit
+  with NO N and FIVE parents (it has a     linear M *and* a 5-bit linear N, and
+  PLL_VIDEO3, we do not)                   four parents. Copied over: wrong
+                                           register, wrong divider, and a fifth
+                                           mux index pointing at nothing
+  ---------------------------------------  ---------------------------------------
+  :1014-1017 bus-tcon-tv0 and bus-tcon-tv1 TCONTV0_BGR 0x1604 and TCONTV1_BGR
+  share ONE register, 0xb9c, bits 0 and 1  0x160C are two separate registers,
+                                           each bit0 gate / bit16 reset. This is
+                                           the PWM trap again, exactly:
+                                           ccu-sun55i-a523.c puts PWM0/PWM1 in
+                                           one word too, and on the A733 the
+                                           second gate bit would land on a
+                                           reserved bit and look like it worked
+  ---------------------------------------  ---------------------------------------
+  no DPSS gate exists in the file at all   DPSS_TOP1_BGR 0x16CC, gate and reset
+  ---------------------------------------  ---------------------------------------
+  :1032/:1618 bus-edp and RST_BUS_EDP at   0x164C -- `clk-sunxi-ng-a733-add-edp-bus-gate-and-reset` caught this one; 0xbb0
+  0xbbc                                    and 0xbbc are absent from the A733's
+                                           register list entirely
+  ---------------------------------------  ---------------------------------------
+
+THE ONE OPEN QUESTION THIS PATCH WAS ASKED TO CLOSE -- CLOSED
+-------------------------------------------------------------
+Earlier in the bring-up the ~200 MHz net feeding the eDP bus gate was called
+ahb in our own clock model, which was the thing under test: the rate was
+settled, the name was not.
+
+The name is settled, by the UM, and it is AHB. AHB_MAT_CLK_GATING_REG 0x05C0
+bit 4 is VID_OUT1_AHB_GATE_SW_CFG, the gate of the Video Out1 AHB clock
+-- so the UM itself calls the bus feeding the whole VIDEO_OUT1
+domain, which is where EDP_BGR, TCONTV1_BGR and DPSS_TOP1_BGR live, the AHB.
+It is one bit away from SERDES_AHB_GATE_SW_CFG at bit 8, which this driver
+already models as bus-serdes parented to ahb.
+
+The rate agrees from two directions: UM 4.1.4.3 lists AHB at a typical 200 MHz with the maximum
+also 200 MHz, and the 8 GiB board reads AHB_CLK_REG 0x02002500 = 0x03000002 -> source 3 = pll-peri0-600m,
+M = /3 -> 200 MHz exactly.
+
+So "ahb" in this driver is no longer an inference for the display gates. It
+still is for bus-ths, bus-pwm0/1 and bus-edp, whose comments say so; the UM
+names a Video Out1 AHB gate and no THS or PWM one.
+
+WHAT ccu_nm_ops DOES NOT DO, AND WHY IT MATTERS ON A BOARD
+----------------------------------------------------------
+It does not wait for LOCK on the enable path. ccu_helper_wait_for_lock() runs
+at the end of ccu_nm_set_rate() only, so UM 4.1.4.1 Method 2 -- set factors,
+PLL_EN, LOCK_ENABLE, wait LOCK, wait 20 us, then open the output gate
+(A733 user manual) -- is honoured when the rate is set and not when the clock
+is merely enabled. A consumer must therefore clk_set_rate() before relying on
+the output, which a modeset does anyway. Not papered over with a private op:
+this file uses mainline primitives only, and the pending observable below is
+exactly the thing that would catch it.
+
+Verified: applies at fuzz 0 as part of the full series against a freshly
+unpacked 6.18.36; ccu-sun60iw2.o builds warning-free at ARCH=arm64 W=1;
+scripts/check-binding-ids.sh green over all eight A733 headers; checkpatch
+--strict reports no new class of finding beyond the three every other CCU
+patch in this tree produces. Ids allocated when this was written: clocks
+60-68, resets 25-26, next free 69 and 27.
+
+NOT hardware-proven. What would prove it, as one observable, and what would
+falsify it: with a consumer holding
+these clocks, PLL_VIDEO1_CTRL @0x02002140 reads 0xF9524C00 -- bit 28 LOCK set,
+N = 0x4C, P0 field 5, M1 0, and bit 26 clear because we use one output -- and
+EDP_TV_CLK_REG @0x02003640 reads 0x81000001. Falsified by those registers
+reading correct while SRC0_MVID @0x0574084C does not follow: the CCU echoing a
+write proves the write landed, not that a clock came out of it. MVID is
+read-only in asynchronous mode and is measured by the DP core from the incoming
+video clock, which is why it is the falsifier and the CCU read is not.
+
+Assisted-by: Claude
+---
+--- a/include/dt-bindings/clock/sun60i-a733-ccu.h
++++ b/include/dt-bindings/clock/sun60i-a733-ccu.h
+@@ -84,4 +84,19 @@
+ /* eDP/DP transmitter bus gate -- EDP_BGR_REG 0x164C bit0. */
+ #define CLK_BUS_EDP		59
+ 
++/*
++ * The DisplayPort pixel path: the three video PLLs, their "4X" output taps
++ * (the four-way source mux of EDP_TV_CLK is VIDEO0/1/2PLL4X + PERI0PLL2X), the
++ * eDP/TV pixel clock itself, and the two VIDEO_OUT1 bus gates it feeds.
++ */
++#define CLK_PLL_VIDEO0		60
++#define CLK_PLL_VIDEO1		61
++#define CLK_PLL_VIDEO2		62
++#define CLK_VIDEO0_PLL4X	63
++#define CLK_VIDEO1_PLL4X	64
++#define CLK_VIDEO2_PLL4X	65
++#define CLK_EDP_TV		66
++#define CLK_BUS_TCON_TV1	67
++#define CLK_BUS_DPSS_TOP1	68
++
+ #endif /* _DT_BINDINGS_CLK_SUN60I_A733_CCU_H_ */
+--- a/include/dt-bindings/reset/sun60i-a733-ccu.h
++++ b/include/dt-bindings/reset/sun60i-a733-ccu.h
+@@ -40,4 +40,8 @@
+ /* eDP/DP transmitter reset -- EDP_BGR_REG 0x164C bit16. */
+ #define RST_BUS_EDP		24
+ 
++/* VIDEO_OUT1 pixel path: TCONTV1_BGR 0x160C bit16, DPSS_TOP1_BGR 0x16CC bit16. */
++#define RST_BUS_TCON_TV1	25
++#define RST_BUS_DPSS_TOP1	26
++
+ #endif /* _DT_BINDINGS_RST_SUN60I_A733_CCU_H_ */
+--- a/drivers/clk/sunxi-ng/ccu-sun60iw2.c
++++ b/drivers/clk/sunxi-ng/ccu-sun60iw2.c
+@@ -504,6 +504,296 @@
+  */
+ static SUNXI_CCU_GATE_HWS(bus_edp_clk,    "bus-edp",    ahb_hws, 0x164C, BIT(0),  0);
+ 
++/*
++ * The video PLLs and the eDP/TV pixel clock -- the chain that carries a
++ * DisplayPort mode:
++ *
++ *   pll-ref 24 MHz -> PLL_VIDEOx (VCO) -> VIDEOxPLL4X -> EDP_TV_CLK -> TCON_TV1
++ *
++ * Nothing in this tree modelled a video PLL before this; `clk-sunxi-ng-a733-add-edp-bus-gate-and-reset` added only the
++ * eDP *bus* gate and said in its own header why it left EDP_TV_CLK out -- "its
++ * mux cannot be expressed by this tree yet [...] this CCU models none of the
++ * three video PLLs". That is what this block closes.
++ *
++ * PLL_VIDEO0/1/2_CTRL_REG, 0x0120 / 0x0140 / 0x0160, reset 0x40126200, one
++ * layout for all three (A733 UM V0.92; field tables
++ * in section 4.1.6):
++ *
++ *   31      PLL_EN             0=Disable 1=Enable          (reset 0)
++ *   30      PLL_LDO_EN                                     (reset 1)
++ *   29      LOCK_ENABLE                                    (reset 0)
++ *   28      LOCK               read-only
++ *   27      PLL_OUTPUT0_GATE   gates the "4X" tap          (reset 0)
++ *   26      PLL_OUTPUT1_GATE   gates the "3X" tap          (reset 0)
++ *   22:20   PLL_OUTPUT0_DIV    P0 = field + 1, 0..7
++ *   18:16   PLL_OUTPUT1_DIV    P1 = field + 1, 0..7
++ *   15:8    PLL_N              N  = field + 1, field >= 11
++ *   1       PLL_INPUT_DIV      M1 = field + 1, 0..1
++ *
++ *   VIDEOxPLL4X = InputFreq * N / M1 / P0
++ *   VIDEOxPLL3X = InputFreq * N / M1 / P1
++ *
++ * VCO range 1.26 GHz .. 2.52 GHz, input pre-divider 1/2, P0/P1 each 1..8 --
++ * UM Table 4-2 "PLL Specifications", PLL_VIDEO0/1/2 rows.
++ *
++ * ⚠ InputFreq is 24 MHz, and the parent below is pll-ref, NOT the 26 MHz DCXO.
++ * UM 4.1.4.1 says some PLLs take their input from either the DCXO or the
++ * REFPLL, and that the REFPLL is fixed at 24 MHz; Table 4-3's
++ * VIDEO0~1_PLL row reads DCXO 24 / REF_SEL 0 / N 99 / VCO 2376 / 4x 1188 /
++ * 3x 792 -- the same REF_SEL 0 column as
++ * PLL_PERI0/1, which this driver already parents to pll-ref. The register's own
++ * note about the 26 MHz DCXO case (1188 MHz default for VIDEO1PLL4X)
++ * means "on a 26 MHz board", not "put 26 in the formula": 24 * 99 / 1 / 2 = 1188
++ * closes, 26 * 99 / 1 / 2 = 1287 appears nowhere. Mixing up 24 and 26 is a defect
++ * class that has already cost this tree three bugs.
++ *
++ * ⚠ "4X" and "3X" are names, not factors. The UM never defines them
++ * numerically and they are inconsistent across PLLs (for PERI0 "2x" is /2; for
++ * VIDEO "4x" is also /2 at the default P0 = 2). Both taps are plain linear
++ * dividers and are modelled as such -- never infer a factor from the name.
++ *
++ * Only the 4X tap is modelled. The 3X tap (bit 26 / [18:16]) has no consumer in
++ * this tree, so a clock for it would be dead code; it is named here instead
++ * because retuning a video PLL moves it, and the UM's PLL distribution figure
++ * puts CSI_MASTER on PLL_VIDEO1's outputs. Consequence for
++ * anyone reading a register dump: after this driver has configured the pixel
++ * clock, PLL_VIDEO1_CTRL bit 26 is 0 where a vendor capture has it 1. That is
++ * deliberate and the UM asks for it: with several outputs on a PLL, the
++ * output gate of each output actually used is to be set
++ * (A733 user manual). We use one.
++ *
++ * Enable/disable is split the way the hardware splits it, and the way UM
++ * 4.1.4.1 recommends: PLL_EN (bit 31) is the ccu_nm's own enable, and the tap's
++ * enable is PLL_OUTPUT0_GATE (bit 27), so a consumer can drop the output
++ * without stopping the PLL -- the UM advises against enabling or
++ * disabling the PLLs while in use, and says to clear the PLL_OUTPUT_GATE bit in
++ * the PLLx_CTRL_REG when the clock is not needed.
++ * PLL_LDO_EN and LOCK_ENABLE are not clock gates and are forced in probe().
++ *
++ * ⚠ What ccu_nm_ops does NOT do: wait for LOCK on the enable path.
++ * ccu_helper_wait_for_lock() runs at the end of ccu_nm_set_rate() only, so the
++ * UM's "wait LOCK, then 20 us, then open the output gate" (Method 2)
++ * is honoured when the rate is set and not when the clock is merely
++ * enabled. A consumer must therefore clk_set_rate() the PLL before it relies on
++ * the output, which is what a modeset does anyway. Stated so it is not
++ * rediscovered on a board.
++ */
++#define SUN60IW2_PLL_VIDEO0_REG		0x0120
++#define SUN60IW2_PLL_VIDEO1_REG		0x0140
++#define SUN60IW2_PLL_VIDEO2_REG		0x0160
++
++/*
++ * UM Table 4-2, PLL_VIDEO0/1/2 rows: VCO 1.26 GHz .. 2.52 GHz.
++ * The floor here is 1272 MHz and not 1260, and the 12 MHz matter:
++ * ccu_nm_determine_rate() CLAMPS a too-low request to min_rate and returns,
++ * but ccu_nm_set_rate() does not clamp at all -- it calls ccu_nm_find_best(),
++ * which returns the largest reachable rate <= its target. With min_rate at the
++ * spec figure the pair would agree on 1260 MHz and then program 24 * 52 =
++ * 1248 MHz, below the documented window. 1272 = 24 * 53 is the lowest VCO that
++ * is both inside the window and exactly reachable from a 24 MHz reference, so
++ * the clamp lands on a value set_rate can actually produce. 2520 = 24 * 105 is
++ * exact at the top. (The vendor uses the same 1272000000, and this is the
++ * reasoning that says it is right rather than a rounding accident.)
++ */
++#define SUN60IW2_PLL_VIDEO_MIN_VCO	1272000000U
++#define SUN60IW2_PLL_VIDEO_MAX_VCO	2520000000U
++
++/* PLL_VIDEOx_CTRL bits that are not modelled as clock gates. */
++#define SUN60IW2_PLL_VIDEO_LDO_EN	BIT(30)
++#define SUN60IW2_PLL_VIDEO_LOCK_ENABLE	BIT(29)
++
++/*
++ * Written out three times rather than through a local macro, because that is
++ * what this file already does for the two identical peripheral PLLs and what
++ * every mainline sunxi CCU does: the SUNXI_CCU_* macros live in headers, driver
++ * files spell their PLLs out.
++ *
++ * n: PLL_N [15:8], N = field + 1, and the minimum is the UM's own floor --
++ * the UM floor of 11 for PLL_N is a constraint on the
++ * FIELD, so N >= 12. m: PLL_INPUT_DIV [1], one bit, M1 = field + 1 (1 or 2).
++ */
++static struct ccu_nm pll_video0_clk = {
++	.enable		= BIT(31),
++	.lock		= BIT(28),
++	.n		= _SUNXI_CCU_MULT_OFFSET_MIN_MAX(8, 8, 1, 12, 255),
++	.m		= _SUNXI_CCU_DIV(1, 1),
++	.min_rate	= SUN60IW2_PLL_VIDEO_MIN_VCO,
++	.max_rate	= SUN60IW2_PLL_VIDEO_MAX_VCO,
++	.common		= {
++		.reg		= SUN60IW2_PLL_VIDEO0_REG,
++		.hw.init	= CLK_HW_INIT_PARENTS_HW("pll-video0",
++				pll_ref_hws, &ccu_nm_ops,
++				CLK_SET_RATE_UNGATE),
++	},
++};
++
++static const struct clk_hw *pll_video0_hws[] = { &pll_video0_clk.common.hw };
++
++static struct ccu_nm pll_video1_clk = {
++	.enable		= BIT(31),
++	.lock		= BIT(28),
++	.n		= _SUNXI_CCU_MULT_OFFSET_MIN_MAX(8, 8, 1, 12, 255),
++	.m		= _SUNXI_CCU_DIV(1, 1),
++	.min_rate	= SUN60IW2_PLL_VIDEO_MIN_VCO,
++	.max_rate	= SUN60IW2_PLL_VIDEO_MAX_VCO,
++	.common		= {
++		.reg		= SUN60IW2_PLL_VIDEO1_REG,
++		.hw.init	= CLK_HW_INIT_PARENTS_HW("pll-video1",
++				pll_ref_hws, &ccu_nm_ops,
++				CLK_SET_RATE_UNGATE),
++	},
++};
++
++static const struct clk_hw *pll_video1_hws[] = { &pll_video1_clk.common.hw };
++
++static struct ccu_nm pll_video2_clk = {
++	.enable		= BIT(31),
++	.lock		= BIT(28),
++	.n		= _SUNXI_CCU_MULT_OFFSET_MIN_MAX(8, 8, 1, 12, 255),
++	.m		= _SUNXI_CCU_DIV(1, 1),
++	.min_rate	= SUN60IW2_PLL_VIDEO_MIN_VCO,
++	.max_rate	= SUN60IW2_PLL_VIDEO_MAX_VCO,
++	.common		= {
++		.reg		= SUN60IW2_PLL_VIDEO2_REG,
++		.hw.init	= CLK_HW_INIT_PARENTS_HW("pll-video2",
++				pll_ref_hws, &ccu_nm_ops,
++				CLK_SET_RATE_UNGATE),
++	},
++};
++
++static const struct clk_hw *pll_video2_hws[] = { &pll_video2_clk.common.hw };
++
++/*
++ * The 4X taps: divider PLL_OUTPUT0_DIV [22:20] (linear, P0 = field + 1) gated
++ * by PLL_OUTPUT0_GATE (bit 27), both inside the PLL's own control register.
++ *
++ * CLK_SET_RATE_PARENT here and on edp-tv below is deliberate, and it is the
++ * opposite of what the SMHC block above does -- for a reason that is in that
++ * block's own comment. There the parents are FIXED taps of a shared peripheral
++ * PLL: the request walks up, cannot be honoured, and the framework then divides
++ * against a parent rate that was never programmed (measured, 2026-07-25, an
++ * eMMC bus that ran at twice its reported rate). Here every stage is genuinely
++ * settable and owned by this one consumer, so the request IS honoured, and a
++ * single clk_set_rate() on the pixel clock configures PLL, tap and divider --
++ * the idiom every mainline sunxi display driver uses.
++ *
++ * Worked through for the mode that has run on silicon, 1920x1200 at 154 MHz,
++ * because "it propagates" is not a claim anyone can check:
++ *   ccu_mp_find_best_with_parent_adj() tries m*p = 2 -> asks the tap for
++ *   308 MHz -> clk_divider_bestdiv() tries div 6 -> asks the PLL for 1848 MHz
++ *   -> ccu_nm_find_best() returns N = 77, M1 = 1 exactly (24 * 77 = 1848, and
++ *   n ascending makes 77/1 win over the equally exact 154/2).
++ *   Registers that come out: PLL_VIDEO1_CTRL [15:8] = 0x4C, bit 1 = 0,
++ *   [22:20] = 5 (P0 = 6), EDP_TV_CLK [12:8] = 0 (N = 1), [4:0] = 1 (M = 2).
++ *   Those are the values written by hand for the picture of 2026-08-18.
++ */
++static SUNXI_CCU_M_HWS_WITH_GATE(video0_pll4x_clk, "video0-pll4x",
++				 pll_video0_hws, SUN60IW2_PLL_VIDEO0_REG,
++				 20, 3, BIT(27), CLK_SET_RATE_PARENT);
++static SUNXI_CCU_M_HWS_WITH_GATE(video1_pll4x_clk, "video1-pll4x",
++				 pll_video1_hws, SUN60IW2_PLL_VIDEO1_REG,
++				 20, 3, BIT(27), CLK_SET_RATE_PARENT);
++static SUNXI_CCU_M_HWS_WITH_GATE(video2_pll4x_clk, "video2-pll4x",
++				 pll_video2_hws, SUN60IW2_PLL_VIDEO2_REG,
++				 20, 3, BIT(27), CLK_SET_RATE_PARENT);
++
++/*
++ * EDP_TV_CLK_REG 0x1640 -- this register IS the DisplayPort
++ * pixel clock. There is no TCONTVx_CLK register on this part: the TV TCONs take
++ * their pixel clock from EDP_TV_CLK (eDP/DP path) or HDMI_TV_CLK (HDMI path).
++ *
++ *   31      EDP_TV_CLK_GATING  0=OFF 1=ON
++ *   26:24   CLK_SRC_SEL        000 VIDEO0PLL4X, 001 VIDEO1PLL4X,
++ *                              010 VIDEO2PLL4X, 011 PERI0PLL2X
++ *   12:8    FACTOR_N           N = FACTOR_N + 1, FACTOR_N 0..31
++ *   4:0     FACTOR_M           M = FACTOR_M + 1, FACTOR_M 0..31
++ *   EDP_TV_CLK = Clock Source / M / N
++ *
++ * ⚠ Both dividers are LINEAR, not power-of-two, and that is stated twice in the
++ * UM rather than inferred: N = FACTOR_N + 1 with FACTOR_N 0..31
++ * (A733 user manual) and the same for M -- a
++ * 5-bit field with an arithmetic range of 0..31 can only be linear -- and 4.1.4.4
++ * describes ordinary working clocks as divided by a plain counter, with
++ * FACTOR_M as the division coefficient,
++ * with the power-of-two/mask behaviour called out there as the GPU's exception.
++ * SUNXI_CCU_DUALDIV_MUX_GATE (CCU_FEATURE_DUAL_DIV) is the mainline primitive
++ * for exactly that shape and is what `clk-sunxi-ng-a733-add-smhc-pll-peri1-clocks` already uses for the SMHC clocks; a
++ * plain ccu_mp would treat [12:8] as a shift and produce 308/2/2^1 = 77 MHz.
++ *
++ * All four mux inputs are modelled, which is why PLL_VIDEO0 and PLL_VIDEO2 are
++ * here at all: with parents missing, ccu_mux_helper_get_parent() returns the raw
++ * register field as a parent index, so a partially modelled mux does not fail --
++ * it silently reports the wrong parent, or orphans the clock. PERI0PLL2X is the
++ * pll-peri0-2x this driver already has.
++ *
++ * CLK_SET_RATE_NO_REPARENT: which of the four sources drives the panel is a
++ * pipeline decision, not something a rate request may make. Without the flag
++ * ccu_mux_helper_determine_rate() walks all four parents and can pick one whose
++ * PLL is switched off -- ccu_nm_recalc_rate() reports a rate from the register
++ * fields whether or not PLL_EN is set, so an off PLL looks like a 1188 MHz
++ * source. The mux is selected from the device tree instead
++ * (assigned-clock-parents on the TCON node) and never by the rate machinery.
++ */
++static const struct clk_parent_data edp_tv_parents[] = {
++	{ .hw = &video0_pll4x_clk.common.hw },	/* 000 VIDEO0PLL4X */
++	{ .hw = &video1_pll4x_clk.common.hw },	/* 001 VIDEO1PLL4X */
++	{ .hw = &video2_pll4x_clk.common.hw },	/* 010 VIDEO2PLL4X */
++	{ .hw = &pll_peri0_2x_clk.common.hw },	/* 011 PERI0PLL2X   */
++};
++
++static SUNXI_CCU_DUALDIV_MUX_GATE(edp_tv_clk, "edp-tv", edp_tv_parents,
++				  0x1640,
++				  0, 5,		/* M */
++				  8, 5,		/* N */
++				  24, 3,	/* mux */
++				  BIT(31),	/* gate */
++				  CLK_SET_RATE_PARENT |
++				  CLK_SET_RATE_NO_REPARENT);
++
++/*
++ * The two VIDEO_OUT1 bus gates the pixel path needs besides the eDP one `clk-sunxi-ng-a733-add-edp-bus-gate-and-reset`
++ * added, both bit0 gate / bit16 reset, both reset 0:
++ *
++ *   TCONTV1_BGR_REG   0x160C  TCON_TV1, the timing controller that scans the
++ *                             mode and feeds eDP0
++ *   DPSS_TOP1_BGR_REG 0x16CC  the VO1 top block, DISPLAY1_TOP @0x05510000,
++ *                             which carries TV_CLK_EDP_I2S1_SRC -- the bit that
++ *                             routes TCON_TV1's output to eDP rather than HDMI
++ *                             (identified during bring-up)
++ *
++ * ⚠ Gate AND reset, both, for each. That is `clk-sunxi-ng-a733-add-edp-bus-gate-and-reset`'s measured rule, not a
++ * convention: on the 8 GiB board on 2026-08-18 the eDP window read 0x00000000 across its
++ * whole 4 KiB with the gate set and the reset still asserted, and answered its
++ * core id the moment bit 16 was released. TCONTV1_BGR and DPSS_TOP1_BGR have
++ * the identical two-bit layout and the by-hand bring-up writes 0x00010000 then
++ * 0x00010001 to each, in that order -- reset de-asserted first, then the gate,
++ * per UM 4.1.4.4.
++ *
++ * ⚠ A523 rejected, and this is the PWM trap again. ccu-sun55i-a523.c:1014-1017
++ * puts bus-tcon-tv0 and bus-tcon-tv1 in ONE register, 0xb9c, as bits 0 and 1 --
++ * exactly the shape that made `clk-sunxi-ng-a733-add-pwm0-pwm1-gates-and-resets` dangerous, where the A523 has PWM0/PWM1 in
++ * one word and the A733 has two. Here too the A733 has two registers, 0x1604
++ * and 0x160C, each with its own bit0/bit16 pair: carried over unchanged, the
++ * TCON_TV1 gate would land on TCONTV0_BGR's reserved bit 1 and the write would
++ * look like it had succeeded. The A523 has no DPSS gate at all, and its eDP
++ * gate sits at 0xbbc, an address absent from the A733's register list
++ * (`clk-sunxi-ng-a733-add-edp-bus-gate-and-reset`'s header has that one in full).
++ *
++ * The bus parent is ahb, and unlike the other BGR gates in this file that is
++ * not an inference any more. The UM names the bus itself: AHB_MAT_CLK_GATING_REG
++ * 0x05C0 bit 4 is VID_OUT1_AHB_GATE_SW_CFG, the gate of the Video Out1 AHB clock
++ * (A733 user manual), i.e. the whole VIDEO_OUT1 domain these two gates live
++ * in hangs off AHB -- one bit away from the SERDES_AHB gate at bit 8 this driver
++ * already models. The rate follows: UM 4.1.4.3 gives AHB a typical
++ * frequency of 200 MHz, with the maximum also 200 MHz, and
++ * the 8 GiB board reads AHB_CLK_REG 0x02002500 = 0x03000002 -> src 3 = pll-peri0-600m,
++ * M = /3 -> 200 MHz exactly.
++ * Nothing derives a rate from a BGR gate, but the name is now cited rather than
++ * assumed.
++ */
++static SUNXI_CCU_GATE_HWS(bus_tcon_tv1_clk,  "bus-tcon-tv1",  ahb_hws, 0x160C, BIT(0), 0);
++static SUNXI_CCU_GATE_HWS(bus_dpss_top1_clk, "bus-dpss-top1", ahb_hws, 0x16CC, BIT(0), 0);
++
+ /* ccu_common-based clocks (registered and reset-mapped by the core). */
+ static struct ccu_common *sun60iw2_ccu_clks[] = {
+ 	&pll_ref_clk.common,
+@@ -552,6 +842,15 @@
+ 	&bus_pwm0_clk.common,
+ 	&bus_pwm1_clk.common,
+ 	&bus_edp_clk.common,
++	&pll_video0_clk.common,
++	&pll_video1_clk.common,
++	&pll_video2_clk.common,
++	&video0_pll4x_clk.common,
++	&video1_pll4x_clk.common,
++	&video2_pll4x_clk.common,
++	&edp_tv_clk.common,
++	&bus_tcon_tv1_clk.common,
++	&bus_dpss_top1_clk.common,
+ 	&mbus_gmac0_clk.common,
+ };
+ 
+@@ -617,8 +916,17 @@
+ 		[CLK_BUS_PWM0]		= &bus_pwm0_clk.common.hw,
+ 		[CLK_BUS_PWM1]		= &bus_pwm1_clk.common.hw,
+ 		[CLK_BUS_EDP]		= &bus_edp_clk.common.hw,
++		[CLK_PLL_VIDEO0]	= &pll_video0_clk.common.hw,
++		[CLK_PLL_VIDEO1]	= &pll_video1_clk.common.hw,
++		[CLK_PLL_VIDEO2]	= &pll_video2_clk.common.hw,
++		[CLK_VIDEO0_PLL4X]	= &video0_pll4x_clk.common.hw,
++		[CLK_VIDEO1_PLL4X]	= &video1_pll4x_clk.common.hw,
++		[CLK_VIDEO2_PLL4X]	= &video2_pll4x_clk.common.hw,
++		[CLK_EDP_TV]		= &edp_tv_clk.common.hw,
++		[CLK_BUS_TCON_TV1]	= &bus_tcon_tv1_clk.common.hw,
++		[CLK_BUS_DPSS_TOP1]	= &bus_dpss_top1_clk.common.hw,
+ 	},
+-	.num	= CLK_BUS_EDP + 1,
++	.num	= CLK_BUS_DPSS_TOP1 + 1,
+ };
+ 
+ static struct ccu_reset_map sun60iw2_ccu_resets[] = {
+@@ -647,6 +955,8 @@
+ 	[RST_BUS_PWM0]		= { 0x0784, BIT(16) },
+ 	[RST_BUS_PWM1]		= { 0x078C, BIT(16) },
+ 	[RST_BUS_EDP]		= { 0x164C, BIT(16) },
++	[RST_BUS_TCON_TV1]	= { 0x160C, BIT(16) },
++	[RST_BUS_DPSS_TOP1]	= { 0x16CC, BIT(16) },
+ };
+ 
+ static const struct sunxi_ccu_desc sun60iw2_ccu_desc = {
+@@ -665,6 +975,16 @@
+ 	SUN60IW2_PLL_PERI1_REG,
+ };
+ 
++/*
++ * Kept apart from pll_regs[] on purpose: that loop forces PLL_EN on, which is
++ * right for the always-on peripheral PLLs and wrong for these three.
++ */
++static const u32 video_pll_regs[] = {
++	SUN60IW2_PLL_VIDEO0_REG,
++	SUN60IW2_PLL_VIDEO1_REG,
++	SUN60IW2_PLL_VIDEO2_REG,
++};
++
+ static int sun60iw2_ccu_probe(struct platform_device *pdev)
+ {
+ 	void __iomem *reg;
+@@ -696,6 +1016,24 @@
+ 	val |= BIT(27) | BIT(26) | BIT(25);
+ 	writel(val, reg + SUN60IW2_PLL_PERI1_REG);
+ 
++	/*
++	 * The video PLLs get LDO_EN and LOCK_ENABLE but deliberately NOT
++	 * PLL_EN: they are OFF at reset, nothing on this board needs them
++	 * before a display driver asks, and PLL_EN is modelled as the clock's
++	 * own enable so the framework owns it. LDO_EN is already 1 at reset and
++	 * LOCK_ENABLE is 0, and both have to be set before the PLL can lock and
++	 * report it -- UM 4.1.4.1 "PLL Enable" Method 2, steps 1 and 4
++	 * (A733 user manual). Read on the 8 GiB board at the U-Boot prompt, 2026-08-19:
++	 * PLL_VIDEO1_CTRL = 0x41126200, i.e. EN 0, LOCK_ENABLE 0, LDO_EN 1, and
++	 * every configurable field at the documented default
++	 *.
++	 */
++	for (i = 0; i < ARRAY_SIZE(video_pll_regs); i++) {
++		val = readl(reg + video_pll_regs[i]);
++		val |= SUN60IW2_PLL_VIDEO_LDO_EN | SUN60IW2_PLL_VIDEO_LOCK_ENABLE;
++		writel(val, reg + video_pll_regs[i]);
++	}
++
+ 	return devm_sunxi_ccu_probe(&pdev->dev, reg, &sun60iw2_ccu_desc);
+ }
+ 

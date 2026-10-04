@@ -1,0 +1,292 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] drm: a733: dp: enable the transmitter output before training, not after
+
+THE DEFECT
+-----------
+
+On this board link training does not reach clock recovery unless four registers
+are already set, and `drm-a733-dp-register-a-drm-bridge`'s .atomic_enable sets them after training rather than
+before -- they live in sun60i_dp_video_configure(), which it calls once
+sun60i_dp_train() has already returned. The `train` debugfs verb never sets
+them at all and documents itself as standalone. So a real modeset fails even
+once the connector reports connected, and the verb that was supposed to be the
+instrument cannot train on its own either.
+
+The four:
+
+  PAD_DP_LNK_CLK_CFG            0x05760000 = 1   sun60i_dp_video_gates()
+  PAD_DP_VID_CLK_CFG            0x05760004 = 1   sun60i_dp_video_gates()
+  DP_TRANSMITTER_OUTPUT_ENABLE  0x05740080 = 1   UM 15.4.7.14
+  DP_INPUT_SOURCE_ENABLE        0x05740094 = 1   UM 15.4.7.16
+
+THE MEASUREMENT
+----------------
+
+On the 8 GiB board, 2026-08-22. The original negative and positive
+runs came first; the staircase
+below was taken afterwards, on one boot, and then reproduced from cold on a
+second.
+
+  nothing written                     fails -- four boots running, always "CR
+                                      round 4: every lane at maximum swing and
+                                      still no lock", sink DPCD 0x202-0x207 =
+                                      00 00 80 00 33 33
+  both eDP_REG_PAD gates only         FAILS
+  0x0080 + 0x0094 only, gates shut    FAILS
+  all four                            TRAINS -- "link trained: 2700 Mb/s over 4
+                                      lanes, CR in 2 round(s), EQ in 1", sink
+                                      77 77 01 01 11 11
+  all four + the MSA block            no change, still trains
+  all four + TCON_TV1 enabled         no change, still trains
+
+⚠ THE FIRST WRITE-UP OF THIS DEFECT WAS TOO COARSE AND IS RETRACTED HERE. It
+said the pixel path had to be programmed and running. It does not: on the cold
+confirmation run SRC0_MVID read 0x00000000 and TCON_TV1's TV_GINT0 at
+0x05731004 read 0x00000000 -- no video clock arriving at the core, the timing
+generator off -- and the link trained. Neither a scanning TCON nor a pixel
+clock nor the MSA block is required, and the earlier open question --
+which of the writes training needs -- is settled by
+the staircase.
+
+⬜ WHY these four is still not explained, and the patch says so at the function.
+The UM gives the rule without the mechanism: TRANSMITTER_OUTPUT_ENABLE is to
+be set only once the link output is configured, so that the controller does
+not disturb the PHY while it powers up (15.4.7.14), and
+INPUT_SOURCE_ENABLE starts the NO_VIDEO pattern while no video stream runs
+(15.4.7.16).
+
+⚠ `drm-a733-dp-the-main-video-stream` ALREADY DREW THE RIGHT CONCLUSION AND THE CALL ORDER DEFEATED IT. Its
+comment above those two writes, unchanged in this patch, ends by saying that
+the source enable puts the NO_VIDEO pattern on the link while no stream is
+enabled, which is exactly the state to be in while training runs. Its
+debugfs help says the same thing to the user -- write "configure" before
+link training, "stream" after it (`drm-a733-dp-the-main-video-stream`). Both are correct. The only
+thing missing was a driver that did it.
+
+WHAT THIS CHANGES
+------------------
+
+One new function, sun60i_dp_train_output_enable(), doing exactly those four
+writes and nothing else, called from sun60i_dp_train_once() between
+sun60i_dp_link_configure() and sun60i_dp_train_configure_ends(). Both entry
+points into training go through sun60i_dp_train(), so ONE insertion covers the
+`train` debugfs verb and .atomic_enable, and nothing depends any longer on a
+debugfs verb having been run first.
+
+After link_configure and not before it, because that is what 15.4.7.14 asks for
+(set it once the link output is configured) and it is also the arrangement
+the 2026-08-20 four-lane run used: `link`, then `configure`, then `train` --
+where the enables survived a second sun60i_dp_link_configure() inside the
+training call. Per rung rather than once per call, because a rate change is a
+PHY teardown and rebuild on this part.
+
+⚠ .atomic_enable IS NOT REORDERED, and that is the point rather than an
+omission. The MSA and the transfer unit stay AFTER training: the transfer unit
+is computed from the rate and lane count the ladder settles on
+(sun60i_dp_video_transfer_unit() reads dp->link_rate and dp->link_lanes), so
+programming it before the ladder would program it for a rung that may never be
+used. Only the four writes moved, and they read neither field.
+
+⚠ AND THE CRTC WAS NEVER THE PROBLEM. On the modeset path TCON_TV1 is already
+enabled when this bridge is: drm_atomic_helper_commit_modeset_enables() calls
+drm_atomic_helper_commit_crtc_enable() -- which reaches
+sun60i_kms_crtc_atomic_enable() (sun60i-kms.c:542), the display engine, then
+sun60i_tcon_tv_kms_enable() (:567) -- before it calls
+drm_atomic_helper_commit_encoder_bridge_enable(), which is what reaches
+.atomic_enable. Those are the three adjacent calls of one function,
+drm_atomic_helper.c:1761, :1763 and :1765, and this driver's
+.atomic_commit_tail is the stock drm_atomic_helper_commit_tail_rpm()
+(sun60i-kms.c:636). Recorded because the first reading of this defect proposed
+reordering CRTC against bridge, and that would have been a change to the commit
+sequence in answer to a fault that is four register writes inside one driver.
+
+DIAGNOSTICS
+------------
+
+No line is deleted. One is added: a missing eDP_REG_PAD window is now refused
+at training with its address and the consequence named, where before the two
+gates were simply never written and the link failed at maximum swing with
+nothing pointing at the reg property. `drm-a733-dp-the-main-video-stream`'s `video` verbs, its help text and
+`drm-a733-dp-instrument-the-training-failure-paths`'s failure decoding are untouched, and `echo 0 > train` on a bare boot
+remains runnable -- it is the instrument that produced the negative above, and
+this tree does not delete diagnostics.
+
+WHAT THE VENDOR DOES DIFFERENTLY
+---------------------------------
+
+Read in allwinner-bsp, branch cubie-aiot-v1.4.8.
+
+| vendor | ours |
+|---|---|
+| gets the four for free and never states the rule. Its DP path trains at edp_main_link_setup() (sunxi_drm_edp.c:4501) and only then writes video format, timings and transfer unit (:4511, :4516, :4521) -- the same shape as ours -- because edp_hw_enable() (:4479) has already opened the gates and the enables on the way in. Nothing in that driver says training depends on them | the dependency is named at the function that has it, with the staircase that measured it, and it is asserted per training attempt rather than inherited from an enable path |
+| has no way to train without a full modeset, so this fault cannot occur there -- and equally cannot be measured there | the `train` verb is standalone in fact and not only in its documentation, which is what made the staircase possible at all |
+| one line and a return code for a failed link | the give-up reason, the round counters, the sink's own DPCD 0x202-0x207 (`drm-a733-dp-instrument-the-training-failure-paths`), and now a named refusal when the second reg window is absent |
+| trains at one rate and one lane count with no fallback | rate then lane ladder (`drm-a733-dp-link-training`), and the four writes re-asserted on every rung of it |
+
+AND IN MAINLINE
+----------------
+
+Worth stating because it goes the other way. Surveyed in 6.18.36, the normal
+order is train first and program MSA afterwards -- dw-dp.c:1673 then :1679
+(MSA at :1252), analogix_dp_core.c:844 then :857, cdns-mhdp8546-core.c:1939
+then :1982, tegra/sor.c:2879 then :2897, tc358767.c:1597 then :1603,
+i915 intel_ddi.c:2937 then :2975. This patch KEEPS that order; it is the four
+enables that move, not the video programming.
+
+⚠ But the enables themselves have no mainline precedent, and one driver does
+the exact opposite: cdns-mhdp8546-core.c:1393 "Disable framer for link
+training" turns its video framer OFF for the duration. A grep of the tree for
+any statement that a DP source's output or stream must be enabled before its
+own link training returns nothing. So this is an A733 property, it is stated at
+the function that depends on it, and nobody should carry it elsewhere by
+analogy.
+
+WHAT IT OWES
+-------------
+
+  1. THE VERB, ON A COLD BOOT, and this is the whole claim:
+
+       echo 1 > /sys/kernel/debug/5740000.displayport/aux_enable
+       echo 0 > /sys/kernel/debug/5740000.displayport/train
+       cat   /sys/kernel/debug/5740000.displayport/train
+
+     Nothing else -- no bring-up script, no TCON verb, no `video configure`.
+     PASS: dmesg "link trained: 2700 Mb/s over 4 lanes", and the readback shows
+     the SINK's bytes, DPCD 0x202-0x205 = 77 77 01 01, clock recovery done on
+     every active lane, equalisation done, symbol locked, interlane aligned.
+     FALSIFIED BY the signature of the failing run above -- "CR round 4: every lane at
+     maximum swing and still no lock" and 00 00 80 00 33 33 -- which would mean
+     the four writes are not the precondition after all, or are being defeated
+     by their position after sun60i_dp_link_configure().
+
+  2. THE MODESET, on a kernel carrying `drm-a733-kms-drm-device-for-the-display-pipe` and `arm64-dts-a733-display-engine-node-and-tcon-dp-edge`:
+
+       modetest -M sun60i-a733-kms -s <connector>@<crtc>:1920x1200
+
+     PASS: "link trained: 2700 Mb/s over 4 lanes" followed by "video stream
+     enabled ... the sink reports it in sync (DPCD 0x205)", and a picture.
+     Falsified by "link training failed" on that path, or by a trained link
+     with SRC0_USER_FIFO_STATUS non-zero, which would say the MSA and the
+     transfer unit are being written for a different link than the one that
+     trained.
+
+  3. THE NEGATIVE THAT MAKES 1 MEAN SOMETHING, on the same boot and before it:
+     with this patch reverted, the same two commands must still fail. Both arms
+     on one kernel is the only admissible
+     shape, and the alternative -- comparing against a different boot -- is how
+     half a session was lost on 2026-08-22.
+
+Checked only by an automated build -- NOT hardware-proven and not hardware-exercised in this form. What
+has run on silicon is the register state, set by hand; no build of this driver
+has yet made those writes itself.
+
+Assisted-by: Claude
+
+diff --git a/drivers/gpu/drm/sun60i/sun60i-dp.c b/drivers/gpu/drm/sun60i/sun60i-dp.c
+--- a/drivers/gpu/drm/sun60i/sun60i-dp.c
++++ b/drivers/gpu/drm/sun60i/sun60i-dp.c
+@@ -1955,6 +1955,69 @@ static int sun60i_dp_train_configure_ends(struct sun60i_dp *dp)
+ 	return ret;
+ }
+ 
++/*
++ * FOUR WRITES THE LINK WILL NOT TRAIN WITHOUT, AND THEY ARE NOT VIDEO.
++ *
++ * The two eDP_REG_PAD clock gates, TRANSMITTER_OUTPUT_ENABLE and
++ * INPUT_SOURCE_ENABLE. Nothing here describes a mode, so nothing here depends
++ * on anything training decides -- which is what lets it run BEFORE the pattern
++ * while the MSA and the transfer unit stay after it, where they must be: the
++ * transfer unit is computed from the rate and the lane count the ladder settles
++ * on (sun60i_dp_video_transfer_unit()).
++ *
++ * THE MEASUREMENT, the 8 GiB board / 2026-08-22, staircase on one boot and
++ * reproduced from cold on a second, preceded by an original negative and
++ * positive run:
++ *
++ *   nothing written                          fails, four boots running, always
++ *                                            "every lane at maximum swing and
++ *                                            still no lock", sink DPCD
++ *                                            0x202-0x207 = 00 00 80 00 33 33
++ *   both eDP_REG_PAD gates only              FAILS
++ *   0x0080 + 0x0094 only, gates shut         FAILS
++ *   all four                                 TRAINS -- "2700 Mb/s over 4 lanes,
++ *                                            CR in 2 round(s), EQ in 1", sink
++ *                                            77 77 01 01 11 11
++ *   all four + the MSA block                 no change, still trains
++ *   all four + TCON_TV1 enabled              no change, still trains
++ *
++ * ⚠ AND THE PIXEL PATH IS NOT PART OF IT. On the cold confirmation run
++ * SRC0_MVID read 0x00000000 and TCON_TV1's TV_GINT0 at 0x05731004 read
++ * 0x00000000 -- no video clock at the core, the timing generator off -- and the
++ * link trained anyway. So the coarse reading this defect was first written up
++ * with, that "the pixel path must be programmed and running", is WRONG and is
++ * not what this function implements. Neither a scanning TCON, nor a pixel
++ * clock, nor the MSA block is required. Nothing here reaches outside this
++ * driver's own two register windows, and nothing here needs another device.
++ *
++ * ⬜ WHY these four is not explained. The UM gives the shape of the rule and
++ * not the reason: TRANSMITTER_OUTPUT_ENABLE is to be set only once the link
++ * output is configured, so that the controller does not disturb the PHY
++ * while it powers up (15.4.7.14) -- hence its position here,
++ * after sun60i_dp_link_configure() -- and INPUT_SOURCE_ENABLE starts the
++ * NO_VIDEO pattern while no video stream runs
++ * (15.4.7.16). `drm-a733-dp-the-main-video-stream` wrote both of those facts down, and drew the right
++ * conclusion in as many words: NO_VIDEO is "exactly the state to be in while
++ * training runs". The call order defeated it. This is that conclusion made
++ * true on both paths into training rather than only on the one a user
++ * drives by hand.
++ */
++static int sun60i_dp_train_output_enable(struct sun60i_dp *dp)
++{
++	if (!dp->pad) {
++		dev_err(dp->dev,
++			"no eDP_REG_PAD window: this node needs a second reg entry at 0x05760000, and without its two clock gates this link does not reach clock recovery\n");
++		return -ENODEV;
++	}
++
++	sun60i_dp_video_gates(dp, true);
++
++	writel(TX_OUTPUT_ENABLE, dp->base + DP_TRANSMITTER_OUTPUT_ENABLE);
++	writel(INPUT_SOURCE_ENABLE_SST, dp->base + DP_INPUT_SOURCE_ENABLE);
++
++	return 0;
++}
++
+ /*
+  * One attempt at one rate and one lane count: configure the PHY, tell both ends
+  * the same thing, then CR and EQ.
+@@ -1973,6 +2036,17 @@ static int sun60i_dp_train_once(struct sun60i_dp *dp, unsigned int rate_mbps,
+ 	if (ret)
+ 		return ret;
+ 
++	/* Then the four writes without which this link does not reach clock
++	 * recovery on this board -- the measurement is at
++	 * sun60i_dp_train_output_enable(). Here rather than once per
++	 * sun60i_dp_train() call because a rate change is a PHY teardown and
++	 * rebuild, so every rung re-asserts them; they cost two register writes
++	 * and two gate writes and depend on nothing this loop produces.
++	 */
++	ret = sun60i_dp_train_output_enable(dp);
++	if (ret)
++		return ret;
++
+ 	ret = sun60i_dp_train_configure_ends(dp);
+ 	if (ret)
+ 		return ret;
+@@ -2443,6 +2517,16 @@ static void sun60i_dp_bridge_atomic_enable(struct drm_bridge *bridge,
+ 	/* Auto on both: the rate ladder asks the sink and the PHY, and the lane
+ 	 * ladder is the fallback DP 1.4 section 3.5.1.2.1 requires. A modeset must not
+ 	 * hardcode either -- that is the vendor behaviour `drm-a733-dp-link-training` replaced.
++	 *
++	 * ⚠ TRAINING BEFORE VIDEO IS CORRECT HERE, and it is correct for one
++	 * reason only: the four writes this board will not train without are
++	 * inside the call, at sun60i_dp_train_output_enable(). Everything
++	 * sun60i_dp_video_configure() adds on top of them -- the MSA and the
++	 * transfer unit -- was measured to make no difference to training, and
++	 * the transfer unit MUST stay on this side of it, because it is computed
++	 * from the rate and lane count the ladder settles on. Moving the video
++	 * configure above the training call would program it for a rung that may
++	 * never be used.
+ 	 */
+ 	ret = sun60i_dp_train(dp, 0, 0);
+ 	if (ret) {

@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Sat, 3 Oct 2026 17:13:28 +0200
+Subject: [PATCH] fix(allwinner): A733: apply Cortex-A76 erratum 3888013
+
+Cortex-A76 erratum 3888013 (Programmer Cat B, present in r0p0-r4p1,
+open; SDEN-885749), "Loads issued to Non-Cacheable or Device GRE memory
+can violate ordering requirements". A load to a Non-cacheable or
+Device-GRE line, then something that orders a younger load after it (an
+address dependency through a page-table update, a modification of
+executed instructions, or a load-acquire followed by a non-temporal
+load), then a younger load to the same line: under specific timing the
+younger load returns the stale data the first one brought in. The A733's
+A76 cores are r4p1. Non-cacheable memory is what Linux maps for
+DMA-coherent buffers and write-combined framebuffers.
+
+Workaround: the reset handler sets CPUACTLR2_EL1[22], which disables
+linking several Non-cacheable or Device-GRE loads to one read request
+for a line. Arm warns that this "might have a significant performance
+impact to Non-cacheable and Device GRE read bandwidth for streaming
+scenarios".
+
+Its own patch, so the cost can be measured with and without it on the
+same chain. Measured on the A733 (2026-09-26): -51 % Non-cacheable read
+bandwidth (ldp) and -34 % (memcpy) on the A76 cores, A55 cores and
+cached memory unchanged. Decision: it stays on.
+
+The vendor BL31 is a blob (v2.5) built years before the workaround
+existed upstream; it very probably does not apply it.
+
+Assisted-by: Claude
+---
+ plat/allwinner/sun60i_a733/platform.mk | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/plat/allwinner/sun60i_a733/platform.mk b/plat/allwinner/sun60i_a733/platform.mk
+index a18b4cd64..bb7627ba5 100644
+--- a/plat/allwinner/sun60i_a733/platform.mk
++++ b/plat/allwinner/sun60i_a733/platform.mk
+@@ -88,6 +88,16 @@ ERRATA_A76_2743102		:=	1
+ ERRATA_A76_2356586		:=	1
+ WORKAROUND_CVE_2025_10263	:=	1
+ 
++# Cortex-A76 erratum 3888013 (Cat B, r0p0-r4p1, open): a younger load to a
++# Non-cacheable or Device-GRE line can return stale data brought in by an
++# older load to the same line, across an address dependency, an instruction
++# modification or a load-acquire. The reset handler sets CPUACTLR2_EL1[22],
++# so the core no longer links several such loads to one read request. Arm
++# warns of a significant Non-cacheable / Device-GRE read bandwidth loss for
++# streaming; measured on the A733: -51 % (ldp) and -34 % (memcpy)
++# Non-cacheable read bandwidth on the A76 cores.
++ERRATA_A76_3888013		:=	1
++
+ USE_COHERENT_MEM		:=	0
+ WARMBOOT_ENABLE_DCACHE_EARLY	:=	1
+ HW_ASSISTED_COHERENCY		:=	1

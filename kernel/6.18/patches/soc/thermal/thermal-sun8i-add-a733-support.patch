@@ -1,0 +1,166 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] thermal: sun8i: add A733 (sun60iw2) support
+
+The A733's thermal block is register-compatible with the H6 layout: every
+SUN50I_H6_* offset in this driver lands on a live, correctly shaped register on
+this part, and the vendor driver programs CTRL0 and MFC with the same constants
+this driver writes (0x01DF002F and 0x00000005, read back on a running board).
+THS_PER (this driver's SUN50I_H6_THS_PC) is the exception: the reused
+sun50i_h6_thermal_init() writes 365, the H6 value, where the vendor's
+sun60iw2_thermal_init() writes 28 and the UM's init sequence 0x3A = 58
+(UM V1.00 7.1.6.1 Step 5, p. 344). At 365 each sensor updates every
+1.25 s instead of 0.10 s (vendor) or 0.20 s (UM); `thermal-sun8i-a733-filter-the-trend-fed-to-step-wise` measures and works
+with that cadence, it does not change it.
+
+Three things differ and are handled here.
+
+Five sensors, not four, so MAX_SENSOR_NUM grows by one. The ENABLE register
+reads 0x0000001F on hardware, and DATA, CDATA and ALARM each have exactly five
+populated entries -- 0xD4 upwards reads zero.
+
+Which block each sensor sits in: the UM says 0 = CPUB, 1 = DDR, 2 = NPU,
+3 = CPUL, 4 = GPU. ⚠ The two CPU entries are measured the other way
+round -- ths 0 is at the A55 and ths 3 at the A76 -- by a per-cluster stimulus
+replicated on two dates (one of them the 2026-08-15 series on the 8 GiB
+board). Nothing in this driver depends on it: the sensor index is passed
+straight through from the DT cell to temp_data_base + 4 * id, so the mapping is
+a device-tree question and `arm64-dts-a733-thermal-zones-and-cpu-throttling` is where it is decided and argued. It is
+recorded here only because this comment used to assert the UM order as fact.
+
+A second clock. The ADC runs off a 24 MHz conversion clock whose CCU reset
+default is OFF, so has_mod_clk is set alongside has_bus_clk_reset.
+
+The transfer function is the one value in this patch that is not from a
+document: the UM does not print the raw-to-Celsius formula. It was first
+regressed on silicon -- two straight segments, exact on 34 of 35 sweep points,
+all five sensors on two dies, between 39 and 74 C -- and it is the vendor's
+formula, sun60iw2_calc_temp() in the vendor sunxi_thermal.c: same slopes
+(-62 and -59 mC/LSB), same intercepts (174964 = 2822 * 62 and 167265 =
+2835 * 59), same breakpoint (raw > 1769), checked in the code and against the
+vendor driver's register/report pairs on three kernels (`arm64-dts-a733-thermal-zones-and-cpu-throttling`). So our scale is
+the vendor's scale over the whole range, not only the fitted one. What is open
+is the absolute accuracy of Allwinner's formula above 74 C, and that can only
+be checked with an external thermometer; nothing on this board can. The fuses
+do not settle it: they carry one calibration point, ft_temp = 25.0 C, which
+fixes a per-sensor offset, not the slope.
+
+No calibration cell is wired. The A733 does carry per-die factory data in the
+SID fuses, and the fuse-to-CDATA transform is known, though not from the UM
+(which only says to write the eFuse value to THSn_CDATA): the vendor's
+sun60iw2_ths_calibrate() reads SID 0x44/0x48/0x4c as a packed 12-bit array
+(ft_temp, then the five sensors) and writes cdata = 0x800 - delta, and that
+arithmetic reproduced the live CDATA registers of a vendor board 5 of 5 (2026-08-16). This driver does not
+implement it, and sun8i_ths_calibrate() is written to continue without it.
+The measured cost of shipping on the 0x800 reset default is -12..+7 LSB
+across five sensors on two dies = -0.74..+0.43 C, an order of magnitude
+inside the sensor's own +-3 C.
+
+needs_sram stays false: that is an H616 erratum, not this part.
+
+Assisted-by: Claude
+---
+--- a/drivers/thermal/sun8i_thermal.c
++++ b/drivers/thermal/sun8i_thermal.c
+@@ -25,7 +25,7 @@
+ 
+ #include "thermal_hwmon.h"
+ 
+-#define MAX_SENSOR_NUM	4
++#define MAX_SENSOR_NUM	5
+ 
+ #define FT_TEMP_MASK				GENMASK(11, 0)
+ #define TEMP_CALIB_MASK				GENMASK(11, 0)
+@@ -114,6 +114,38 @@
+ 		return -1590 * reg / 10 + 276000;
+ }
+ 
++/*
++ * A733. The UM extract this port was written from does not print the raw-to-
++ * temperature formula, so it was derived on silicon instead: a vendor-BSP board
++ * was swept from idle to load and its reported millidegrees regressed against
++ * the raw DATA words read back in the same instant. 34 of 35 points fall
++ * exactly on one of two straight lines, and the cold line reproduces all five
++ * sensors on two different dies to the millidegree:
++ *
++ *   raw 1778..2191  (39.1..64.7 C)   temp_mC = 174964 - 62 * raw
++ *   raw 1586..1761  (63.4..73.7 C)   temp_mC = 167265 - 59 * raw
++ *
++ * The breakpoint sits near raw 1770. A two-segment response is not unusual
++ * here -- sun50i_h5_calc_temp() above switches on the raw word for the same
++ * reason.
++ *
++ * This is the vendor's formula, not a fit of ours: sun60iw2_calc_temp() in the
++ * vendor sunxi_thermal.c has the same slopes (-62, -59), the same intercepts
++ * (2822 * 62 = 174964, 2835 * 59 = 167265) and the same breakpoint (raw >
++ * 1769), so this scale is the vendor's above 73.7 C too. What stays open is
++ * the absolute accuracy of that formula above 74 C, and only an external
++ * thermometer can check it. The SID fuses carry one calibration point
++ * (ft_temp = 25.0 C): an offset per sensor, not the slope.
++ */
++static int sun60i_a733_calc_temp(struct ths_device *tmdev,
++				 int id, int reg)
++{
++	if (reg >= 1770)
++		return 174964 - 62 * reg;
++
++	return 167265 - 59 * reg;
++}
++
+ static int sun8i_ths_get_temp(struct thermal_zone_device *tz, int *temp)
+ {
+ 	struct tsensor *s = thermal_zone_device_priv(tz);
+@@ -709,6 +741,46 @@
+ 	.calc_temp = sun8i_ths_calc_temp,
+ };
+ 
++/*
++ * A733 (sun60iw2). Five sensors. The UM places them
++ * 0 = CPUB, 1 = DDR,
++ * 2 = NPU, 3 = CPUL, 4 = GPU; the two CPU entries are measured the other way
++ * round (ths 0 at the A55, ths 3 at the A76) and the device tree follows the
++ * measurement -- see the thermal-zones comment in
++ * sun60i-a733-cubie-a7s-minimal.dts. This driver is index-agnostic either way:
++ * the DT cell becomes sensor[i].id and addresses temp_data_base + 4 * i.
++ * Register-compatible with the H6 layout: every SUN50I_H6_*
++ * offset lands on a live, correctly shaped register on this part, and the
++ * vendor driver programs CTRL0 and MFC with the same constants this driver
++ * writes. THS_PER (SUN50I_H6_THS_PC) is not the same: the reused
++ * sun50i_h6_thermal_init() writes 365, the vendor 28, the UM's init sequence
++ * 0x3A = 58 -- 1.25 s per sensor update here against 0.10 s and 0.20 s.
++ *
++ * Two clocks: the bus gate, and a 24 MHz conversion clock that the ADC needs
++ * and whose CCU reset default is OFF -- hence has_mod_clk as well as
++ * has_bus_clk_reset.
++ *
++ * No calibration cell. The A733 does have per-die factory data in the SID
++ * fuses, and the fuse-to-CDATA transform is known from the vendor's
++ * sun60iw2_ths_calibrate() (SID 0x44/0x48/0x4c, cdata = 0x800 - delta),
++ * verified 5 of 5 against a vendor board's live CDATA -- but this driver does
++ * not implement it, and sun8i_ths_calibrate() continues without it. Measured
++ * cost of shipping uncalibrated on this part: CDATA reads 0x7F4..0x807 across
++ * five sensors on two dies, i.e. -12..+7 LSB from the 0x800 reset default, or
++ * -0.74..+0.43 C at 62 mC/LSB -- an order of magnitude inside the sensor's own
++ * +-3 C rating. Calibration is a refinement here, not a dependency.
++ */
++static const struct ths_thermal_chip sun60i_a733_ths = {
++	.sensor_num = 5,
++	.has_bus_clk_reset = true,
++	.has_mod_clk = true,
++	.temp_data_base = SUN50I_H6_THS_TEMP_DATA,
++	.calibrate = sun50i_h6_ths_calibrate,
++	.init = sun50i_h6_thermal_init,
++	.irq_ack = sun50i_h6_irq_ack,
++	.calc_temp = sun60i_a733_calc_temp,
++};
++
+ static const struct of_device_id of_ths_match[] = {
+ 	{ .compatible = "allwinner,sun8i-a83t-ths", .data = &sun8i_a83t_ths },
+ 	{ .compatible = "allwinner,sun8i-h3-ths", .data = &sun8i_h3_ths },
+@@ -719,6 +791,7 @@
+ 	{ .compatible = "allwinner,sun50i-h6-ths", .data = &sun50i_h6_ths },
+ 	{ .compatible = "allwinner,sun20i-d1-ths", .data = &sun20i_d1_ths },
+ 	{ .compatible = "allwinner,sun50i-h616-ths", .data = &sun50i_h616_ths },
++	{ .compatible = "allwinner,sun60i-a733-ths", .data = &sun60i_a733_ths },
+ 	{ /* sentinel */ },
+ };
+ MODULE_DEVICE_TABLE(of, of_ths_match);

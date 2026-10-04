@@ -1,0 +1,166 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: a733: enable r_i2c1 + HUSB311 Type-C port controller
+
+Adds the last piece between "USB3 is alive" and "USB3 is usable". On 2026-07-21
+the combo-PHY came up on the 8 GiB board and xhci reported SuperSpeed Plus (LINK_STUS0 =
+0x111), J4 VBUS was on (PL2 high, verified via PL_CFG0/PL_DAT), and still nothing
+enumerated -- on any bus, not even at USB2. A compliant device only presents its
+pull-up once it sees Rp on CC, and with no TCPC driving CC1/CC2 they float.
+
+  - S_TWI1 @ 0x07084000, IRQ GIC_SPI 204 (the interrupt list of the A733 user manual
+    intid 236). Read from our spec; the vendor DT happens to agree here, which is
+    a cross-check rather than the source.
+  - pins PL12/PL13 at mux 3 (the pin tables of the A733 user manual: PL12 = S-TWI1-SCK, PL13 = S-TWI1-SDA).
+    Several PL/PM pairs can carry S_TWI1; this is the pair the board wires.
+  - U4 = HUSB311 @ 0x4e, IRQ TYPEC_INT = PL3, supply VCC_3V3_TYPEC = SWOUT1
+    (190).
+
+No new driver: mainline tcpci_rt1711h matches "richtek,rt1711h", the fallback
+compatible the HUSB311 is register-compatible with.
+
+The connector is declared source/host only. `phy-allwinner-a733-add-serdes-combophy` hard-codes NORMAL lane
+orientation because we have no orientation source yet, so advertising dual-role
+or a flipped plug would promise more than the PHY can deliver. Once the TCPC
+reports orientation, that limit and this property go together.
+
+HW-pending, one observable: the TCPC probes on i2c-1, a device plugged into J4
+enumerates, and /sys/bus/usb/devices/*/speed gains an entry beyond the six root
+hubs plus hub -- 5000 or 10000 for a SuperSpeed stick.
+
+Assisted-by: Claude
+
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -1611,6 +1611,19 @@
+ 				allwinner,pinmux = <2>;
+ 				function = "r_i2c0";
+ 			};
++
++			/*
++			 * Type-C port controller I2C = S_TWI1 on PL12/PL13.
++			 * the pin tables of the A733 user manual: PL12 sel 3 = S-TWI1-SCK, PL13 sel 3 =
++			 * S-TWI1-SDA -- several PL/PM pairs can carry S_TWI1, this
++			 * is the pair the board wires (schematic; the vendor DT
++			 * agrees, but the spec table is the source here).
++			 */
++			r_i2c1_pins: r-i2c1-pins {
++				pins = "PL12", "PL13";
++				allwinner,pinmux = <3>;
++				function = "r_i2c1";
++			};
+ 		};
+ 
+ 		/*
+@@ -1680,6 +1693,112 @@
+ 				};
+ 			};
+ 		};
++
++		/*
++		 * S_TWI1 @ 0x07084000 (the memory map of the A733 user manual: SYSCPUS_APBS1,
++		 * 0x07084000-0x07084FFF), IRQ GIC_SPI 204 (S_TWI1 intid 236,
++		 * the interrupt list of the A733 user manual). Both read off our own spec, not copied from
++		 * another SoC -- the same care that caught the A523 r_i2c0
++		 * address landing inside S_UART1 on the A733.
++		 *
++		 * It exists for exactly one consumer: the Type-C port controller.
++		 */
++		r_i2c1: i2c@7084000 {
++			compatible = "allwinner,sun8i-v536-i2c",
++				     "allwinner,sun6i-a31-i2c";
++			reg = <0x0 0x07084000 0x0 0x400>;
++			interrupts = <GIC_SPI 204 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&r_ccu CLK_BUS_R_I2C1>;
++			resets = <&r_ccu RST_BUS_R_I2C1>;
++			pinctrl-names = "default";
++			pinctrl-0 = <&r_i2c1_pins>;
++			status = "okay";
++
++			#address-cells = <1>;
++			#size-cells = <0>;
++
++			/*
++			 * U4 = HUSB311, the USB Type-C port controller on J4's
++			 * CC1/CC2 (
++			 * supply VCC_3V3_TYPEC = SWOUT1, IRQ TYPEC_INT = PL3, ibid
++			 * :190). It does CC detection, orientation and VBUS sense;
++			 * the lane muxing itself happens inside the SoC COMB0 PHY.
++			 *
++			 * Why this node is what makes USB3 usable rather than just
++			 * alive: on 2026-07-21 the combo-PHY came up and xhci
++			 * reported SuperSpeed Plus (LINK_STUS0 = 0x111), J4 VBUS
++			 * was on (PL2 high), and still nothing enumerated -- a
++			 * compliant device only presents its pull-up once it sees
++			 * Rp on CC, and with no TCPC driving CC1/CC2 they float.
++			 *
++			 * No new driver is needed: mainline tcpci_rt1711h matches
++			 * "richtek,rt1711h", which the HUSB311 is register-
++			 * compatible with (same fallback the vendor DT uses).
++			 */
++			typec_pd: usb-pd@4e {
++				compatible = "hynetek,husb311", "richtek,rt1711h";
++				reg = <0x4e>;
++				interrupt-parent = <&r_pio>;
++				interrupts = <0 3 IRQ_TYPE_LEVEL_LOW>;
++				vbus-supply = <&reg_usb3_vbus>;
++				status = "okay";
++
++				usb_con: connector {
++					compatible = "usb-c-connector";
++					label = "USB-C";
++					/*
++					 * Host-only: the board is a DFP here.
++					 * Orientation IS handled -- `phy-allwinner-a733-add-serdes-combophy` mirrors
++					 * the lanes and TCPM reports the plug
++					 * direction through the graph below.
++					 */
++					power-role = "source";
++					data-role = "host";
++					typec-power-opmode = "default";
++					/*
++					 * No USB-PD policy here, and saying so
++					 * is required rather than optional:
++					 * tcpm_fw_get_caps() sets pd_supported
++					 * from the absence of this property and
++					 * then insists on source-pdos, failing
++					 * probe with -EINVAL. Observed on the 8 GiB board,
++					 * 2026-07-21. We only want Type-C
++					 * attach/Rp so a device connects; PD
++					 * would need a power policy this board
++					 * does not have.
++					 */
++					pd-disable;
++
++					/* The SS lanes are orientation-mirrored
++					 * inside COMB0, so TCPM has to tell the
++					 * combo-PHY which way the plug went in.
++					 * port@1 is that link. port@0 is required
++					 * by the binding whenever `ports` is used
++					 * and is inert here:
++					 * dwc3 only builds a role switch when
++					 * usb-role-switch is set, which it is not.
++					 */
++					ports {
++						#address-cells = <1>;
++						#size-cells = <0>;
++
++						port@0 {	/* High Speed */
++							reg = <0>;
++							usb_con_hs: endpoint {
++								remote-endpoint = <&usb3_hs>;
++							};
++						};
++
++						port@1 {	/* Super Speed */
++							reg = <1>;
++							usb_con_ss: endpoint {
++								remote-endpoint = <&combophy0_ss>;
++							};
++						};
++					};
++				};
++			};
++		};
+ 
+ 		/*
+ 		 * RTC-CCU (PRCM @0x07090000, AON domain). Provides the two SERDES

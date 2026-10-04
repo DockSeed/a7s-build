@@ -1,0 +1,168 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: allwinner: a733: add Timer1 as the tick broadcast device
+
+What. Describe the A733's Timer1_CPUX (0x02052000) with the sun8i-a23 timer
+fallback, and extend the binding to accept "allwinner,sun60i-a733-timer".
+timer-sun4i.c then registers timer 0 as a global clockevent ("sun4i_tick",
+rating 350, ONESHOT | PERIODIC | DYNIRQ, no C3STOP), and the tick layer
+takes it as the broadcast device instead of the hrtimer emulation.
+
+Why. The DT describes only the per-CPU arch timer, and
+cpu-sleep-0 stops it (local-timer-stop). With no other clockevent,
+arm64's time_init() installs the hrtimer broadcast (bc_hrtimer, rating 0).
+The CPU its hrtimer is pinned to gets -EBUSY from tick_broadcast_enter()
+(broadcast_needs_cpu(), kernel/time/tick-broadcast.c), and
+cpuidle_enter_state() then puts it in WFI (drivers/cpuidle/cpuidle.c).
+Measured at idle: 1.5-1.7 CPUs of idle time go to WFI this
+way (6 GiB board). Under a fixed 50 % injection, one A55 per run
+injected all of its idle time in WFI (8 GiB board). A clockevent
+without C3STOP and not per-CPU outranks bc_hrtimer
+(tick_check_broadcast_device()), and broadcast_needs_cpu() returns 0 for
+anything that is not the hrtimer emulation.
+
+Where each value comes from (A733 UM V1.00, original PDF):
+  * 8.2.6 register list, PDF p. 386: Timer1_CPUX base 0x02052000;
+    TMR_IRQ_EN 0x00, TMR_IRQ_STA 0x04, TMRn_CTRL / INTV_VALUE / CUR_VALUE
+    at 0x10 / 0x14 / 0x18 + 0x10 * n for n = 0..3. The memory map (PDF p. 25)
+    gives the same base, 4K.
+  * 8.2.7.3 TMR0_CTRL_REG, PDF p. 388: bit 7 mode (1 = single), 6:4
+    prescaler, 3:2 source (00 RTC_32K, 01 SYS_CLK24M, reset 01), bit 1
+    reload, bit 0 enable. 8.2.7.2: status bits are W1C. These are
+    timer-sun4i.c's TIMER_CTL_ONESHOT / CLK_PRES / CLK_SRC / RELOAD /
+    ENABLE, TIMER_IRQ_EN_REG / TIMER_IRQ_ST_REG and TIMER_CTL/INTVAL/
+    CNTVAL_REG(n), bit for bit. The driver uses timer 0 (clockevent) and
+    timer 1 (32-bit down-counting clocksource, rating 350, below
+    arch_sys_counter's 400). Timers 2 and 3 stay free.
+  * Interrupt table, PDF p. 616: INTID 131 TIMER1_0, 132 TIMER1_1, 133-134
+    TIMER1_2/3, so GIC SPI 99-102.
+    The binding's sun8i-a23 clause takes exactly two interrupts, the same
+    as the A64/H6/H616 nodes. The driver requests only the first.
+  * Clock: 8.2.3 and 8.2.7.3 name the two count clocks SYS_CLK24M (01) and
+    RTC_32K (00), selected in CTRL[3:2]; the driver writes 01. The CCU
+    register list has TIMER0_CLKn and TIMER0_BGR_REG but no gate or reset
+    for Timer1, so the node has no resets property.
+
+Silicon, 8 GiB board, 2026-09-24, test kernel (no driver bound),
+busybox devmem:
+  * Readback 0x02052000..0x0205204b: IRQ_EN 0, IRQ_STA 0, TMR0..3_CTRL
+    0x00000004 each (the documented reset value, at four offsets), every
+    INTV and CUR 0. Boot0, BL31 and U-Boot leave the block untouched, and
+    it answers non-secure reads.
+  * Stimulus on timer 3, which the driver never uses: INTV = 0xffffffff,
+    CTRL = source | reload | enable. The writes stick (reload self-clears:
+    0x7 reads back 0x5), and the counter runs down. Against the board's own
+    CLOCK_REALTIME (arch_sys_counter, NTP-synchronised, 8 ms from the host)
+    over 2 s: source 01 counts at 25.996 MHz, source 00 at 32.8 kHz; over
+    10 s on the test kernel 26.001 MHz and 32 769 Hz. So the
+    input the UM calls SYS_CLK24M is the 26 MHz DCXO on this SoC -- the
+    24-versus-26-MHz defect type. The node names &dcxo26M, the board's DCXO
+    fixed-clock (`clk-sunxi-ng-a733-feed-pll-ref-from-the-dcxo`), which has its rate at time_init() through
+    of_clk_init(); the RTC-CCU's CLK_RTC_DCXO would come from a platform
+    driver, after time_init(). With &sys24M every event would fire 1/13
+    early and the "timer" clocksource would run 8 % fast. Interrupt enable
+    stayed 0; timer 3 was stopped and restored.
+
+Rejected: TIMER0 at 0x03009000, the address where the H6 has its a23-style
+timer. On the A733 that address holds a different block: 56-bit counters,
+TIMER_CTRL_REG at 0x20 + 0x20 * N, and TIMER_SEC_REG resets to 0x3FF, so
+every timer is secure (8.1.6-8.1.7.3, PDF p. 379-381). No mainline driver
+fits it, and BL31 would have to release it first. Nothing is taken from the
+A523, whose mainline DT has no timer node. The node sits between the CCU and
+the eFuse, not after WDT0 at 0x02050000 where address order puts it: `arm64-dts-a733-cubie-a7s-watchdog-on-wdt-cpus`
+carries the WDT0 node's closing lines as context, and an insertion there
+breaks `arm64-dts-a733-cubie-a7s-watchdog-on-wdt-cpus` at fuzz 0.
+
+Vendor: the 6.6 BSP drives TIMER0 at 0x03009000 through its own driver
+("allwinner,sun50i-timer", bus gate, reset, two module clocks, one
+interrupt) and does not describe Timer1. Nothing is taken from it; Timer1
+needs no vendor code, only the mainline driver.
+
+Verified on silicon, 8 GiB board, 2026-09-24, test kernel 6.18.36-t9997
+against the default kernel without this patch on the same image, each booted by label:
+  * broadcast/current_device reads sun4i_tick; /proc/timer_list shows it as
+    the broadcast device and no bc_handler; "timer@2052000" (GICv3 131)
+    counts on all eight CPUs; clocksource stays arch_sys_counter.
+  * Idle, 2 x 60 s: 0 tick_broadcast_oneshot_control() refusals (default
+    kernel 7131-7751); deep share 89.5-99.9 % on every CPU (default 18-95 %);
+    WFI idle time 0.35 CPUs (default 2.0-2.2 CPUs).
+  * Injection at 50 % into cpu-sleep-0, 2 x 90 s: every injected core 100 %
+    in cpu-sleep-0, 0 refusals. Default kernel: the broadcast hrtimer's
+    owner put 73 % and 100 % of its injected idle in WFI.
+  * Wake, traced, 8 000 absolute 20 ms sleeps per kernel: a deep core is
+    woken by the Timer1 interrupt directly; hrtimer expiry to handler
+    170 / 217 us (A55 / A76 median) against 169 / 212 us for the default
+    kernel's deep wakes by the broadcast IPI. 88-98 % of the sleeps now go
+    deep (default 1-5 %), so the median wake to the task rises from ~95 / 32
+    us (WFI) to 262 / 281 us, the deep state's own cost. No wake is late in
+    the kernel; the two sleeps over 1 ms were WFI sleeps whose task waited
+    behind another one until the next tick.
+  * timesyncd after 4 packets, two boots: offset +2.05 / +0.42 ms, frequency
+    -4.1 / +2.7 ppm. No WARN, RCU stall or lockup.
+
+For a comparison run without it: A7S_SKIP_PATCHES=arm64-dts-a733-add-timer1-as-the-tick-broadcast-device.
+
+Assisted-by: Claude
+---
+--- a/Documentation/devicetree/bindings/timer/allwinner,sun4i-a10-timer.yaml
++++ b/Documentation/devicetree/bindings/timer/allwinner,sun4i-a10-timer.yaml
+@@ -24,6 +24,7 @@
+               - allwinner,sun50i-a64-timer
+               - allwinner,sun50i-h6-timer
+               - allwinner,sun50i-h616-timer
++              - allwinner,sun60i-a733-timer
+           - const: allwinner,sun8i-a23-timer
+ 
+   reg:
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -551,6 +551,50 @@
+ 		};
+ 
+ 		/*
++		 * Timer1_CPUX, the tick broadcast device. The arch timer stops in
++		 * cpu-sleep-0 (local-timer-stop). Without a clockevent that keeps
++		 * running there, the kernel emulates the broadcast with an
++		 * hrtimer, and whichever CPU holds that hrtimer is refused deep
++		 * idle. This block is a SoC peripheral with its own SPIs, not
++		 * part of any core, so a core power-down does not stop it.
++		 *
++		 * reg     A733 UM V1.00 8.2.6 (PDF p. 386): base 0x02052000;
++		 *         TMR_IRQ_EN 0x00, TMR_IRQ_STA 0x04 (W1C), TMRn_CTRL,
++		 *         INTV and CUR at 0x10, 0x14, 0x18 + 0x10 * n, n = 0..3.
++		 *         0x50 covers the header and all four timers.
++		 * compat  8.2.7.3 (PDF p. 388): CTRL bit 7 single mode, 6:4
++		 *         prescaler, 3:2 source (01 = SYS_CLK24M), 1 reload,
++		 *         0 enable. That is the layout timer-sun4i.c drives for
++		 *         the sun8i-a23 fallback: timer 0 is the clockevent,
++		 *         timer 1 a free-running clocksource.
++		 * irq     Interrupt table, PDF p. 616: INTID 131 TIMER1_0 and
++		 *         132 TIMER1_1, GIC SPI 99 and 100. The a23 binding
++		 *         takes two; the driver uses the first.
++		 * clocks  The driver selects source 01, which 8.2.3 and 8.2.7.3
++		 *         call SYS_CLK24M. On silicon it counts at 26 MHz, so it
++		 *         is the DCXO (timer 3 read back against the host clock
++		 *         on the 8 GiB board: 25.996 MHz with 01, 32.8 kHz with
++		 *         00 = RTC_32K). Hence &dcxo26M, which is a fixed-clock
++		 *         and so has a rate at time_init(), before the RTC-CCU
++		 *         probes. With &sys24M every event would fire 1/13
++		 *         early. The CCU has no gate or reset for this block;
++		 *         its TIMER0_BGR_REG belongs to the other one.
++		 *
++		 * Not TIMER0 at 0x03009000, the address of the H6's a23-style
++		 * timer: on the A733 that is a different block (56-bit
++		 * counters, CTRL at 0x20 + 0x20 * n, every timer secure out of
++		 * reset; UM 8.1.6-8.1.7.3, PDF p. 379-381).
++		 */
++		timer@2052000 {
++			compatible = "allwinner,sun60i-a733-timer",
++				     "allwinner,sun8i-a23-timer";
++			reg = <0x0 0x02052000 0x0 0x50>;
++			interrupts = <GIC_SPI 99 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SPI 100 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&dcxo26M>;
++		};
++
++		/*
+ 		 * Security ID / eFuse array. Register-compatible with the A64
+ 		 * layout: the fuse array is mirrored into the ARM window at
+ 		 * base + 0x200, plain MMIO reads (no H3-style PRCTL readout).

@@ -1,0 +1,154 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] drm/a733: kms: advertise ARGB8888, which the layer already scans
+
+Every GBM/EGL client that asks for an alpha channel gets AR24, and on
+this driver addfb then rejects the whole frame. Measured on the 8 GiB board on
+2026-09-08 with glmark2 on a test build of this series: the GPU renders at 1920x1200
+through zink on the PowerVR, 166-170 FPS, and not one frame reaches
+the screen --
+
+  sun60i-a733-kms display-engine: [drm:drm_gem_fb_init_with_funcs]
+    Unsupported pixel format AR24 little-endian (0x34325241) / modifier 0x0
+  sun60i-a733-kms display-engine: [drm:drm_internal_framebuffer_create]
+    could not create framebuffer
+
+repeated once per frame, surfacing in userspace as "Failed to create FB:
+-22" and "Failed to get gbm front buffer". Note the modifier in that line: 0x0
+is DRM_FORMAT_MOD_LINEAR, which we do advertise. LINEAR was never the problem.
+The format list was, and it had exactly one entry.
+
+WHY THIS COSTS NO NEW REGISTER VALUE, WHICH IS THE ONLY REASON IT IS ALLOWED
+
+`drm-a733-kms-drm-device-for-the-display-pipe`'s own comment argues against
+adding formats, and the argument is right: "advertising a format the layer
+would program wrong is worse than advertising one". ARGB8888 does not trip
+it, and that is a property of the hardware programming rather than a
+preference:
+
+  - sun60i_de_attctl() takes no arguments. It returns one constant word,
+    0xff008403, decoded field by field: global alpha [31:24] = 0xff,
+    RGB_MODE bit 15, FBFMT [12:8] = 4, ALPHA_MODE [2:1] = 01, EN.
+  - ALPHA_MODE 01 is global/layer alpha. The layer takes its alpha from the
+    [31:24] field, which is 0xff, and never reads the pixel's fourth byte.
+  - AR24 and XR24 are the same 32-bit little-endian layout; they differ only
+    in what that fourth byte means, and this layer does not look at it.
+
+So the same word scans an AR24 buffer and an XR24 buffer identically. This
+patch adds a name to the list. It does not add a code path, and it writes no
+value this tree has not already had on silicon.
+
+WHAT IT DOES NOT DO
+
+  - No per-pixel blending. On a single primary plane over an opaque BKCOLOR
+    there is nothing to blend against, so there is no alpha meaning to lose
+    here -- but a second plane, or a non-opaque background, has to revisit
+    it.
+  - No new modifier, no scaling, no positioning, no second format family.
+    The other three restrictions in that comment stand untouched.
+
+FALSIFIERS, in the order they answer
+
+  1. The two drm_dbg_kms lines above must not appear for AR24 any more, with
+     drm.debug=0x04 and the same glmark2 invocation.
+  2. glmark2 must stop printing "Failed to create FB: -22" -- zero
+     occurrences, not fewer.
+  3. A PICTURE, and this is the one that matters: glmark2 must appear on the
+     monitor in place of the fbcon login. Witness is the TCON's own scanout
+     verb, never fb0/blank and never dpms, plus an eye on the screen.
+     ⚠ The console on that monitor is fbcon and it shares card0, so the
+     first cut of this header required vtcon1 unbound first. THE BOARD
+     SAYS OTHERWISE: vtcon1 stayed bound, read back as 1, and glmark2
+     took the DRM master with fbcon stepping aside by itself.
+     `drm-a733-kms-drm-device-for-the-display-pipe`'s cmp
+     proof needed the unbind because it compared a buffer fbcon was
+     writing into -- a second writer, which is not the same thing as a
+     client that owns the CRTC.
+  4. The pixels must be right, not merely present: sink_crc must change
+     between two different rendered pictures and hold constant across a
+     static one, sampled as echo 0; echo 1; cat on sink_crc.
+  5. XRGB8888 must still work exactly as before -- the console proof
+     (16/16 cells) must still pass.
+     Since 3 turns out not to need the unbind, 3 and 5 share one boot.
+     ⚠ But 5 WRITES ITS OWN STRING into the framebuffer, so it leaves the
+     screen changed. Run it after 4, never before, or 4 has no static
+     picture left to measure.
+
+✅ HW-PROVEN on the 8 GiB board, 2026-09-08, a test build of this series booted as its own extlinux
+label, the real default untouched. F1 met: zero AR24 rejections, was one
+per frame. F2 met: zero "Failed to create FB", was one per frame, glmark2
+Score 164-168 at 1920x1200 through zink on the PowerVR. F3 met: glmark2's
+horse on the screen, confirmed by eye, with the TCON scanning cleanly
+underneath -- line counter 2..1231, 4 wraps, underflow 0, lostwarn 0.
+F4a met: sink_crc 0x6553 -> 0x8687 -> 0x437d under a moving picture.
+F5 met: console proof 16/16 cells, bit for bit, same boot.
+
+⬜ F4b was not obtained, and BOTH attempts were the measurer's fault, not
+the sink's. The first used the console as the "static" picture, and the
+console has a blinking cursor. The second ran after falsifier 5, which
+writes "A733 FBCON PROOF" into the framebuffer, and after a printf of the
+measurer's own into the same tty -- both still on the screen when the
+samples were taken, as confirmed by eye. So no static
+picture ever existed to measure, twice over, and the wobbling values
+(0x317f, 0xf149, 0x5d4f, 0xf149) say nothing about sink_crc. The
+2026-08-26 reading of three identical values stands unchallenged.
+⇒ Redo on a genuinely static screen, BEFORE falsifier 5, with the cursor
+off on the controlling terminal rather than by redirection.
+
+⚠ WHAT THIS FIXES AND WHAT IT LEAVES. addfb succeeds; the flip does not
+always find a buffer. "Failed to get gbm front buffer" still appears 1642
+times in 25 s at ~169 FPS -- about 39 % of frames. That is the vblank
+half, not the format half: this driver calls no drm_vblank_init(), has no
+.enable_vblank, and completes a flip with drm_atomic_helper_fake_vblank()
+from the commit tail, so flip completion is decoupled from the real
+scanout. A deliberate state of this tree, and the next thing to pick up.
+
+Assisted-by: Claude
+
+--- a/drivers/gpu/drm/sun60i/sun60i-kms.c
++++ b/drivers/gpu/drm/sun60i/sun60i-kms.c
+@@ -319,12 +319,31 @@
+  * one of those restrictions is what `drm-a733-display-engine-dram-into-tcon-tv1` has on silicon and not one of them is
+  * a placeholder for something that would work if asked:
+  *
+- *   - ONE FORMAT. sun60i_de_attctl() builds a single word with FBFMT =
+- *     OVL_FBFMT_XRGB8888 and RGB_MODE set. The channel's format field is five
+- *     bits wide and the DE can do many more, but each one is a different
+- *     ATTCTL and, for YUV, a different CCSC matrix -- none of which has been on
+- *     a board. Advertising a format the layer would program wrong is worse than
+- *     advertising one.
++ *   - ONE LAYER PROGRAMMING, TWO NAMES FOR IT. sun60i_de_attctl() builds a
++ *     single word with FBFMT = OVL_FBFMT_XRGB8888 and RGB_MODE set. The
++ *     channel's format field is five bits wide and the DE can do many more,
++ *     but each one is a different ATTCTL and, for YUV, a different CCSC
++ *     matrix -- none of which has been on a board. Advertising a format the
++ *     layer would program wrong is worse than advertising one.
++ *
++ *     ARGB8888 is the one exception, and it is an exception because it costs
++ *     no new register value. It is XRGB8888's memory layout byte for byte, and
++ *     ATTCTL sets ALPHA_MODE = OVL_ALPHA_MODE_LAYER with a global alpha of
++ *     0xff, so the layer takes its alpha from that field and never reads the
++ *     pixel's fourth byte. The same word therefore scans an AR24 buffer and an
++ *     XR24 buffer identically -- this adds a name, not a code path.
++ *
++ *     ⚠ What it does NOT add is per-pixel blending. On a single primary plane
++ *     over an opaque BKCOLOR there is nothing to blend against, so alpha has
++ *     no meaning here to lose; a second plane would have to revisit this.
++ *     ⚠ Why it is needed rather than cosmetic: every GBM/EGL client that asks
++ *     for an alpha channel gets AR24, and addfb then fails the whole frame.
++ *     Measured on the 8 GiB board on 2026-09-08 with glmark2 -- the GPU rendered at
++ *     1920x1200 and every single frame died in
++ *     drm_gem_fb_init_with_funcs() with "Unsupported pixel format AR24
++ *     little-endian (0x34325241) / modifier 0x0", errno -22, so nothing ever
++ *     reached the screen. The modifier in that line is 0x0: LINEAR was never
++ *     the problem, the format list was.
+  *   - LINEAR ONLY. TFBD (tiled-framebuffer decode) is left at reset by `drm-a733-display-engine-dram-into-tcon-tv1` and
+  *     read back rather than written, so there is no compressed source to
+  *     describe. DRM_FORMAT_MOD_LINEAR is therefore the complete list.
+@@ -337,6 +356,7 @@
+  */
+ static const u32 sun60i_kms_plane_formats[] = {
+ 	DRM_FORMAT_XRGB8888,
++	DRM_FORMAT_ARGB8888,
+ };
+ 
+ static const u64 sun60i_kms_plane_modifiers[] = {

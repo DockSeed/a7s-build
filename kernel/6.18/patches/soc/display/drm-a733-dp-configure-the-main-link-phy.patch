@@ -1,0 +1,540 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] drm: allwinner: A733 DP -- the transmitter becomes a PHY consumer and configures the main link
+
+[Recipe cut: regenerated: the debugfs knobs removed from the AUX patch are
+not touched here.]
+
+This is the caller `phy-allwinner-a733-combophy-dp-rate-2700`'s rate table never had. The DisplayPort transmitter takes
+the COMB0 combo-PHY as a phy consumer and asks it for a link rate and a lane
+count through phy_configure() with a union phy_configure_opts_dp -- on the
+shipping driver, in a kernel with no bring-up Kconfig set.
+
+WHY THE TRANSMITTER AND NOT THE PHY ITSELF
+------------------------------------------
+
+The alternative was for the combo-PHY to apply its own rate table when the
+Type-C mux selects the DisplayPort personality, i.e. inside `phy-allwinner-a733-combophy-register-a-typec-mux` and `phy-allwinner-a733-combophy-dp-reset-sequence`. It was
+rejected, and the evidence is not a preference:
+
+  1. THE RATE IS NOT KNOWN AT ALT-MODE ENTRY. It is the outcome of reading the
+     sink's DPCD (0x0001 MAX_LINK_RATE, 0x0002 MAX_LANE_COUNT) over AUX and
+     intersecting it with the source. The DP alt-mode VDO carries a SIGNALLING
+     field, which is a capability, not a negotiated link rate. The mux callback
+     has no AUX channel and no DPCD; this driver owns both.
+  2. RATE AND LANE FALLBACK ARE TRAINING DECISIONS. DP 1.4 falls back after a
+     failed clock recovery or channel equalisation -- events only the link
+     training state machine sees. A mux callback fires once, at entry, and
+     never hears that training failed.
+  3. SWING AND PRE-EMPHASIS ARRIVE PER LANE FROM THE SINK. DPCD 0x206/0x207
+     ADJUST_REQUEST is answered inside the training loop, through the same
+     phy_configure() with set_voltages. There is no version of the mux-side
+     design that can deliver those, so it would have to be split anyway --
+     leaving one path for the rate and another for the swing, on the same PMA.
+  4. IT IS WHAT THE FRAMEWORK IS FOR. include/linux/phy/phy-dp.h defines
+     phy_configure_opts_dp with link_rate, lanes, voltage[4], pre[4], ssc and
+     the four set_* flags -- a DP controller's vocabulary, not a Type-C mux's.
+     phy_ops.configure is "used to change the PHY parameters", and phy_ops.validate
+     exists so a consumer can ask before changing them.
+  5. IT IS WHAT MAINLINE DOES, WITHOUT EXCEPTION. Every DisplayPort controller in
+     the tree that has a serdes behind it is the phy_configure() caller:
+     drivers/gpu/drm/bridge/synopsys/dw-dp.c:596-660,
+     drivers/gpu/drm/bridge/cadence/cdns-mhdp8546-core.c:808-1130 (which is the
+     consumer of phy-cadence-torrent.c -- and our PHY is a Torrent derivative),
+     drivers/gpu/drm/msm/dp/dp_ctrl.c:1298-1943,
+     drivers/gpu/drm/mediatek/mtk_dp.c:1256-1273,
+     drivers/gpu/drm/bridge/analogix/analogix_dp_reg.c:524-601,
+     drivers/gpu/drm/xlnx/zynqmp_dp.c:738-746.
+     Zero PHY drivers apply a DP rate table from a Type-C mux callback. The
+     closest thing in mainline to our hardware -- phy-qcom-qmp-combo.c, a
+     USB3+DP combo PHY with a Type-C mux on the same lanes -- splits it exactly
+     this way: qmp_combo_typec_mux_set() (:3808) chooses the personality and
+     touches no rate table, while the rate tables live behind
+     qmp_combo_dp_configure() (:2971) and are applied from the DP consumer's
+     request.
+  6. IT IS ALSO WHAT THE VENDOR DOES. Its eDP driver takes the combo-PHY with
+     devm_phy_get(dev, "combo-phy") and calls phy_configure() from its rate/lane
+     setup and again from its training loop
+     (bsp/drivers/drm/sunxi_device/sunxi_edp.c:604-641, sunxi_drm_edp.c:2906).
+     On this one point the vendor and mainline agree, and so do we.
+
+WHAT THIS DRIVER NOW DOES
+-------------------------
+
+  - takes the main-link PHY with devm_phy_optional_get(dev, "dp"). The DT side is
+    `arm64-dts-a733-dp-main-link-phy`.
+  - reads the sink's own capability bytes with drm_dp_read_dpcd_caps() before
+    choosing anything. The rate and the lane count come from the sink, not from a
+    constant.
+  - picks the highest rate the sink offers that the PHY validates, clamping the
+    lane count to the four COMB0 physically has.
+  - takes phy_init() on that PHY -- refcounted, so it never pulls COMB0 out from
+    under dwc3 -- because phy.h says phy_ops.configure requires it.
+  - calls phy_configure() once, from one function, and CHECKS THE RETURN.
+  - exposes `link` under debugfs: read for the sink's caps and what the PHY
+    accepted, write "<rate Mb/s> [lanes]" for an exact request or "0" for the
+    best the two agree on.
+
+ONE CONSEQUENCE OF THE PHANDLE, NAMED RATHER THAN DISCOVERED
+------------------------------------------------------------
+
+Taking the phy properly means this driver's probe now depends on combophy0's.
+devm_phy_optional_get() returns -EPROBE_DEFER while that provider has not
+registered, and dev_err_probe() passes it up, so sun60i-dp defers -- correctly --
+until COMB0 exists. The consequence is that if the combo-PHY never probes at all,
+the AUX channel is unreachable too, where before it was not.
+
+That is the right trade and it is deliberate: combophy0 probing is already a
+prerequisite for the SuperSpeed link this board is proven on, and the alternative
+is the vendor's -- swallow the deferral, come up with no main link, and say so
+only at INFO level. A driver that half-probes is harder to diagnose than one that
+defers. But it is a change in what a combo-PHY probe failure costs, so it is
+written down here rather than found later.
+
+WHAT IT DELIBERATELY DOES NOT DO
+--------------------------------
+
+  - It does not write DPCD 0x100 LINK_BW_SET / 0x101 LANE_COUNT_SET, nor this
+    core's own link registers. Those two ends must be set together with the
+    training pattern sequence; writing one of them here would leave source and
+    sink describing different links with nothing in the tree to re-converge
+    them -- which is exactly the failure seen in an earlier test on the board,
+    where only LINK_BW_SET and DPCD 0x100 moved and the PMA stayed at
+    2.7 Gbps.
+  - It does not train. No training pattern, no DPCD 0x102, no adjust-request
+    loop. Link training, including where it will differ from the vendor's
+    training path, is owed by the training patch, and this patch does not
+    pretend to have paid it.
+  - It does not call phy_power_on()/phy_power_off() on the combo-PHY. Which
+    personality COMB0 carries is the Type-C mux's decision, driven by TCPM from
+    the alt-mode negotiation. A transmitter that powered the lanes up on its own
+    would be racing that decision -- and the PHY refuses a configure until the
+    lanes really are DisplayPort's, so it could not win the race anyway.
+  - It does not configure anything at bind: nothing here runs until the
+    AUX channel has been opened deliberately.
+
+WHY A DEBUGFS FILE IS THE TRIGGER, AND HOW IT DIFFERS FROM DEBUG INSTRUMENTATION
+--------------------------------------------------------------------------------
+
+`drm-allwinner-a733-displayport-aux` established the pattern and the reason has not changed: this tree has no KMS
+driver, no drm_device and no HPD path into one, so there is nothing else to call
+sun60i_dp_link_configure(). What matters is the difference from a DP
+debug-instrumentation patch that this recipe does not carry, which is what this
+patch exists to get away from:
+
+  - That patch is CONFIG_PHY_SUN60I_A733_COMBO_DP_BRINGUP, bool, default n. It does not
+    exist in a delivery kernel. This is compiled into the shipping module.
+  - It is an actuator: it drives the Type-C switch and mux callbacks by hand
+    and takes the four lanes away from SuperSpeed by construction. This takes
+    nothing: it configures a PHY that has already been given to DisplayPort, and
+    the PHY refuses it otherwise.
+  - sun60i_dp_link_configure() is shaped after dw_dp_link_configure() /
+    dw_dp_phy_configure() (dw-dp.c:596-660) precisely so that link training calls
+    THIS function and adds its DPCD writes around it, rather than growing a
+    second way to reach the PHY.
+
+WHERE THE VENDOR DRIVER DIFFERS, AND WHAT THIS PATCH DOES
+---------------------------------------------------------
+
+The vendor's shape on this path is right -- its DP driver
+is a phy consumer -- and this tree says so rather than inventing a difference.
+Its handling differs:
+
+| vendor | ours |
+|---|---|
+| devm_phy_get(dev, "combo-phy") run through IS_ERR_OR_NULL() and turned into "not setting, maybe not used" (sunxi_drm_edp.c:2906-2911): -EPROBE_DEFER is swallowed, so on a boot where the combo-PHY has not probed yet the DP driver comes up permanently with no main link and logs it at INFO | devm_phy_optional_get(), which returns NULL only for an ABSENT property and propagates every real error including the deferral, through dev_err_probe() |
+| phy_configure() called from two void helpers whose return value is never looked at (sunxi_edp.c:604-641) -- a PHY that refused a rate is indistinguishable from one that applied it | the return is checked, logged with the rate and lane count that were refused, and the recorded link state is cleared rather than left claiming a rate |
+| phy_validate()'s answer mapped so that both -EOPNOTSUPP and -EINVAL become "pass" (sunxi_drm_edp.c:846-868), so the one case its PHY does reject is discarded; and when two phys are present the second overwrites the first's answer | validate is used to CHOOSE, not to approve: a rate the PHY does not validate is skipped. The -EOPNOTSUPP ambiguity (no .validate op vs a provider refusing with that code) is resolved by falling through to the sink maximum and letting configure give the real answer -- never by treating a refusal as a pass |
+| never calls phy_init() on the combo-PHY -- edp_phy_init() inits aux_phy and dp_phy only, and edp_phy_exit() carries "// ignore combo phy, leave it until other module configure it" (sunxi_drm_edp.c:826-843), i.e. it depends on the USB stack having initialised the PHY and says so | phy_init()/phy_exit() taken and released by this driver, refcounted by the framework, so the dependency is expressed instead of assumed |
+| the link rate is taken from a lane_para structure filled elsewhere; there is no rate or lane fallback anywhere in the path | the rate comes from the sink's DPCD each time the link is configured, and the ladder that will carry fallback is here and consults the PHY |
+
+WHAT IT OWES
+------------
+
+  1. The four-lane result reproduced on a kernel WITHOUT
+     CONFIG_PHY_SUN60I_A733_COMBO_DP_BRINGUP. Observable, with a sink on J4 and
+     the port in a DP-only pin assignment:
+
+       echo 1 > /sys/kernel/debug/5740000.displayport/aux_enable
+       cat     /sys/kernel/debug/5740000.displayport/link      # sink caps
+       echo 0 >/sys/kernel/debug/5740000.displayport/link      # configure
+       cat     /sys/kernel/debug/5740000.displayport/link      # 2700 Mb/s, 4 lanes
+
+     then train by hand over AUX and read DPCD
+     0x202/0x203 = 0x77 0x77, 0x204 bit0, 0x205 bit0, and 0x210.. = 00 80 per
+     lane. Falsified by: `link` reporting a configured rate while PMA idx 0xC010
+     still reads 0x5100 -- that would mean the call returned success without the
+     table landing.
+  2. The negative control, which is the half that matters: with NO DP pin
+     assignment entered, `echo 0 > link` must FAIL, with the PHY's own message
+     about the lanes not being DisplayPort's, and LINK_CTRL0 0x06C01000 must
+     still read 0x00000111.
+  3. A SUPERSPEED RE-PROOF. This node now references the combophy0 node that is
+     HW-proven at 10 Gbps, and RST_BUS_SERDES is shared. Observable: with no DP
+     sink attached, `lsusb -t` still shows a SuperSpeed device at 10000M after a
+     full boot, and after `echo 1 > aux_enable` as well -- the AUX path takes no
+     reference on the main-link PHY.
+  4. DPCD is read over AUX every time the link is configured, so a sink that
+     NACKs will fail the configure rather than produce a guessed rate. Not yet
+     observed on hardware.
+
+Not hardware-proven, checked only by an automated build. No kernel was built
+locally for this patch by design; it applies at fuzz 0 on the full series.
+
+Assisted-by: Claude
+
+diff --git a/drivers/gpu/drm/sun60i/sun60i-dp.c b/drivers/gpu/drm/sun60i/sun60i-dp.c
+--- a/drivers/gpu/drm/sun60i/sun60i-dp.c
++++ b/drivers/gpu/drm/sun60i/sun60i-dp.c
+@@ -4,11 +4,19 @@
+  *
+  * The A733's DisplayPort transmitter is a Trilinear DP 1.4 core at 0x05740000,
+  * fed by TCON_TV1 and driving the SERDES COMB0 lanes out of the Type-C
+- * connector. This driver implements exactly one part of it -- the AUX channel --
+- * and deliberately nothing else: no link training, no video, no KMS. AUX is what
+- * carries DPCD and EDID, so it is the first piece whose result can be checked
+- * against something the sink says about itself rather than against a register we
+- * wrote ourselves.
++ * connector. This driver implements two parts of it and deliberately nothing
++ * else: the AUX channel, and the configuration of the main link's PHY.
++ *
++ * AUX is what carries DPCD and EDID, so it was the first piece whose result can
++ * be checked against something the sink says about itself rather than against a
++ * register we wrote ourselves.
++ *
++ * The main link is the second, and it is a PHY consumer's job: COMB0 belongs to
++ * the combo-PHY driver, and a DisplayPort controller reaches it through
++ * phy_configure() with a union phy_configure_opts_dp, the way every DP
++ * controller in mainline does. What is still absent is link training and video:
++ * no training pattern sequence, no DPCD 0x100/0x102 writes, no mode setting, no
++ * KMS.
+  *
+  * Every register offset and field below comes from the UM's own register list
+  * (chapter 15.4.7 of the A733 user manual) and
+@@ -37,6 +45,7 @@
+  * Copyright (c) 2026 DockSeed
+  */
+ 
++#include <linux/array_size.h>
+ #include <linux/bitfield.h>
+ #include <linux/clk.h>
+ #include <linux/debugfs.h>
+@@ -44,6 +53,7 @@
+ #include <linux/i2c.h>
+ #include <linux/io.h>
+ #include <linux/iopoll.h>
++#include <linux/minmax.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+ #include <linux/of.h>
+@@ -51,6 +61,8 @@
+ #include <linux/platform_device.h>
+ #include <linux/reset.h>
+ #include <linux/seq_file.h>
++#include <linux/sprintf.h>
++#include <linux/uaccess.h>
+ 
+ #include <drm/display/drm_dp.h>
+ #include <drm/display/drm_dp_helper.h>
+@@ -105,15 +117,51 @@
+ 
+ #define AUX_MAX_PAYLOAD			16
+ 
++/*
++ * COMB0 carries four lanes to the Type-C connector J4 and there is no fifth lane
++ *, so a
++ * sink advertising more is clamped rather than believed.
++ */
++#define SUN60I_DP_MAX_LANES		4
++
++/*
++ * The DP link rate ladder, highest first, in the units DRM counts link rates in
++ * -- drm_dp_bw_code_to_link_rate() returns 162000 for RBR, so the unit is 10 kHz
++ * and Mb/s is that divided by 100. dw-dp.c:604 makes the same conversion for the
++ * same reason: phy_configure_opts_dp counts in Mb/s.
++ *
++ * The ladder exists so that rate selection can ask the PHY what it can do
++ * instead of assuming. Today the PHY has one table (2700 Mb/s), so "auto" lands
++ * there; when a second table is ported, this code needs no change.
++ */
++static const unsigned int sun60i_dp_link_rates[] = { 810000, 540000, 270000, 162000 };
++
++#define SUN60I_DP_RATE_TO_MBPS(r)	((unsigned int)(r) / 100)
++
+ struct sun60i_dp {
+ 	struct device		*dev;
+ 	void __iomem		*base;
+ 	struct clk		*bus_clk;
+ 	struct reset_control	*reset;
+ 	struct phy		*aux_phy;
++	/* The main link. A second consumer of the COMB0 combo-PHY, which dwc3
++	 * also holds -- the two are mutually exclusive on the wire and the
++	 * Type-C mux arbitrates, so one struct phy with two consumers is what
++	 * the hardware is. This driver never powers it on or off; it only
++	 * configures it.
++	 */
++	struct phy		*link_phy;
++	bool			link_phy_inited;
+ 	struct drm_dp_aux	aux;
+ 	struct mutex		lock;		/* serialises enable/disable */
+ 	bool			enabled;
++	/* The sink's own capability bytes, and what was last asked of the PHY.
++	 * rate is in Mb/s, the unit phy_configure_opts_dp counts in.
++	 */
++	u8			dpcd[DP_RECEIVER_CAP_SIZE];
++	bool			dpcd_valid;
++	unsigned int		link_rate;
++	unsigned int		link_lanes;
+ };
+ 
+ static inline struct sun60i_dp *aux_to_dp(struct drm_dp_aux *aux)
+@@ -334,16 +382,225 @@ static int sun60i_dp_aux_enable(struct sun60i_dp *dp)
+ 	return ret;
+ }
+ 
++static void sun60i_dp_link_release(struct sun60i_dp *dp)
++{
++	if (!dp->link_phy_inited)
++		return;
++
++	/* Refcounted: the combo-PHY's own .exit runs only when the LAST
++	 * consumer leaves, so this never pulls COMB0 out from under dwc3
++	 * (drivers/phy/phy-core.c, phy_exit()).
++	 */
++	phy_exit(dp->link_phy);
++	dp->link_phy_inited = false;
++	dp->link_rate = 0;
++	dp->link_lanes = 0;
++}
++
+ static void sun60i_dp_aux_disable(struct sun60i_dp *dp)
+ {
++	sun60i_dp_link_release(dp);
+ 	i2c_del_adapter(&dp->aux.ddc);
+ 	phy_power_off(dp->aux_phy);
+ 	phy_exit(dp->aux_phy);
+ 	reset_control_assert(dp->reset);
+ 	clk_disable_unprepare(dp->bus_clk);
++	dp->dpcd_valid = false;
+ 	dp->enabled = false;
+ }
+ 
++/*
++ * ---------------------------------------------------------------------------
++ * The main link
++ * ---------------------------------------------------------------------------
++ *
++ * COMB0's four lanes are configured through the generic PHY framework, exactly
++ * as every DisplayPort controller in mainline configures its serdes:
++ * phy_configure() with a union phy_configure_opts_dp. The transmitter is the
++ * consumer and the combo-PHY is the provider; nothing else in this tree calls
++ * phy_configure() on the real path, which is why four lanes did not train.
++ *
++ * This driver never calls phy_power_on()/phy_power_off() on that PHY. Which
++ * personality COMB0 carries is the Type-C mux's decision, driven by TCPM from
++ * the alt-mode negotiation, and the PHY refuses a configure until the lanes are
++ * actually DisplayPort's. A transmitter that powered the lanes up on its own
++ * would be racing that decision.
++ */
++
++/* Fill the DP half of a configure/validate request. The union is zeroed first
++ * and always: its callers in mainline routinely leave it partly uninitialised
++ * (dw-dp.c declares it on the stack and sets only the fields it uses), and a provider that
++ * logs or bounds-checks a field the consumer never set then reads stack.
++ */
++static void sun60i_dp_fill_opts(union phy_configure_opts *opts,
++				unsigned int rate_mbps, unsigned int lanes)
++{
++	*opts = (union phy_configure_opts){
++		.dp = {
++			.link_rate = rate_mbps,
++			.lanes	   = lanes,
++			.set_rate  = 1,
++			.set_lanes = 1,
++		},
++	};
++}
++
++/*
++ * Read what the sink says it can do. This is the sink's own answer, not a
++ * register of ours reading back, which is why the rate and lane count are taken
++ * from here rather than assumed.
++ */
++static int sun60i_dp_link_probe(struct sun60i_dp *dp)
++{
++	int ret;
++
++	ret = drm_dp_read_dpcd_caps(&dp->aux, dp->dpcd);
++	if (ret < 0) {
++		dev_err(dp->dev, "DPCD capability read failed: %d\n", ret);
++		dp->dpcd_valid = false;
++		return ret;
++	}
++
++	dp->dpcd_valid = true;
++
++	return 0;
++}
++
++/*
++ * Pick the highest rate the sink offers that the PHY says it can produce.
++ *
++ * phy_validate() is what makes this a question rather than a guess, and it has
++ * one ambiguity worth naming: phy_core returns -EOPNOTSUPP both for "this PHY
++ * has no .validate op" and for a provider that refuses the request with that
++ * code. So a ladder that finds nothing is NOT treated as "no rate works" -- it
++ * drops back to the sink maximum and lets phy_configure() give the real
++ * answer. The vendor resolves the same ambiguity the other way and it costs it
++ * the check: sunxi_drm_edp.c:846-868 maps both -EOPNOTSUPP and -EINVAL to
++ * "pass", so a PHY that rejects a lane count is indistinguishable from one that
++ * has no opinion.
++ */
++static unsigned int sun60i_dp_link_best_rate(struct sun60i_dp *dp,
++					     unsigned int lanes)
++{
++	unsigned int sink_max = drm_dp_max_link_rate(dp->dpcd);
++	union phy_configure_opts opts;
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(sun60i_dp_link_rates); i++) {
++		unsigned int mbps;
++
++		if (sun60i_dp_link_rates[i] > sink_max)
++			continue;
++
++		mbps = SUN60I_DP_RATE_TO_MBPS(sun60i_dp_link_rates[i]);
++		sun60i_dp_fill_opts(&opts, mbps, lanes);
++
++		if (!phy_validate(dp->link_phy, PHY_MODE_DP, PHY_SUBMODE_DP,
++				  &opts))
++			return mbps;
++	}
++
++	dev_warn(dp->dev,
++		 "no link rate up to %u Mb/s validated by the PHY; asking for the sink maximum anyway\n",
++		 SUN60I_DP_RATE_TO_MBPS(sink_max));
++
++	return SUN60I_DP_RATE_TO_MBPS(sink_max);
++}
++
++/*
++ * Configure the main link. THIS is the function link training calls -- it is
++ * shaped after dw_dp_link_configure()/dw_dp_phy_configure()
++ * (drivers/gpu/drm/bridge/synopsys/dw-dp.c:596-660) so that when training lands
++ * it calls this and adds its own DPCD writes, rather than growing a second way
++ * to reach the PHY.
++ *
++ * rate_mbps == 0 or lanes == 0 mean "the best this sink and this PHY agree on".
++ *
++ * What this deliberately does NOT do: write DPCD 0x100/0x101 LINK_BW_SET and
++ * LANE_COUNT_SET, or this core's own link registers. Those two must be set
++ * together with the training pattern sequence, and writing one end here would
++ * leave the source and the sink describing different links with nothing in the
++ * tree to re-converge them -- which is the exact failure mode seen in an earlier
++ * test on the board, when only LINK_BW_SET moved.
++ */
++static int sun60i_dp_link_configure(struct sun60i_dp *dp, unsigned int rate_mbps,
++				    unsigned int lanes)
++{
++	union phy_configure_opts opts;
++	int ret;
++
++	if (!dp->enabled) {
++		dev_err(dp->dev, "the AUX channel is down; nothing can be read from the sink\n");
++		return -ENODEV;
++	}
++
++	if (!dp->link_phy) {
++		dev_err(dp->dev,
++			"no main-link PHY: this node needs phys = <&combophy0> with phy-names \"dp\"\n");
++		return -ENODEV;
++	}
++
++	ret = sun60i_dp_link_probe(dp);
++	if (ret)
++		return ret;
++
++	if (!lanes)
++		lanes = drm_dp_max_lane_count(dp->dpcd);
++	lanes = min_t(unsigned int, lanes, SUN60I_DP_MAX_LANES);
++
++	/* A sink that answers 0 here is answered by name rather than passed
++	 * down to be refused with less context.
++	 */
++	if (!lanes) {
++		dev_err(dp->dev,
++			"sink reports 0 lanes (DPCD 0x0002 = 0x%02x); nothing to configure\n",
++			dp->dpcd[DP_MAX_LANE_COUNT]);
++		return -EINVAL;
++	}
++
++	if (!rate_mbps)
++		rate_mbps = sun60i_dp_link_best_rate(dp, lanes);
++
++	/* phy_ops.configure requires phy_init() to have been called
++	 * (include/linux/phy/phy.h). Taken here rather than at bind, so a board
++	 * that never uses DisplayPort never initialises COMB0 on this driver's
++	 * account, and released again in sun60i_dp_link_release().
++	 */
++	if (!dp->link_phy_inited) {
++		ret = phy_init(dp->link_phy);
++		if (ret) {
++			dev_err(dp->dev, "main-link phy_init: %d\n", ret);
++			return ret;
++		}
++		dp->link_phy_inited = true;
++	}
++
++	sun60i_dp_fill_opts(&opts, rate_mbps, lanes);
++
++	ret = phy_configure(dp->link_phy, &opts);
++	if (ret) {
++		/* Checked, not discarded. The vendor calls phy_configure() from
++		 * two void helpers and looks at neither return value
++		 * (sunxi_edp.c:604-641), so a PHY that refused a rate is
++		 * indistinguishable there from one that applied it.
++		 */
++		dev_err(dp->dev,
++			"main-link PHY refused %u Mb/s over %u lanes: %d\n",
++			rate_mbps, lanes, ret);
++		dp->link_rate = 0;
++		dp->link_lanes = 0;
++		return ret;
++	}
++
++	dp->link_rate = rate_mbps;
++	dp->link_lanes = lanes;
++
++	dev_info(dp->dev, "main link configured: %u Mb/s, %u lanes\n",
++		 rate_mbps, lanes);
++
++	return 0;
++}
++
+ static void sun60i_dp_teardown(void *data)
+ {
+ 	struct sun60i_dp *dp = data;
+@@ -391,6 +648,24 @@ static int sun60i_dp_probe(struct platform_device *pdev)
+ 	if (IS_ERR(dp->aux_phy))
+ 		return dev_err_probe(dev, PTR_ERR(dp->aux_phy), "AUX phy\n");
+ 
++	/*
++	 * The main link: COMB0, shared with dwc3 and arbitrated by the Type-C
++	 * mux inside that PHY. Optional, and only in the sense that the AUX
++	 * channel works without it -- a DT that omits it gets a working DPCD and
++	 * EDID path and a named refusal from `link`.
++	 *
++	 * devm_phy_optional_get(), not the vendor's shape: sunxi_drm_edp.c:2906
++	 * runs devm_phy_get() through IS_ERR_OR_NULL() and turns every failure
++	 * into "not used, maybe", which swallows -EPROBE_DEFER -- so on a boot
++	 * where the combo-PHY has not probed yet, its DP driver comes up
++	 * permanently without a main link and says so only at INFO level. The
++	 * optional variant returns NULL for an ABSENT property and propagates
++	 * every real error, including the deferral.
++	 */
++	dp->link_phy = devm_phy_optional_get(dev, "dp");
++	if (IS_ERR(dp->link_phy))
++		return dev_err_probe(dev, PTR_ERR(dp->link_phy), "main-link phy\n");
++
+ 	dp->aux.name = dev_name(dev);
+ 	dp->aux.dev = dev;
+ 	dp->aux.transfer = sun60i_dp_aux_transfer;

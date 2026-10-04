@@ -1,0 +1,504 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] drm: a733: close two teardown races the success path never walks
+
+Two independent defects, one theme: a path that tears hardware down while
+something else is still using it. Neither is a regression, neither is on the
+HW-proven success path, and neither has been observed on silicon -- they are
+read out of the code and out of the locking rules the two subsystems already
+state for themselves. Found by code review of
+the display driver.
+
+Line numbers below are the files as they stand after `drm-a733-dp-chain-a-hpd-bridge-on-the-typec-receptacle`, i.e. the tree this
+patch applies to.
+
+FIX 1 -- sun60i_dp_aux_transfer() checks dp->enabled with no barrier at all
+===========================================================================
+
+WHAT IS WRONG
+
+sun60i-dp.c:453 reads dp->enabled and then, twelve lines later, does MMIO
+against the block that flag describes. It is the only shared field in
+struct sun60i_dp read outside dp->lock: link_lanes, link_rate, dpcd_valid,
+hpd_asserted and enabled itself are held under it in .detect (:3043),
+.edid_read (:3069), .hpd_notify (:3106), .atomic_enable (:3178),
+.atomic_disable (:3244), .attach (:3292), .detach (:3345), teardown (:3382)
+and all nine debugfs verbs. Here there is nothing.
+
+sun60i_dp_aux_disable() (:1365) runs on the other side of that read:
+phy_power_off(), phy_exit(), reset_control_assert(), clk_disable_unprepare().
+
+THE SCENARIO, AND THE DOOR IT COMES THROUGH IS NOT THE ONE THE COMMENT NAMES
+
+The guard's own comment blames /dev/drm_dp_auxN. That node cannot exist in this
+image: it is gated on CONFIG_DRM_DISPLAY_DP_AUX_CHARDEV
+(drivers/gpu/drm/display/Kconfig:35), which configs/a733_defconfig does not
+carry, so drm_dp_aux_register_devnode() is the stub at
+drm_dp_helper_internal.h:23. ⚠ The symbol was RENAMED upstream from
+DRM_DP_AUX_CHARDEV, so grepping the old spelling returns nothing and looks like
+confirmation -- it is not evidence either way, and the review that found this
+defect cited the old name.
+
+The real door is CONFIG_I2C_CHARDEV=y (configs/a733_defconfig:429). Once
+.attach has called drm_dp_aux_register() the I2C-over-AUX adapter is published
+permanently as /dev/i2c-N, and dp->lock appears nowhere between an
+i2c_transfer() there and this function.
+
+So: a process holds /dev/i2c-N open and issues a transfer. The Type-C cable is
+pulled. typec_displayport calls drm_connector_oob_hotplug_event(), which reaches
+sun60i_dp_bridge_hpd_notify(), which takes dp->lock and calls
+sun60i_dp_aux_disable(). Best case the reader has passed :453 and is inside
+readl_poll_timeout(), so it polls a dead window for its full 3 ms and reports
+-ETIMEDOUT instead of -ENODEV -- which drm_dp_dpcd_access() then retries 32
+times, exactly what the guard exists to prevent. Worst case a readl()/writel()
+lands after clk_disable_unprepare(), which is MMIO against a block whose bus
+clock is off. This driver has never measured that state; `drm-allwinner-a733-displayport-aux` measured only the
+gated-plus-reset one, where the window reads zero.
+
+⚠ THE OBVIOUS FIX IS A DEADLOCK, AND IT IS NOT CLOSE
+
+The review proposes taking dp->lock in sun60i_dp_aux_transfer(), on the
+statement that "no caller holds it except .edid_read, which then needs a
+_locked variant". That statement is false, and it is false nine times over.
+Every one of these holds dp->lock and then issues AUX through a drm_dp_*
+helper, which lands in this function:
+
+  sun60i_dp_video_write()      :1324 guard -> sun60i_dp_video_sink_confirms_stream()
+                                     -> drm_dp_dpcd_read_link_status()  :1070
+  sun60i_dp_link_write()       :2512 guard -> sun60i_dp_link_configure() :1618
+  sun60i_dp_train_show()       :2596 guard -> drm_dp_dpcd_read_link_status() :2601
+  sun60i_dp_train_write()      :2670 guard -> sun60i_dp_train()  (the whole ladder)
+  sun60i_dp_dpcd_show()        :2699 guard -> drm_dp_dpcd_read_data()    :2704
+  sun60i_dp_edid_show()        :2774 guard -> sun60i_dp_edid_block() -> i2c
+  .edid_read                   :3069 guard -> drm_edid_read_ddc()
+  .hpd_notify                  :3106 guard -> sun60i_dp_link_probe() -> :1429
+  .atomic_enable               :3178 guard -> sun60i_dp_train()  -> :1710 :1763
+                                                :1848 :1850 :1932 :1934 :2048 :2120
+
+dp->lock is a plain devm_mutex_init() mutex (:3515). Re-acquiring it in the
+transfer path is an immediate self-deadlock on EVERY modeset, EVERY hot-plug
+and EVERY debugfs verb -- i.e. it would hang precisely the path that is
+hardware-proven. It is not a matter of adding one _locked variant; it is nine
+call chains, several of them recursive through the training ladder.
+
+WHAT THIS DOES INSTEAD
+
+Nothing at all in sun60i_dp_aux_transfer(). Not one lock, not one extra load on
+the hot path; the dp->enabled test stays exactly as the hardware proof left it.
+
+The barrier goes one level up, onto the lock that every route to aux->transfer
+ALREADY holds and that this driver was simply not using: aux->hw_mutex.
+
+  * drm_dp_dpcd_access() takes it around the whole 32-retry loop
+    (drm_dp_helper.c:594, unlocked at :643).
+  * the i2c path takes it through the adapter's own lock ops --
+    drm_dp_aux_init() installs drm_dp_i2c_lock_ops (drm_dp_helper.c:2358;
+    the ops struct itself is at :2244-2248), lock_bus() is mutex_lock(&aux->hw_mutex) (:2229-2232), and
+    i2c_transfer() calls __i2c_lock_bus_helper() -> i2c_lock_bus() before
+    __i2c_transfer() (i2c-core-base.c:2313-2318, i2c-core.h:37-50).
+  * the aux chardev would take it too, and does not exist here anyway.
+
+The public API for exactly this is drm_dp_dpcd_set_powered(), whose kerneldoc
+describes the case verbatim: "If the device attached to the aux bus is powered
+down then there's no reason to attempt a transfer. Error out immediately"
+(drm_dp_helper.c:596-599, the check itself at :600-603). So:
+
+  1. sun60i_dp_aux_disable() calls drm_dp_dpcd_set_powered(&dp->aux, false) as
+     its FIRST statement, before it touches the PHY, the reset or the clock.
+     That call takes aux->hw_mutex, so it cannot return while a transfer is
+     still inside sun60i_dp_aux_transfer(); and once it HAS returned,
+     drm_dp_dpcd_access() (:600) and drm_dp_i2c_xfer() (:2148) both bail with
+     -EBUSY without calling aux->transfer at all. The teardown below it is
+     therefore unreachable while an MMIO access to the block is in flight, in
+     both directions.
+  2. sun60i_dp_aux_enable() opens it again, LAST, after the gate, the reset,
+     the PHY and the divider are all up.
+  3. probe() closes it right after drm_dp_aux_init(), because the field is
+     zero-initialised to "powered" and .attach can register the DDC adapter --
+     and with it /dev/i2c-N -- before any sun60i_dp_aux_enable() has run.
+
+WHY THE SUCCESS PATH CANNOT CHANGE
+
+This is the constraint that shaped the fix, so it is spelled out rather than
+asserted:
+
+  * Zero new locking in the transfer path. sun60i_dp_aux_transfer() is
+    byte-identical apart from its comment. No AUX transaction is serialised
+    against anything it was not already serialised against, because every one
+    of them already ran under aux->hw_mutex before this patch.
+  * No lock is held across a DRM core call. drm_dp_dpcd_set_powered() takes
+    aux->hw_mutex, sets a bool and drops it; it is three of the driver's own
+    lines, in enable, disable and probe, and none of them is inside a callback
+    the core invokes with a lock of its own.
+  * No new lock ORDER either. The order dp->lock -> aux->hw_mutex is what the
+    driver has done since `drm-allwinner-a733-displayport-aux` -- every entry in the nine-call-chain table
+    above is exactly that -- and these three calls follow it. The inverse
+    order, aux->hw_mutex -> dp->lock, is what taking dp->lock in
+    sun60i_dp_aux_transfer() would have created, and it is the reason that fix
+    deadlocks. It is not created here.
+  * The error code the guard was chosen for is preserved. The comment argues
+    -ENODEV over -ETIMEDOUT because the core retries a timeout 32 times. The
+    helper's own refusal is -EBUSY, returned BEFORE that retry loop is entered
+    (drm_dp_helper.c:600-603, ahead of the retry loop at :611), so nothing is
+    retried.
+  * The wait in sun60i_dp_aux_disable() is bounded and sleepable. All four
+    callers (:2424 debugfs aux_enable, :3132 .hpd_notify, :3352 .detach, :3384
+    teardown) already hold dp->lock, so the context sleeps. One AUX transaction
+    is capped at AUX_REPLY_TIMEOUT_US = 3 ms by the readl_poll_timeout() at
+    :514; the helpers bound their own retries (32 in drm_dp_dpcd_access(),
+    aux->ddc.retries = 3). Worst case is a few hundred milliseconds on a cable
+    unplug, against MMIO into an unclocked block.
+
+FALSIFIER
+
+No board is needed for the deadlock half; it is a lockdep question and lockdep
+answers it. Boot with CONFIG_PROVE_LOCKING=y and run, in this order:
+
+  echo 1 > /sys/kernel/debug/5740000.displayport/aux_enable
+  cat    /sys/kernel/debug/5740000.displayport/dpcd     # dp->lock -> hw_mutex
+  i2cdetect -y -r $(i2c-N of the DP AUX adapter)        # hw_mutex alone
+  echo 0 > /sys/kernel/debug/5740000.displayport/aux_enable
+
+Expect: all four complete, dmesg carries no "possible circular locking
+dependency" and no "held lock freed". REFUTED by any lockdep splat naming
+dp->lock and hw_mutex together -- that would mean an inverse acquisition exists
+somewhere this analysis missed.
+
+For the race itself, on a board, with a monitor attached and AUX up:
+
+  while :; do i2cget -y <N> 0x50 0x00 >/dev/null 2>&1; done &
+  # unplug the Type-C cable
+
+Expect: the reader's errors turn to -EBUSY (i2cget prints "Read failed") at the
+instant `hot-plug: sink gone` appears, and dmesg carries no "AUX poll expired"
+line from after it. REFUTED by an "AUX poll expired" line timestamped after
+`hot-plug: sink gone`, which would mean a transfer got past the gate -- and
+refuted just as firmly by an SError or an interconnect stall, which would mean
+the gate closed too late.
+
+⚠ NOT PROVEN ON SILICON. The defect was read, not measured, and so is the fix.
+
+FIX 2 -- sun60i_de_start()'s error path resets the DE with a layer fetching
+===========================================================================
+
+WHAT IS WRONG
+
+sun60i-de.c:1294 calls sun60i_de_layer(), which stages LAY0_ATTCTL with the
+enable bit and the scanout address de->fb_dma. On the only commit backend this
+driver has, .stage is sun60i_de_mmio_stage() -> sun60i_de_write() (:521-524),
+a plain store -- so the write has LANDED when that call returns, not when
+->arm() does. From that point the layer is armed to fetch on the TCON's next
+frame-start pulse, which is the state the driver itself announces at :1314 as
+"scanning ... from %pad".
+
+The two checks that follow both jumped to err_clocks (:1298, :1309), and
+err_clocks is clk_disable_unprepare() + reset_control_assert()
+(sun60i_de_clocks_off()). No sun60i_de_layer_disable(), no sun60i_de_quiesce().
+
+The regular path does both, in that order, and sun60i_de_stop() (:1337-1342)
+says why in its own header: "it has to be given time to finish what is in
+flight before its reset is asserted underneath it". The comment above
+DE_QUIESCE_FRAMES (:350-357) is blunter: "Asserting a bus master's reset in the
+middle of an AXI burst is the classic way to wedge an interconnect, and the
+memory the layer was reading goes straight back to CMA immediately afterwards."
+
+The error path was doing precisely the thing the driver documents as forbidden,
+and it was reachable only from a failure -- so the first symptom would have
+been a wedged interconnect during a bring-up failure, i.e. the moment when
+nobody trusts any other observable either.
+
+THE SCENARIO
+
+sun60i_de_verify() (:759) checks two registers in order: channel VI0
+LAY0_ATTCTL first, blender 0 PIPE_CTL second. The interesting failure is the
+one where the FIRST passes and the second does not -- ATTCTL read back exactly
+as written, so the layer is fetching, while the blender window refused the
+write ("the window is open but did not take the write", :789). verify returns
+-EIO, and before this patch the next thing to happen was reset_control_assert()
+on a live AXI master.
+
+On the debugfs path it gets worse by one step: sun60i_de_enable() (:1351) calls
+sun60i_de_fb_free() on failure, so dma_free_coherent() hands the pages the DE
+may still be reading straight back to CMA.
+
+WHAT THIS DOES
+
+One extra landing label. Jumps taken AFTER the first datapath write go to
+err_layer:, which does sun60i_de_layer_disable() + sun60i_de_quiesce() and then
+falls through to err_clocks: -- the same sequence, in the same order, that
+sun60i_de_stop() uses.
+
+sun60i_de_check_alive()'s jump (:1279) deliberately still goes straight to
+err_clocks: it runs before sun60i_de_top_open(), so no datapath register has
+been written, no bus master is fetching, and there is nothing to quiesce.
+
+Two details that were checked rather than assumed:
+
+  * sun60i_de_quiesce() divides by de->mode.clock. de->mode is assigned at
+    probe (:1960, sun60i_display_mode_1920x1200) and overwritten by
+    drm_mode_copy() in sun60i_de_kms_enable() (:1740) before sun60i_de_start()
+    is ever called, so it is never zero on either path. This is the same
+    expression sun60i_de_stop() already evaluates unconditionally.
+  * the ->arm() failure at :1298 also routes to err_layer, even though on the
+    MMIO backend sun60i_de_mmio_arm() cannot fail (it returns 0
+    unconditionally, :526-536). If a future RCQ backend makes that reachable,
+    the staged ATTCTL may never have committed and the quiesce is 34 ms wasted
+    on a failure path -- which is the cheap direction to be wrong in.
+
+COORDINATION WITH `drm-a733-three-consistency-fixes` -- CHECKED AGAINST ITS TEXT, NOT GUESSED AT. `drm-a733-three-consistency-fixes` landed
+while this patch was being written and does make sun60i_de_layer_disable()
+return int (sun60i-de.c:1107 after it). It adds no __must_check, so the
+err_layer: call site here compiles clean at W=1 on the combined stack -- and it
+is the same call site convention sun60i_de_stop() itself uses two lines later,
+which also drops the return. If a later patch adds __must_check, both call
+sites need the return consumed, not just this one.
+
+FALSIFIER
+
+The failure is not reachable by hand today, so the falsifier is the code path,
+made visible:
+
+  # a DE that fails verify: hold the blender window shut by starting the DE
+  # from a state where de_top was never opened -- or simply instrument it
+  echo 1 > /sys/kernel/debug/5000000.display-engine/enable
+
+Expect on a verify failure: the two dev_err lines from sun60i_de_verify(), then
+a ~34 ms gap (two frames at the 1920x1200 mode), then the block goes to reset,
+and `cat state` afterwards reads LAY0_ATTCTL as 0. REFUTED by LAY0_ATTCTL still
+carrying its enable bit after the failure, or by no gap at all -- either means
+the quiesce did not run.
+
+The stronger falsifier is the one this patch cannot run: a failure injected
+while the TCON is genuinely scanning, with the DE's AXI port watched. Nobody
+has done that, and nobody should conclude from its absence that the old path
+was safe -- the interconnect stall it risks is not something a verify failure
+would survive to report.
+
+⚠ NOT PROVEN ON SILICON.
+
+WHAT THE VENDOR DOES HERE
+=========================
+
+The answer differs per fix.
+
+Fix 1: sunxi_drm_edp.c cannot have this defect, but only because it
+never calls drm_dp_aux_register(), never publishes an I2C-over-AUX adapter and
+hand-rolls its own AUX entry points, so there is no externally reachable caller
+to race in the first place. It also has no equivalent guard at all: its
+transfer path does no enabled-check, which is the defect `drm-allwinner-a733-displayport-aux` already answers.
+
+Fix 2: the A523/T527 series carries a patch of its own titled "channel quiesce
+before stopping" -- which this driver's DE_QUIESCE_FRAMES comment already cites
+as the precedent. What neither that series nor the vendor does is apply the
+same care to the FAILURE path. That is what this patch adds, and it is one
+label.
+
+VERIFIED
+========
+
+  applies clean : yes, BOTH WITH AND WITHOUT `drm-a733-dp-repair-three-error-paths` and `drm-a733-three-consistency-fixes`, `patch -p1 --fuzz=0`
+                  on a freshly unpacked 6.18.36 in each case. No .rej, no
+                  .orig, either way.
+                    (a) series alone -- all 129 of patches/*.patch in glob
+                        order, then this patch. Every hunk at offset 0.
+                    (b) the real stack -- that series, then `drm-a733-dp-repair-three-error-paths`, then `drm-a733-three-consistency-fixes`,
+                        then this patch. Applies with line offsets only
+                        (dp.c +40/+65/+95, de.c +14), which --fuzz=0 permits:
+                        it forbids fuzzy CONTEXT matching, not relocation.
+                  The hunks are cut against the series-alone tree (a) deliberately,
+                  because that makes the patch independent of whether `drm-a733-dp-repair-three-error-paths` and
+                  `drm-a733-three-consistency-fixes` are present -- (a) and (b) are both real runs, not one
+                  run and one inference.
+                  ⚠ Where it came CLOSE: `drm-a733-dp-repair-three-error-paths`'s `@@ -626,18 +675,9 @@` rewrites
+                  sun60i_dp_aux_enable()'s adapter-add block, ~15 lines above
+                  this patch's `dp->enabled = true` hunk. It does not touch the
+                  tail, so the ordering this fix depends on survives -- verified
+                  by reading the merged function, not by the exit status:
+                  dp->enabled = true, then drm_dp_dpcd_set_powered(true), then
+                  return 0, with every err_ label below them.
+  builds        : yes, both trees -- `make ARCH=arm64 W=1
+                  drivers/gpu/drm/sun60i/`, native aarch64 gcc 14.2.0, with
+                  DRM_SUN60I_{DP,DE,TCON_TV,KMS}=m and I2C_CHARDEV=y. All four
+                  objects compile with NO warning on the series-alone tree and
+                  NO warning on the `drm-a733-dp-repair-three-error-paths`+`drm-a733-three-consistency-fixes`+`drm-a733-close-two-teardown-races` stack.
+  new symbols   : one, drm_dp_dpcd_set_powered(), declared at
+                  include/drm/display/drm_dp_helper.h:534 and exported at
+                  drm_dp_helper.c:693. <drm/display/drm_dp_helper.h> is already
+                  included by this file (:87), so no new include.
+  checkpatch    : `--strict --terse --no-signoff` reports 0 errors, 0 checks
+                  and 1 warning -- the >75-char commit description, which `drm-a733-dp-detect-reports-hot-plug-not-dpcd-valid`
+                  and `drm-a733-dp-chain-a-hpd-bridge-on-the-typec-receptacle` emit identically and which is this tree's headerless
+                  patch format, not a defect in this patch.
+  lockdep       : NOT run. The deadlock analysis above is a reading of every
+                  dp->lock acquisition in the file plus every path the DP
+                  helper takes to aux->transfer; CONFIG_PROVE_LOCKING is the
+                  falsifier, and nobody has booted it.
+  on silicon    : NO. Neither fix. Both defects were read out of the code.
+
+Assisted-by: Claude
+
+diff --git a/drivers/gpu/drm/sun60i/sun60i-de.c b/drivers/gpu/drm/sun60i/sun60i-de.c
+--- a/drivers/gpu/drm/sun60i/sun60i-de.c
++++ b/drivers/gpu/drm/sun60i/sun60i-de.c
+@@ -1191,7 +1191,7 @@ static int sun60i_de_start(struct sun60i_de *de)
+ 	ret = de->commit->arm(de);
+ 	if (ret) {
+ 		dev_err(de->dev, "commit (%s): %d\n", de->commit->name, ret);
+-		goto err_clocks;
++		goto err_layer;
+ 	}
+ 
+ 	/*
+@@ -1202,7 +1202,7 @@ static int sun60i_de_start(struct sun60i_de *de)
+ 	 */
+ 	ret = sun60i_de_verify(de);
+ 	if (ret)
+-		goto err_clocks;
++		goto err_layer;
+ 
+ 	de->enabled = true;
+ 	de->layer_on = true;
+@@ -1216,6 +1216,28 @@ static int sun60i_de_start(struct sun60i_de *de)
+ 
+ 	return 0;
+ 
++	/*
++	 * TWO LANDING LABELS, and which one a failure takes is decided by one
++	 * question: has sun60i_de_layer() run? Everything above it is the
++	 * control plane, so a failure there leaves no bus master fetching and
++	 * err_clocks is the whole of the cleanup -- which is why
++	 * sun60i_de_check_alive() still jumps straight there.
++	 *
++	 * From sun60i_de_layer() onwards it is not. That call stages
++	 * LAY0_ATTCTL with the enable bit and the scanout address, and
++	 * .stage on the only backend this driver has is a plain
++	 * sun60i_de_write() -- so by the time either of the two checks below it
++	 * can fail, the layer is armed to fetch from de->fb_dma on the TCON's
++	 * next frame-start pulse. Dropping into err_clocks from there asserts
++	 * the DE's reset underneath a live AXI master, which is precisely what
++	 * the comment at DE_QUIESCE_FRAMES exists to forbid, and on the debugfs
++	 * path sun60i_de_enable() then hands the same pages back with
++	 * dma_free_coherent(). This is the failure the error path was creating
++	 * out of a failure the hardware had already contained.
++	 */
++err_layer:
++	sun60i_de_layer_disable(de);
++	sun60i_de_quiesce(de);
+ err_clocks:
+ 	sun60i_de_clocks_off(de);
+ 
+diff --git a/drivers/gpu/drm/sun60i/sun60i-dp.c b/drivers/gpu/drm/sun60i/sun60i-dp.c
+--- a/drivers/gpu/drm/sun60i/sun60i-dp.c
++++ b/drivers/gpu/drm/sun60i/sun60i-dp.c
+@@ -422,19 +422,44 @@ static ssize_t sun60i_dp_aux_transfer(struct drm_dp_aux *aux,
+ 	 *
+ 	 * Until drm_dp_aux_register() had a caller, every route into this
+ 	 * function ran through a debugfs verb or through an i2c adapter that
+-	 * only exists while the block is enabled. drm_dp_aux_register() adds two
+-	 * that do not: the /dev/drm_dp_auxN chardev, which any process holding
+-	 * it open can drive at any instant, and an adapter that stays registered
+-	 * across an `echo 0 > aux_enable`. Both land here with the bus clock
+-	 * gated and the reset asserted -- the state in which `drm-allwinner-a733-displayport-aux` MEASURED the
+-	 * whole 4 KiB window reading zero. The first readl() would then see
+-	 * "no request in progress", the AUX_COMMAND write would go nowhere, and
+-	 * the poll below would burn its full 3 ms before reporting a timeout
+-	 * that says nothing about the sink.
++	 * only exists while the block is enabled. drm_dp_aux_register() adds one
++	 * that does not: an I2C-over-AUX adapter that stays registered across an
++	 * `echo 0 > aux_enable`, which CONFIG_I2C_CHARDEV=y publishes as
++	 * /dev/i2c-N for any process to drive at any instant. It lands here with
++	 * the bus clock gated and the reset asserted -- the state in which `drm-allwinner-a733-displayport-aux`
++	 * MEASURED the whole 4 KiB window reading zero. The first readl() would
++	 * then see "no request in progress", the AUX_COMMAND write would go
++	 * nowhere, and the poll below would burn its full 3 ms before reporting a
++	 * timeout that says nothing about the sink.
++	 *
++	 * ⚠ NOT the /dev/drm_dp_auxN chardev this comment used to name. That node
++	 * is gated on CONFIG_DRM_DISPLAY_DP_AUX_CHARDEV (drm/display/Kconfig:35 --
++	 * the symbol was renamed from DRM_DP_AUX_CHARDEV upstream, so the old
++	 * spelling greps clean in this tree and proves nothing), and it appears
++	 * nowhere in configs/a733_defconfig: drm_dp_aux_register_devnode() is the
++	 * stub at drm_dp_helper_internal.h:23 and the node does not exist. What
++	 * DOES exist is CONFIG_I2C_CHARDEV=y (a733_defconfig:429). Naming the
++	 * wrong door is what kept the real hole invisible: this is a PLAIN READ
++	 * of dp->enabled, and dp->lock -- which every other shared field in this
++	 * struct is held under -- is nowhere in the i2c path.
++	 *
++	 * ⚠ AND IT CANNOT BECOME THE BARRIER BY TAKING dp->lock HERE. That is a
++	 * self-deadlock, not a fix: .atomic_enable, .hpd_notify, .edid_read and
++	 * five debugfs verbs all hold dp->lock across drm_dp_* helpers that land
++	 * in this function. The barrier is one level up instead, where the lock
++	 * that every route to aux->transfer ALREADY holds lives:
++	 * sun60i_dp_aux_disable() calls drm_dp_dpcd_set_powered(false), which
++	 * takes aux->hw_mutex, and after it returns drm_dp_dpcd_access() and
++	 * drm_dp_i2c_xfer() both refuse before calling us at all.
++	 *
++	 * This test survives as the second line, and as the only cover for the
++	 * window between bind and the first sun60i_dp_aux_enable().
+ 	 *
+ 	 * -ENODEV, not -ETIMEDOUT: the DRM core retries a timeout (32 times, per
+ 	 * drm_dp_dpcd_access()) and does not retry a missing device, and no
+-	 * number of retries can change this answer.
++	 * number of retries can change this answer. The helper's own refusal is
++	 * -EBUSY, returned before that retry loop is entered, so it keeps the
++	 * property this line was chosen for.
+ 	 */
+ 	if (!dp->enabled)
+ 		return -ENODEV;
+@@ -667,6 +692,13 @@ static int sun60i_dp_aux_enable(struct sun60i_dp *dp)
+ 	}
+ 
+ 	dp->enabled = true;
++
++	/* Opened LAST, on purpose: from here a transfer that wins aux->hw_mutex
++	 * finds a block whose gate, reset, PHY and divider are all up. The
++	 * counterpart is the first line of sun60i_dp_aux_disable().
++	 */
++	drm_dp_dpcd_set_powered(&dp->aux, true);
++
+ 	dev_info(dp->dev, "AUX up: core 0x%08x, divider %lu\n",
+ 		 core_id, rate_mhz);
+ 
+@@ -1263,6 +1295,26 @@ static void sun60i_dp_link_release(struct sun60i_dp *dp)
+ 
+ static void sun60i_dp_aux_disable(struct sun60i_dp *dp)
+ {
++	/*
++	 * FIRST, and this one line is the whole fix. It takes aux->hw_mutex, so
++	 * it cannot return while a transfer is still inside
++	 * sun60i_dp_aux_transfer(); once it has returned,
++	 * drm_dp_dpcd_access() and drm_dp_i2c_xfer() both fail with -EBUSY
++	 * without calling aux->transfer. Everything below -- and in particular
++	 * reset_control_assert() and clk_disable_unprepare() -- is therefore
++	 * unreachable while an MMIO access to this block is in flight.
++	 *
++	 * The wait is bounded, and every caller of this function already holds
++	 * dp->lock and may sleep: one AUX transaction is capped at
++	 * AUX_REPLY_TIMEOUT_US = 3 ms by the readl_poll_timeout() in
++	 * sun60i_dp_aux_transfer(), and the helpers bound their own retries
++	 * (32 in drm_dp_dpcd_access(), aux->ddc.retries = 3 for i2c).
++	 *
++	 * NOT dp->lock in the transfer path, which is the obvious-looking fix
++	 * and deadlocks -- see the block above the dp->enabled test.
++	 */
++	drm_dp_dpcd_set_powered(&dp->aux, false);
++
+ 	sun60i_dp_video_disable(dp);
+ 	sun60i_dp_link_release(dp);
+ 	/* Only the adapter this function's counterpart added. The core's one
+@@ -3084,6 +3136,16 @@ static int sun60i_dp_probe(struct platform_device *pdev)
+ 	dp->aux.transfer = sun60i_dp_aux_transfer;
+ 	drm_dp_aux_init(&dp->aux);
+ 
++	/*
++	 * Down from bind, because that is what is true: no consumer has entered
++	 * DisplayPort alt mode and sun60i_dp_aux_enable() has not run. The flag
++	 * is zero-initialised to "powered", which would leave the window between
++	 * here and .attach's drm_dp_aux_register() -- where the DDC adapter, and
++	 * with it /dev/i2c-N, appears -- guarded by the unlocked dp->enabled
++	 * read alone.
++	 */
++	drm_dp_dpcd_set_powered(&dp->aux, false);
++
+ 	/*
+ 	 * of_node is what of_drm_find_bridge() matches on, so it is what lets
+ 	 * the encoder half find this bridge without either driver knowing about

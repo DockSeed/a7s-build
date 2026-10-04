@@ -1,0 +1,1174 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] drm: allwinner: A733 TCON_TV1 -- the timing generator, and its own video source
+
+[Recipe cut: the debugfs files enable, source, pattern and scanout are not
+carried; the raster is started by the KMS master only.]
+
+The block that turns a pixel clock into a raster, and the second half of the
+pixel path this tree can now drive from a driver rather than by hand. TCON_TV1
+sits at 0x05731000, feeds the DisplayPort transmitter at 0x05740000, and can be
+its own video source -- which is why a picture on this SoC needs neither a
+display engine nor a KMS driver.
+
+THIS IS A TRANSCRIPTION OF A PROVEN SEQUENCE
+--------------------------------------------
+
+Fifteen registers, driven by hand on the 8 GiB board on 2026-08-18 with the effect
+watched at each step, and the result was a 1920x1200 test pattern on a
+DisplayPort monitor, confirmed by eye. The target state was cross-read the
+same day off a live vendor link: fifteen non-zero words in the whole 4 KiB
+window, which is the most useful number in that capture:
+whatever a TCON driver for this SoC is, it is not large.
+
+Every field comes from the A733 UM's own TCON_TV register list, chapter
+15.2.10, not from the classic sunxi TCON1 layout -- that would be the wrong
+provenance, and it is why this file names the four words the UM does NOT
+describe individually instead of guessing at them.
+
+WHAT IS COMPUTED, WHAT IS CARRIED, AND WHAT IS DROPPED
+------------------------------------------------------
+
+| register              | this driver                                          |
+|-----------------------|------------------------------------------------------|
+| TV_BASIC1..5          | computed from the mode: the mode minus one throughout |
+|                       | with the vertical total doubled, as 15.2.10.7 says    |
+| TV_CTL START_DELAY    | computed, blanking lines minus five -- see below      |
+| TV_IO_POL             | two bits from the mode's sync flags, IO2_INV carried   |
+| TV_PIXELDEPTH_MODE    | computed from bpc; must agree with the DP side's MISC0|
+| TV_SRC_CTL            | VDBIST + pattern, both reachable from debugfs         |
+| TV_GCTL, TV_IO_TRI    | carried; TV_GCTL bit 31 is not in the UM              |
+| TV_GINT0              | ZERO, not the vendor's interrupt enable -- see below   |
+| TV_DEBUG              | ZERO, which is the CLEAR of its two W0C latches       |
+| TCON 0x0500, 0x0FE8   | carried, in no UM register list at all                |
+| TCON 0x0304, 0x0308   | NOT written -- settled, see below                     |
+| VO1 0x0000, 0x0020    | computed: the two documented VIDEO_OUT1_SYS registers |
+| VO1 0x00F4            | carried, in no UM register list                       |
+
+THREE OF THOSE ARE DEPARTURES FROM THE BY-HAND RUN, EACH NAMED IN THE CODE
+
+1. TV_GINT0_REG is written zero where the run writes TV_VB_INT_EN. Nothing in
+   this tree services a TCON interrupt, and an enabled interrupt with no handler
+   is a latch nobody clears. Falsified by: the scan stopping without it.
+
+2. TV_DEBUG_REG is written zero where the run writes back the 0x000002E5 it read
+   from a live link. Only bits 30 and 29 of that register are writable, both are
+   R/W0C, and [15:0] is a read-only line counter -- so zero is the clear, and
+   0x2E5 is a line number written into a counter.
+
+3. TV_FILL_BEGIN (0x0304) and TV_FILL_END (0x0308) are not written, and this one
+   is settled rather than argued. Both are documented, at 0x304 + N*0x0C and
+   0x308 + N*0x0C (UM 15.2.10.18/19), which is why a plain offset search misses
+   them; both are gated by TV_FILL_CTL_REG bit 31 TV_FILL_EN, "0: Bypass", which
+   is zero at reset, zero on the vendor's live link and zero in our own run. And
+   the two values are explained: the vendor programs FILL_BEGIN = (vtotal+1)<<12
+   and FILL_END = (vtotal+vactive_space)<<12 every modeset
+   (tcon_tv_reg.c:147-153), so 0x004D4000 / 0x004D3000 are 1236<<12 and 1235<<12
+   against VTOTAL 1235 -- its own arithmetic with the feature switched off.
+
+THE ONE UNDOCUMENTED WORD THAT IS LOAD-BEARING
+-----------------------------------------------
+
+TV_GCTL_REG bit 31. UM 15.2.10.1 gives this register [5:4] PIXEL_MODE, bit 0
+UNSTRICT_TIMING_MODE_SEL and calls [31:6] reserved, yet both the vendor's live
+link and the run that produced a picture carry 0x80000000 and nothing scans
+without it. Every sunxi TCON has called the same bit TCON_EN; that is a
+hypothesis about why it works, not a source, and the comment on
+TV_GCTL_REG in the code says so.
+
+⬜ TCON 0x0500, TCON 0x0FE8 and VO1 0x00F4 are in no UM list, and there is now a
+cheap experiment for all three: the VENDOR'S OWN DRIVER DOES NOT WRITE THEM
+EITHER. Its TCON_TV register model stops at 0x340 (tcon_tv_reg.h:415) and its
+TCON-TOP model at 0x2C (tcon_top_type.h:216-231). So what a live vendor link
+carries at those offsets is power-on state or the bootloader's, which makes the
+three writes candidates for deletion. Reading them at the U-Boot prompt settles
+it, exactly as it settled PLL_VIDEO1 bit 24 on 2026-08-19.
+
+START_DELAY -- A HINT THAT VERIFIED, AND TWO DEFECTS NOT TAKEN
+--------------------------------------------------------------
+
+UM 15.2.10.6 gives the field ([19:4]) and its meaning (it delays the release of
+the SYNC signal towards the DE, in lines; with a value of 2, de_syn stays valid
+until the end of the 2nd line) and no value. The vendor computes
+vertical blanking minus five and a live link carries exactly that: 1235 - 1200 -
+5 = 30 = the 0x1E in 0x800001E0. The formula is taken because it reproduces
+silicon; the five is a bare magic number in that code and is named as one here
+rather than presented as a derivation.
+
+Two defects in that code are not taken, and both are silent:
+
+  - it declares the field FIVE bits wide, start_delay:5 at [8:4]
+    (tcon_tv_reg.h:66), against the UM's [19:4]. It therefore clamps at 31 and
+    pins every mode with more than 36 blanking lines to the same delay.
+  - the subtraction runs on a u32 (tcon_tv_reg.c:154-157), so a mode with fewer
+    than five blanking lines wraps to ~4.29e9, fails the unsigned "> 31" test
+    and is programmed as the MAXIMUM delay -- for the mode that wanted the
+    minimum.
+
+VDBIST IS A MODE, NOT THE ARCHITECTURE
+---------------------------------------
+
+TV_SRC_CTL_REG bit 0 chooses the data source: 0 takes the picture from the
+display engine, 1 from the VDBIST pattern generator, and [2:1]
+picks colour bars, greyscale, black-by-white or gridding. UM 15.2.6.3 describes
+the generator as a test aid for exercising and debugging the lane path from
+TCON_TV through HDMI/eDP to the screen.
+
+That bit is why a picture needs no display engine -- and it is also why a
+picture can never be a console. So it is one register bit here, reachable both
+ways from debugfs in the register's own 0/1 encoding, and every other register
+in this driver is derived from a struct drm_display_mode. Writing 0 to `source`
+today gives a black screen and that is the correct answer, not a bug: there is
+no display-engine driver yet to be the source. When there is, it clears that bit
+and nothing in this file changes shape.
+
+THE OBSERVABLE THIS PATCH OWES
+-------------------------------
+
+Not "the registers read back". TV_DEBUG_REG [15:0] TV_CURRENT_LINE is a counter
+the TCON's own scan drives, bounded by the programmed VTOTAL. debugfs `scanout`
+samples it 512 times ~100 us apart -- spread deliberately, because 512 reads
+back to back span microseconds and would report a stuck counter on a perfectly
+scanning TCON -- and reports min, max, wraps and a verdict against the mode's
+VTOTAL with a tolerance derived from the sampling stride, not picked.
+
+Next to it, the two sticky data-supply latches, read before and after the
+window so an old underflow is not reported as a new one. Nothing has ever
+exercised them here. ⬜ The UM and the vendor disagree about bit 29: the UM
+calls it LOSTWARN, the vendor's model calls it TCON_TV0's field
+polarity (tcon_tv_reg.h:185-198). They agree on bit 30, which is this TCON's
+FIFO underflow either way, and TCON_TV0 is dark on this board -- so the report
+is safe under both readings and the ambiguity is recorded rather than resolved.
+
+WHERE THE VENDOR DRIVER DIFFERS HERE, AND WHAT THIS PATCH DOES
+--------------------------------------------------------------
+
+Observations from the vendor BSP source
+(bsp/drivers/drm/sunxi_device/{sunxi_tcon.c,hardware/lowlevel_tcon/*}).
+
+| vendor | ours |
+|---|---|
+| `tcon_tv_close()` disables a different interrupt than open enables: open enables LCD_IRQ_TCON1_VBLK (14), close clears LCD_IRQ_TCON0_VBLK (15) -- tcon_tv_reg.c:101 against :109, so bit 14 stays set. The TCON_TV vblank interrupt is never disabled | no interrupt is enabled at all, because nothing here services one, and the reason is recorded here |
+| the IRQ is freed BEFORE the source is stopped (sunxi_tcon.c:834 before :835-836), and `sunxi_tcon_free_irq()` can decline to free at all, comparing a pointer against a struct that every mode_init overwrites by memcpy -- the line then leaks and the next request on a non-shared IRQ returns -EBUSY | — |
+| FIFO underflow is sampled every vblank and dropped: tcon_tv_reg.c:91 clears it, sunxi_drm_crtc.c:1595 increments a counter, and that counter is printed only in a debugfs atomic-state dump (:1830). No log line, no recovery | read and reported with the line counter, before and after a measured window, with the UM's own words for what each latch means |
+| TV_FILL_BEGIN/END/DATA written on every modeset into a block whose enable is gated on `vactive_space`, which no code in that tree ever assigns -- so FILL_END always lands below FILL_BEGIN and FILL_EN is always 0 | not written; the gate is read from the UM and the values are explained rather than carried |
+| START_DELAY truncated to five bits and computed with an unsigned subtraction that wraps | the UM's field width, and a guarded subtraction |
+| `is_enabled = true` is set before the bring-up begins (sunxi_tcon.c:799) and not one of the five calls after it -- clocks, resets, rate, timings, IRQ -- has its return value checked; `sunxi_tcon_edp_mode_init` returns 0 unconditionally, and its caller ignores that too | every clock, reset and rate call checked and unwound; `enabled` set only after the last of them |
+| `devm_ioremap_resource()` tested against NULL (sunxi_tcon.c:890, sunxi_tcon_top.c:63) -- it returns an ERR_PTR, so the check is dead and an error pointer is dereferenced as MMIO. `platform_get_irq` tested with `if (!irq_no)` (:896), likewise dead for a negative errno | IS_ERR / dev_err_probe throughout |
+| the pixel clock is set with `clk_set_rate()` and the result never read back (sunxi_tcon.c:801-802) | asked for, then read back and refused if the clock model did not deliver it -- PLL_VIDEO1 and EDP_TV_CLK are new in this tree and are the thing under test |
+| its `colorbar` sysfs writes a 3-bit `src_sel` starting at bit 0 (tcon_tv_reg.h:56), which straddles the UM's VDBIST_MODE (bit 0) and TV_SRC_SEL ([2:1]) -- so half of its 0..7 range silently turns the pattern generator OFF | the two fields are separate, named, and carry the UM's own encoding |
+| ~200 dead lines in one 579-line file: `tcon_tv_ceu()` with a 91-entry sine table and five colour matrices, zero callers, and external linkage, so it stays in the build; `tcon_de_attach()` whose entire 30-line body sits after an unconditional `return 0` | — |
+| no `readl`/`writel` anywhere in the TCON layer: a `volatile struct *` with bitfield stores, `__iomem` cast through `uintptr_t` (sunxi_tcon.c:888), and therefore no barriers between register writes and the clock/reset calls around them | normal MMIO accessors |
+
+AND WHAT IT GETS RIGHT, WHICH IS TAKEN RATHER THAN DIFFERENTIATED FROM
+
+  - The enable ORDER. It clears TV_EN, the module enable and both halves of the
+    interrupt register before touching a timing register, and asserts TV_EN last
+    (tcon_tv_reg.c:29-38, :100). Off a fresh reset those first writes are no-ops,
+    which is why the by-hand run never needed them -- they are what makes a
+    second enable, or an enable over a bootloader's splash, land in a defined
+    state. This driver does the same and says where it comes from.
+  - Sync polarity is derived from the mode, not hardcoded, and the SAME two
+    flags are fed to the DisplayPort side's MSA polarity register -- so the TCON
+    and the transmitter cannot describe different modes. That is the right
+    architecture and this driver keeps it, with the mode as the single source.
+  - Timing arithmetic is consistently zero-based and folds the sync pulse into
+    the back porch, which is what the registers want.
+
+THE DEVICE TREE THIS CONSUMES, AND THE TWO THINGS IT DOES NOT FIND THERE
+------------------------------------------------------------------------
+
+The node is added by `arm64-dts-a733-tcon-tv1-and-the-dp-phy-pad-window` on the branch that models the pixel clock, so this
+patch contains no DTS and takes what that node describes:
+
+    tcon_tv1: lcd-controller@5731000 {
+            compatible = "allwinner,sun60i-a733-tcon-tv";
+            reg = <0x0 0x05731000 0x0 0x1000>;
+            clocks = <&ccu CLK_BUS_TCON_TV1>, <&ccu CLK_EDP_TV>;
+            clock-names = "bus", "tcon-tv";
+            resets = <&ccu RST_BUS_TCON_TV1>;
+    };
+
+⬜ TWO THINGS THE HARDWARE NEEDS AND THAT NODE DOES NOT CARRY. Both are
+optional in this driver and neither is optional on silicon, so both are named
+at enable with their addresses rather than skipped silently:
+
+  1. VIDEO_OUT1_SYS (DISPLAY1_TOP) at 0x05510000. Two registers out of its
+     4 KiB: TV_CLK_EDP_I2S1_SRC bit 5 and VO1_MODULE_GATING bit 21 TV1_GATE.
+     Without them this TCON's clock comes from the HDMI side and its output
+     stays gated -- and the symptom is a perfect-looking TCON register set and
+     no picture. `arm64-dts-a733-tcon-tv1-and-the-dp-phy-pad-window` states the intent to give that block a node of its own,
+     the shape mainline uses for sun8i-tcon-top, and that the node is owed;
+     until it exists this driver takes an OPTIONAL second reg window, and
+     without either it logs:
+
+       no VIDEO_OUT1_SYS window: 0x05510000 bit 5 (clock from EDP) and
+       0x05510020 bit 21 (TV1_GATE) are NOT set
+
+  2. The DPSS_TOP1 gate and reset (DPSS_TOP1_BGR, CCU 0x16CC). TOP1 is in the
+     path and TOP0 is not. Taken as an optional "dpss" clock and reset here;
+     absent, enable logs that 0x020036CC is not touched.
+
+Whether those live on this node or on a block of their own is the device
+tree's decision, not this driver's -- which is why they are optional lookups
+and a loud warning rather than a probe failure. A bring-up session can make
+both by hand; a KMS driver must not inherit a silent gap.
+
+VO1_MODULE_GATING was first listed here as one of the words absent from the UM.
+It is not: UM 15.2.9.2 names bits 28, 21 and 20, and the 0x00200000 a live
+link carries is exactly TV1_GATE released with TV0's two gates shut.
+
+The node's `interrupts = <GIC_SPI 58 ...>` is deliberately not requested: this
+driver enables no TCON interrupt, for the reason given above.
+
+FILES
+-----
+
+This patch adds
+drivers/gpu/drm/sun60i/sun60i-tcon-tv.c and sun60i-display.h, and edits
+drivers/gpu/drm/Makefile plus the Kconfig and Makefile that
+`drm-allwinner-a733-displayport-aux` created.
+The device-tree half is not in this patch.
+
+drivers/gpu/drm/Makefile's `obj-$(CONFIG_DRM_SUN60I_DP) += sun60i/` becomes
+`obj-y += sun60i/` for the same reason `obj-y += renesas/` reads that way: the
+directory now holds two independent tristates, and the old line would skip the
+whole directory when only the TCON is enabled.
+
+WHAT IT OWES
+------------
+
+  1. THE SCAN. With a sink on J4, the port in a DP pin assignment and the CCU
+     patches present. ⚠ The debugfs directory is named after the DT node, and
+     `arm64-dts-a733-tcon-tv1-and-the-dp-phy-pad-window` calls it lcd-controller@5731000, so it is 5731000.lcd-controller and
+     not 5731000.tcon:
+
+       echo 1 > /sys/kernel/debug/5731000.lcd-controller/enable
+       cat     /sys/kernel/debug/5731000.lcd-controller/scanout
+
+     PASS is the verdict line reading SCANNING with a maximum of 1235 -- the
+     programmed VTOTAL -- and at least one wrap over the 512 samples. Falsified
+     by: a stuck counter (nothing is scanning), a maximum above 1235 (the timing
+     went in wrong), or `underflow`/`lostwarn` set during the window.
+  2. THE REGISTER STATE, against the register values of a working link:
+     0x05731090 = 0x800001E0, 0x0573109C = 0x077F04AF, 0x057310A0 = 0x081F006F,
+     0x057310A4 = 0x09A6001F, 0x057310A8 = 0x001F0005, 0x05731098 = 0x000009A6,
+     0x05731088 = 0x06000000, 0x0573108C = 0x0FFFFFFF, 0x05731040 = 0x00000001,
+     0x05731340 = 0x00000001, 0x05731000 = 0x80000000, 0x05510000 = 0x00000020,
+     0x05510020 = 0x00200000. Two differences from those values are intended and are
+     the point: 0x05731004 reads 0x00000000 rather than 0x40000000, and 0x05731304
+     / 0x05731308 read 0x00000000 rather than 0x004D4000 / 0x004D3000.
+  3. A PICTURE, by eye, with the transmitter's half (`drm-a733-dp-the-main-video-stream`) and link training.
+     Nothing else proves the pattern is on the screen -- a register
+     read-back is not that proof.
+
+Build-tested only -- not hardware-proven. Applies at fuzz 0 on the full series; the
+sun60i/ directory builds W=1 warning-free with CONFIG_DRM_SUN60I_TCON_TV=m;
+checkpatch --strict reports 0 errors, 0 warnings, 0 checks.
+
+Assisted-by: Claude
+
+diff --git a/drivers/gpu/drm/Makefile b/drivers/gpu/drm/Makefile
+--- a/drivers/gpu/drm/Makefile
++++ b/drivers/gpu/drm/Makefile
+@@ -194,7 +194,7 @@ obj-$(CONFIG_DRM_ATMEL_HLCDC)	+= atmel-hlcdc/
+ obj-y			+= renesas/
+ obj-y			+= omapdrm/
+ obj-$(CONFIG_DRM_SUN4I) += sun4i/
+-obj-$(CONFIG_DRM_SUN60I_DP) += sun60i/
++obj-y			+= sun60i/
+ obj-y			+= tilcdc/
+ obj-$(CONFIG_DRM_QXL) += qxl/
+ obj-$(CONFIG_DRM_VIRTIO_GPU) += virtio/
+diff --git a/drivers/gpu/drm/sun60i/Kconfig b/drivers/gpu/drm/sun60i/Kconfig
+--- a/drivers/gpu/drm/sun60i/Kconfig
++++ b/drivers/gpu/drm/sun60i/Kconfig
+@@ -15,3 +15,20 @@ config DRM_SUN60I_DP
+ 
+ 	  Say M here if you want DisplayPort alternate mode over the Type-C
+ 	  port to be able to identify the attached sink.
++
++config DRM_SUN60I_TCON_TV
++	tristate "Allwinner A733 (sun60iw2) TCON_TV1 timing controller"
++	depends on DRM && OF
++	depends on ARCH_SUNXI || COMPILE_TEST
++	help
++	  Enable this for TCON_TV1 of the Allwinner A733 (sun60iw2), the timing
++	  generator that feeds the DisplayPort transmitter. It programs a raster
++	  from a mode and can drive that raster from the TCON's own built-in
++	  pattern generator (VDBIST), which is what makes a picture provable on
++	  this SoC before a display engine or a KMS driver exists.
++
++	  It is not a KMS driver and registers no CRTC yet. It references no
++	  symbol from drm.ko; the DRM dependency is the shape it grows into.
++
++	  Say M here if you want the DisplayPort output of this SoC to be able
++	  to scan a mode.
+diff --git a/drivers/gpu/drm/sun60i/Makefile b/drivers/gpu/drm/sun60i/Makefile
+--- a/drivers/gpu/drm/sun60i/Makefile
++++ b/drivers/gpu/drm/sun60i/Makefile
+@@ -1,2 +1,3 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ obj-$(CONFIG_DRM_SUN60I_DP) += sun60i-dp.o
++obj-$(CONFIG_DRM_SUN60I_TCON_TV) += sun60i-tcon-tv.o
+diff --git a/drivers/gpu/drm/sun60i/sun60i-display.h b/drivers/gpu/drm/sun60i/sun60i-display.h
+new file mode 100644
+--- /dev/null
++++ b/drivers/gpu/drm/sun60i/sun60i-display.h
+@@ -0,0 +1,44 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * The one video mode this SoC's display path has ever driven, in one place.
++ *
++ * TCON_TV1 and the DisplayPort transmitter must describe the SAME mode: the
++ * TCON generates the raster and the transmitter's Main Stream Attributes tell
++ * the sink what that raster is, and the hardware reports a disagreement between
++ * the two as SRC0_USER_FIFO_STATUS != 0, which the UM describes as a mode
++ * programming error. Two copies of these numbers in two drivers is
++ * therefore not a tidiness question -- one source of truth is the invariant.
++ *
++ * This header is bring-up scaffolding with a defined end: when a KMS driver
++ * exists, the mode comes from the connector and both drivers take it as an
++ * argument, which is why every function that uses it already does.
++ *
++ * 1920x1200 CVT reduced blanking, 154.00 MHz, +HSync -VSync. Cross-checked
++ * three ways: the sink's own EDID (a ThinkVision T23d-10
++ * monitor), TCON_TV1's timing
++ * registers and the transmitter's MSA block, the last two read independently
++ * from a live vendor link.
++ *
++ *
++ * Copyright (c) 2026 DockSeed
++ */
++
++#ifndef _SUN60I_DISPLAY_H_
++#define _SUN60I_DISPLAY_H_
++
++#include <drm/drm_modes.h>
++
++static const struct drm_display_mode sun60i_display_mode_1920x1200 = {
++	.clock		= 154000,
++	.hdisplay	= 1920,
++	.hsync_start	= 1968,
++	.hsync_end	= 2000,
++	.htotal		= 2080,
++	.vdisplay	= 1200,
++	.vsync_start	= 1203,
++	.vsync_end	= 1209,
++	.vtotal		= 1235,
++	.flags		= DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_NVSYNC,
++};
++
++#endif /* _SUN60I_DISPLAY_H_ */
+diff --git a/drivers/gpu/drm/sun60i/sun60i-tcon-tv.c b/drivers/gpu/drm/sun60i/sun60i-tcon-tv.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/gpu/drm/sun60i/sun60i-tcon-tv.c
+@@ -0,0 +1,808 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Allwinner A733 (sun60iw2) TCON_TV1 -- the timing generator of the pixel path.
++ *
++ * TCON_TV1 sits at 0x05731000 and drives the DisplayPort transmitter at
++ * 0x05740000. It is the block that turns a
++ * pixel clock into a raster: horizontal and vertical totals, sync widths and
++ * back porches, sync polarity, and the enable that starts the scan.
++ *
++ * IT CAN ALSO BE ITS OWN VIDEO SOURCE, AND THAT IS A MODE, NOT THE ARCHITECTURE.
++ * TV_SRC_CTL_REG (0x0040) bit 0 VDBIST_MODE selects between
++ * the display engine (0) and the VDBIST pattern generator (1), with [2:1]
++ * TV_SRC_SEL picking colour bars, greyscale,
++ * black-by-white or gridding. UM 15.2.6.3 describes the generator as a test
++ * aid for exercising and debugging the lane path from TCON_TV through
++ * HDMI/eDP to the screen.
++ *
++ * That is why a picture on this SoC needs no display engine and no KMS driver --
++ * and it is also why it can never show a console. So the source is one register
++ * bit in this driver, reachable both ways, and every other register here is
++ * derived from a struct drm_display_mode rather than from the pattern
++ * generator. When the display engine arrives, it clears that bit and nothing
++ * else in this file changes shape.
++ *
++ * WHERE THE VALUES COME FROM. Every field below is from the A733 UM's own
++ * TCON_TV register list, chapter 15.2.10 -- not from the classic sunxi TCON1
++ * layout, which would be the wrong provenance. The four registers
++ * this driver programs that the UM does NOT describe are marked as such,
++ * individually, and are carried because a proven sequence writes them, not
++ * because they are understood.
++ *
++ * The reference this transcribes is a by-hand run on the 8 GiB board on 2026-08-18
++ * that put a 1920x1200 test pattern on a DisplayPort monitor
++ * and was cross-read against a live vendor link
++ * captured the same day.
++ *
++ *
++ * THE OBSERVABLE THIS DRIVER OWES IS NOT "THE REGISTERS READ BACK". It is
++ * TV_DEBUG_REG's free-running line counter sweeping to exactly the programmed
++ * VTOTAL, sampled hundreds of times.
++ *
++ * Copyright (c) 2026 DockSeed
++ */
++
++#include <linux/bitfield.h>
++#include <linux/clk.h>
++#include <linux/debugfs.h>
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <linux/ktime.h>
++#include <linux/minmax.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/reset.h>
++#include <linux/seq_file.h>
++
++#include <drm/drm_modes.h>
++
++#include "sun60i-display.h"
++
++/*
++ * TCON_TV1, UM chapter 15.2.10. Reset values are the UM's; the "live" values
++ * are what a working link
++ * carries.
++ */
++#define TV_GCTL_REG			0x0000
++/*
++ * ⚠ Bit 31 is NOT in the UM. 15.2.10.1 gives this register [5:4] PIXEL_MODE,
++ * bit 0 UNSTRICT_TIMING_MODE_SEL and calls [31:6] reserved -- yet both the
++ * vendor's live link and the by-hand run that produced a picture carry
++ * 0x80000000 here, and nothing scans without it. Every sunxi TCON has called
++ * the same bit TCON_EN, which is a hypothesis about why it works and not a
++ * source. Carried with the debt named.
++ */
++#define  TV_GCTL_MODULE_EN		BIT(31)
++#define  TV_GCTL_PIXEL_MODE		GENMASK(5, 4)	/* 00 = one pixel/clock */
++#define  TV_GCTL_UNSTRICT_TIMING	BIT(0)
++#define TV_GINT0_REG			0x0004
++#define TV_SRC_CTL_REG			0x0040		/* the A733 user manual */
++#define  TV_SRC_CTL_SEL			GENMASK(2, 1)
++#define  TV_SRC_CTL_VDBIST_MODE		BIT(0)
++#define TV_IO_POL_REG			0x0088		/* the A733 user manual */
++#define  TV_IO_POL_IO3_INV		BIT(27)		/* de */
++#define  TV_IO_POL_IO2_INV		BIT(26)		/* pixel_clk */
++#define  TV_IO_POL_IO1_INV		BIT(25)		/* hsync */
++#define  TV_IO_POL_IO0_INV		BIT(24)		/* vsync */
++#define TV_IO_TRI_REG			0x008c		/* the A733 user manual */
++#define TV_CTL_REG			0x0090		/* the A733 user manual */
++#define  TV_CTL_TV_EN			BIT(31)
++#define  TV_CTL_START_DELAY		GENMASK(19, 4)
++#define TV_BASIC1_REG			0x0098		/* the A733 user manual */
++#define  TV_BASIC1_VT			GENMASK(16, 0)
++#define TV_BASIC2_REG			0x009c		/* the A733 user manual */
++#define  TV_BASIC2_XO			GENMASK(30, 16)
++#define  TV_BASIC2_YO			GENMASK(14, 0)
++#define TV_BASIC3_REG			0x00a0		/* the A733 user manual */
++#define  TV_BASIC3_HT			GENMASK(31, 16)
++#define  TV_BASIC3_HBP			GENMASK(14, 0)
++#define TV_BASIC4_REG			0x00a4		/* the A733 user manual */
++/*
++ * ⚠ [31:16] is NOT in the UM either: 15.2.10.10 documents [14:0] VBP and calls
++ * [31:15] reserved. Silicon carries 2 x VTOTAL there, the same number
++ * TV_BASIC1's documented VT field already holds, on both the vendor's live link
++ * and ours. Carried, not understood.
++ */
++#define  TV_BASIC4_VT_UNDOC		GENMASK(31, 16)
++#define  TV_BASIC4_VBP			GENMASK(14, 0)
++#define TV_BASIC5_REG			0x00a8		/* the A733 user manual */
++#define  TV_BASIC5_HSPW			GENMASK(27, 16)
++#define  TV_BASIC5_VSPW			GENMASK(11, 0)
++/*
++ * TV_DEBUG_REG, UM 15.2.10.14, and the bit numbering is easy to
++ * get wrong by one. In the UM's flattened two-column layout each field NAME sits
++ * on the line ABOVE its bit number, so TV_FIFO_UNDER_FLOW
++ * belongs to the "30" in the register's bit list and LOSTWARN to the
++ * "29"; bit 31 is reserved and [15:0] is TV_CURRENT_LINE, the
++ * line now being output. Silicon agrees: the by-hand run sampled
++ * 0x10000055, i.e. bit 28 TV_FIELD_POLARITY set with a line count of 0x55,
++ * which decodes only under this numbering.
++ *
++ * ⚠ The vendor's register model disagrees about two of these and it is worth
++ * knowing which claim rests on what. Its header
++ * (bsp/drivers/drm/sunxi_device/hardware/lowlevel_tcon/tcon_tv_reg.h:185-198)
++ * gives [11:0] tcon_tv_current_line, [27:16] tcon0_current_line, bit 28
++ * tcon_tv_field_polarity, bit 29 tcon0_field_polarity, bit 30
++ * tcon_tv_fifo_under_flow, bit 31 tcon0_fifo_under_flow -- i.e. it reads the
++ * register as carrying BOTH TCONs and has no LOSTWARN concept at all. The two
++ * readings agree exactly where it matters: bit 30 is this TCON's FIFO underflow
++ * either way, and bit 28 is its field polarity either way. They differ on bit 29
++ * and on whether the line counter is 12 or 16 bits.
++ *
++ * Neither difference can mislead here. TCON_TV0 is dark on this board -- its
++ * gate reads zero under the vendor stack too -- so bit 29 is zero under both
++ * readings, and a 1235-line mode needs 11 bits. ⬜ A mode with more than 4095
++ * lines would separate the counter widths; nothing separates bit 29 today.
++ *
++ * Both latches are R/W0C (cleared by writing 0), so clearing them is a write of
++ * zero, not of one.
++ */
++#define TV_DEBUG_REG			0x00fc
++#define  TV_DEBUG_FIFO_UNDER_FLOW	BIT(30)		/* the A733 user manual */
++#define  TV_DEBUG_LOSTWARN		BIT(29)		/* the A733 user manual */
++#define  TV_DEBUG_FIELD_POLARITY	BIT(28)
++#define  TV_DEBUG_CURRENT_LINE		GENMASK(15, 0)
++#define TV_FILL_CTL_REG			0x0300		/* 15.2.10.17 */
++#define  TV_FILL_EN			BIT(31)
++#define TV_PIXELDEPTH_MODE_REG		0x0340		/* the A733 user manual */
++#define  TV_PIXELDEPTH_IPI_FORMAT	GENMASK(6, 4)	/* 000 = RGB */
++#define  TV_PIXELDEPTH_MODE		GENMASK(2, 0)
++#define   TV_PIXELDEPTH_6BIT		0
++#define   TV_PIXELDEPTH_8BIT		1
++#define   TV_PIXELDEPTH_10BIT		2
++#define   TV_PIXELDEPTH_12BIT		3
++#define   TV_PIXELDEPTH_16BIT		4
++
++/*
++ * Two words this driver writes that are in no UM register list at all -- the
++ * TCON_TV list ends at TV_PIXELDEPTH_MODE_REG (0x0340). Carried, because the
++ * sequence that produced a picture writes them and a live vendor link carries
++ * the same values.
++ *
++ * ⬜ And the vendor's kernel does not write them either: its TCON_TV register
++ * model stops at 0x340 (tcon_tv_reg.h:415, sizeof(struct tcon_tv_reg) = 0x344)
++ * and no code in its display tree reaches those offsets. So the values seen on
++ * a live vendor link are power-on state or the bootloader's, not that driver's
++ * configuration -- which makes these two writes candidates for deletion rather
++ * than mysteries. The experiment that settles it is the cheap one that settled
++ * PLL_VIDEO1 bit 24: read both at the U-Boot prompt, before any kernel runs.
++ */
++#define TV_UNDOC_0500_REG		0x0500
++#define  TV_UNDOC_0500_VALUE		0x00080000
++#define TV_UNDOC_0FE8_REG		0x0fe8
++#define  TV_UNDOC_0FE8_VALUE		0x02000000
++
++/*
++ * VIDEO_OUT1_SYS / DISPLAY1_TOP at 0x05510000, UM 15.2.8's register list. It
++ * has exactly two documented registers and this driver writes both.
++ */
++#define VO1_TV_CLK_EDP_I2S1_SRC		0x0000		/* the A733 user manual */
++/* must be 1 when TCON_TV1 feeds the EDP path */
++#define  VO1_TV1_EDP_HDMI_CK_SEL	BIT(5)
++#define  VO1_TV1_CLK_SRC		BIT(4)		/* 0 = CCMU, 1 = CVBSOUT1 */
++#define VO1_MODULE_GATING		0x0020		/* UM 15.2.9.2 */
++#define  VO1_TV0_HDMI_GATE		BIT(28)
++#define  VO1_TV1_GATE			BIT(21)		/* 0: Gating 1: Release */
++#define  VO1_TV0_GATE			BIT(20)
++/*
++ * ⚠ And one that is not in that list. Carried from the proven sequence, and
++ * under the same doubt as TCON 0x0500/0x0FE8: the vendor's own model of this
++ * block stops at 0x002C (tcon_top_type.h:216-231) and nothing in its tree names
++ * 0x00F4, so what a live link carries there did not come from its driver.
++ */
++#define VO1_UNDOC_00F4_REG		0x00f4
++#define  VO1_UNDOC_00F4_VALUE		0x0000010d
++
++/*
++ * START_DELAY is documented as a meaning and not as a value: it delays the
++ * release of the SYNC signal towards the DE, counted in lines; with a value
++ * of 2, de_syn stays valid until the end of the 2nd line.
++ * Units are lines, and the UM gives no recommended setting.
++ *
++ * The vendor computes vertical-blanking-minus-five and a live link carries
++ * exactly that: (1235 - 1200) - 5 = 30, which is the 0x1E in the 0x800001E0 a
++ * working link holds. The formula is a hint that verified against silicon, so
++ * it is taken -- but the five is a bare magic number in that code with no
++ * derivation, and it is named as one here rather than hidden behind an
++ * expression that looks derived.
++ *
++ * TWO DEFECTS IN THAT CODE ARE NOT TAKEN, and both are silent:
++ *  - it declares the field five bits wide, start_delay:5 at bits [8:4]
++ *    (tcon_tv_reg.h:66), where UM 15.2.10.6 gives [19:4]. It therefore clamps
++ *    at 31 and pins every mode whose blanking exceeds 36 lines to the same
++ *    value. This driver uses the UM's width.
++ *  - the subtraction is done on a u32 (tcon_tv_reg.c:154-157), so a mode with
++ *    fewer than five blanking lines wraps to ~4.29e9, fails the unsigned
++ *    "> 31" test and is written as the MAXIMUM delay -- for the mode that
++ *    wanted the minimum. This driver guards the subtraction.
++ */
++#define TV_START_DELAY_GUARD		5
++
++/* The pixel clock must land on the mode, not near it. */
++#define TCON_PIXEL_CLK_TOLERANCE_PERCENT	1
++
++struct sun60i_tcon_tv {
++	struct device		*dev;
++	void __iomem		*regs;		/* TCON_TV1  0x05731000 */
++	void __iomem		*vo1;		/* VIDEO_OUT1_SYS 0x05510000 */
++	struct clk		*bus_clk;
++	struct clk		*dpss_clk;	/* optional, see probe() */
++	struct clk		*pixel_clk;
++	struct reset_control	*reset;
++	struct reset_control	*dpss_reset;	/* optional, see probe() */
++	struct mutex		lock;		/* serialises enable/disable */
++	bool			enabled;
++	struct drm_display_mode	mode;
++	u8			bpc;
++};
++
++static u32 sun60i_tcon_tv_depth(u8 bpc)
++{
++	switch (bpc) {
++	case 6:
++		return TV_PIXELDEPTH_6BIT;
++	case 8:
++		return TV_PIXELDEPTH_8BIT;
++	case 10:
++		return TV_PIXELDEPTH_10BIT;
++	case 12:
++		return TV_PIXELDEPTH_12BIT;
++	case 16:
++		return TV_PIXELDEPTH_16BIT;
++	default:
++		return TV_PIXELDEPTH_8BIT;
++	}
++}
++
++/*
++ * Refuse a mode that does not fit the registers rather than truncate it into
++ * them. Every bound here is a field width from UM 15.2.10, and a mode that
++ * overflows one would otherwise be programmed as a different, plausible mode --
++ * the failure would look like bad hardware.
++ */
++static int sun60i_tcon_tv_check_mode(struct sun60i_tcon_tv *tcon,
++				     const struct drm_display_mode *mode)
++{
++	if (mode->hdisplay < 1 || mode->vdisplay < 1)
++		return -EINVAL;
++	if (mode->htotal <= mode->hsync_start || mode->hsync_end <= mode->hsync_start)
++		return -EINVAL;
++	if (mode->vtotal <= mode->vsync_start || mode->vsync_end <= mode->vsync_start)
++		return -EINVAL;
++	if (mode->hsync_start < mode->hdisplay || mode->vsync_start < mode->vdisplay)
++		return -EINVAL;
++
++	/*
++	 * Twice the vertical total goes into two fields of different widths --
++	 * TV_BASIC1's documented [16:0] and TV_BASIC4's undocumented [31:16] --
++	 * so the narrower one is the bound.
++	 */
++	if (2 * mode->vtotal > (int)FIELD_MAX(TV_BASIC4_VT_UNDOC) ||
++	    2 * mode->vtotal > (int)FIELD_MAX(TV_BASIC1_VT))
++		return -EINVAL;
++	if (mode->hdisplay - 1 > (int)FIELD_MAX(TV_BASIC2_XO) ||
++	    mode->vdisplay - 1 > (int)FIELD_MAX(TV_BASIC2_YO))
++		return -EINVAL;
++	if (mode->htotal - 1 > (int)FIELD_MAX(TV_BASIC3_HT) ||
++	    mode->htotal - mode->hsync_start - 1 > (int)FIELD_MAX(TV_BASIC3_HBP))
++		return -EINVAL;
++	if (mode->vtotal - mode->vsync_start - 1 > (int)FIELD_MAX(TV_BASIC4_VBP))
++		return -EINVAL;
++	if (mode->hsync_end - mode->hsync_start - 1 > (int)FIELD_MAX(TV_BASIC5_HSPW) ||
++	    mode->vsync_end - mode->vsync_start - 1 > (int)FIELD_MAX(TV_BASIC5_VSPW))
++		return -EINVAL;
++	if (mode->vtotal - mode->vdisplay > (int)FIELD_MAX(TV_CTL_START_DELAY))
++		return -EINVAL;
++
++	if (mode->flags & DRM_MODE_FLAG_INTERLACE) {
++		dev_err(tcon->dev, "interlaced modes are not implemented here\n");
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++/*
++ * The timing quartet, and it is the mode minus one throughout with the vertical
++ * total doubled -- UM 15.2.10.7 gives 1125 for an interlaced (odd/even) field
++ * and 2250 for progressive scanning as its example, and the counter's boundary
++ * is half of that value.
++ *
++ * The back porches are the UM's, which fold the sync pulse in: TV_BASIC3's HBP
++ * is documented "(HSPW+HBP)", i.e. the distance from the leading edge of sync to
++ * the first active pixel, minus one. That is htotal - hsync_start - 1, and it is
++ * the same 112 the transmitter's own MSA HSTART carries.
++ */
++static void sun60i_tcon_tv_timings(struct sun60i_tcon_tv *tcon,
++				   const struct drm_display_mode *mode)
++{
++	u32 hbp = mode->htotal - mode->hsync_start - 1;
++	u32 vbp = mode->vtotal - mode->vsync_start - 1;
++
++	writel(FIELD_PREP(TV_BASIC1_VT, 2 * mode->vtotal),
++	       tcon->regs + TV_BASIC1_REG);
++	writel(FIELD_PREP(TV_BASIC2_XO, mode->hdisplay - 1) |
++	       FIELD_PREP(TV_BASIC2_YO, mode->vdisplay - 1),
++	       tcon->regs + TV_BASIC2_REG);
++	writel(FIELD_PREP(TV_BASIC3_HT, mode->htotal - 1) |
++	       FIELD_PREP(TV_BASIC3_HBP, hbp),
++	       tcon->regs + TV_BASIC3_REG);
++	writel(FIELD_PREP(TV_BASIC4_VT_UNDOC, 2 * mode->vtotal) |
++	       FIELD_PREP(TV_BASIC4_VBP, vbp),
++	       tcon->regs + TV_BASIC4_REG);
++	writel(FIELD_PREP(TV_BASIC5_HSPW, mode->hsync_end - mode->hsync_start - 1) |
++	       FIELD_PREP(TV_BASIC5_VSPW, mode->vsync_end - mode->vsync_start - 1),
++	       tcon->regs + TV_BASIC5_REG);
++}
++
++/*
++ * Sync polarity and the output pads.
++ *
++ * TV_IO_POL inverts four internal signals on their way out (UM 15.2.10.12), and
++ * two of the four follow the mode: a live vendor link at this mode carries
++ * IO2_INV | IO1_INV, and this mode is +HSync -VSync (CVT reduced blanking), so
++ * the inverted one is the sync the mode wants positive. The vendor derives the
++ * same two bits the same way -- io0_inv from PVSYNC, io1_inv from PHSYNC
++ * (tcon_tv_reg.c:143-144 over sunxi_drm_intf.c:99,108) -- and feeds those two
++ * flags to the transmitter's MSA polarity register as well, so its TCON and its
++ * DisplayPort side cannot disagree about the mode. That is right and it is
++ * taken; this driver keeps the same single source, the mode.
++ *
++ * ⚠ One mode cannot falsify it. 1920x1200 CVT-RB is the only mode ever run
++ * here, and at +HSync -VSync "derived from the mode" and "a constant that
++ * normalises the internal interface to a fixed polarity" produce the same word.
++ * A -HSync or +VSync mode separates them in one run.
++ *
++ * IO2_INV (the pixel clock) is not a property of the mode. The vendor hardcodes
++ * it too, unconditionally and without a comment (tcon_tv_reg.c:225); we carry it
++ * and say that is what we are doing.
++ *
++ * TV_IO_TRI is the register whose reset is NOT zero (0x0F000000) and which the
++ * vendor still changes, so "write only what differs from zero" misses it. All
++ * ones tri-states every output pad: this TCON feeds the DisplayPort encoder
++ * inside the SoC and drives no external RGB bus, so nothing should be driving a
++ * pin. ⚠ [23:0] is undescribed in 15.2.10.13; all-ones is what a working link
++ * carries, and the vendor writes the same word in two halves
++ * (tcon_tv_reg.c:226-230).
++ */
++static void sun60i_tcon_tv_io(struct sun60i_tcon_tv *tcon,
++			      const struct drm_display_mode *mode)
++{
++	u32 pol = TV_IO_POL_IO2_INV;
++
++	if (mode->flags & DRM_MODE_FLAG_PHSYNC)
++		pol |= TV_IO_POL_IO1_INV;
++	if (mode->flags & DRM_MODE_FLAG_PVSYNC)
++		pol |= TV_IO_POL_IO0_INV;
++
++	writel(pol, tcon->regs + TV_IO_POL_REG);
++	writel(0x0fffffff, tcon->regs + TV_IO_TRI_REG);
++}
++
++/*
++ * Route VIDEO_OUT1_SYS to us. Two documented registers, both required:
++ *
++ *  - TV_CLK_EDP_I2S1_SRC bit 5, the UM's own instruction for this exact case.
++ *    Bit 4 TCON_TV1_CLK_SRC stays 0 = "Clock from CCMU", which is where the
++ *    pixel clock this driver enables comes from.
++ *  - VO1_MODULE_GATING bit 21 TV1_GATE, "0: Gating 1: Release". ⚠ This register
++ *    was filed in this tree as one of the words absent from the UM. It is not:
++ *    UM 15.2.9.2 names bits 28, 21 and 20, and the 0x00200000 a live vendor link
++ *    carries is exactly TV1_GATE released with TV0's two gates left shut.
++ *
++ * Written whole rather than read-modify-write, deliberately: TCON_TV0 and its
++ * HDMI gate must stay closed -- they read all zero on this board even under the
++ * vendor stack -- and a driver that ORs into this register would preserve
++ * whatever a bootloader left there.
++ */
++static void sun60i_tcon_tv_route(struct sun60i_tcon_tv *tcon)
++{
++	if (!tcon->vo1) {
++		/*
++		 * Loud, and with the addresses, because this is the difference
++		 * between a TCON that scans into the eDP encoder and one that
++		 * scans into a gated HDMI output -- and the symptom of the
++		 * second is a perfect-looking register set and no picture.
++		 */
++		dev_warn(tcon->dev,
++			 "no VIDEO_OUT1_SYS window: 0x05510000 bit 5 (clock from EDP) and 0x05510020 bit 21 (TV1_GATE) are NOT set\n");
++		return;
++	}
++
++	writel(VO1_TV1_EDP_HDMI_CK_SEL, tcon->vo1 + VO1_TV_CLK_EDP_I2S1_SRC);
++	writel(VO1_TV1_GATE, tcon->vo1 + VO1_MODULE_GATING);
++	writel(VO1_UNDOC_00F4_VALUE, tcon->vo1 + VO1_UNDOC_00F4_REG);
++}
++
++static void sun60i_tcon_tv_pixeldepth(struct sun60i_tcon_tv *tcon)
++{
++	u32 depth = FIELD_PREP(TV_PIXELDEPTH_MODE,
++			       sun60i_tcon_tv_depth(tcon->bpc));
++
++	/*
++	 * ⚠ TV_PIXELDEPTH_MODE_REG must agree with the transmitter's MISC0. Its
++	 * reset is 000 = 6-bit while the DisplayPort side is configured 8 bpc,
++	 * and at reset a 6-bit colorbar pattern is sent into a
++	 * framing configuration counting 24 bits per pixel. IPI_FORMAT stays
++	 * 000 = RGB.
++	 */
++	writel(depth, tcon->regs + TV_PIXELDEPTH_MODE_REG);
++}
++
++static void sun60i_tcon_tv_set_source(struct sun60i_tcon_tv *tcon,
++				      bool vdbist, u32 pattern)
++{
++	u32 val = FIELD_PREP(TV_SRC_CTL_SEL, pattern);
++
++	if (vdbist)
++		val |= TV_SRC_CTL_VDBIST_MODE;
++
++	writel(val, tcon->regs + TV_SRC_CTL_REG);
++}
++
++/*
++ * The register writes, in the order of the by-hand run that produced a picture
++ * (step 4 of that run), with TV_EN last. The live capture
++ * this file also cites says nothing about order -- it is a snapshot -- and
++ * ordering is where TCON bring-up usually fails, so the order comes from the
++ * run, not from the snapshot.
++ *
++ * THREE DELIBERATE DIFFERENCES FROM THAT RUN, each named here rather than
++ * discovered later:
++ *
++ *  1. TV_GINT0_REG is written ZERO, where the run writes 0x40000000
++ *     (TV_VB_INT_EN). Nothing in this tree services a TCON
++ *     interrupt, and an enabled interrupt with no handler is not a diagnostic,
++ *     it is a latch nobody clears. Falsified by: the scan stopping without it,
++ *     which would be a finding and would come back with a handler attached.
++ *  2. TV_DEBUG_REG is written ZERO, where the run writes back the 0x000002E5 it
++ *     read from a live link. Only bits 30 and 29 of this register are writable
++ *     and both are R/W0C, so zero is the clear; [15:0] is read-only and writing
++ *     a line number into it is writing into a counter.
++ *  3. TV_FILL_BEGIN (0x0304) and TV_FILL_END (0x0308) are NOT written, and
++ *     this one is settled rather than guessed. They are documented -- UM
++ *     15.2.10.18/19 put them at 0x304 + N*0x0C and 0x308 + N*0x0C, which is why
++ *     an offset search misses them -- and gated by TV_FILL_CTL_REG (0x0300)
++ *     bit 31 TV_FILL_EN, "0: Bypass", which is zero at reset, zero on the
++ *     vendor's live link and zero in our own run.
++ *
++ *     The two values a live link carries are its fill arithmetic with the
++ *     feature off: the vendor programs FILL_BEGIN = (vtotal + 1) << 12 and
++ *     FILL_END = (vtotal + vactive_space) << 12 on every modeset
++ *     (tcon_tv_reg.c:147-153), and 0x004D4000 / 0x004D3000 are 1236 << 12 and
++ *     1235 << 12 against a VTOTAL of 1235. Its FILL_EN is gated on
++ *     vactive_space, which no code in that tree ever assigns -- so FILL_EN is
++ *     always 0 and FILL_END always lands BELOW FILL_BEGIN. Three registers
++ *     written every modeset into a bypassed block. Nothing here reproduces it.
++ *     Falsified by: the picture needing them, which would mean TV_FILL_EN is
++ *     not the gate the UM says it is.
++ */
++static void sun60i_tcon_tv_program(struct sun60i_tcon_tv *tcon)
++{
++	const struct drm_display_mode *mode = &tcon->mode;
++	u32 vblank = mode->vtotal - mode->vdisplay;
++	u32 start_delay = vblank > TV_START_DELAY_GUARD ?
++			  vblank - TV_START_DELAY_GUARD : 0;
++
++	/*
++	 * Stop before programming, and this half IS taken from the vendor
++	 * because it is right: it clears TV_EN, the module enable and both
++	 * halves of the interrupt register before touching a timing register,
++	 * and asserts TV_EN last (tcon_tv_reg.c:29-38 and :100). Off a fresh
++	 * reset these three writes are no-ops, which is why the by-hand run
++	 * never needed them; they are what makes a second enable, or an enable
++	 * over a bootloader's splash, land in a defined state.
++	 */
++	writel(0, tcon->regs + TV_CTL_REG);
++	writel(0, tcon->regs + TV_GCTL_REG);
++	writel(0, tcon->regs + TV_GINT0_REG);
++
++	sun60i_tcon_tv_timings(tcon, mode);
++	writel(TV_UNDOC_0500_VALUE, tcon->regs + TV_UNDOC_0500_REG);
++	writel(TV_UNDOC_0FE8_VALUE, tcon->regs + TV_UNDOC_0FE8_REG);
++	sun60i_tcon_tv_io(tcon, mode);
++	writel(0, tcon->regs + TV_DEBUG_REG);
++	sun60i_tcon_tv_set_source(tcon, true, 0);
++	sun60i_tcon_tv_pixeldepth(tcon);
++	writel(0, tcon->regs + TV_GINT0_REG);
++	writel(TV_GCTL_MODULE_EN, tcon->regs + TV_GCTL_REG);
++	writel(TV_CTL_TV_EN | FIELD_PREP(TV_CTL_START_DELAY, start_delay),
++	       tcon->regs + TV_CTL_REG);
++}
++
++/*
++ * The pixel clock is asked for and then read back, because the clock model is
++ * the thing under test here: PLL_VIDEO1 and EDP_TV_CLK are new, and a driver
++ * that programs a raster on a rate it never checked produces a picture-shaped
++ * failure. 1 % is generous for a mode whose clock the divider hits exactly.
++ */
++static int sun60i_tcon_tv_set_pixel_clk(struct sun60i_tcon_tv *tcon,
++					const struct drm_display_mode *mode)
++{
++	unsigned long want = mode->clock * 1000L;
++	unsigned long got, delta;
++	int ret;
++
++	ret = clk_set_rate(tcon->pixel_clk, want);
++	if (ret) {
++		dev_err(tcon->dev, "pixel clock %lu Hz refused: %d\n", want, ret);
++		return ret;
++	}
++
++	ret = clk_prepare_enable(tcon->pixel_clk);
++	if (ret) {
++		dev_err(tcon->dev, "pixel clock enable: %d\n", ret);
++		return ret;
++	}
++
++	got = clk_get_rate(tcon->pixel_clk);
++	delta = abs((long)got - (long)want);
++	if (delta > want / 100 * TCON_PIXEL_CLK_TOLERANCE_PERCENT) {
++		dev_err(tcon->dev, "pixel clock is %lu Hz, the mode wants %lu Hz\n",
++			got, want);
++		clk_disable_unprepare(tcon->pixel_clk);
++		return -EINVAL;
++	}
++
++	dev_info(tcon->dev, "pixel clock %lu Hz\n", got);
++
++	return 0;
++}
++
++static void sun60i_tcon_tv_clocks_off(struct sun60i_tcon_tv *tcon)
++{
++	clk_disable_unprepare(tcon->pixel_clk);
++	clk_disable_unprepare(tcon->dpss_clk);
++	clk_disable_unprepare(tcon->bus_clk);
++	reset_control_assert(tcon->dpss_reset);
++	reset_control_assert(tcon->reset);
++}
++
++/*
++ * Reset de-assert first, then the gate -- UM 4.1.4.4, the A733 user manual. The DPSS
++ * TOP1 pair is optional here only in the device-tree sense: it is in the path
++ * (TOP0 is not), but whether it arrives as a second clock/reset on this node or
++ * is modelled elsewhere is the device tree's business, and a driver that
++ * hard-required a name it cannot see would fail for a reason that has nothing
++ * to do with the hardware.
++ */
++static int sun60i_tcon_tv_clocks_on(struct sun60i_tcon_tv *tcon)
++{
++	int ret;
++
++	if (!tcon->dpss_clk && !tcon->dpss_reset)
++		dev_warn(tcon->dev,
++			 "no DPSS_TOP1 clock or reset in DT: 0x020036CC is NOT touched\n");
++
++	ret = reset_control_deassert(tcon->reset);
++	if (ret)
++		return ret;
++
++	ret = reset_control_deassert(tcon->dpss_reset);
++	if (ret)
++		goto err_reset;
++
++	ret = clk_prepare_enable(tcon->bus_clk);
++	if (ret)
++		goto err_dpss_reset;
++
++	ret = clk_prepare_enable(tcon->dpss_clk);
++	if (ret)
++		goto err_bus;
++
++	return 0;
++
++err_bus:
++	clk_disable_unprepare(tcon->bus_clk);
++err_dpss_reset:
++	reset_control_assert(tcon->dpss_reset);
++err_reset:
++	reset_control_assert(tcon->reset);
++
++	return ret;
++}
++
++static int sun60i_tcon_tv_enable(struct sun60i_tcon_tv *tcon)
++{
++	int ret;
++
++	ret = sun60i_tcon_tv_check_mode(tcon, &tcon->mode);
++	if (ret) {
++		dev_err(tcon->dev,
++			"mode %dx%d @ %d kHz does not fit this TCON's registers\n",
++			tcon->mode.hdisplay, tcon->mode.vdisplay,
++			tcon->mode.clock);
++		return ret;
++	}
++
++	/*
++	 * Pixel clock first, then the resets and gates, then the routing, then
++	 * the registers -- the order of the run this transcribes
++	 * (steps 1 to 4 of that run), kept because ordering
++	 * is where TCON bring-up usually fails and the live capture that gives
++	 * the target values is a snapshot that says nothing about it.
++	 */
++	ret = sun60i_tcon_tv_set_pixel_clk(tcon, &tcon->mode);
++	if (ret)
++		return ret;
++
++	ret = sun60i_tcon_tv_clocks_on(tcon);
++	if (ret) {
++		dev_err(tcon->dev, "gates and resets: %d\n", ret);
++		goto err_pixel_clk;
++	}
++
++	sun60i_tcon_tv_route(tcon);
++	sun60i_tcon_tv_program(tcon);
++	tcon->enabled = true;
++
++	dev_info(tcon->dev, "scanning %dx%d, %d kHz, htotal %d vtotal %d\n",
++		 tcon->mode.hdisplay, tcon->mode.vdisplay, tcon->mode.clock,
++		 tcon->mode.htotal, tcon->mode.vtotal);
++
++	return 0;
++
++err_pixel_clk:
++	clk_disable_unprepare(tcon->pixel_clk);
++
++	return ret;
++}
++
++static void sun60i_tcon_tv_disable(struct sun60i_tcon_tv *tcon)
++{
++	writel(0, tcon->regs + TV_CTL_REG);
++	writel(0, tcon->regs + TV_GCTL_REG);
++	/*
++	 * And put the second window back too, before the clocks go: routing is
++	 * state this driver wrote into a block it does not own, and a driver
++	 * that unbinds should not leave TV1_GATE released behind it.
++	 */
++	if (tcon->vo1) {
++		writel(0, tcon->vo1 + VO1_MODULE_GATING);
++		writel(0, tcon->vo1 + VO1_TV_CLK_EDP_I2S1_SRC);
++	}
++	sun60i_tcon_tv_clocks_off(tcon);
++	tcon->enabled = false;
++}
++
++static void sun60i_tcon_tv_teardown(void *data)
++{
++	struct sun60i_tcon_tv *tcon = data;
++
++	scoped_guard(mutex, &tcon->lock)
++		if (tcon->enabled)
++			sun60i_tcon_tv_disable(tcon);
++}
++
++static int sun60i_tcon_tv_map(struct platform_device *pdev,
++			      struct sun60i_tcon_tv *tcon)
++{
++	struct device *dev = &pdev->dev;
++	struct resource *res;
++
++	tcon->regs = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(tcon->regs))
++		return PTR_ERR(tcon->regs);
++
++	/*
++	 * The second window is VIDEO_OUT1_SYS (DISPLAY1_TOP) at 0x05510000, and
++	 * this driver needs exactly two registers out of its 4 KiB:
++	 * TV_CLK_EDP_I2S1_SRC bit 5 (it must be 1 when TCON_TV1 feeds EDP)
++	 * and VO1_MODULE_GATING bit 21
++	 * TV1_GATE. Without them this TCON's clock comes from the HDMI side and
++	 * its output stays gated.
++	 *
++	 * It is OPTIONAL because the device tree may model that block as a node
++	 * of its own -- the shape mainline uses for sun8i-tcon-top -- rather
++	 * than as a second window here, and that decision is not this driver's
++	 * to force. Absent, the TCON is still programmed and the two writes it
++	 * did not make are named at enable, so a bring-up session can make them
++	 * by hand and a KMS driver later cannot inherit a silent gap.
++	 */
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
++	if (res) {
++		tcon->vo1 = devm_ioremap_resource(dev, res);
++		if (IS_ERR(tcon->vo1))
++			return dev_err_probe(dev, PTR_ERR(tcon->vo1),
++					     "VIDEO_OUT1_SYS window\n");
++	}
++
++	return 0;
++}
++
++static int sun60i_tcon_tv_resources(struct device *dev,
++				    struct sun60i_tcon_tv *tcon)
++{
++	tcon->bus_clk = devm_clk_get(dev, "bus");
++	if (IS_ERR(tcon->bus_clk))
++		return dev_err_probe(dev, PTR_ERR(tcon->bus_clk), "bus clock\n");
++
++	tcon->pixel_clk = devm_clk_get(dev, "tcon-tv");
++	if (IS_ERR(tcon->pixel_clk))
++		return dev_err_probe(dev, PTR_ERR(tcon->pixel_clk),
++				     "pixel clock\n");
++
++	/*
++	 * Unnamed, i.e. index 0. The node carries a single reset and no
++	 * reset-names, and a named lookup against a node without that property
++	 * fails -- so this asks for the reset the node actually describes. It
++	 * keeps working if reset-names is added later.
++	 */
++	tcon->reset = devm_reset_control_get_exclusive(dev, NULL);
++	if (IS_ERR(tcon->reset))
++		return dev_err_probe(dev, PTR_ERR(tcon->reset), "reset\n");
++
++	/*
++	 * DPSS_TOP1 is in the path where TOP0 is not, and its gate and reset
++	 * are a separate pair. Optional for the same reason as the second reg
++	 * window: whether they hang off this node or off a block of their own
++	 * is the device tree's decision. Absent, they are named at enable
++	 * rather than silently skipped.
++	 */
++	tcon->dpss_clk = devm_clk_get_optional(dev, "dpss");
++	if (IS_ERR(tcon->dpss_clk))
++		return dev_err_probe(dev, PTR_ERR(tcon->dpss_clk), "DPSS clock\n");
++
++	tcon->dpss_reset = devm_reset_control_get_optional_exclusive(dev, "dpss");
++	if (IS_ERR(tcon->dpss_reset))
++		return dev_err_probe(dev, PTR_ERR(tcon->dpss_reset),
++				     "DPSS reset\n");
++
++	return 0;
++}
++
++static int sun60i_tcon_tv_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct sun60i_tcon_tv *tcon;
++	int ret;
++
++	tcon = devm_kzalloc(dev, sizeof(*tcon), GFP_KERNEL);
++	if (!tcon)
++		return -ENOMEM;
++
++	tcon->dev = dev;
++	tcon->mode = sun60i_display_mode_1920x1200;
++	tcon->bpc = 8;
++	platform_set_drvdata(pdev, tcon);
++
++	ret = devm_mutex_init(dev, &tcon->lock);
++	if (ret)
++		return ret;
++
++	ret = sun60i_tcon_tv_map(pdev, tcon);
++	if (ret)
++		return ret;
++
++	ret = sun60i_tcon_tv_resources(dev, tcon);
++	if (ret)
++		return ret;
++
++	ret = devm_add_action_or_reset(dev, sun60i_tcon_tv_teardown, tcon);
++	if (ret)
++		return ret;
++
++	dev_info(dev, "A733 TCON_TV1 on %s, idle until a KMS master binds\n", dev_name(dev));
++
++	return 0;
++}
++
++static const struct of_device_id sun60i_tcon_tv_of_match[] = {
++	{ .compatible = "allwinner,sun60i-a733-tcon-tv" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, sun60i_tcon_tv_of_match);
++
++static struct platform_driver sun60i_tcon_tv_driver = {
++	.probe	= sun60i_tcon_tv_probe,
++	.driver	= {
++		.name		= "sun60i-a733-tcon-tv",
++		.of_match_table	= sun60i_tcon_tv_of_match,
++	},
++};
++module_platform_driver(sun60i_tcon_tv_driver);
++
++MODULE_DESCRIPTION("Allwinner A733 TCON_TV1 timing controller");
++MODULE_LICENSE("GPL");

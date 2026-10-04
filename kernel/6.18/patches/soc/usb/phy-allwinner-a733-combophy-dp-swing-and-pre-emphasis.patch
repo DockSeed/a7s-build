@@ -1,0 +1,555 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] phy: allwinner: A733 combo-PHY -- swing and pre-emphasis through phy_configure()
+
+`phy-allwinner-a733-combophy-dp-rate-2700` and `phy-allwinner-a733-combophy-bracket-the-dp-rate-table` gave this PHY a .configure that carries the rate and the lane count.
+The third arm, set_voltages, was refused:
+
+    if (dp->set_voltages) {
+            dev_warn_once(cp->dev,
+                          "DP swing/pre-emphasis not implemented, link training cannot complete\n");
+            return -EOPNOTSUPP;
+    }
+
+That was an honest refusal and it was also a hard blocker: link training IS the
+swing/pre-emphasis loop. A DisplayPort source reads the sink's adjust request,
+drives what it asked for, and reads again -- with this arm refused, the loop
+cannot get past clock recovery on any lane the sink is not already happy with.
+This patch implements it.
+
+THE SEQUENCE IS MAINLINE'S, THE VALUES ARE THE BOARD'S
+-------------------------------------------------------
+
+This PHY is a Cadence Torrent derivative and cdns_torrent_dp_set_voltages()
+(drivers/phy/cadence/phy-cadence-torrent.c:1558) is the sequence register for
+register. Five registers per lane, in this order, and the first and last are a
+freeze/thaw bracket whose REASON mainline states in words rather than leaving to
+be guessed at (:1568-1571, :1592-1595): TX_DIAG_ACYA[0] set "to freeze the
+current state of the analog TX driver", cleared "to allow the state of analog TX
+driver to reflect the new programmed one". So the four coefficient writes land
+atomically as far as the analog front end is concerned.
+
+⚠ That bracket is NOT `phy-allwinner-a733-combophy-dp-reset-sequence`'s reset bracket and must not be confused with it.
+Swing changes happen on a LIVE link between two training rounds; tearing the
+link down there would destroy the thing being trained. The rate and lane writes
+keep the reset bracket, set_voltages gets the ACYA one, and .configure now runs
+them as three independent arms in mainline's order -- lanes, rate, voltages
+(phy-cadence-torrent.c:1602-1637).
+
+The five register indices are mainline's own constants offset by the lane-CDB
+base: 0x4000 + lane * 0x200 + {0x0040, 0x004C, 0x0050, 0x00C6, 0x01E7}. The
+cross-check that they are the same registers is `phy-allwinner-a733-combophy-dp-rate-2700`'s own rate table, which
+already carries the absolute results (0x4040/0x4240/0x4440/0x4640 for
+TX_TXCC_CTRL, 0x4050.. for MGNFS).
+
+WHERE THE COEFFICIENT VALUES COME FROM -- NOT ONE SOURCE, SO NOT ONE CLAIM
+---------------------------------------------------------------------------
+
+There is no UM field table for these registers at all: the vendor's
+trilinear_dp14.h is a bare offset list and the PMA is Cadence's, not
+Allwinner's. So the table is stated cell by cell:
+
+  (0,0), (1,0)  EXERCISED ON SILICON. Training starts at (0,0); the sink asked
+                for swing 1 on all four lanes and four lanes then reached CR in
+                one round and EQ in one round, 77 77 01 01, all four symbol-error
+                counters valid at zero, and a picture.
+  (2,0)         READ BACK off a live vendor four-lane link: the four MGNFS words
+                read 0x0010 0x000E 0x000E 0x0010, which is this row to the digit
+                (the same four are the "4 disagree" entries in
+                `phy-allwinner-a733-combophy-dp-rate-2700`'s cross-check, and they
+                disagree precisely because they are the values training owns).
+  the rest      vendor dp_lv_table_2g7 -- a HINT, not verified, and marked as
+                such in the code rather than presented as known.
+  (2,1)         the weakest: it is the one LEGAL DP cell that our shell script
+                a733-dp-link-train.sh (a user-space training script used before
+                this driver; not part of this recipe) never names, so it falls
+                into that script's catch-all together with the illegal ones.
+                Carried from there, unexercised.
+
+WHERE THE VENDOR DRIVER DIFFERS, AND WHAT THIS DOES INSTEAD
+------------------------------------------------------------
+
+  vendor                                   | ours
+  -----------------------------------------+------------------------------------
+  per-lane index taken from sysfs straight | bounds-checked in the PROVIDER, the
+  into dp_lv_table[sw][pre], no bound      | way cdns_torrent_dp_verify_config()
+                                           | does: each level 0..3 AND their sum
+                                           | at most 3 (DP 1.4 Table 3-1), with
+                                           | -ERANGE and the offending lane named
+  trilinear_set_lane_sw_pre() -- an EMPTY  | no such slot; the swing lives where
+  function registered in the ops table     | the hardware is, in the PHY
+  varies DRV_DIAG_TX_DRV with pre-emphasis | kept -- here the vendor's values
+  where mainline pins it at 0x0003         | match this board and mainline's
+                                           | generic table does not
+  illegal cells: repeats the last legal row| kept, rather than mainline's
+                                           | 0xFFFF placeholders. Unreachable
+                                           | twice over (the check above, and the
+                                           | DP driver clamps before asking), so
+                                           | it is a third belt, not a path
+
+⚠ And one defect in OUR OWN shell instrument, which this table fixes:
+a733-dp-link-train.sh has a single catch-all arm serving both the legal cell
+(2,1) and every illegal one, so swing 3 with any pre-emphasis gets the (2,1) row
+instead of repeating (3,0). Unreachable in practice and still not what a reader
+of that script would predict.
+
+WHAT IS STILL REFUSED, BY NAME
+------------------------------
+
+Every link rate except 2700 Mb/s, and SSC. There is one PMA rate table; a swing
+table for a rate that cannot be configured would be dead code that looks like
+rate support, so the 1620 Mb/s swing table is deliberately NOT here either.
+
+⚠ NOT HARDWARE-PROVEN, AND THE BOARD RUN THAT LOOKED LIKE IT MIGHT PROVE IT DID
+NOT
+--------------------------------------------------------------------------------
+
+A test boot on the 8 GiB board, 2026-08-19, carried this patch, proved `phy-allwinner-a733-combophy-dp-lane-map-and-inverts` outright and
+proved nothing here. Nothing in that session read a drive level this patch had
+written: the one MGNFS reading taken was at the wrong address (below), and the
+training attempts made after the Type-C recovery could not exercise it either --
+that recovery had left DP alt mode, so the four COMB0 lanes were in reset and
+there was no link for a drive level to act on. The same failure reproduced on
+`dp545`, a kernel WITHOUT these patches, which rules them out as its cause.
+
+⚠ RECOVERY IS A POWER CYCLE, not an unbind/bind of the rt1711h i2c device: its
+second use that day left DP alt mode outright and the kernel then wedged with RCU
+stalls on one CPU until the board was power-cycled anyway.
+
+⚠ The MGNFS reading taken in that session ("still zero") was taken at
+0x06C98xxx, which is NOT TX_TXCC_MGNFS_MULT_000. The register is at
+0x06C80000 + ((0x4000 + lane*0x200 + 0x50) << 1) = 0x06C880A0 / 0x06C884A0 /
+0x06C888A0 / 0x06C88CA0 -- the PMA base
+(A733 user manual, chapter 2 Memory Map, COMBPHY0), the index
+from what a733_combophy_dp_set_voltages() writes and from `phy-allwinner-a733-combophy-dp-rate-2700`'s rate table,
+which carries the same four indices (0x4050/0x4250/0x4450/0x4650) as absolute
+results. So that reading says nothing about this patch in either direction.
+
+WHAT IT OWES
+------------
+
+  1. A link that trains from the driver. Observable: with `drm-a733-dp-link-training` in the same
+     kernel, `echo 0 > /sys/kernel/debug/5740000.displayport/train` returns 0
+     and DPCD 0x202/0x203 read 0x77 0x77 with 0x204 bit0 set.
+     Falsified by: phy_configure() still returning -EOPNOTSUPP, or CR never
+     completing on a board and cable where the shell script
+     a733-dp-link-train.sh does complete it.
+  2. The registers this patch writes, read back at a known level. Observable:
+     after training settles at swing 1 / pre 0 on all four lanes (which is what
+     the 8 GiB board + the bench sink asked for on 2026-08-18), the four MGNFS words
+     0x06C880A0 / 0x06C884A0 / 0x06C888A0 / 0x06C88CA0 read 0x001F001F,
+     0x001E001E, 0x001E001E, 0x001F001F (16-bit values mirrored into both halves
+     of a 32-bit read).
+     Falsified by: 0x002A002A, which is what `phy-allwinner-a733-combophy-dp-rate-2700`'s rate table leaves behind and
+     therefore means set_voltages never ran.
+  3. ⚠ A SUPERSPEED RE-PROOF. This patch adds PMA writes to the driver that owns
+     COMB0 and RST_BUS_SERDES is shared. Observable: on a boot with NO DP sink
+     attached, `lsusb -t` still shows a SuperSpeed device at 10000M, and
+     LINK_CTRL0 0x06C01000 still reads 0x00000111.
+     Falsified by: SuperSpeed dropping, or any of the five per-lane registers
+     moving on a port that never entered DP alt mode.
+
+NOT HARDWARE-PROVEN -- and see the section above: the 2026-08-19 test boot
+carried this patch, proved `phy-allwinner-a733-combophy-dp-lane-map-and-inverts`, and settled nothing here. Builds clean at W=1
+with the debug instrumentation both on and off; checkpatch 0/0.
+
+The coefficient cells marked as vendor values come from
+dp_lv_table_2g7 in drivers/phy/sunxi-cadence-combophy.c from
+radxa/allwinner-bsp (commit b36af3872d4e, "aiot-linux-v1.4.6 release"; the
+file is unchanged on the branches cubie-aiot-v1.4.6 and cubie-aiot-v1.4.8),
+GPL-2.0, Copyright(c) 2020 - 2023 Allwinner Technology Co.,Ltd. and
+Copyright (C) 2024 Allwinner Electronics Co., Ltd.:
+https://github.com/radxa/allwinner-bsp/blob/b36af3872d4e6e91da6e929f4ccf4822b3ea9d66/drivers/phy/sunxi-cadence-combophy.c
+The write sequence follows cdns_torrent_dp_set_voltages() in
+drivers/phy/cadence/phy-cadence-torrent.c (Linux 6.18, GPL-2.0-only,
+Copyright 2018 Cadence Design Systems, Inc.).
+
+Assisted-by: Claude
+
+diff --git a/drivers/phy/allwinner/phy-sun60i-a733-combophy.c b/drivers/phy/allwinner/phy-sun60i-a733-combophy.c
+--- a/drivers/phy/allwinner/phy-sun60i-a733-combophy.c
++++ b/drivers/phy/allwinner/phy-sun60i-a733-combophy.c
+@@ -151,6 +151,42 @@
+ #define A733_DP_LANE_INVERT_DEFAULT	GENMASK(A733_DP_LANES - 1, 0)
+ #define A733_DP_LANE_MAP_IDENTITY	0x00003210
+ 
++/*
++ * The PMA's per-lane transmit CDB. The five register indices below are
++ * mainline's own Cadence Torrent constants -- this PHY is a Torrent derivative
++ * and its swing/pre-emphasis sequence is cdns_torrent_dp_set_voltages()
++ * register for register (drivers/phy/cadence/phy-cadence-torrent.c:1558). The
++ * lane-CDB base 0x4000 and the 0x200-word lane stride are what turn them into
++ * the absolute indices `phy-allwinner-a733-combophy-dp-rate-2700`'s own rate table already carries (0x4040, 0x4240,
++ * 0x4440, 0x4640 for TX_TXCC_CTRL), which is the cross-check that they are the
++ * same registers:
++ *
++ *   TX_TXCC_CTRL           0x0040   phy-cadence-torrent.c:169
++ *   TX_TXCC_CPOST_MULT_00  0x004C   :170
++ *   TX_TXCC_MGNFS_MULT_000 0x0050   :172
++ *   DRV_DIAG_TX_DRV        0x00C6   :174
++ *   TX_DIAG_ACYA           0x01E7   :186
++ *
++ * ⚠ Byte offset = word index << 1, and the block is 16 bits wide -- a 32-bit
++ * read shows every value mirrored into both halves.
++ */
++#define PMA_TX_CDB(lane, idx)		(((0x4000 + (lane) * 0x200 + (idx)) << 1))
++#define PMA_TX_TXCC_CTRL		0x0040
++#define  PMA_TX_TXCC_CTRL_VAL		0x08A4	/* identical to mainline's constant */
++#define PMA_TX_TXCC_CPOST_MULT_00	0x004C
++#define PMA_TX_TXCC_MGNFS_MULT_000	0x0050
++#define PMA_DRV_DIAG_TX_DRV		0x00C6
++#define PMA_TX_DIAG_ACYA		0x01E7
++#define  PMA_TX_DIAG_ACYA_HBDC		BIT(0)
++
++/* DP 1.4 Table 3-1: four swing levels, four pre-emphasis levels, and their sum
++ * may not exceed 3. Both bounds are enforced in this provider, the way
++ * cdns_torrent_dp_verify_config() does (phy-cadence-torrent.c:1405-1417) --
++ * the vendor takes a per-lane index straight from sysfs into dp_lv_table[sw][pre]
++ * with no bound at all.
++ */
++#define A733_DP_LEVEL_MAX		3
++
+ #define SERDES_REFCLK_RATE		100000000	/* serdes-phy-cfg = 100 MHz */
+ #define PHY_LOCK_TIMEOUT_US		2000
+ #define PMA_READY_TIMEOUT_US		10000
+@@ -927,6 +963,133 @@
+ }
+ 
+ /*
++ * One cell of the transmit de-emphasis table: the three Torrent coefficient
++ * registers, with MGNFS carried PER LANE because on this board it is per lane.
++ *
++ * WHERE THESE NUMBERS COME FROM, cell by cell, because it is not one source:
++ *
++ *   (0,0), (1,0)  exercised on silicon. Training starts at (0,0) and the sink
++ *                 asked for swing 1 on all four lanes; four lanes then reached
++ *                 CR in one round and EQ in one round, 77 77 01 01, zero symbol
++ *                 errors, and a picture. The rows below say for
++ *                 each other cell whether it was read back or
++ *                 carried.
++ *   (2,0)         READ BACK off a live vendor four-lane link on the 8 GiB board: the four
++ *                 MGNFS words read 0x0010 0x000E 0x000E 0x0010, which is this
++ *                 row to the digit (`phy-allwinner-a733-combophy-dp-rate-2700`'s row; the
++ *                 capture is not tracked in this tree).
++ *                 That is a register read on silicon, not a value out of code.
++ *   the rest      vendor dp_lv_table_2g7, i.e. a HINT that has not been
++ *                 verified. Marked as such rather than presented as known: no
++ *                 UM field table exists for these registers at all.
++ *
++ *   (2,1)         the weakest of all -- it is the one valid DP cell that
++ *                 the shell script this replaces never names, so it falls into
++ *                 that script's catch-all arm together with the ILLEGAL cells.
++ *                 The values are carried from there and are unexercised.
++ *
++ * ⚠ The illegal cells (voltage + pre > 3) repeat the last legal row of their
++ * swing, which is the vendor's behaviour, where mainline's
++ * vltg_coeff[][] writes 0xFFFF into them (phy-cadence-torrent.c:646-649). They
++ * are unreachable twice over -- a733_combophy_dp_check() refuses the request and
++ * the DP driver clamps before asking -- so this is a third belt, not a path.
++ *
++ * ⚠ The shell script this replaces gets the illegal cells wrong in a way a table
++ * cannot: its single catch-all gives swing 3 with any pre-emphasis the (2,1)
++ * row instead of repeating (3,0). Unreachable, and still not what a reader of
++ * that script would predict.
++ *
++ * ⬜ Still open, and named rather than guessed: lanes 1 and 2 sit one MGNFS step
++ * below lanes 0 and 3 in every row. That reads like trace-length compensation
++ * and nothing in the vendor tree says so -- no comment, no changelog, no
++ * reference measurement.
++ */
++struct a733_dp_swing {
++	u16	diag_tx_drv;
++	u16	cpost_mult;
++	u16	mgnfs_mult[A733_DP_LANES];
++};
++
++/* [voltage swing][pre-emphasis], 2700 Mb/s. The 1620 Mb/s table is NOT here:
++ * this PHY has no 1620 PMA table either, so a swing table for a rate that
++ * cannot be configured would be dead code that looks like rate support.
++ */
++static const struct a733_dp_swing a733_dp_swing_2700[4][4] = {
++	/* swing 0 */
++	{ { 0x0003, 0x0000, { 0x0028, 0x0026, 0x0026, 0x0028 } },
++	  { 0x00B2, 0x0008, { 0x0024, 0x0023, 0x0023, 0x0024 } },
++	  { 0x00B2, 0x0016, { 0x001C, 0x001B, 0x001B, 0x001C } },
++	  { 0x00B2, 0x0023, { 0x000B, 0x000A, 0x000A, 0x000B } } },
++	/* swing 1 -- (1,3) is illegal and repeats (1,2) */
++	{ { 0x0003, 0x0000, { 0x001F, 0x001E, 0x001E, 0x001F } },
++	  { 0x00B2, 0x000A, { 0x001A, 0x0019, 0x0019, 0x001A } },
++	  { 0x00B2, 0x0019, { 0x000A, 0x0009, 0x0009, 0x000A } },
++	  { 0x00B2, 0x0019, { 0x000A, 0x0009, 0x0009, 0x000A } } },
++	/* swing 2 -- (2,2) and (2,3) are illegal and repeat (2,1) */
++	{ { 0x0003, 0x0000, { 0x0010, 0x000E, 0x000E, 0x0010 } },
++	  { 0x0082, 0x0011, { 0x0000, 0x0000, 0x0000, 0x0000 } },
++	  { 0x0082, 0x0011, { 0x0000, 0x0000, 0x0000, 0x0000 } },
++	  { 0x0082, 0x0011, { 0x0000, 0x0000, 0x0000, 0x0000 } } },
++	/* swing 3 -- everything but (3,0) is illegal and repeats it */
++	{ { 0x0003, 0x0000, { 0x0000, 0x0000, 0x0000, 0x0000 } },
++	  { 0x0003, 0x0000, { 0x0000, 0x0000, 0x0000, 0x0000 } },
++	  { 0x0003, 0x0000, { 0x0000, 0x0000, 0x0000, 0x0000 } },
++	  { 0x0003, 0x0000, { 0x0000, 0x0000, 0x0000, 0x0000 } } },
++};
++
++/*
++ * Apply the swing and pre-emphasis each lane was asked for.
++ *
++ * THE FREEZE/THAW BRACKET IS THE POINT, and it is not `phy-allwinner-a733-combophy-dp-reset-sequence`'s reset bracket --
++ * this runs on a LIVE link, between two training rounds, and tearing the link
++ * down here would destroy the thing being trained. TX_DIAG_ACYA[0] is what
++ * makes that safe, and mainline says why in words this driver does not have to
++ * guess at: bit set "to freeze the current state of the analog TX driver",
++ * cleared "to allow the state of analog TX driver to reflect the new programmed
++ * one" (phy-cadence-torrent.c:1568-1571, :1592-1595). So the four coefficient
++ * writes land atomically as far as the analog front end is concerned and the
++ * output never walks through an intermediate drive level.
++ *
++ * ⚠ The rate table leaves MGNFS at 0x002A on all four lanes -- mainline's
++ * generic swing-0 value, not this board's. So a link that has just had its rate
++ * configured is at a drive level nothing measured; the first thing training does
++ * is call this with swing 0 / pre 0 on every lane, which is also what puts the
++ * source and the sink at the same starting level.
++ */
++static void a733_combophy_dp_set_voltages(struct a733_combophy *cp,
++					  const struct phy_configure_opts_dp *dp)
++{
++	unsigned int lane;
++
++	for (lane = 0; lane < dp->lanes; lane++) {
++		const struct a733_dp_swing *row =
++			&a733_dp_swing_2700[dp->voltage[lane]][dp->pre[lane]];
++		void __iomem *acya = cp->pma +
++				     PMA_TX_CDB(lane, PMA_TX_DIAG_ACYA);
++		u16 v;
++
++		v = readw(acya);
++		writew(v | PMA_TX_DIAG_ACYA_HBDC, acya);
++
++		writew(PMA_TX_TXCC_CTRL_VAL,
++		       cp->pma + PMA_TX_CDB(lane, PMA_TX_TXCC_CTRL));
++		writew(row->diag_tx_drv,
++		       cp->pma + PMA_TX_CDB(lane, PMA_DRV_DIAG_TX_DRV));
++		/* MGNFS is indexed by the PHYSICAL lane as well as by the level:
++		 * the per-lane skew belongs to the board, the level to what that
++		 * lane asked for.
++		 */
++		writew(row->mgnfs_mult[lane],
++		       cp->pma + PMA_TX_CDB(lane, PMA_TX_TXCC_MGNFS_MULT_000));
++		writew(row->cpost_mult,
++		       cp->pma + PMA_TX_CDB(lane, PMA_TX_TXCC_CPOST_MULT_00));
++
++		v = readw(acya);
++		writew(v & ~PMA_TX_DIAG_ACYA_HBDC, acya);
++	}
++}
++
++/*
+  * Is this rate/lane request one the driver can carry out? Split out of
+  * .configure so that .validate can answer the same question with no side
+  * effects, which is what phy.h requires of it: "It must not change any actual
+@@ -939,6 +1102,8 @@
+  */
+ static int a733_combophy_dp_check(const struct phy_configure_opts_dp *dp)
+ {
++	unsigned int i;
++
+ 	if (dp->set_rate) {
+ 		if (dp->link_rate != DP_LINK_RATE_HBR_MBPS || dp->ssc)
+ 			return -EOPNOTSUPP;
+@@ -949,9 +1114,64 @@
+ 			return -EINVAL;
+ 	}
+ 
++	/* set_voltages names its lanes through the SAME `lanes` field even when
++	 * set_lanes is clear ("Only lanes specified by 'lanes' parameter will be
++	 * affected", include/linux/phy/phy-dp.h), so it has to be checked here
++	 * too -- otherwise a swing-only request with a stale lane count indexes
++	 * past the four the PMA has.
++	 */
++	if (dp->set_voltages) {
++		if (!dp->lanes || dp->lanes > A733_DP_LANES)
++			return -EINVAL;
++
++		for (i = 0; i < dp->lanes; i++)
++			if (dp->voltage[i] > A733_DP_LEVEL_MAX ||
++			    dp->pre[i] > A733_DP_LEVEL_MAX ||
++			    dp->voltage[i] + dp->pre[i] > A733_DP_LEVEL_MAX)
++				return -ERANGE;
++	}
++
+ 	return 0;
+ }
+ 
++/* Say which half was refused and with which number. Split out because
++ * .configure has three refusal cases now and .validate must have none -- a rate
++ * ladder that asks before it acts would otherwise print a line per rung.
++ *
++ * ⚠ Only the field the consumer actually SET is printed. union
++ * phy_configure_opts is routinely left partly uninitialised by its callers
++ * (dw-dp.c:559 declares it on the stack and fills three fields), so printing
++ * dp->lanes for a rate-only request would be printing whatever was on that
++ * stack.
++ */
++static void a733_combophy_dp_refused(struct a733_combophy *cp,
++				     const struct phy_configure_opts_dp *dp,
++				     int ret)
++{
++	unsigned int i;
++
++	switch (ret) {
++	case -EOPNOTSUPP:
++		dev_warn(cp->dev,
++			 "DP link rate %u Mb/s%s refused: only %u Mb/s without SSC has a PMA table\n",
++			 dp->link_rate, dp->ssc ? " with SSC" : "",
++			 DP_LINK_RATE_HBR_MBPS);
++		return;
++	case -EINVAL:
++		dev_warn(cp->dev,
++			 "DP lane count %u refused: the PMA lane word encodes 1, 2 or 4\n",
++			 dp->lanes);
++		return;
++	case -ERANGE:
++		for (i = 0; i < dp->lanes && i < A733_DP_LANES; i++)
++			dev_warn(cp->dev,
++				 "DP lane %u swing %u / pre-emphasis %u refused: DP 1.4 Table 3-1 allows each 0..%u and their sum at most %u\n",
++				 i, dp->voltage[i], dp->pre[i],
++				 A733_DP_LEVEL_MAX, A733_DP_LEVEL_MAX);
++		return;
++	}
++}
++
+ /*
+  * phy_ops.configure is how a DisplayPort controller asks for a link rate and a
+  * lane count, and on the real alt-mode path that controller is the DP
+@@ -975,10 +1195,51 @@
+  * 0x100 while the PMA stayed at 2.7 Gbps is what an earlier
+  * measurement found: RBR fails at any lane count.
+  *
+- * What is still not implemented, and is refused rather than half-applied: the
+- * swing/pre-emphasis tables (combo0_dp_set_sw_pre), and every link rate except
+- * 2700 Mb/s.
++ * SWING/PRE-EMPHASIS IS NOT IN THAT BRACKET, deliberately. It is applied on a
++ * live link between two training rounds and carries its own, much smaller
++ * bracket -- TX_DIAG_ACYA, see a733_combophy_dp_set_voltages(). Putting it
++ * inside the reset staircase would tear down the link training is converging.
++ * Mainline's Torrent driver makes the same split: set_lanes, set_rate and
++ * set_voltages are three independent arms of one .configure call, in that order
++ * (phy-cadence-torrent.c:1602-1637).
++ *
++ * What is still not implemented, and is refused rather than half-applied: every
++ * link rate except 2700 Mb/s, and SSC.
+  */
++/* The rate/lane half of .configure, inside `phy-allwinner-a733-combophy-dp-reset-sequence`'s reset bracket. Caller holds
++ * cp->lock.
++ *
++ * Lane count first and the rate table last, which is the order the vendor
++ * reaches (combo0_dp_set_lanes() then combo0_dp_set_rate() in its .configure)
++ * -- with one difference: the vendor writes the lane word into a LIVE PMA,
++ * outside any bracket. It is inside ours, because a PMA write into a live PHY is
++ * what cost a board an SError on 2026-08-18 and nothing says this word is
++ * exempt.
++ */
++static int a733_combophy_dp_apply_link(struct a733_combophy *cp,
++				       const struct phy_configure_opts_dp *dp)
++{
++	int ret = 0;
++
++	a733_combophy_dp_teardown(cp);
++
++	if (dp->set_lanes)
++		ret = a733_combophy_dp_set_lanes(cp, dp->lanes);
++
++	if (!ret && dp->set_rate)
++		a733_combophy_dp_rate_2700(cp);
++
++	/* Always release, even if the write above failed: leaving the link in
++	 * reset would strand the PHY in a state no later call recovers, and
++	 * UM 18.2.6.8 requires POWER_STATE_REQ to return to 0 and be
++	 * re-requested, which the staircase does.
++	 */
++	if (a733_combophy_dp_reset_seq(cp) && !ret)
++		ret = -EIO;
++
++	return ret;
++}
++
+ static int a733_combophy_configure(struct phy *phy,
+ 				   union phy_configure_opts *opts)
+ {
+@@ -986,34 +1247,12 @@
+ 	struct phy_configure_opts_dp *dp = &opts->dp;
+ 	int ret;
+ 
+-	if (dp->set_voltages) {
+-		dev_warn_once(cp->dev,
+-			      "DP swing/pre-emphasis not implemented, link training cannot complete\n");
+-		return -EOPNOTSUPP;
+-	}
+-
+-	if (!dp->set_rate && !dp->set_lanes)
++	if (!dp->set_rate && !dp->set_lanes && !dp->set_voltages)
+ 		return 0;
+ 
+-	/* -EOPNOTSUPP is the rate, -EINVAL the lane count. Each is named on its
+-	 * own, and only the field the consumer actually set is printed: a
+-	 * union phy_configure_opts is routinely left partly uninitialised by
+-	 * its callers (dw-dp.c declares it on the stack and fills three
+-	 * fields), so printing dp->lanes for a rate-only request would be
+-	 * printing whatever was on that stack.
+-	 */
+ 	ret = a733_combophy_dp_check(dp);
+-	if (ret == -EOPNOTSUPP) {
+-		dev_warn(cp->dev,
+-			 "DP link rate %u Mb/s%s refused: only %u Mb/s without SSC has a PMA table\n",
+-			 dp->link_rate, dp->ssc ? " with SSC" : "",
+-			 DP_LINK_RATE_HBR_MBPS);
+-		return ret;
+-	}
+ 	if (ret) {
+-		dev_warn(cp->dev,
+-			 "DP lane count %u refused: the PMA lane word encodes 1, 2 or 4\n",
+-			 dp->lanes);
++		a733_combophy_dp_refused(cp, dp, ret);
+ 		return ret;
+ 	}
+ 
+@@ -1055,32 +1294,19 @@
+ 		goto out;
+ 	}
+ 
+-	/* The bracket. Lane count first and the rate table last, which is the
+-	 * order the vendor reaches (combo0_dp_set_lanes() then
+-	 * combo0_dp_set_rate() in its .configure) -- with one difference: the
+-	 * vendor writes the lane word into a LIVE PMA, outside any bracket. It
+-	 * is inside ours, because a PMA write into a live PHY is what cost a
+-	 * board an SError on 2026-08-18 and nothing says this word is exempt.
+-	 */
+-	a733_combophy_dp_teardown(cp);
+-
+-	if (dp->set_lanes) {
+-		ret = a733_combophy_dp_set_lanes(cp, dp->lanes);
++	if (dp->set_rate || dp->set_lanes) {
++		ret = a733_combophy_dp_apply_link(cp, dp);
+ 		if (ret)
+-			goto release;
++			goto out;
+ 	}
+ 
+-	if (dp->set_rate)
+-		a733_combophy_dp_rate_2700(cp);
+-
+-release:
+-	/* Always release, even if a write above failed: leaving the link in
+-	 * reset would strand the PHY in a state no later call recovers, and
+-	 * UM 18.2.6.8 requires POWER_STATE_REQ to return to 0 and be
+-	 * re-requested, which the staircase does.
++	/* Live-link write, no reset bracket. Last, as in mainline's Torrent
++	 * .configure, so a call that does all three leaves the drive level
++	 * matching the rate and lane count it has just set rather than the
++	 * generic value the rate table put there.
+ 	 */
+-	if (a733_combophy_dp_reset_seq(cp) && !ret)
+-		ret = -EIO;
++	if (dp->set_voltages)
++		a733_combophy_dp_set_voltages(cp, dp);
+ 
+ out:
+ 	mutex_unlock(&cp->lock);

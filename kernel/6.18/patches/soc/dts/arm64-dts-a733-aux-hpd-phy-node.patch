@@ -1,0 +1,158 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: a733: add the DisplayPort AUX/HPD PHY node
+
+One node, the device-tree side of patch `phy-allwinner-a733-aux-hpd-phy`: it describes the DP AUX/HPD analog
+front end at 0x06C01E00 -- three registers inside the SERDES subsystem aperture,
+AUX_HPD_PHY_PINS_CTRL0/1/2, UM 18.2.6.12-18.2.6.14, listed as +0x1e00 in
+the user manual.
+
+Kept separate from `phy-allwinner-a733-aux-hpd-phy` because it is separable: the driver is reviewable
+against the UM field tables on its own, and the node is where the board-level
+claims live.
+
+reg
+---
+
+`<0x0 0x06c01e00 0x0 0x200>` -- base and length exactly as the block is laid out
+in the UM register list (0x1e00, 0x1e04, 0x1e08, next block COMB1 at 0x2000) and
+as the vendor DT describes it. Unit address 6c01e00, no collision with
+combophy0's 6c01000.
+
+⚠ The window sits *inside* combophy0's first window (0x06C01000 + 0x1000 from
+`arm64-dts-a733-add-usb3-dwc3-combophy`). That is not an oversight in this node and it is not fixed here: the
+overlap is handled on the driver side, which maps non-exclusively, and the clean
+fix -- shrinking combophy0's window to the 0xa00 it actually needs -- edits the
+HW-proven USB3 node and belongs to a patch that re-proves SuperSpeed. The
+reasoning is written out in `phy-allwinner-a733-aux-hpd-phy`'s header and in the driver comment; this line
+exists so a reader of the DT alone does not conclude the reg is wrong.
+
+clocks / resets
+---------------
+
+`CLK_SERDES_PHY_CFG` and `RST_BUS_SERDES`, i.e. the SERDES-wide pair that
+combophy0 (`phy-allwinner-a733-add-serdes-combophy` and `arm64-dts-a733-add-usb3-dwc3-combophy`) and serdes_ccu (`clk-sunxi-ng-a733-add-serdes-subsystem-clocks`) already take. Two consequences,
+both deliberate:
+
+ - the reset is *shared*. Those two hold it deasserted for the running USB3
+   controller; a node that could assert it would be able to take their registers
+   away. reset_control_get_shared() on the driver side makes this node's
+   deassert a refcount bump and its assert a decrement that never reaches zero
+   while USB3 lives.
+ - no `assigned-clock-rates`. combophy0 sets serdes-phy-cfg to 100 MHz in its
+   phy_init; both PHYs run off that one net, so a rate here would be two drivers
+   fighting over one clock.
+
+No `dcxo-serdes0`: the vendor's aux_hpd init enables the serdes clock only, and
+nothing in the AUX block's three registers references the DCXO.
+
+No power-domain. combophy0 has none either (`arm64-dts-a733-usb3-power-domain` attached PD_USB2 to the dwc3
+controller alone), and no domain id for the SERDES/DP side has a source.
+Guessing one is exactly the class of value this tree does not
+guess.
+
+Board wiring the node stands for
+--------------------------------
+
+ - DP-AUXP/AUXN -> Type-C J4 SBU1/SBU2 through 100 nF DC blocking caps
+   (C105/C107, sch p12 L38-44; SoC-side nets sch p6 L124-125).
+ - **No external SBU mux and no redriver on this board.** HUSB311 is a CC/PD
+   controller only. Whatever handles a
+   reversed plug is inside the SoC.
+ - DP-REXT = R68 3.01K (sch p6 L144-145).
+ - DP-HPD (sch p6 L127) appears on no other schematic page, so it is not routed
+   to the connector; in DP alt mode HPD arrives over CC as a DisplayPort
+   Attention message.
+ - The block's rail is AVDD-HPD-AUX, 3.3 V (sch p6 L130). Our
+   rail map does not name its PMIC output (the
+   regulator column is empty), so no `*-supply` is declared. A `regulator-fixed`
+   stand-in would satisfy the binding and prove nothing.
+
+status and the missing consumer
+-------------------------------
+
+`status = "okay"` with no consumer, and that is safe rather than sloppy: the
+`phy-allwinner-a733-aux-hpd-phy` probe path maps the window, gets the clock and the reset, creates the phy
+and returns without touching a register. The first write happens when something
+calls phy_init()/phy_power_on(), and nothing does yet.
+
+⚠ When that consumer arrives it must not call `phy_power_on()` at bind. The
+vendor's DP stack does the equivalent and logs 34 AUX timeouts over 4.5 s on
+every boot with nothing plugged into J4 (the 8 GiB board);
+`phy_power_on()` is the point at which this front end's bandgap and AUX
+enable come up, so it belongs after DP alt mode has been entered and the mux is
+in a DP state, not at bind. Full reasoning and the measured numbers are in
+`phy-allwinner-a733-aux-hpd-phy`'s header and in the driver's file comment.
+
+The label is `aux_hpd` so the DP transmitter can pick it up unchanged when it
+lands. The vendor puts that consumer on its eDP node as
+
+	phys = <&combo0_dp>, <&aux_hpd_phy>;
+	phy-names = "dp-phy", "aux-phy";
+
+and `aux_hpd_phy` there is the child node of an `aux-hpd@6c01e00` container; our
+tree has no container, so the same wiring here reads
+
+	phys = <&combo0_dp>, <&aux_hpd>;
+	phy-names = "dp-phy", "aux-phy";
+
+on the eDP0 node at 0x05740000 -- which this tree does not model yet, and which
+needs its EDP_BGR gate in the CCU first (measured 2026-08-17: EDP_BGR_REG at
+0x0200364C reads 0x00000000 on our kernel).
+
+Verified: applies at fuzz 0 on top of the current series, dtc builds the dtb
+with no new warning, and the compiled dtb carries phy@6c01e00 with its
+compatible, reg, clock and reset. NOT verified: the board. What a board would
+have to show is in `phy-allwinner-a733-aux-hpd-phy`'s header -- the three registers reading 0x03331131 /
+0x00010e0d / 0x00000000, and USB3 still enumerating at SuperSpeed afterwards.
+
+Assisted-by: Claude
+
+diff --git a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -1449,6 +1449,45 @@
+ 					remote-endpoint = <&usb_con_ss>;
+ 				};
+ 			};
++		};
++
++		/*
++		 * DisplayPort AUX/HPD analog front end (patch `phy-allwinner-a733-aux-hpd-phy`). Three registers
++		 * at SERDES_SUBSYS_APP + 0x1e00..0x1e08 (UM
++		 * 18.2.6.12-14): the AUX receiver/transmitter trims and enables, the
++		 * on-chip termination, and the HPD circuitry. It is its own PHY
++		 * instance in the UM block diagram, beside COMB0_PHY_SERDES rather
++		 * than inside it, and it is the block that makes AUX -- and therefore
++		 * DPCD, EDID and link training -- possible at all.
++		 *
++		 * Board side: DP-AUXP/AUXN go to Type-C J4 SBU1/SBU2 through 100 nF
++		 * DC blocking caps with no external mux or redriver
++		 * (sch p12 L19-44; SoC nets on sch p6
++		 * L124-125). DP-REXT = R68 3.01K (sch p6 L144-145). The DP-HPD pad
++		 * (sch p6 L127) appears on no other schematic page, i.e. it is not
++		 * routed to the connector -- in DP alt mode HPD arrives over CC as a
++		 * DisplayPort Attention message, not on a wire.
++		 *
++		 * Clock and reset are the SERDES-wide ones, shared with combophy0 and
++		 * serdes_ccu. The reset is shared on purpose: those two hold it
++		 * deasserted for the running USB3 controller, and this node must never
++		 * be able to take it away. No rate is assigned here -- combophy0 owns
++		 * the 100 MHz serdes-phy-cfg rate.
++		 *
++		 * No consumer yet. When the DP transmitter (eDP0 @0x05740000) lands it
++		 * references this as its second phy, the vendor's shape being
++		 * phys = <&combo0_dp>, <&aux_hpd>; phy-names = "dp-phy", "aux-phy";
++		 * The driver touches no register until that consumer calls phy_init().
++		 */
++		aux_hpd: phy@6c01e00 {
++			compatible = "allwinner,sun60i-a733-aux-hpd-phy";
++			reg = <0x0 0x06c01e00 0x0 0x200>;
++			clocks = <&ccu CLK_SERDES_PHY_CFG>;
++			clock-names = "serdes";
++			/* shared: combophy0 and serdes_ccu hold it deasserted too */
++			resets = <&ccu RST_BUS_SERDES>;
++			#phy-cells = <0>;
++			status = "okay";
+ 		};
+ 
+ 		/*

@@ -1,0 +1,242 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: a733: the TCON_TV1 node, and the DP transmitter's second window
+
+The device-tree half of `clk-sunxi-ng-a733-video-plls-and-edp-tv-pixel-clock`. Two changes to one file:
+
+  1. a tcon_tv1 node -- TCON_TV1 @0x05731000, the timing controller that scans
+     the mode and hands it to the DisplayPort transmitter;
+  2. the eDP node gains its second reg window, eDP_REG_PAD @0x05760000.
+
+`arm64-dts-a733-displayport-transmitter` SAID THIS PATCH WOULD COME
+-------------------------------
+The second window is not a change of mind. `arm64-dts-a733-displayport-transmitter` shipped with one window on
+purpose and named its own successor in the same sentence:
+
+    "The vendor also maps eDP_REG_PAD at 0x05760000 and this node deliberately
+     does not. Its clock gates (LNK_CLK_GATING, VID0/VID1) read 0x00000000
+     through an entire successful AUX session including a full 128-byte EDID
+     fetch -- measured, not assumed -- so nothing on the AUX path needs them.
+     The window goes in when a patch is shown to need it, which is most likely
+     the one that first drives pixels."
+
+This is that patch, and the prediction held exactly: the AUX path never needed
+those gates, and video does not work without them.
+
+⚠ AND THEIR ABSENCE DOES NOT LOOK LIKE A MISSING CLOCK GATE
+------------------------------------------------------------
+This is the reason the window is described in the node's comment rather than
+left for the driver author to discover. With DP_LNK_CLK_CFG and DP_VID_CLK_CFG
+shut, fifteen of the seventeen main-stream-attribute registers read back
+exactly what was written, and only MVID and NVID misbehave -- NVID silently
+dropping a write, because it lives in the video clock domain. A driver that
+verifies its own read-backs passes on fifteen registers and then goes hunting
+in MVID, which is read-only in asynchronous mode and therefore innocent.
+
+WHERE THE VALUES COME FROM
+--------------------------
+  TCON_TV1 base    0x05731000, 4 KiB, group VIDEO_OUT1_SYS
+                   the A733 user manual (TCON_TV1),
+  UM 15.2: TCON_TV1 is the TCON that drives eDP
+  interrupt        INTID 90 "TV1" = GIC_SPI 58
+                   the A733 user manual,
+  eDP_REG_PAD base 0x05760000, named in the UM's own register list next to
+                   eDP_CTRL 0x05740000
+  DP_LNK_CLK_CFG   offset 0x0000, bit0 LNK_CLK_GATING, (1 = clock running, 0 = gated)
+                   UM 15.4.8.1
+  DP_VID_CLK_CFG   offset 0x0004, bit4 VID1_CLK_GATING, bit0 VID0_CLK_GATING
+                   UM 15.4.8.2
+  clocks/resets    CLK_BUS_TCON_TV1 / RST_BUS_TCON_TV1 (TCONTV1_BGR 0x160C
+                   bit0/bit16) and CLK_EDP_TV (EDP_TV_CLK_REG
+                   0x1640), all added by `clk-sunxi-ng-a733-video-plls-and-edp-tv-pixel-clock`
+
+Silicon: on the 8 GiB board on 2026-08-18 this exact set -- TCONTV1_BGR 0x00010001,
+EDP_TV_CLK 0x81000001, DP_LNK_CLK_CFG 0x1, DP_VID_CLK_CFG 0x1 -- put a test
+pattern on a 1920x1200 DisplayPort link, with TV_DEBUG_REG's line counter
+sweeping to the programmed VTOTAL and SRC0_USER_FIFO_STATUS at zero.
+This patch describes that state;
+it does not yet produce it, because nothing binds the node.
+
+TWO CLOCKS ON THE TCON, AND WHY THE SECOND ONE IS A PIXEL CLOCK
+---------------------------------------------------------------
+"bus" is the TCONTV1_BGR gate, with its reset in bit 16 of the same word --
+both, always, which on this SoC is measured rather than conventional: `clk-sunxi-ng-a733-add-edp-bus-gate-and-reset`
+showed the eDP window reading zero across all 4 KiB with the gate set and the
+reset still asserted.
+
+"tcon-tv" is EDP_TV_CLK. There is no TCONTVx_CLK register on this part at all;
+the TV TCONs take their pixel clock from EDP_TV_CLK (the eDP/DP path) or from
+HDMI_TV_CLK (the HDMI path), which is why the pixel clock appears on the TCON
+node and not on the transmitter.
+
+assigned-clock-parents pins EDP_TV_CLK's four-way source mux to VIDEO1PLL4X.
+That is a board fact and not a preference: the 6 GiB board under the vendor stack, driving
+a live eDP link on 2026-07-18, read EDP_TV_CLK = 0x81000000 with CLK_SRC_SEL =
+001 and PLL_VIDEO0 and PLL_VIDEO2 both switched off.
+There is no assigned-clock-rates: the rate is the mode's and belongs to a
+modeset. `clk-sunxi-ng-a733-video-plls-and-edp-tv-pixel-clock` gives edp-tv CLK_SET_RATE_NO_REPARENT precisely so that this
+device-tree line, and nothing else, decides the source.
+
+⚠ It takes effect when a driver binds this node, not at CCU probe:
+of_clk_set_defaults() is called from platform_probe() (drivers/base/platform.c),
+so today the property is inert. Said out loud because "the DT sets the mux" is
+otherwise easy to read as "the mux is set".
+
+WHAT IS DELIBERATELY NOT IN THIS PATCH
+--------------------------------------
+DISPLAY1_TOP @0x05510000 -- the VO1 top block, gated by DPSS_TOP1_BGR 0x16CC,
+which carries TV_CLK_EDP_I2S1_SRC bit 5, which has to be 1 when TCON_TV1
+feeds eDP. The pixel path does not work without that
+write, and it is still missing here on purpose: it is a separate 4 KiB block
+with its own gate and its own reset, so it gets its own node. Both mainline
+(sun8i-tcon-top) and the vendor
+(bsp/drivers/drm/sunxi_device/sunxi_tcon_top.c:32-99, which asks for
+"clk_bus_dpss_top", "rst_bus_dpss_top" and a clock it calls "clk_ahb") describe
+it as a device of its own. Folding it into the TCON node would build, probe and
+have to be undone later. `clk-sunxi-ng-a733-video-plls-and-edp-tv-pixel-clock` adds CLK_BUS_DPSS_TOP1 and RST_BUS_DPSS_TOP1; the
+node is owed, and this is where the debt is recorded.
+
+No supplies, no port graph, no panel. Unchanged from `arm64-dts-a733-displayport-transmitter`'s reasoning: this
+board has no panel, and the display engine is provably off the critical path --
+TCON_TV1 generates its own test pattern through VDBIST, which
+is how the picture on 2026-08-18 was produced with no DE, no KMS and no DRM
+device at all.
+
+The window is 4 KiB. The UM documents exactly two registers in eDP_REG_PAD, at
+offsets 0x0 and 0x4; 4 KiB is the granularity every other block in this file
+uses (DISPLAY1_TOP and TCON_TV1 are both 4 KiB) and it sits inside the 256 KiB
+the module map gives eDP0 as a whole, 0x05740000-0x0577FFFF.
+
+COMPATIBLE
+----------
+"allwinner,sun60i-a733-tcon-tv". There is no dt-binding document for it, exactly
+as there is none for "allwinner,sun60i-a733-dp" from `arm64-dts-a733-displayport-transmitter` -- the node is
+described in-tree only, and the binding is owed by whichever patch first sends
+either compatible upstream. Named here rather than left to be discovered.
+
+Verified: applies at fuzz 0 as part of the full series against a freshly
+unpacked 6.18.36, and also with `arm64-dts-a733-dp-main-link-phy` present, checked both orders. The dtb
+builds with no new dtc warning against the pre-patch build, and the compiled dtb
+carries lcd-controller@5731000 with its compatible, reg, GIC_SPI 58, both
+clocks, its reset and both assigned-clock properties, and displayport@5740000
+with two reg windows and reg-names "dp", "phy-pad".
+
+NOT hardware-proven, and it cannot be on its own: no driver binds
+"allwinner,sun60i-a733-tcon-tv". What would prove it, as one observable: the dtb carries the node and the second
+window, and the driver that consumes them binds -- and then TV_DEBUG_REG
+@0x057310FC's line counter sweeps to exactly the programmed VTOTAL over >= 200
+samples, which is the TCON proof and is not "the registers read back". What
+would falsify the second window specifically: SRC0_NVID @0x05740854 accepting a
+write and reading it back, i.e. its clock domain running without
+DP_VID_CLK_CFG. That is the register that silently dropped writes with the
+gates shut, so it is the one that tests them.
+
+Assisted-by: Claude
+
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -1301,6 +1301,63 @@
+ 		 * spaces: INTID 185 is PCIE0_MSI.
+ 		 */
+ 		/*
++		 * TCON_TV1 -- the timing controller that scans the mode and hands it
++		 * to the DisplayPort transmitter. UM 15.2: TCON_TV1 is the TCON that drives
++		 * eDP; base 0x05731000, 4 KiB, group
++		 * VIDEO_OUT1_SYS.
++		 *
++		 * interrupts: INTID 90 "TV1" = GIC_SPI 58
++		 *. Nothing
++		 * requests it yet; it is here because it describes the hardware.
++		 *
++		 * clocks: two, and they come from different places in the CCU.
++		 * "bus" is TCONTV1_BGR_REG 0x160C bit0, with its reset in bit16 --
++		 * both are needed, which on this SoC is measured rather than assumed
++		 * (`clk-sunxi-ng-a733-add-edp-bus-gate-and-reset`: with the eDP gate set and the reset still asserted the whole
++		 * register window read zero). "tcon-tv" is EDP_TV_CLK, the pixel
++		 * clock: there is no TCONTVx_CLK register on this part, the TV TCONs
++		 * take their pixel clock from EDP_TV_CLK or from HDMI_TV_CLK
++		 *.
++		 *
++		 * assigned-clock-parents pins EDP_TV_CLK's four-way source mux to
++		 * VIDEO1PLL4X. That is a board fact, not a preference: PLL_VIDEO1 is
++		 * the display PLL here (the 6 GiB board under the vendor stack driving a live
++		 * eDP link, 2026-07-18: EDP_TV_CLK = 0x81000000, CLK_SRC_SEL = 001,
++		 * with VIDEO0 and VIDEO2 switched off).
++		 * No assigned-clock-rates: the rate is the mode's and belongs to a
++		 * modeset, not to the device tree.
++		 *
++		 * ⚠ These take effect when a driver binds this node, not at CCU
++		 * probe -- of_clk_set_defaults() runs from platform_probe()
++		 * (drivers/base/platform.c). Today nothing binds it, so this node
++		 * changes no register; it describes the block for the driver that
++		 * will.
++		 *
++		 * Not here, and named so it is not mistaken for an omission: the VO1
++		 * top block DISPLAY1_TOP @0x05510000 (gate/reset DPSS_TOP1_BGR
++		 * 0x16CC), whose bit 5 TV_CLK_EDP_I2S1_SRC must be 1 when TCON_TV1
++		 * drives eDP. It is a
++		 * separate 4 KiB block with its own gate and reset, so it gets its own
++		 * node, the shape mainline already uses for sun8i-tcon-top. Its clock
++		 * and reset ids exist; the node is owed.
++		 */
++		tcon_tv1: lcd-controller@5731000 {
++			compatible = "allwinner,sun60i-a733-tcon-tv";
++			reg = <0x0 0x05731000 0x0 0x1000>,
++			      <0x0 0x05510000 0x0 0x1000>;
++			reg-names = "tcon", "vo1";
++			interrupts = <GIC_SPI 58 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&ccu CLK_BUS_TCON_TV1>, <&ccu CLK_EDP_TV>,
++				 <&ccu CLK_BUS_DPSS_TOP1>;
++			clock-names = "bus", "tcon-tv", "dpss";
++			resets = <&ccu RST_BUS_TCON_TV1>, <&ccu RST_BUS_DPSS_TOP1>;
++			reset-names = "tcon", "dpss";
++			assigned-clocks = <&ccu CLK_EDP_TV>;
++			assigned-clock-parents = <&ccu CLK_VIDEO1_PLL4X>;
++			status = "okay";
++		};
++
++		/*
+ 		 * The DisplayPort transmitter -- a Trilinear DP 1.4 core, identified
+ 		 * by its own CORE_ID register reading 0x000A0509, the value UM
+ 		 * 15.4.7 documents (measured on the 8 GiB board 2026-08-18 after ungating the
+@@ -1311,11 +1368,25 @@
+ 		 * no output port graph. Those arrive with the KMS work and extend
+ 		 * this node rather than replacing it.
+ 		 *
+-		 * reg: the 4 KiB control window. The second window the vendor also
+-		 * maps -- eDP_REG_PAD at 0x05760000 -- is deliberately NOT here: its
+-		 * clock gates read 0x00000000 through an entire successful AUX
+-		 * session including a full EDID fetch, so nothing on this path needs
+-		 * it. It goes in when something is shown to need it.
++		 * reg: two windows. "dp" is the 4 KiB control window. "phy-pad" is
++		 * eDP_REG_PAD at 0x05760000, whose entire documented content is two
++		 * clock gates -- DP_LNK_CLK_CFG bit0 LNK_CLK_GATING (UM 15.4.8.1,
++		 * A733 user manual) and DP_VID_CLK_CFG bit0/bit4 VID0/VID1
++		 * (15.4.8.2).
++		 *
++		 * `arm64-dts-a733-displayport-transmitter` shipped with one window and predicted this patch in the same
++		 * sentence: the gates "read 0x00000000 through an entire successful
++		 * AUX session including a full EDID fetch, so nothing on this path
++		 * needs them. It goes in when something is shown to need it." Video
++		 * is what needed them.
++		 *
++		 * ⚠ Their absence does NOT present as a missing clock gate, which is
++		 * why the window is described here rather than left to be found: with
++		 * them shut, fifteen of the seventeen main-stream-attribute registers
++		 * read back exactly what was written and only MVID and NVID misbehave
++		 * -- NVID silently dropping a write, because it lives in the video
++		 * clock domain. A driver that verifies its own read-backs passes on
++		 * fifteen and then goes hunting in the wrong register.
+ 		 *
+ 		 * interrupts: INTID 94 "EDP" = GIC_SPI 62 (interrupt list of the
+ 		 * A733 user manual). The AUX driver polls AUX_STATUS and does not
+@@ -1352,7 +1423,9 @@
+ 		 */
+ 		edp0: displayport@5740000 {
+ 			compatible = "allwinner,sun60i-a733-dp";
+-			reg = <0x0 0x05740000 0x0 0x1000>;
++			reg = <0x0 0x05740000 0x0 0x1000>,
++			      <0x0 0x05760000 0x0 0x1000>;
++			reg-names = "dp", "phy-pad";
+ 			interrupts = <GIC_SPI 62 IRQ_TYPE_LEVEL_HIGH>;
+ 			clocks = <&ccu CLK_BUS_EDP>;
+ 			clock-names = "bus";

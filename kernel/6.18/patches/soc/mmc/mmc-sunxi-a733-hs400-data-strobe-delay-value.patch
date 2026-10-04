@@ -1,0 +1,129 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] mmc: sunxi: A733 - give the HS400 data-strobe delay an actual value
+
+host->ds_dl was never assigned. It came out of kzalloc as 0 and went straight
+into SMHC_DS_DL on every HS400 mode switch, so the strobe delay this driver has
+been running is not a chosen value, it is an unset one.
+
+That matters more than a number usually would, because the data strobe is what
+frames HS400 data. A delay outside the eye does not merely skew the bits, it
+loses the start of the block -- which is exactly the error class the board
+reports with the HS400 2x timing mode applied and everything else matching the vendor:
+
+    876 x  sunxi-mmc 4022000.mmc: smc 1 err, cmd 18, RD DCE SBE !!
+    dd: /dev/mmcblk1: Input/output error   (0 bytes transferred)
+
+A live sweep on the 8 GiB board read data for every delay from 2 to 40 and nothing at 0 or
+from 48 upward. Take that as a candidate eye, not as proof: the sweep poked the
+register between transfers, and the SMHC2 aperture only answers while the module
+clock runs, so some of those writes may never have reached the hardware (on a
+fresh boot the same register reads 0x00000000 although the driver had written
+0x80). What the sweep cannot be wrong about is the endpoint it started from: 0
+delivered nothing, and 0 is what we were running.
+
+So the value now comes from the cfg, as a controller/board property, and travels
+through sunxi_mmc_hs400_enable() with the card clock gated like every other
+timing value -- rather than being poked in from userspace, which is how the last
+two measurement rounds went wrong. 20 sits in the middle of the candidate eye
+rather than on an edge. The vendor runs 2, but arrives there through a runtime
+retry recalibration, not as a constant, so its value is not transferable.
+
+This is a stopgap with a mechanism, not a tuning solution: the honest fix is an
+->execute_hs400_tuning callback that sweeps the delay against an EXT_CSD read at
+init, the way the vendor recalibrates and the way mtk-sd does it. `mmc-sunxi-add-a733-emmc-hs400` once
+carried such a sweep and it was dropped. Re-introducing it is the follow-up; this
+patch makes the default stop being an accident in the meantime.
+
+Test that decides it: cold boot, then a 64 MiB read twice with md5 compared, on
+the first access after init -- not after any failed transfer, because a bad delay
+leaves the controller wedged until a power cycle and every later measurement is
+then worthless.
+
+Assisted-by: Claude
+---
+--- a/drivers/mmc/host/sunxi-mmc.c
++++ b/drivers/mmc/host/sunxi-mmc.c
+@@ -296,12 +296,15 @@ struct sunxi_mmc_cfg {
+ 
+ 	/* controller carries the HS400 data-strobe delay path */
+ 	bool can_hs400;
+ 
+ 	/* SMHC_FIFOTH value; 0 selects SDXC_FIFOTH_DEFAULT */
+ 	u32 fifoth;
++
++	/* HS400 data-strobe delay line value (0..63) */
++	u32 ds_dl;
+ };
+ 
+ struct sunxi_mmc_host {
+ 	struct device *dev;
+ 	struct mmc_host	*mmc;
+ 	struct reset_control *reset;
+@@ -907,15 +910,23 @@ static void sunxi_mmc_hs400_enable(struct sunxi_mmc_host *host,
+ 	rval = mmc_readl(host, REG_SD_NTSR);
+ 	rval &= ~(SDXC_NTSR_DAT_SAM_PH_MASK | SDXC_HS400_NEW_SAM_EN);
+ 	rval |= SDXC_NTSR_MODE_SEL;
+ 	mmc_writel(host, REG_SD_NTSR, rval);
+ 
+ 	/*
+-	 * Data-strobe delay: enable the software delay line, load
+-	 * host->ds_dl. Stays 0: at 150 MHz every delay reads back, the
+-	 * sweep was dropped, and the UM prescribes no value.
++	 * Data-strobe delay: enable the software delay line and load the
++	 * delay. This is where HS400 decides whether it can find the start of
++	 * a block at all -- the strobe is what frames the data, and a delay
++	 * outside the eye produces start-bit errors rather than merely skewed
++	 * data (measured 2026-07-25: 876 x "cmd 18, RD DCE SBE" with the delay
++	 * at 0, and the transfer delivering nothing).
++	 *
++	 * host->ds_dl was never assigned, so it was 0 from kzalloc -- not a
++	 * chosen value, an unset one. The UM prescribes none, so it comes from
++	 * the cfg and is a board/controller property until a proper
++	 * ->execute_hs400_tuning sweep replaces it.
+ 	 */
+ 	rval = mmc_readl(host, REG_DS_DL_REG);
+ 	rval &= ~SDXC_DS_DL_SW_MASK;
+ 	rval |= host->ds_dl & SDXC_DS_DL_SW_MASK;
+ 	rval |= SDXC_CAL_DL_SW_EN;
+ 	mmc_writel(host, REG_DS_DL_REG, rval);
+@@ -1488,12 +1499,25 @@ static const struct sunxi_mmc_cfg sun60i_a733_emmc_cfg = {
+ 	/* UM 11.3.8.17 recommends BSIZE_OF_TRANS = 3 (MSize 16), TX_TL = 240
+ 	 * and RX_TL = 15, and 11.3.6.2 writes 0x300F00F0 verbatim.
+ 	 * Vendor silicon on the 8 GiB board reads exactly this while writing this eMMC
+ 	 * at HS400.
+ 	 */
+ 	.fifoth = 0x300f00f0,
++	/*
++	 * Data-strobe delay. A live sweep on the 8 GiB board (2026-07-25) read data for
++	 * every delay from 2 to 40 and nothing at 0 or from 48 up, so 20 sits
++	 * in the middle of the candidate eye rather than on its edge. That
++	 * sweep was taken by poking the register between transfers and is NOT
++	 * conclusive -- the aperture only answers while the module clock runs,
++	 * so some of those writes may never have landed. What is certain is
++	 * that the previous value was not chosen at all: host->ds_dl was never
++	 * assigned and came out of kzalloc as 0, the one low value the sweep
++	 * never saw deliver a byte. The vendor runs 2, arrived at by a runtime
++	 * retry recalibration rather than as a constant.
++	 */
++	.ds_dl = 20,
+ };
+ 
+ static const struct of_device_id sunxi_mmc_of_match[] = {
+ 	{ .compatible = "allwinner,sun4i-a10-mmc", .data = &sun4i_a10_cfg },
+ 	{ .compatible = "allwinner,sun5i-a13-mmc", .data = &sun5i_a13_cfg },
+ 	{ .compatible = "allwinner,sun7i-a20-mmc", .data = &sun7i_a20_cfg },
+@@ -1748,12 +1772,14 @@ static int sunxi_mmc_probe(struct platform_device *pdev)
+ 	 * hardware support on this controller and is never offered.
+ 	 */
+ 	if (!host->cfg->can_hs400)
+ 		mmc->caps2 &= ~MMC_CAP2_HS400;
+ 	mmc->caps2 &= ~MMC_CAP2_HS400_ES;
+ 
++	host->ds_dl = host->cfg->ds_dl;
++
+ 	ret = sunxi_mmc_init_host(host);
+ 	if (ret)
+ 		goto error_free_dma;
+ 
+ 	pm_runtime_set_active(&pdev->dev);
+ 	pm_runtime_set_autosuspend_delay(&pdev->dev, 50);

@@ -1,0 +1,164 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] mmc: sunxi: HALF_START_BIT is a controller property, not part of HS400
+
+EMMC_DDR_SBIT_DET bit 0 is written unconditionally with the HS400 mode-enable
+bit, as though the two belonged together. They do not, and the two stacks
+disagree about it on the same silicon with the same card.
+
+THE FACT
+--------
+Read under load on the 8 GiB board (SanDisk iNAND SDINBDV4-32G / DV4032, eMMC 5.1, HS400
+200 MHz 8 bit 1.8 V), ours against the vendor 6.6 stack, two independent vendor
+dumps agreeing:
+
+    EMMC_DDR_SBIT_DET 0x10C   ours 0x80000001   vendor 0x80000000
+
+i.e. identical but for HALF_START_BIT. The vendor writes that card at
+152.5/154.1 MiB/s where we reach 139.1/139.2.
+
+WHAT THE UM SAYS
+----------------
+a733-um-v0.92, 11.3.8.32, offset 0x010C, register name EMMC_DDR_SBIT_DET,
+default 0x0000_0000. The section heading names it the start-bit detection control
+register for eMMC 4.5 DDR.
+
+  [31] HS400_MD_EN    R/W 0x0  HS400 mode enable; the UM requires it to be 1
+                               before any data transfer command in HS400 mode.
+  [0]  HALF_START_BIT R/W 0x0  selects how long a start bit the controller
+                               accepts: 0 = a full cycle, 1 = less than a full
+                               cycle. The UM says to set it to 1 for eMMC 4.5
+                               or newer and to 0 for SD cards.
+
+Two different things share one register. [31] is a mode enable the UM makes a
+requirement. [0] is a receive-side timing tolerance: how short a start bit the
+controller will still call a start bit. It is written for the eMMC 4.5 DDR
+receive path -- that is the register's own title -- and HS400 (eMMC 5.0) frames
+its read data on the card's data strobe, not on a start bit measured against the
+controller's clock. The UM's advice for eMMC 4.5 or newer is why `mmc-sunxi-add-a733-emmc-hs400` set it; the
+title of the register it sits in is why that is not obviously right.
+
+Silicon agrees with the UM on the default: HALF_START_BIT reads 0 out of reset
+on both the 8 GiB board and the 6 GiB board.
+
+WHAT THIS CHANGES
+-----------------
+The bit becomes cfg->hs400_half_start_bit and is written explicitly in both
+directions, so leaving HS400 or re-entering it can no longer leave a stale bit
+behind. sun60i_a733_emmc_cfg sets it to false. Nothing else in the tree sets
+it, so no other controller's behaviour changes: every other cfg leaves the bit
+at whatever it had, which for all of them is "never touched, because only the
+can_hs400 path reaches this code".
+
+A build without this patch is the other arm: there the bit
+is 1 as before.
+
+WHAT THIS IS NOT
+----------------
+It is not a throughput candidate, and the arithmetic says so before the board
+does. The deficit is 0.412 us per 512-byte block (ours 3.459 us against the
+vendor's 3.047, from mmc_request_start -> mmc_request_done over 1 MiB
+requests). At a 200 MHz card clock one clock period is 5 ns, so the gap is about
+82 clock periods per block. The entire difference between a full-cycle and a
+shorter start bit is one. Whatever is costing 82 periods a block, it is
+not this bit, and a run that changes only this bit and shows 150 MiB/s would
+mean the model is wrong, not that the bit was the cause.
+
+It is also not "the vendor does it". The vendor's value is why the difference
+was noticed; the reason to make it a property is that the UM attaches it to a
+different mode's receive path than the one we set it in, and that it was landed
+in `mmc-sunxi-add-a733-emmc-hs400` as part of an HS400 recipe that only started working two patches later,
+so its contribution was never isolated.
+
+VERIFIED / NOT VERIFIED
+-----------------------
+- Applies clean at fuzz 0 on a fresh unpack with the series in order: yes.
+- Builds: NOT claimed, not built here.
+- Silicon: NOT proven. One observable falsifies it on the 8 GiB board: a cold boot that
+  reaches HS400 and passes the read/write/md5 integrity run with
+  EMMC_DDR_SBIT_DET reading 0x80000000 under load. If instead the HS400 read
+  path reports start-bit errors ("RD DCE SBE" in the error histogram of
+  the test run), the UM's advice covers HS400 after all and this
+  patch is wrong. Note that such a failure now costs the mode and not the card,
+  because the strobe sweep withdraws MMC_CAP2_HS400 and the card re-inits at
+  HS200 -- that behaviour is a separate patch in this series and this one is
+  easier to test with it applied.
+
+Assisted-by: Claude
+---
+--- a/drivers/mmc/host/sunxi-mmc.c
++++ b/drivers/mmc/host/sunxi-mmc.c
+@@ -378,6 +378,16 @@
+ 	u32 ds_dl;
+ 
+ 	/*
++	 * Set EMMC_DDR_SBIT_DET HALF_START_BIT (bit 0) while the bus is in
++	 * HS400. The UM's advice is unconditional (HALF_START_BIT=1 for
++	 * eMMC 4.5 or newer), the register it lives in is named for eMMC 4.5
++	 * DDR, and silicon resets it to 0 -- so it is a property of the
++	 * controller/card pair, not of the mode, and it belongs here where it
++	 * can be turned over without touching the mode code.
++	 */
++	bool hs400_half_start_bit;
++
++	/*
+ 	 * The host waits for the card to release DAT0 after a write and after
+ 	 * an R1b command, i.e. it offers MMC_CAP_WAIT_WHILE_BUSY. Needs the
+ 	 * SMHC_THLD BCIG busy-clear interrupt and SMHC_STATUS CARD_BUSY.
+@@ -1518,14 +1528,29 @@
+ 	mmc_writel(host, REG_DS_DL_REG, rval);
+ 
+ 	/*
+-	 * HS400 mode enable + half start-bit detection, required before the
+-	 * first HS400 data command (UM EMMC_DSBD[31] + [0]). The board chip is
+-	 * eMMC 5.1 and HALF_START_BIT's reset default reads 0 on silicon
+-	 * (the 8 GiB board and the 6 GiB board), so it must be set explicitly, not left to the default.
++	 * HS400 mode enable, required before the first HS400 data command
++	 * (UM EMMC_DSBD[31]: the bit must be 1 before any data transfer
++	 * command in HS400 mode).
++	 *
++	 * HALF_START_BIT[0] is a separate question and now a cfg property.
++	 * The UM's advice -- 1 for eMMC 4.5 or newer, 0 for SD cards --
++	 * sits in a register the same UM titles as the eMMC 4.5 DDR start-bit
++	 * detection register, describing how long a start bit the
++	 * controller will accept (0 = a full cycle,
++	 * 1 = less than a full cycle). That is the eMMC 4.5 DDR receive
++	 * path; HS400 is eMMC 5.0 and frames its read data on the card's data
++	 * strobe. Reset default is 0, in the UM and on silicon (the 8 GiB board and the 6 GiB board).
++	 * So it is set from the cfg, explicitly either way, never left to
++	 * whatever the last mode wrote.
++	 *
+ 	 * The clock is still gated here; the caller turns it back on.
+ 	 */
+ 	rval = mmc_readl(host, REG_EMMC_DSBD);
+-	rval |= SDXC_HS400_MD_EN | SDXC_HALF_START_BIT;
++	rval |= SDXC_HS400_MD_EN;
++	if (host->cfg->hs400_half_start_bit)
++		rval |= SDXC_HALF_START_BIT;
++	else
++		rval &= ~SDXC_HALF_START_BIT;
+ 	mmc_writel(host, REG_EMMC_DSBD, rval);
+ }
+ 
+@@ -2512,6 +2537,22 @@
+ 	 * retry recalibration rather than as a constant.
+ 	 */
+ 	.ds_dl = 20,
++	/*
++	 * HALF_START_BIT stays 0, which is the UM's reset default and what
++	 * both boards read out of reset. The UM's advice to set it for eMMC 4.5
++	 * or newer concerns the eMMC 4.5 DDR start-bit detector, in the
++	 * register named for it; HS400 does not frame its read data that way.
++	 * Silicon under load on the 8 GiB board reads EMMC_DDR_SBIT_DET 0x80000001 for us
++	 * and 0x80000000 for the vendor stack, which writes the same card
++	 * faster -- a difference worth settling, not a reason on its own.
++	 *
++	 * NOTE: it cannot be the write deficit. The gap is 0.412 us per 512-byte
++	 * block (3.459 us against 3.047 us, the 8 GiB board, DV4032); at a 200 MHz card
++	 * clock that is ~82 clock periods, and the whole span between a full
++	 * and a half start bit is one. Expect this to change correctness, or
++	 * nothing -- not throughput.
++	 */
++	.hs400_half_start_bit = false,
+ };
+ 
+ static const struct of_device_id sunxi_mmc_of_match[] = {

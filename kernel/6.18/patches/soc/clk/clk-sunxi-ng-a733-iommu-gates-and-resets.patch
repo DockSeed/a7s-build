@@ -1,0 +1,192 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Thu, 17 Sep 2026 17:00:00 +0200
+Subject: [PATCH] clk: sunxi-ng: a733: IOMMU0/IOMMU1 gates and resets, all gates critical
+
+The two IOMMUs (driver `iommu-sun60i-add-the-allwinner-a733-iommu-driver`, nodes `arm64-dts-a733-the-two-iommus`) need their clocks and resets in the
+CCU. Eight gates and two resets, each naming one register field of
+the A733 user manual:
+
+  clock / reset         register (CCU offset)             field
+  CLK_IOMMU0_SYS_MCLK   IOMMU0_BGR_REG 0x058C             bit 0
+  CLK_IOMMU0_SYS_PCLK   IOMMU0_BGR_REG 0x058C             bit 1
+  CLK_IOMMU0_SYS_HCLK   IOMMU0_BGR_REG 0x058C             bit 2
+  CLK_MBUS_IOMMU0       MBUS_MAT_CLK_GATING_REG 0x05E0    bit 0
+  CLK_IOMMU1_SYS_MCLK   IOMMU1_BGR_REG 0x05B4             bit 0
+  CLK_IOMMU1_SYS_PCLK   IOMMU1_BGR_REG 0x05B4             bit 1
+  CLK_IOMMU1_SYS_HCLK   IOMMU1_BGR_REG 0x05B4             bit 2
+  CLK_MBUS_IOMMU1       MBUS_MAT_CLK_GATING_REG 0x05E0    bit 1
+  RST_BUS_IOMMU0        IOMMU0_BGR_REG 0x058C             bit 16
+  RST_BUS_IOMMU1        IOMMU1_BGR_REG 0x05B4             bit 16
+
+Both BGR registers reset to 0x00010007 (gates pass, reset de-asserted), and
+the MBUS gates reset to 1. Read on the 8 GiB board on 2026-09-15 under our kernel,
+which has no IOMMU driver: IOMMU0_BGR 0x00010007, IOMMU1_BGR 0x00010007,
+MBUS_MAT_CLK_GATING 0xF1015803 (bits 0 and 1 set).
+
+IDS. Clocks 86-93 and resets 32-33, the next free ids when this was written,
+checked against the applied tree (86 clock ids and 32 reset ids, no
+duplicates); no other branch in flight added a binding id. The parent is ahb, as for every other
+bus gate in this driver, which does not model the bus-matrix root.
+
+⚠ ALL EIGHT GATES ARE CLK_IS_CRITICAL. Every master in the UM's list reaches
+memory through its IOMMU, in bypass as much as translating: both IOMMUs
+reset with every master in bypass, and that is how the USB host (IOMMU0
+master 0) and the display engine (IOMMU1 master 2) have always run on this
+tree. Whether a gated IOMMU still passes a bypassed master's traffic is not
+measured. An unclaimed gate is closed by clk_disable_unused(), and an IOMMU
+driver that fails to probe leaves its gates unclaimed. `clk-sunxi-ng-a733-gpu-bus-matrix-gates-are-critical` measured exactly
+that failure for the GPU's bus-matrix gates. So the gates keep their reset
+state; gating an IOMMU for power is a later step that needs the measurement
+first.
+
+VERIFIED HERE: applies with fuzz 0 on top of the full series;
+a duplicate-id check on the applied tree: clock header 94 ids,
+reset header 34 ids, no duplicates. The dtb built with cpp + dtc from the
+tree with `arm64-dts-a733-the-two-iommus` and `arm64-dts-a733-display-engine-behind-iommu1` applied carries iommu@3910000 clocks <ccu 90 91 92 93>
+and resets <ccu 33>.
+
+HARDWARE-PROVEN on the 8 GiB board 2026-09-18, with a test build of this series. Booted without
+clk_ignore_unused: after boot IOMMU0_BGR and IOMMU1_BGR both read 0x00010007
+and MBUS_MAT_CLK_GATING reads 0xF1015803 with bits 0 and 1 set, so
+clk_disable_unused() closed none of the eight gates -- the failure `clk-sunxi-ng-a733-gpu-bus-matrix-gates-are-critical`
+measured for the GPU's matrix gates. The USB host enumerates in the same boot
+(WiFi card, its hub, the DP billboard device), and IOMMU0's four masters stay
+in bypass. The reset is only ever de-asserted; nothing asserts it.
+
+Assisted-by: Claude
+---
+--- a/include/dt-bindings/clock/sun60i-a733-ccu.h
++++ b/include/dt-bindings/clock/sun60i-a733-ccu.h
+@@ -142,4 +142,22 @@
+ #define CLK_AHB_GPU0		84
+ #define CLK_MBUS_GPU0		85
+ 
++/*
++ * The two IOMMUs. Per IOMMU four gates, each naming one register field:
++ * IOMMUn_BGR_REG (IOMMU0 0x058C, IOMMU1 0x05B4) bit 0 SYS_MCLK_GATING, bit 1
++ * SYS_PCLK_GATING and bit 2 SYS_HCLK_GATING, and the bus-matrix master gate
++ * IOMMUn_MBUS_GATE_SW_CFG in MBUS_MAT_CLK_GATING_REG 0x05E0 (IOMMU0 bit 0,
++ * IOMMU1 bit 1).
++ *
++ * 86-93 are the next free ids on main; 80-85 are the GPU's, added by `clk-sunxi-ng-a733-gpu-pll-module-clock-bus-gates-and-reset`.
++ */
++#define CLK_IOMMU0_SYS_MCLK	86
++#define CLK_IOMMU0_SYS_PCLK	87
++#define CLK_IOMMU0_SYS_HCLK	88
++#define CLK_MBUS_IOMMU0		89
++#define CLK_IOMMU1_SYS_MCLK	90
++#define CLK_IOMMU1_SYS_PCLK	91
++#define CLK_IOMMU1_SYS_HCLK	92
++#define CLK_MBUS_IOMMU1		93
++
+ #endif /* _DT_BINDINGS_CLK_SUN60I_A733_CCU_H_ */
+--- a/include/dt-bindings/reset/sun60i-a733-ccu.h
++++ b/include/dt-bindings/reset/sun60i-a733-ccu.h
+@@ -66,4 +66,12 @@
+  */
+ #define RST_BUS_GPU0		31
+ 
++/*
++ * IOMMU -- IOMMUn_BGR_REG (IOMMU0 0x058C, IOMMU1 0x05B4) bit 16 SYS_RST
++ * (0 = Assert, 1 = De-assert). 32-33 are the next free reset ids on main;
++ * 31 is the GPU's.
++ */
++#define RST_BUS_IOMMU0		32
++#define RST_BUS_IOMMU1		33
++
+ #endif /* _DT_BINDINGS_RST_SUN60I_A733_CCU_H_ */
+--- a/drivers/clk/sunxi-ng/ccu-sun60iw2.c
++++ b/drivers/clk/sunxi-ng/ccu-sun60iw2.c
+@@ -1701,6 +1701,49 @@
+ static SUNXI_CCU_GATE_HWS(mbus_gpu0_clk, "mbus-gpu0", ahb_hws, 0x05E0, BIT(16),
+ 			  CLK_IS_CRITICAL);
+ 
++/*
++ * The two IOMMUs (UM chapter 10; IOMMU0 serves USB0_USB1, CSI, ISP and VE_ENC,
++ * IOMMU1 the VE, DE0, DI, G2D and EINK).
++ *
++ *   iommuN-sys-mclk/-pclk/-hclk  IOMMU0_BGR_REG 0x058C / IOMMU1_BGR_REG 0x05B4,
++ *                                bits 0/1/2, reset 0x00010007
++ *                                (A733 user manual); bit 16 is the reset, in the map below.
++ *   mbus-iommuN                  MBUS_MAT_CLK_GATING_REG 0x05E0 bit 0 (IOMMU0)
++ *                                and bit 1 (IOMMU1), reset 1.
++ *
++ * Read on the 8 GiB board 2026-09-15 under our kernel, which has no IOMMU driver: both BGR
++ * registers 0x00010007 and MBUS_MAT_CLK_GATING 0xF1015803 -- all eight gates
++ * set, both resets de-asserted (dump saved as
++ * 20260915.log).
++ *
++ * ⚠ ALL EIGHT ARE CLK_IS_CRITICAL, and that is a decision about what is NOT
++ * known. Every master in the UM's list reaches memory through its IOMMU, in
++ * bypass as well as translating: both IOMMUs reset with every master in bypass,
++ * and that is how USB and the display engine have run on this tree. Whether a
++ * gated IOMMU still passes a bypassed master's traffic is unmeasured. A gate
++ * that is only unclaimed would be closed by clk_disable_unused() -- on IOMMU0
++ * that is the USB host's path, on IOMMU1 the display engine's -- and an IOMMU
++ * driver that fails to probe would leave both unclaimed. `clk-sunxi-ng-a733-gpu-bus-matrix-gates-are-critical` is the measured
++ * case of exactly that for the GPU's bus-matrix gates. Gating an IOMMU for
++ * power is a later step, and it needs the measurement first.
++ */
++static SUNXI_CCU_GATE_HWS(iommu0_sys_mclk_clk, "iommu0-sys-mclk", ahb_hws,
++			  0x058C, BIT(0), CLK_IS_CRITICAL);
++static SUNXI_CCU_GATE_HWS(iommu0_sys_pclk_clk, "iommu0-sys-pclk", ahb_hws,
++			  0x058C, BIT(1), CLK_IS_CRITICAL);
++static SUNXI_CCU_GATE_HWS(iommu0_sys_hclk_clk, "iommu0-sys-hclk", ahb_hws,
++			  0x058C, BIT(2), CLK_IS_CRITICAL);
++static SUNXI_CCU_GATE_HWS(mbus_iommu0_clk, "mbus-iommu0", ahb_hws,
++			  0x05E0, BIT(0), CLK_IS_CRITICAL);
++static SUNXI_CCU_GATE_HWS(iommu1_sys_mclk_clk, "iommu1-sys-mclk", ahb_hws,
++			  0x05B4, BIT(0), CLK_IS_CRITICAL);
++static SUNXI_CCU_GATE_HWS(iommu1_sys_pclk_clk, "iommu1-sys-pclk", ahb_hws,
++			  0x05B4, BIT(1), CLK_IS_CRITICAL);
++static SUNXI_CCU_GATE_HWS(iommu1_sys_hclk_clk, "iommu1-sys-hclk", ahb_hws,
++			  0x05B4, BIT(2), CLK_IS_CRITICAL);
++static SUNXI_CCU_GATE_HWS(mbus_iommu1_clk, "mbus-iommu1", ahb_hws,
++			  0x05E0, BIT(1), CLK_IS_CRITICAL);
++
+ /* ccu_common-based clocks (registered and reset-mapped by the core). */
+ static struct ccu_common *sun60iw2_ccu_clks[] = {
+ 	&pll_ref_clk.common,
+@@ -1776,6 +1819,14 @@
+ 	&ahb_gpu0_clk.common,
+ 	&bus_gpu0_clk.common,
+ 	&mbus_gpu0_clk.common,
++	&iommu0_sys_mclk_clk.common,
++	&iommu0_sys_pclk_clk.common,
++	&iommu0_sys_hclk_clk.common,
++	&mbus_iommu0_clk.common,
++	&iommu1_sys_mclk_clk.common,
++	&iommu1_sys_pclk_clk.common,
++	&iommu1_sys_hclk_clk.common,
++	&mbus_iommu1_clk.common,
+ };
+ 
+ static struct clk_hw_onecell_data sun60iw2_hw_clks = {
+@@ -1866,8 +1917,16 @@
+ 		[CLK_BUS_GPU0]		= &bus_gpu0_clk.common.hw,
+ 		[CLK_AHB_GPU0]		= &ahb_gpu0_clk.common.hw,
+ 		[CLK_MBUS_GPU0]		= &mbus_gpu0_clk.common.hw,
++		[CLK_IOMMU0_SYS_MCLK]	= &iommu0_sys_mclk_clk.common.hw,
++		[CLK_IOMMU0_SYS_PCLK]	= &iommu0_sys_pclk_clk.common.hw,
++		[CLK_IOMMU0_SYS_HCLK]	= &iommu0_sys_hclk_clk.common.hw,
++		[CLK_MBUS_IOMMU0]	= &mbus_iommu0_clk.common.hw,
++		[CLK_IOMMU1_SYS_MCLK]	= &iommu1_sys_mclk_clk.common.hw,
++		[CLK_IOMMU1_SYS_PCLK]	= &iommu1_sys_pclk_clk.common.hw,
++		[CLK_IOMMU1_SYS_HCLK]	= &iommu1_sys_hclk_clk.common.hw,
++		[CLK_MBUS_IOMMU1]	= &mbus_iommu1_clk.common.hw,
+ 	},
+-	.num	= CLK_MBUS_GPU0 + 1,
++	.num	= CLK_MBUS_IOMMU1 + 1,
+ };
+ 
+ static struct ccu_reset_map sun60iw2_ccu_resets[] = {
+@@ -1903,6 +1962,8 @@
+ 	[RST_BUS_NPU_AXI]	= { 0x0B04, BIT(17) },
+ 	[RST_BUS_NPU_AHB]	= { 0x0B04, BIT(18) },
+ 	[RST_BUS_GPU0]		= { 0x0B24, BIT(16) },
++	[RST_BUS_IOMMU0]	= { 0x058C, BIT(16) },
++	[RST_BUS_IOMMU1]	= { 0x05B4, BIT(16) },
+ };
+ 
+ static const struct sunxi_ccu_desc sun60iw2_ccu_desc = {

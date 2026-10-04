@@ -1,0 +1,258 @@
+From 1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Tue, 21 Jul 2026 14:00:00 +0200
+Subject: [PATCH v3] arm64: dts: a733: add the core-level PSCI idle states, one
+ per cluster
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add a core power-down idle state for each cluster and point every cpu@N
+at its own: cpu0-cpu5 (Cortex-A55) at cpu-sleep-0-a55, cpu6-cpu7
+(Cortex-A76) at cpu-sleep-0-a76. Both carry the same PSCI parameter;
+they differ in how long the core takes to come back.
+
+v3: the latencies are measured on this boot chain instead of
+copied from the vendor device tree, and the two clusters differ, so the
+one state becomes two. v2: the cluster-level state is gone, see
+CLUSTER STATE below.
+
+THE NUMBERS (us)
+
+                      entry   exit   entry+exit   min-residency
+  cpu-sleep-0-a55       50     150       200          3570
+  cpu-sleep-0-a76       50     210       260          3570
+  v2, both (vendor)     46      59       105          3570
+
+Linux never uses entry and exit on their own. With no wakeup-latency-us,
+dt_idle_states.c adds them, and the sum is what cpuidle compares with a
+PM QoS limit, what /sys/devices/system/cpu/cpuN/cpuidle/state1/latency
+reads, and what idle injection filters on (`arm64-dts-a733-idle-injection-cooling`: the exit-latency-us of
+a thermal-idle node is a limit on this sum, so admitting the deep state
+takes >= 200 on cpu2-cpu5 and >= 260 on cpu6-cpu7).
+
+HOW THEY WERE MEASURED. 8 GiB board (DRAM trained at 2040 MHz),
+2026-09-24, default boot chain (native CPU_SUSPEND), this kernel with
+the v2 DT; instruments: our own test programs
+(a733-idle-wake.c, a733-idle-latency.py; not part of this recipe).
+Checked on the 6 GiB board (DRAM at 2400 MHz) with the same instruments: inside every bound below (A55 exit max
+144 us, A76 203 us; worst wake 167 / 234 us).
+
+  * A thread pinned to the target core blocks on an eventfd; another
+    core wakes it at a random delay d after the target went idle, with
+    cpuidle state0 disabled on the target so that it takes the deep
+    state. From ftrace (trace_clock mono): d = sched_waking minus the
+    target's cpu_idle entry, latency = the target's cpu_idle exit minus
+    sched_waking.
+  * Both clusters pinned to the lowest OPP, 247 MHz. The wake path is
+    mostly software -- BL31 warm boot, context restore, cpu_pm
+    notifiers -- and runs at the core clock: at the highest OPP the same
+    wake takes 61 us on the A55 and about 120 us on the A76. The lowest
+    OPP is the worst case, so that is what the DT carries.
+  * exit = the fully entered state (d >= 60 us), maximum over two runs,
+    rounded up to 5 us: A55 147 -> 150 (p50 124, p99 129-132, n=6439,
+    cpu2 and cpu4), A76 208 -> 210 (p50 181-196, p99 204-205, n=5076,
+    cpu6 and cpu7).
+  * entry. A wake that lands while the core is still going down waits
+    for the rest of the entry and then the whole exit, so latency + d
+    stays constant until the core is down: 172 us on the A55 from
+    d = 8 to 48 us, about 246 us on the A76 from d = 12 to 48 us. From
+    d = 48 us on, both sit on their exit plateau. Earlier than ~8 us
+    (A55) / ~12 us (A76) the wake aborts the entry instead: BL31 checks
+    ISR_EL1 before it commits (psci_cpu_suspend_start()) and returns
+    without powering down, in 21-32 us. entry = 50 for both.
+  * So entry + exit bounds every wake measured this way (worst: A55
+    171 us, A76 242 us). A timer wake is slower by one hop: this DT has
+    no broadcast timer, so a core in this state (local-timer-stop) is
+    woken by another core's broadcast hrtimer. Measured with
+    cyclictest --laptop at 20 ms, lowest OPP: p99 169-183 us (A55) and
+    232-236 us (A76), inside the bounds; one A55 timer wake of 1904 took
+    207 us.
+
+min-residency-us stays the vendor's 3570 us. It is an energy break-even,
+not a latency, and no trace shows it; an A/B on the 6 GiB board
+(2026-09-24) against 1000 us found no difference in idle power (means
+within 12 mW of 4.07 W over four arms). Labelled as the vendor's value.
+
+What is spec-firm: the encoding of arm,psci-suspend-param itself, per
+the PSCI specification (ARM DEN 0022) original power-state format --
+  0x00010000 = state-type 1 (power-down), power level 0 (core)
+These are the standard field positions, not vendor-invented values, and
+the format is the one our firmware answers PSCI_FEATURES(CPU_SUSPEND)
+with (TF-A builds with PSCI_EXTENDED_STATE_ID = 0).
+
+WHY TWO NODES AND NOT ONE. cpuidle-psci registers one driver per CPU
+(psci_idle_init_cpu(): drv->cpumask = cpumask_of(cpu)), and
+dt_init_idle_driver() only requires the states to agree across that
+driver's mask, so each cluster can point at its own node. The node name
+becomes the state name in sysfs.
+
+CLUSTER STATE (v2). v1 also declared cluster-sleep-0,
+0x01010000 = power-down at power level 1. The encoding was right: TF-A
+builds the A733 as root / one cluster / eight cores (PLAT_MAX_PWR_LVL 2,
+plat_power_domain_tree_desc in plat/allwinner/common/sunxi_topology.c),
+so level 1 is the DSU cluster, and 0x01010000 passes the SBZ mask
+(PSTATE_VALID_MASK 0xFCFE0000). The vendor BL31 v2.5 entered it. Our
+BL31 does not implement a cluster power-down: its validate_power_state
+refuses every level other than 0 with PSCI_E_INVALID_PARAMS
+(the TF-A patch `allwinner-a733-native-psci-cpu-suspend`, sunxi_validate_power_state). That refusal is correct,
+and it is where v1 went wrong: it assumed a rejected
+state is merely "not used". It is used on every idle entry. cpuidle
+counts the rejection and returns without WFI, do_idle() asks the
+governor again, and nothing in the kernel retires a state that keeps
+failing. Measured on our chain (2026-09-23): 1.4-2.6 million
+refused CPU_SUSPEND calls per core in about 40 s, one every ~10 us --
+an idle loop that spins through cpu_pm_enter(), the context save and an
+SMC round trip instead of sleeping. The DT and the BL31 ship together,
+so the DT declares what the BL31 implements: core level only. The
+cluster state comes back in the same change that teaches the firmware
+a cluster power-down (DSU PPU, L3 maintenance, GIC-600 stream gating).
+
+Depends on patch `arm64-dts-a733-cpu-topology` (cpu topology) and sits on top of `arm64-dts-a733-heterogeneous-pmu`. No driver
+code: cpuidle plus PSCI firmware do the work once the DT describes the
+states. `arm64-dts-a733-cache-geometry` carries the cpu-idle-states lines as context and is
+regenerated with this version.
+
+VERIFIED THIS PASS:
+  * patch -p1 --fuzz=0 clean against `clk-sunxi-ng-add-A733-sun60iw2-minimal-ccu` to `arm64-dts-a733-heterogeneous-pmu`, and the full series
+    applies at fuzz 0 with `arm64-dts-a733-cache-geometry` regenerated
+  * dtc: /cpus/idle-states holds cpu-sleep-0-a55 and cpu-sleep-0-a76,
+    cpu@0..cpu@500 reference the first, cpu@600/cpu@700 the second
+  * silicon, 8 GiB board, 2026-09-24: the default kernel booted with
+    this dtb as its own label reads state1 = cpu-sleep-0-a55, latency 200
+    on cpu0-cpu5 and cpu-sleep-0-a76, latency 260 on cpu6-cpu7; usage
+    rises on all eight cores over 60 s idle. The measurement above was
+    repeated on this DT (the second of the two runs).
+  * the dtb was built locally: the change is DT only, and the same local
+    build of main reproduces the test build's dtb byte for byte
+
+PENDING:
+  * when this was written, the thermal-idle limit in
+    `arm64-dts-a733-idle-injection-cooling` read 100 and kept idle
+    injection on WFI; that patch now uses 500, which admits both states.
+
+DELIBERATELY OMITTED:
+  * thermal-idle sub-nodes (BSP carries them on cpu@2-7) -- part of the
+    thermal cooling machinery, which is `arm64-dts-a733-idle-injection-cooling`.
+
+Assisted-by: Claude
+---
+ .../sun60i-a733-cubie-a7s-minimal.dts         | 48 +++++++++++++++++++
+ 1 file changed, 48 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -55,6 +55,7 @@
+ 			reg = <0x000>;
+ 			enable-method = "psci";
+ 			next-level-cache = <&L2_0>;
++			cpu-idle-states = <&cpu_sleep_0_a55>;
+ 		};
+ 
+ 		cpu1: cpu@100 {
+@@ -63,6 +64,7 @@
+ 			reg = <0x100>;
+ 			enable-method = "psci";
+ 			next-level-cache = <&L2_1>;
++			cpu-idle-states = <&cpu_sleep_0_a55>;
+ 		};
+ 
+ 		cpu2: cpu@200 {
+@@ -71,6 +73,7 @@
+ 			reg = <0x200>;
+ 			enable-method = "psci";
+ 			next-level-cache = <&L2_2>;
++			cpu-idle-states = <&cpu_sleep_0_a55>;
+ 		};
+ 
+ 		cpu3: cpu@300 {
+@@ -79,6 +82,7 @@
+ 			reg = <0x300>;
+ 			enable-method = "psci";
+ 			next-level-cache = <&L2_3>;
++			cpu-idle-states = <&cpu_sleep_0_a55>;
+ 		};
+ 
+ 		cpu4: cpu@400 {
+@@ -87,6 +91,7 @@
+ 			reg = <0x400>;
+ 			enable-method = "psci";
+ 			next-level-cache = <&L2_4>;
++			cpu-idle-states = <&cpu_sleep_0_a55>;
+ 		};
+ 
+ 		cpu5: cpu@500 {
+@@ -95,6 +100,7 @@
+ 			reg = <0x500>;
+ 			enable-method = "psci";
+ 			next-level-cache = <&L2_5>;
++			cpu-idle-states = <&cpu_sleep_0_a55>;
+ 		};
+ 
+ 		/*
+@@ -114,6 +120,7 @@
+ 			reg = <0x600>;
+ 			enable-method = "psci";
+ 			next-level-cache = <&L2_6>;
++			cpu-idle-states = <&cpu_sleep_0_a76>;
+ 		};
+ 
+ 		cpu7: cpu@700 {
+@@ -122,6 +129,7 @@
+ 			reg = <0x700>;
+ 			enable-method = "psci";
+ 			next-level-cache = <&L2_7>;
++			cpu-idle-states = <&cpu_sleep_0_a76>;
+ 		};
+ 
+ 		cpu-map {
+@@ -139,6 +147,46 @@
+ 				core1 { cpu = <&cpu7>; };
+ 			};
+ 		};
++
++		/*
++		 * PSCI-managed idle states: one core power-down state per
++		 * cluster. Both use the same PSCI parameter; they differ in how
++		 * long the core takes to come back, and cpuidle, PM QoS and idle
++		 * injection all compare against entry + exit. The latencies are
++		 * measured on this boot chain at the lowest OPP, where the wake
++		 * path is slowest; min-residency-us is the vendor's value, kept
++		 * because an A/B against 1000 us found no difference in idle
++		 * power. Method and numbers: this patch's commit message.
++		 *
++		 * Core level only. Our BL31 implements no cluster power-down and
++		 * refuses a level-1 power_state (0x01010000) with INVALID_PARAMS;
++		 * cpuidle never retires a refused state, it asks for it again on
++		 * every idle entry. A cluster state is declared here together
++		 * with the firmware that implements it, not before.
++		 */
++		idle-states {
++			entry-method = "psci";
++
++			/* cpu0-cpu5, Cortex-A55 */
++			cpu_sleep_0_a55: cpu-sleep-0-a55 {
++				compatible = "arm,idle-state";
++				local-timer-stop;
++				entry-latency-us = <50>;
++				exit-latency-us = <150>;
++				min-residency-us = <3570>;
++				arm,psci-suspend-param = <0x00010000>;
++			};
++
++			/* cpu6-cpu7, Cortex-A76 */
++			cpu_sleep_0_a76: cpu-sleep-0-a76 {
++				compatible = "arm,idle-state";
++				local-timer-stop;
++				entry-latency-us = <50>;
++				exit-latency-us = <210>;
++				min-residency-us = <3570>;
++				arm,psci-suspend-param = <0x00010000>;
++			};
++		};
+ 	};
+ 
+ 	/*
+-- 
+2.45.0

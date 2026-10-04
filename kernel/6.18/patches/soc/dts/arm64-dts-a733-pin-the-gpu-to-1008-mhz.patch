@@ -1,0 +1,110 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: a733: pin the GPU to 1008 MHz on its own PLL
+
+`arm64-dts-a733-enable-the-gpu-at-the-vendor-s-operating-point` pinned CLK_GPU0's parent to PLL_PERI0_600M and gave two reasons. Both
+still hold; what has changed is that the rest of the argument has now been
+paid for, so the pin can move to the clock it was always meant to end on.
+
+WHY GPUPLL SERVES 1008 MHz WHEN IT COULD NOT SERVE 600
+
+The VCO window is 1.272-2.52 GHz (UM Table 4-2; the driver
+enforces it as SUN60IW2_PLL_GPU0_MIN_VCO/MAX_VCO, and the floor is 1272 rather
+than 1260 because the VCO is 24 MHz * N). 600 MHz off this PLL would need a
+1200 MHz VCO -- below the floor, which is exactly why `arm64-dts-a733-enable-the-gpu-at-the-vendor-s-operating-point` could not use it.
+1008 MHz needs 24 MHz * 84 = 2016 MHz, comfortably inside. Of the vendor's
+four-row ladder, the top row is the only one this PLL can reach at all.
+
+ONE RATE REQUEST, AND THE MODEL HAS EXACTLY ONE LEGAL ANSWER
+
+gpu0 carries CLK_SET_RATE_PARENT with CLK_SET_RATE_NO_REPARENT, and gpupll
+carries CLK_SET_RATE_PARENT, so a 1008 MHz request propagates instead of being
+absorbed: gpu0's mask divider takes M = 0 (/1, the only table entry that keeps
+the rate), gpupll must then be 1008 MHz, and its P0 must be 2 -- P0 = 1 would
+ask the VCO for 1008 MHz and the enforced floor refuses it. VCO 2016, P0 2,
+M 0. No value here is chosen; each is the only one the window permits.
+
+The mask divider is why the reachable ladder off this source is 1008 / 504 /
+252 / 126 / 63 and nothing between: GPU0_DIV1 masks cycles rather than
+counting: GPU0_CLK = Clock Source * ((16-M)/16) (UM 4.1.4.4),
+and only M = 0, 8, 12, 14, 15 land on an integer ratio. That the
+Armbian tree ships 252/504/1008 is therefore not a source for this
+patch -- it is the same three numbers falling out of the same formula.
+
+⚠ `arm64-dts-a733-enable-the-gpu-at-the-vendor-s-operating-point`'s CLK_SET_RATE_PARENT WARNING DOES NOT TRANSFER, and that is precisely
+what makes this safe now. It warned that a rate request on gpu0 would propagate
+into PLL_PERI0, the PLL that feeds the whole SoC. With GPUPLL as the parent it
+propagates into the GPU's own PLL, which drives nothing else: "mem" is that
+same PLL and drm/powervr only clk_prepare_enable()s it, never sets a rate on it
+(`arm64-dts-a733-gpu-mem-clock-is-the-gpu-pll`, and re-checked in the tree we build).
+
+⚠ THIS PATCH IS NOT SAFE WITHOUT `arm64-dts-a733-dcdc4-is-vdd-gpu-and-it-gets-a-window` IN THE SAME SERIES. The rail boots at
+800 mV; 1008 MHz there is an under-volt, and an under-volt does not announce
+itself. `arm64-dts-a733-dcdc4-is-vdd-gpu-and-it-gets-a-window` raises DCDC4 to 960 mV at PMIC probe, which is seconds before
+powervr probes and this rate is applied.
+
+WHAT WOULD FALSIFY IT, on the board, in one boot:
+
+  1. /sys/kernel/debug/clk/gpu0/clk_rate reads 1008000000 and clk_parent reads
+     gpupll; pll-gpu0 reads 2016000000.
+  2. GPU0_CLK (0x02002b20) reads SEL = 000 and M = 0 with bit 31 set under
+     load, i.e. 0x80000000; PLL_GPU0 (0x020020e0) carries PLL_N = 0x53.
+  3. DCDC4 reads 960000 uV before the GPU is touched.
+  4. the GPU test still ACCEPTs -- same 65536/65536 pixels, at the
+     higher clock. A wrong-pixel failure here is the under-volt signature and
+     means the rail, not the clock, is what needs revisiting.
+
+Assisted-by: Claude
+---
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -2892,8 +2892,49 @@
+ 			 * A733 user manual), so 24 MHz x 50 / 2 = 600 needs
+ 			 * a 1200 MHz VCO, below the floor.
+ 			 */
++			/*
++			 * 1008 MHz on the GPU's own PLL, which replaces the
++			 * PERI0_600M pin above. The reasoning that put it
++			 * there is unchanged and still true -- it is the
++			 * REST of it that has now been paid for.
++			 *
++			 * Why GPUPLL can serve this rate when it could not
++			 * serve 600: the VCO window is 1.272-2.52 GHz (UM
++			 * Table 4-2, and the driver
++			 * enforces it as MIN_VCO/MAX_VCO). 600 MHz needs a
++			 * 1200 MHz VCO, below the floor. 1008 MHz needs
++			 * 24 MHz x 84 = 2016 MHz, comfortably inside it --
++			 * so of the vendor's ladder, only the top row is
++			 * reachable from this PLL at all.
++			 *
++			 * One rate request, and the model has exactly one
++			 * legal answer. gpu0 carries CLK_SET_RATE_PARENT
++			 * with CLK_SET_RATE_NO_REPARENT, and gpupll carries
++			 * CLK_SET_RATE_PARENT, so 1008 MHz propagates:
++			 * gpu0 mask M=0 (/1) -> gpupll 1008 -> P0 must be 2,
++			 * because P0=1 would ask the VCO for 1008 MHz and
++			 * the enforced floor refuses it. VCO 2016, P0 2,
++			 * M 0. Nothing here is a magic number; every step is
++			 * the only one the window permits.
++			 *
++			 * ⚠ `arm64-dts-a733-enable-the-gpu-at-the-vendor-s-operating-point`'s warning about CLK_SET_RATE_PARENT does
++			 * not transfer, and that is the whole reason this is
++			 * now safe: it warned that a rate on gpu0 would
++			 * propagate into PLL_PERI0, the PLL feeding the whole
++			 * SoC. With GPUPLL as the parent the request
++			 * propagates into the GPU's own PLL, which drives
++			 * nothing else -- "mem" is that same PLL and the
++			 * driver only clk_prepare_enable()s it, never sets a
++			 * rate on it (`arm64-dts-a733-gpu-mem-clock-is-the-gpu-pll`).
++			 *
++			 * ⚠ AND IT IS ONLY SAFE WITH THE DCDC4 NODE IN THE
++			 * SAME SERIES. 1008 MHz at the 800 mV this rail
++			 * boots with is an under-volt, and an under-volt does
++			 * not announce itself.
++			 */
+ 			assigned-clocks = <&ccu CLK_GPU0>;
+-			assigned-clock-parents = <&ccu CLK_PLL_PERI0_600M>;
++			assigned-clock-parents = <&ccu CLK_GPUPLL>;
++			assigned-clock-rates = <1008000000>;
+ 			status = "okay";
+ 		};
+ 	};

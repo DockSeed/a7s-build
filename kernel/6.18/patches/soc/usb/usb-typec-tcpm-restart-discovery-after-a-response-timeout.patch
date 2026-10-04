@@ -1,0 +1,117 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] usb: typec: tcpm: restart partner discovery after a response timeout
+
+When the partner's response to Discover Identity, Discover SVIDs or Discover
+Modes (SOP) arrives after tVDMSenderResponse, the VDM state machine times out,
+finishes the AMS and never asks again. Discovery stops at that step, so the
+partner's alternate modes stay unregistered until the next attach. On a
+DisplayPort-over-USB-C connection that is a boot without a picture.
+
+Observed on the Radxa Cubie A7S (HUSB311 as TCPC, source/DFP) with a USB-C
+DisplayPort adapter identifying as 05e3:0f01, cold-booted with the Type-C/DP
+stack built into the kernel so that PD starts ~1 s after VBUS is switched on.
+The adapter normally answers each discovery request within 10-18 ms. In the
+failing boots one answer comes after ~50 ms instead -- once Discover Identity:
+
+    [2.905338] PD TX, header: 0x17af                (Discover Identity)
+    [2.916531] PD TX complete, status: 0
+    [2.946577] AMS DISCOVER_IDENTITY finished       (30 ms: timed out)
+    [2.970208] PD RX, header: 0x528f [1]            (the ACK, 53.7 ms late)
+    [2.970224] PD TX, header: 0x9b0                 (Not_Supported)
+
+and once, after identity and SVIDs had been answered in time, Discover Modes:
+
+    [3.432733] PD TX, header: 0x1baf                (Discover Modes)
+    [3.443935] PD TX complete, status: 0
+    [3.485119] AMS DISCOVER_MODES finished          (timed out)
+    [3.494922] PD RX, header: 0x268f [1]            (the ACK, 51 ms late)
+    [3.494930] PD TX, header: 0xdb0                 (Not_Supported)
+
+with nothing further in either case. Across 18 cold boots before these logs
+were taken, 4 came up without a picture.
+
+A timeout is not a refusal. Restart discovery from Discover Identity when one
+of the three requests times out on SOP, through the same send_discover path
+the collision retry already uses, at most DISCOVER_TIMEOUT_RETRIES times per
+attach (reset on attach and on hard reset). svdm_consume_identity() clears the
+SVIDs and modes gathered by the interrupted pass. SOP' discovery keeps its
+existing handling. The late response itself is not consumed; the restart
+obtains fresh ones.
+
+Checked against torvalds/master (2026-09-12): the discovery bookkeeping has
+been reworked there (vdm_discovery_state), but a response timeout still ends
+discovery without a retry.
+
+Assisted-by: Claude
+
+--- a/drivers/usb/typec/tcpm/tcpm.c
++++ b/drivers/usb/typec/tcpm/tcpm.c
+@@ -271,6 +271,7 @@
+ 
+ #define GET_SINK_CAP_RETRY_MS	100
+ #define SEND_DISCOVER_RETRY_MS	100
++#define DISCOVER_TIMEOUT_RETRIES	3
+ 
+ struct pd_mode_data {
+ 	int svid_index;		/* current SVID index		*/
+@@ -491,6 +492,7 @@
+ 	/* PD state for Vendor Defined Messages */
+ 	enum vdm_states vdm_state;
+ 	u32 vdm_retries;
++	u32 discover_timeouts;
+ 	/* next Vendor Defined Message to send */
+ 	u32 vdo_data[VDO_MAX_SIZE];
+ 	u8 vdo_count;
+@@ -2682,6 +2684,28 @@
+ 		break;
+ 	case VDM_STATE_BUSY:
+ 		port->vdm_state = VDM_STATE_ERR_TMOUT;
++		/*
++		 * A partner that answers Discover Identity, Discover SVIDs or
++		 * Discover Modes only after tVDMSenderResponse has expired is
++		 * never asked again: discovery stops at that step and the
++		 * partner's alternate modes stay unregistered until the next
++		 * attach. Restart discovery from Discover Identity, a bounded
++		 * number of times; svdm_consume_identity() clears the SVIDs and
++		 * modes gathered so far. The late response itself is not
++		 * consumed.
++		 */
++		if (port->tx_sop_type == TCPC_TX_SOP &&
++		    (port->ams == DISCOVER_IDENTITY ||
++		     port->ams == DISCOVER_SVIDS ||
++		     port->ams == DISCOVER_MODES) &&
++		    port->discover_timeouts < DISCOVER_TIMEOUT_RETRIES) {
++			port->discover_timeouts++;
++			tcpm_log(port, "%s timed out, restarting discovery (%u of %u)",
++				 tcpm_ams_str[port->ams], port->discover_timeouts,
++				 DISCOVER_TIMEOUT_RETRIES);
++			port->send_discover = true;
++			mod_send_discover_delayed_work(port, SEND_DISCOVER_RETRY_MS);
++		}
+ 		if (port->ams != NONE_AMS)
+ 			tcpm_ams_finish(port);
+ 		break;
+@@ -4484,6 +4508,7 @@
+ 
+ 	port->attached = true;
+ 	port->send_discover = true;
++	port->discover_timeouts = 0;
+ 	port->send_discover_prime = false;
+ 
+ 	return 0;
+@@ -4638,6 +4663,7 @@
+ 
+ 	port->attached = true;
+ 	port->send_discover = true;
++	port->discover_timeouts = 0;
+ 	port->send_discover_prime = false;
+ 
+ 	return 0;
+@@ -5455,6 +5481,7 @@
+ 		tcpm_unregister_altmodes(port);
+ 		port->nr_sink_caps = 0;
+ 		port->send_discover = true;
++		port->discover_timeouts = 0;
+ 		port->send_discover_prime = false;
+ 		if (port->pwr_role == TYPEC_SOURCE)
+ 			tcpm_set_state(port, SRC_HARD_RESET_VBUS_OFF,

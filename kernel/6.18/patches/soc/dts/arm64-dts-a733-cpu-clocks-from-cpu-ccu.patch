@@ -1,0 +1,475 @@
+From 4a1d7e9c2b8f5036e17c4d92ab53f60c8d1e2743 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Wed, 22 Jul 2026 12:00:00 +0200
+Subject: [PATCH] arm64: dts: a733: wire the CPU clusters to the CPU-PLL
+ controller
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add the CPU-PLL clock controller node (CPU_PLL_CFG @ 0x08870000) and give
+every cpu@N a `clocks` property. This is the DT half; the driver is
+patch `clk-sunxi-ng-a733-add-cpu-pll-ccu`. It is one of the items patch `arm64-dts-a733-cpu-topology` deferred, in its own words:
+"cpupll_ccu node (CPU PLL block @ 0x08870000, separate from main CCU) ...
+Belongs with the cpufreq patch (foundation range); cpu@N `clocks=<>` will
+need extending when that lands."
+
+THE CLOCK CHAIN, END TO END
+
+  DCXO 26 MHz  (RTC-CCU XO_CTRL0 @0x07090160, gate = CLK_RTC_DCXO, `clk-sunxi-ng-a733-rtc-ccu-add-dcxo`)
+    -> CPU_L_PLL   @0x08871000   f = 26 * N / P / (M0*M1)
+    -> EXT_DIVP    @0x0887101C bits[17:16]   /1 /2 /4
+    -> mux         @0x0887101C bits[26:24]   ---> CPU0_5_CLK  -> cores 0..5
+       other mux inputs: CPU_SLOW_CLK (000/001/010), PERI0PLL_DIV2 (100),
+       CPU_BACK_PLL (101)
+
+  same structure at 0x08872000 / 0x0887201C -> CPU6_7_CLK -> cores 6..7
+  same structure at 0x08873000 / 0x0887301C -> DSU_CLK    -> the DSU/L3,
+       plus CPU_AXI = DSU_CLK/M, CPU_GIC = DSU_CLK/M1, CPU_APB = DSU_CLK/N
+
+The distribution is UM 5.1.4.1 "PLL Distribution":
+core0..core5 <- CPU_L_PLL, core6/core7 <- CPU_B_PLL, cluster <- CPU_DSU_PLL.
+The register layout is UM 5.1.5.5 "CPU_PLL_CFG Register List"
+plus the per-register sections for CPU_L, CPU_B, CPU_DSU and
+CPU_SLOW_CLK_SEL.
+
+WHY THE NODE POINTS AT THE MUX AND NOT AT THE PLL
+
+The vendor DT (BSP sun60iw2p1.dtsi:56) writes
+`clocks = <&cpupll_ccu CLK_PLL_CPU_L>` -- the raw PLL -- even though its own
+driver also registers the mux. We point at the mux instead, deliberately.
+
+1. The mux output is what the UM calls the CPU clock. The CPU_L_PLL_CLK_REG
+   field description ends with "CPU0_5_CLK = Clock Source"
+   and CPU_B_PLL_CLK_REG with "CPU6_7_CLK = Clock Source"
+   (A733 user manual). The PLL is one of five sources feeding it. A DT is
+   a description of hardware; the node that describes "the clock this core
+   runs on" is the mux output.
+
+2. Only the mux is documented as safe to switch under load. Both register
+   descriptions state that the mux switches glitch-free and supports
+   dynamic reconfiguration. The PLL carries no such statement; on the
+   contrary, UM 5.1.4.2 (pre-divider frequency modulation)
+   says the PLL has to be re-locked whenever a pre-divider
+   changes, and step 1 of that sequence is to clear
+   PLL_OUTPUT_GATE. Gating the output of a PLL that is the sole clock of a running core
+   stops that core. Naming the mux is what makes the safe sequence
+   expressible in the clk framework: park the mux on CPU_SLOW_CLK or
+   CPU_BACK_PLL, re-lock, switch back -- exactly what
+   ccu_mux_notifier_register() / ccu_mux_notifier_cb() do
+   (drivers/clk/sunxi-ng/ccu_mux.c:286-312).
+
+3. Nothing is lost for DVFS. A mux registered with CLK_SET_RATE_PARENT
+   forwards the rate request to its active parent, so clk_set_rate() on
+   CLK_CPU_L still lands on CPU_L_PLL. Mainline sunxi already does exactly
+   this: sun50i-a100.dtsi:26 and sun50i-h616.dtsi:28 give cpu@N
+   `clocks = <&ccu CLK_CPUX>`, and CLK_CPUX is a SUNXI_CCU_MUX
+   (ccu-sun50i-a100.c:267, ccu-sun50i-h616.c:251), paired with
+   ccu_mux_notifier_register() on pll-cpux.
+
+4. clk_get_rate() on the mux is the only reading that is true at all times.
+   Pointed at the PLL it reports the PLL whatever the mux is doing -- and
+   the mux is not always on the PLL: it has a documented parked state, and
+   whether EXT_DIVP (which sits on the mux input branch, in the CLK register,
+   not in the PLL) is folded into the PLL clock or modelled separately is a
+   driver-internal choice that the DT should not have to depend on. A previous
+   measurement showed what a wrong frequency reading looks like in practice:
+   scaling_cur_freq said 2002 MHz while CPU_B_PLL held N=32 (416 MHz).
+
+WHAT LINUX DOES WITH cpu@N's clocks[0]
+
+Checked in the kernel source before writing. The
+property is load-bearing for two subsystems:
+
+  * drivers/base/arch_topology.c:294 -- topology_parse_cpu_capacity() calls
+    of_clk_get(cpu_node, 0) and, on success, sets
+    per_cpu(capacity_freq_ref) = clk_get_rate()/1000. That value is the
+    multiplier applied to capacity-dmips-mhz (`arm64-dts-a733-capacity-dmips-mhz`) in
+    topology_normalize_cpu_scale() (:246,:253). Note the call site: it is
+    reached from get_cpu_for_node() (:485) inside parse_dt_topology(), i.e.
+    from init_cpu_topology() at arch/arm64/kernel/smp.c:779 --
+    smp_prepare_cpus() time, before any platform driver probes. of_clk_get()
+    will therefore return -EPROBE_DEFER here, IS_ERR_OR_NULL() skips the
+    assignment, and capacity_freq_ref keeps its initial 0 which
+    topology_normalize_cpu_scale() reads as `?: 1`. So this patch does NOT
+    change early-boot capacities; they stay at the 454/1024 ratio `arm64-dts-a733-capacity-dmips-mhz`
+    established. The real update comes later, from
+    init_cpu_capacity_callback() (:400) on CPUFREQ_CREATE_POLICY, which sets
+    capacity_freq_ref = policy->cpuinfo.max_freq and re-normalises. That is
+    the step that will turn 454/1024 into frequency-aware capacities once
+    `nvmem-cpufreq-a733-speed-bin-from-efuse` and `arm64-dts-a733-cpu-opp-tables-and-supply` land -- and it can only happen if the clock resolves.
+
+  * drivers/cpufreq/cpufreq-dt.c:96 -- cpufreq_init() does
+    clk_get(cpu_dev, NULL), which is of_clk_get(np, 0) on the same property,
+    and stores it as policy->clk; set_target() (:51) then drives it through
+    dev_pm_opp_set_rate(). cpufreq-dt is the driver this SoC will get:
+    cpufreq-dt-platdev.c registers the platform device whenever cpu0 has
+    operating-points-v2 and the root compatible is not in the blocklist, and
+    "allwinner,sun60i-a733" is not in that blocklist (:110-114 lists a100,
+    h6, h616, h618, h700 only). So no platdev change is needed later.
+
+  * Energy Model: cpufreq-dt sets .register_em = cpufreq_register_em_with_opp,
+    so the EM is built from the OPP table. That still needs
+    dynamic-power-coefficient, which `arm64-dts-a733-capacity-dmips-mhz` deliberately left out and this
+    patch does not add.
+
+VALUES AND WHERE THEY COME FROM
+
+  reg 0x08870000 -- UM chapter 2 memory map
+    (0x08870000---0x0887FFFF, "CPU_PLL_CFG"). The block is inside CPU_SYS,
+    NOT part of the main CCU at 0x02002000 -- which is precisely why the
+    A733 CCU driver (`clk-sunxi-ng-add-A733-sun60iw2-minimal-ccu`) cannot provide the CPU clocks.
+
+  parent = 26 MHz DCXO -- silicon: XO_CTRL0 @0x07090160 reads 0x983FB0F7
+    byte-identical on the 6 GiB board and the 8 GiB board, DCXO_ST[15:14] = 0b10 = 26 MHz.
+    Spec: UM 9.1.5.4 decodes DCXO_ST 0b10 as the 26M oscillator, and
+    Table 4-2 gives the CPU PLLs a 26 MHz reference (V1.00 PDF p. 410, 41).
+    The CPU_BACK_PLL default note is no cross-check: V0.92 says 975 MHz
+    "when DCXO is 26MHz", V1.00 says 900 MHz "when DCXO is 24MHz" (PDF
+    p. 305), for the same fields (0x40104A00: N=75, OUTPUT_DIV=1). The osc24M node
+    this DT still carries is correct for the main CCU and wrong for the CPU
+    PLLs; that is why the CPU-PLL controller takes its parent from
+    CLK_RTC_DCXO (patch `clk-sunxi-ng-a733-rtc-ccu-add-dcxo`) rather than from &osc24M.
+
+  boot state, for the reviewer to compare against after boot (the 8 GiB board, our
+    6.18.36, register readback):
+      0x08871000 = 0xF8802700  N=0x27=39, P=0, M0=0 -> 26*39 = 1014 MHz
+      0x0887101C = 0x03000000  mux=011 (own PLL), EXT_DIVP=00 (/1)
+      0x08872000 = 0xF8802700  -> 1014 MHz  (A76 cluster, same as A55)
+      0x0887201C = 0x03000000
+      0x08873000 = 0xF8801E00  N=0x1E=30 -> 780 MHz  (DSU)
+      0x0887301C = 0x03000105  mux=011, AXI M=2, GIC M1=2, APB N=2
+                               -> AXI/GIC/APB = 390 MHz
+    Both clusters sit at 1014 MHz because that is what boot0 leaves behind.
+
+WHAT THIS PATCH MUST NOT DUPLICATE, AND DOES NOT
+
+  `arm64-dts-a733-cpu-topology` cpu@N identity, reg, enable-method, cpu-map, cache node graph.
+  `arm64-dts-a733-heterogeneous-pmu` the two arm-pmu nodes.
+  `arm64-dts-a733-psci-idle-states` idle-states + cpu-idle-states on every cpu@N.
+  `arm64-dts-a733-cache-geometry` d/i-cache-size / -line-size / -sets on every cpu@N.
+  `arm64-dts-a733-capacity-dmips-mhz` capacity-dmips-mhz = 454 / 1024.
+  This patch adds exactly one property per cpu@N (`clocks`) and one node.
+  It does not touch capacity-dmips-mhz -- `arm64-dts-a733-capacity-dmips-mhz`'s value is a ratio and stays
+  correct; what changes later is only the frequency it is multiplied by.
+  It does not add operating-points-v2, cpu-supply, opp-supported-hw,
+  dynamic-power-coefficient, #cooling-cells or thermal zones. Those are
+  `nvmem-cpufreq-a733-speed-bin-from-efuse` and `arm64-dts-a733-cpu-opp-tables-and-supply` and later thermal work.
+
+DOES ANYTHING IN THE EXISTING DT ALREADY CLAIM A CPU CLOCK?
+
+No. Checked against the tree with `clk-sunxi-ng-add-A733-sun60iw2-minimal-ccu` to `clk-sunxi-ng-a733-add-minimal-rtc-ccu` + `clk-sunxi-ng-a733-add-smhc-pll-peri1-clocks` to `arm64-dts-allwinner-a733-add-sd-emmc` + `clk-sunxi-ng-a733-add-usb2-clocks` to `usb-typec-tcpci_rt1711h-drop-revision-check` +
+`clk-sunxi-ng-a733-add-gmac0-clocks` to `net-phy-maxio-split-rj45-led-functions` + `mfd-axp20x-Constify-axp313-and-axp717-cells` to `arm64-dts-a733-enable-r-i2c1-husb311-typec` applied: no cpu@N carries a `clocks` property, and
+no node in the tree carries a reg in the 0x08870000-0x0887FFFF window
+(the highest soc child today is rtc_ccu at 0x07090000). The new node is
+appended after it, keeping the soc block roughly address-ordered. So there
+is nothing to remove and nothing to conflict with. The only new coupling is
+&rtc_ccu, which `clk-sunxi-ng-a733-add-minimal-rtc-ccu` already introduced and `clk-sunxi-ng-a733-rtc-ccu-add-dcxo` extends with CLK_RTC_DCXO.
+
+THE DSU: DELIBERATELY NOT REPRESENTED HERE, AND WHY
+
+CPU_DSU_PLL clocks the DynamIQ Shared Unit -- the L3 and the snoop filter
+that all eight cores go through -- and, via the dividers in
+CPU_DSU_PLL_CLK_REG, CPU_AXI, CPU_GIC and CPU_APB. Silicon has it at
+780 MHz with all three dividers at /2 (390 MHz). This patch adds no node
+that consumes it, for three reasons:
+
+1. There is no consumer to write. Linux has no generic "cluster clock"
+   binding a cpu@N could point at; the DSU is not a cpufreq policy. The
+   vendor's own answer is a `dsufreq@0` node with
+   compatible = "allwinner,dsufreq" (BSP sun60iw2p1.dtsi:487), bound there
+   by the BSP's own sunxi-dsufreq driver; mainline has no such driver, so in
+   this tree nothing would bind it. Adding a node that nothing binds would be
+   describing our intentions, not the hardware.
+
+2. The rail makes it a real hazard, not a free win. VDD-DSU is not its own
+   supply: DCDC5 feeds VDD-CPUL
+   (Cortex-A55) and the DSU as one rail. So the DSU's voltage is chosen by
+   whatever the A55 cluster's OPP asks for, and cpufreq knows nothing about
+   the DSU. Anything that raises the DSU frequency is only safe at the
+   *lowest* voltage the A55 policy can select (800 mV on both bins we have
+   measured). The absolute maximum for both rails is 1.2 V
+   (DS Tab. 5-1); nothing here goes near
+   it, and nothing here raises a voltage at all.
+
+3. The DT would still not be where the decision belongs. The clock IDs
+   CLK_PLL_CPU_DSU and CLK_CPU_DSU exist in the header and the controller
+   exposes them; a future devfreq or interconnect consumer can reference
+   them without changing this node.
+
+   Driver-side consequence that must be handled in `clk-sunxi-ng-a733-add-cpu-pll-ccu`, flagged here
+   because this DT is what makes it visible: CLK_CPU_DSU has no consumer in
+   this DT, and CLK_CPU_L / CLK_CPU_B have consumers that never
+   clk_prepare_enable() them (arch_topology only reads the rate; cpufreq-dt
+   only sets rates). clk_disable_unused() at late_initcall would therefore
+   gate them. All three muxes and all four PLLs need CLK_IS_CRITICAL.
+
+THE 75 % QUESTION -- OPEN, AND WORTH SOMEONE'S TIME
+
+Per UM 5.1.4.1, L3 latency depends on the DSU-to-core clock ratio, and
+the UM recommends a DSU clock of at least 75 % of the fastest core's.
+
+Today the DSU runs 780 MHz. Against the A76's top OPP of 2002 MHz that is
+39 %, barely half of what the UM recommends; even against the A55's top of
+1794 MHz it is 43 %. Once `nvmem-cpufreq-a733-speed-bin-from-efuse` and `arm64-dts-a733-cpu-opp-tables-and-supply` let the cores scale, every L3 miss and
+every cross-cluster snoop pays that ratio, and the two A76 cores pay it
+most. 75 % of 2002 MHz would be 1502 MHz, i.e. N=58 (1508 MHz) on the
+existing 26 MHz ladder.
+
+We are NOT doing that here, and the reason is the rail in point 2 above:
+DCDC5 also supplies the six A55s, so the DSU only ever sees the voltage the
+A55 policy has selected, and at idle that is 800 mV. What can be said from
+measurement is narrow but real: on this rail, at 800 mV, an A55 core runs
+1196 MHz in both bins we have measured -- which is
+suggestive but is NOT proof about the DSU, a different logic block with a
+different critical path. And the UM gives no Fmax for the DSU, nor for
+CPU_AXI / CPU_GIC / CPU_APB, which would go from 390 MHz to 598 MHz at
+1196 MHz DSU with today's /2 dividers. The divider fields could absorb that
+(AXI M supports /4, GIC M1 and APB N support /4), but
+"could" is not "may".
+
+So the honest state is: a defensible improvement almost certainly exists
+between 780 MHz and 1196 MHz at unchanged voltage, and we cannot yet name
+the number from the documents we have. What would close it: a documented
+DSU / CPU_AXI / CPU_GIC / CPU_APB maximum frequency at 0.8 V (a datasheet
+electrical table, not a vendor DT), plus a consumer that keeps the DSU
+below whatever DCDC5 is currently at. Recorded here rather than left as
+folklore, because the ratio is a standing performance loss and someone
+should own it.
+
+Under no circumstances is any of this to be reached by raising a rail:
+VDD-CPUL/VDD-CPUB absolute maximum is 1.2 V per DS Tab. 5-1 and the highest
+value in any vendor bin is 1050 mV.
+
+DEPENDENCIES
+
+  `clk-sunxi-ng-a733-add-minimal-rtc-ccu`  rtc_ccu node + driver (already on the branch)
+  `clk-sunxi-ng-a733-rtc-ccu-add-dcxo`  CLK_RTC_DCXO = 2 in the RTC-CCU (the `clocks` parent here)
+  `clk-sunxi-ng-a733-add-cpu-pll-ccu`  the CPU-PLL driver, which brings
+        include/dt-bindings/clock/sun60i-a733-cpu-ccu.h and the
+        "allwinner,sun60i-a733-cpu-ccu" compatible
+
+The dt-bindings header is NOT added by this patch. Repo convention is that
+the header ships with the clk driver that defines the ids (`clk-sunxi-ng-add-A733-sun60iw2-minimal-ccu` carries
+sun60i-a733-ccu.h, `clk-sunxi-ng-a733-add-minimal-rtc-ccu` carries sun60i-a733-rtc-ccu.h), and `clk-sunxi-ng-a733-add-cpu-pll-ccu` is that
+driver here. If `clk-sunxi-ng-a733-add-cpu-pll-ccu` turns out not to carry it, this series fails at dtc
+with "CLK_CPU_L undeclared", which is loud and cheap to fix; the alternative
+-- both patches creating the same new file -- fails at apply time instead.
+
+WHY THE MAPPING IS 0x3038 AND NOT THE VENDOR'S 0x3034
+
+The vendor DT maps 0x3034 (sun60iw2p1.dtsi:826), which works for it because
+its driver never reads the last register in the block. CPU_SLOW_CLK_SEL sits
+*at* offset 0x3034 (UM register list and its CPU_SLOW_CLK_SEL_REG section,
+bits[1:0] = 00 DCXO / 01 CLK32K / 10 CLK16M_RC), so a 0x3034-sized mapping
+covers 0x0000..0x3033 and excludes exactly that register.
+
+Our driver does read it, and must: `clk-sunxi-ng-a733-add-cpu-pll-ccu` parks the core mux on CPU_SLOW_CLK
+while it reprograms a PLL, and this register decides what CPU_SLOW_CLK is.
+Parking eight cores on the 32 kHz clock instead of the DCXO is not a
+performance question. `clk-sunxi-ng-a733-add-cpu-pll-ccu` therefore refuses to probe when the field is not
+00, which it cannot do without the register being mapped. Measured on the 6 GiB board
+and the 8 GiB board on 2026-07-22: 0x08873034 = 0x00000000, i.e. the DCXO — but that is
+boot0's leftover state, not a guarantee, which is the whole reason for the
+check. The block itself is 64 KiB, so 0x3038 is well inside it.
+
+VERIFIED THIS PASS
+
+  * The pre-image was reconstructed by applying every DTS-touching patch in
+    the series (`arm64-dts-allwinner-add-A733-minimal-boot-dt`, `arm64-dts-allwinner-a733-reserve-scp-dram`, `arm64-dts-a733-add-pck600-power-controller` to `arm64-dts-a733-capacity-dmips-mhz`, `arm64-dts-allwinner-a733-add-sd-emmc`, `arm64-dts-a733-add-usb2-ehci-ohci-phy`, `arm64-dts-a733-aon-pinctrl-usb-host-vbus`, `arm64-dts-a733-add-usb3-dwc3-combophy`, `arm64-dts-a733-add-gmac0-ethernet`, `arm64-dts-a733-gmac0-measured-rgmii-delays`,
+    `arm64-dts-a733-ethernet0-alias-for-uboot-mac`, `arm64-dts-a733-enable-r-i2c0-axp318w-pmic`, `arm64-dts-a733-pmic-nmi-irq`, `arm64-dts-a733-enable-r-i2c1-husb311-typec`) to a clean tree; the result is byte-identical to
+    the project's own patched 6.18.36 tree, so this diff is against the real
+    current branch state.
+  * `patch -p1 --dry-run` clean, zero fuzz, zero offset, on that tree.
+  * Kernel-side consumption re-read in 6.18.36 before writing the node, not
+    inferred: arch_topology.c:262-306/:400/:485, cpufreq-dt.c:51/:96,
+    cpufreq-dt-platdev.c:105-190, ccu_mux.c:286-312.
+
+NOT VERIFIED -- what has to happen on hardware
+
+  * Nothing here has been on silicon. It cannot be: the node is inert until
+    `clk-sunxi-ng-a733-add-cpu-pll-ccu` provides the driver and the compatible, and useful only once
+    `nvmem-cpufreq-a733-speed-bin-from-efuse` and `arm64-dts-a733-cpu-opp-tables-and-supply` provide the OPP tables.
+  * dtc W=1 clean -- needs `clk-sunxi-ng-a733-add-cpu-pll-ccu`'s header, so it is checked in the
+    full-series build.
+
+THE ONE OBSERVABLE THAT WOULD FALSIFY THIS PATCH
+
+With `clk-sunxi-ng-a733-rtc-ccu-add-dcxo`+`clk-sunxi-ng-a733-add-cpu-pll-ccu`+`arm64-dts-a733-cpu-clocks-from-cpu-ccu` (+`nvmem-cpufreq-a733-speed-bin-from-efuse` and `arm64-dts-a733-cpu-opp-tables-and-supply` for the OPP table) booted on the 6 GiB board or the 8 GiB board,
+drive cluster0 from 1014 MHz to 1794 MHz and, from a core on the *other*
+cluster (taskset -c 6, so the observer is not the observed), read with
+devmem:
+
+  0x08871000 bits[15:8] must go 0x27 (N=39) -> 0x45 (N=69), and
+  0x0887101C bits[26:24] must be observed leaving 0b011 for one of the
+  backup sources and coming back to 0b011 around that change,
+
+and a fixed-iteration benchmark pinned to cpu0 must then take 1014/1794 =
+0.565x the wall time it took before.
+
+Three distinct ways this fails, each meaning something different:
+  - N never changes            -> the clock never reached the PLL: the mux
+                                  is not CLK_SET_RATE_PARENT, or clocks[0]
+                                  did not resolve at all.
+  - N changes, mux never moves -> the driver re-locks the PLL underneath a
+                                  running core; pointing cpu@N at the mux
+                                  bought nothing and the sequence is unsafe
+                                  by the UM's own gating step.
+  - registers change, wall time does not -> the core is not actually running
+                                  on the clock this DT says it runs on, and
+                                  the whole mux model is wrong.
+
+Assisted-by: Claude
+---
+ .../sun60i-a733-cubie-a7s-minimal.dts         | 63 +++++++++++++++++++
+ 1 file changed, 63 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -16,6 +16,7 @@
+ #include <dt-bindings/interrupt-controller/arm-gic.h>
+ #include <dt-bindings/power/allwinner,sun60i-a733-pck-600.h>
+ #include <dt-bindings/clock/sun60i-a733-ccu.h>
++#include <dt-bindings/clock/sun60i-a733-cpu-ccu.h>
+ #include <dt-bindings/clock/sun60i-a733-r-ccu.h>
+ #include <dt-bindings/clock/sun60i-a733-rtc-ccu.h>
+ #include <dt-bindings/clock/sun60i-a733-serdes-ccu.h>
+@@ -56,12 +57,26 @@
+ 		 *
+ 		 * reg follows the Allwinner MPIDR convention (AFF1<<8 | AFF0),
+ 		 * read back live on the 6 GiB board: 0x000..0x500.
++		 *
++		 * clocks = <&cpupll_ccu CLK_CPU_L> deliberately names the MUX in
++		 * CPU_L_PLL_CLK_REG (0x0887101C bits[26:24]) and not the raw
++		 * CPU_L_PLL. The UM names that mux output CPU0_5_CLK -- it is the
++		 * clock cores 0..5 actually run on -- and documents it as
++		 * switchable glitch-free at run time.
++		 * The PLL is only one of its five sources. A PLL
++		 * re-lock must gate PLL_OUTPUT_GATE off first
++		 * (UM 5.1.4.2), which would stop the clock of a core wired
++		 * straight to the PLL; naming the mux is what lets the driver
++		 * park the core on CPU_SLOW_CLK/CPU_BACK_PLL across the re-lock.
++		 * Nothing is lost for DVFS: the rate request propagates from the
++		 * mux to the PLL via CLK_SET_RATE_PARENT.
+ 		 */
+ 		cpu0: cpu@0 {
+ 			device_type = "cpu";
+ 			compatible = "arm,cortex-a55";
+ 			reg = <0x000>;
+ 			enable-method = "psci";
++			clocks = <&cpupll_ccu CLK_CPU_L>;
+ 			capacity-dmips-mhz = <454>;
+ 			d-cache-size = <32768>;
+ 			d-cache-line-size = <64>;
+@@ -78,6 +93,7 @@
+ 			compatible = "arm,cortex-a55";
+ 			reg = <0x100>;
+ 			enable-method = "psci";
++			clocks = <&cpupll_ccu CLK_CPU_L>;
+ 			capacity-dmips-mhz = <454>;
+ 			d-cache-size = <32768>;
+ 			d-cache-line-size = <64>;
+@@ -94,6 +110,7 @@
+ 			compatible = "arm,cortex-a55";
+ 			reg = <0x200>;
+ 			enable-method = "psci";
++			clocks = <&cpupll_ccu CLK_CPU_L>;
+ 			capacity-dmips-mhz = <454>;
+ 			d-cache-size = <32768>;
+ 			d-cache-line-size = <64>;
+@@ -110,6 +127,7 @@
+ 			compatible = "arm,cortex-a55";
+ 			reg = <0x300>;
+ 			enable-method = "psci";
++			clocks = <&cpupll_ccu CLK_CPU_L>;
+ 			capacity-dmips-mhz = <454>;
+ 			d-cache-size = <32768>;
+ 			d-cache-line-size = <64>;
+@@ -126,6 +144,7 @@
+ 			compatible = "arm,cortex-a55";
+ 			reg = <0x400>;
+ 			enable-method = "psci";
++			clocks = <&cpupll_ccu CLK_CPU_L>;
+ 			capacity-dmips-mhz = <454>;
+ 			d-cache-size = <32768>;
+ 			d-cache-line-size = <64>;
+@@ -142,6 +161,7 @@
+ 			compatible = "arm,cortex-a55";
+ 			reg = <0x500>;
+ 			enable-method = "psci";
++			clocks = <&cpupll_ccu CLK_CPU_L>;
+ 			capacity-dmips-mhz = <454>;
+ 			d-cache-size = <32768>;
+ 			d-cache-line-size = <64>;
+@@ -163,12 +183,19 @@
+ 		 * core6/core7 take CPU_B_PLL as primary clock.
+ 		 *
+ 		 * reg 0x600..0x700 from live DTB on the 6 GiB board (Allwinner 0x100 stride).
++		 *
++		 * clocks = <&cpupll_ccu CLK_CPU_B> names the mux in
++		 * CPU_B_PLL_CLK_REG (0x0887201C bits[26:24]), whose output the UM
++		 * calls CPU6_7_CLK and likewise documents as glitch-free and
++		 * dynamically switchable. Same reasoning as
++		 * cluster0 above.
+ 		 */
+ 		cpu6: cpu@600 {
+ 			device_type = "cpu";
+ 			compatible = "arm,cortex-a76";
+ 			reg = <0x600>;
+ 			enable-method = "psci";
++			clocks = <&cpupll_ccu CLK_CPU_B>;
+ 			capacity-dmips-mhz = <1024>;
+ 			d-cache-size = <65536>;
+ 			d-cache-line-size = <64>;
+@@ -185,6 +212,7 @@
+ 			compatible = "arm,cortex-a76";
+ 			reg = <0x700>;
+ 			enable-method = "psci";
++			clocks = <&cpupll_ccu CLK_CPU_B>;
+ 			capacity-dmips-mhz = <1024>;
+ 			d-cache-size = <65536>;
+ 			d-cache-line-size = <64>;
+@@ -1812,5 +1840,40 @@
+ 			clock-names = "r-ahb";
+ 			#clock-cells = <1>;
+ 		};
++
++		/*
++		 * CPU-PLL controller. CPU_PLL_CFG lives inside the CPU_SYS block
++		 * at 0x08870000, NOT in the main CCU at 0x02002000: UM chapter 2
++		 * memory map gives the window
++		 * 0x08870000-0x0887FFFF.
++		 *
++		 * It holds four PLLs and three CPU clock muxes (UM 5.1.5.5
++		 * "CPU_PLL_CFG Register List"):
++		 *   0x0000 CPU_BACK_PLL_CTRL   0x1000 CPU_L_PLL_CTRL
++		 *   0x2000 CPU_B_PLL_CTRL      0x3000 CPU_DSU_PLL_CTRL
++		 *   0x101C / 0x201C / 0x301C   CPU_L/B/DSU clock register
++		 *                              (source mux + EXT_DIVP)
++		 *   0x3034                     CPU_SLOW_CLK_SEL
++		 *
++		 * Parent is the 26 MHz DCXO, not the osc24M this DT still models
++		 * for the main CCU. Silicon: XO_CTRL0 @0x07090160 reads
++		 * 0x983FB0F7 byte-identical on the 6 GiB board and the 8 GiB board, DCXO_ST[15:14] =
++		 * 0b10 = 26 MHz, the 26M oscillator of UM 9.1.5.4. The UM's
++		 * CPU_BACK_PLL default note is no cross-check: V0.92 names
++		 * 975 MHz at 26 MHz, V1.00 900 MHz at 24 MHz, same fields.
++		 * The gate itself is CLK_RTC_DCXO in the RTC-CCU (patch `clk-sunxi-ng-a733-rtc-ccu-add-dcxo`).
++		 *
++		 * reg size 0x3038 also maps CPU_SLOW_CLK_SEL_REG at 0x3034,
++		 * which patch `clk-sunxi-ng-a733-add-cpu-pll-ccu` reads; the vendor's 0x3034
++		 * stops one register short;
++		 * see this patch's description.
++		 */
++		cpupll_ccu: clock-controller@8870000 {
++			compatible = "allwinner,sun60i-a733-cpu-ccu";
++			reg = <0x0 0x08870000 0x0 0x3038>;
++			clocks = <&rtc_ccu CLK_RTC_DCXO>;
++			clock-names = "dcxo";
++			#clock-cells = <1>;
++		};
+ 	};
+ };
+-- 
+2.45.0

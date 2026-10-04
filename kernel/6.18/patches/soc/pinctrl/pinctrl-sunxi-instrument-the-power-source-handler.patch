@@ -1,0 +1,95 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] pinctrl: sunxi: say what the power-source handler did
+
+License: GPL-2.0 (driver patch).
+
+`pinctrl-sunxi-a733-pf-io-voltage-power-source`'s handler writes GPIO_POW_VAL_SET_CTL and returns 0. On silicon that is
+indistinguishable from three different outcomes, and two board sessions
+(2026-07-29 and 2026-08-02) ended without being able to tell them apart:
+
+  - the property never reached the driver     -> no line at all
+  - the handler refused it (desc gate / bank) -> "refused, ..."
+  - the handler wrote it                      -> the before/after read-back
+
+Project rule: diagnostics are on by default until the hardware proves the fix,
+and the lines stay afterwards. `pinctrl-sunxi-a733-pf-io-voltage-power-source` shipped twice with none, and both times
+the only evidence was that the register still read its reset default,
+which is consistent with "never ran" AND with "ran, the switch failed, and the
+driver restored 3.3 V". One dev_dbg separates them; a third board cycle spent
+guessing does not.
+
+The read-back is the point, not the print. Writing a register is not evidence
+that the bit changed -- the value is re-read inside the same lock and both
+values are reported, so the log line carries the claim instead of asserting it.
+
+Costs nothing when the driver is quiet: CONFIG_DYNAMIC_DEBUG is pinned in
+A733_CONFIGS, so these are inert until dyndbg="file pinctrl-sunxi.c +p".
+
+Note: the dyndbg target is pinctrl-sunxi.c, where the handler lives, not
+pinctrl-sun60iw2.c, which only sets .pf_power_switch.
+
+Assisted-by: Claude
+---
+--- a/drivers/pinctrl/sunxi/pinctrl-sunxi.c
++++ b/drivers/pinctrl/sunxi/pinctrl-sunxi.c
+@@ -673,22 +673,42 @@
+ 	unsigned long flags;
+ 	u32 val;
+ 
+-	if (!pctl->desc->pf_power_switch)
++	u32 before;
++
++	if (!pctl->desc->pf_power_switch) {
++		dev_dbg(pctl->dev,
++			"power-source: pin %u arg %u -- refused, this desc has no pf_power_switch\n",
++			pin, arg);
+ 		return -ENOTSUPP;
++	}
+ 
+ 	/* Only bank PF is SoC-settable through this register. */
+-	if (pin / PINS_PER_BANK != PF_BASE / PINS_PER_BANK)
++	if (pin / PINS_PER_BANK != PF_BASE / PINS_PER_BANK) {
++		dev_dbg(pctl->dev,
++			"power-source: pin %u arg %u -- refused, not in bank PF\n",
++			pin, arg);
+ 		return -ENOTSUPP;
++	}
+ 
+ 	raw_spin_lock_irqsave(&pctl->lock, flags);
+-	val = readl(pctl->membase + A733_POW_VAL_SET_CTL_REG);
++	before = readl(pctl->membase + A733_POW_VAL_SET_CTL_REG);
++	val = before;
+ 	if (arg == 1800000)
+ 		val &= ~BIT(0);
+ 	else
+ 		val |= BIT(0);
+ 	writel(val, pctl->membase + A733_POW_VAL_SET_CTL_REG);
++	/*
++	 * Read back inside the lock. Writing the register is not the claim --
++	 * the claim is that the bit changed, and only a read-back can carry it.
++	 */
++	val = readl(pctl->membase + A733_POW_VAL_SET_CTL_REG);
+ 	raw_spin_unlock_irqrestore(&pctl->lock, flags);
+ 
++	dev_dbg(pctl->dev,
++		"power-source: pin %u arg %u uV -- POW_VAL_SET_CTL %#010x -> %#010x (bit0 %u -> %u)\n",
++		pin, arg, before, val, before & 1, val & 1);
++
+ 	return 0;
+ }
+ 
+@@ -716,6 +736,14 @@
+ 		 * MICROVOLTS, same as the device-tree power-source value.
+ 		 */
+ 		if (param == PIN_CONFIG_POWER_SOURCE) {
++			/*
++			 * Logged before the call: if this line never appears,
++			 * the property never reached the driver at all, which
++			 * is a different defect from the handler refusing it.
++			 */
++			dev_dbg(pctl->dev,
++				"power-source: seen on pin %u, arg %u uV\n",
++				pin, arg);
+ 			ret = sunxi_pconf_set_power_source(pctl, pin, arg);
+ 			if (ret)
+ 				return ret;

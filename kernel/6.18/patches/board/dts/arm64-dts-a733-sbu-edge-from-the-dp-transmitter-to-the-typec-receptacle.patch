@@ -1,0 +1,234 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: a733: the SBU edge from the DisplayPort transmitter to the receptacle
+
+Add the graph edge that `arm64-dts-a733-display-engine-node-and-tcon-dp-edge` said it did not have. `edp0` gains `port@1` and the
+`usb-c-connector` gains `port@2`, and between them they are what lets
+sun60i-dp.c find the receptacle's device_node -- the node an out-of-band
+hot-plug is matched against, and the one thing missing between a Type-C alt
+mode that enters and a connector that never says `connected`.
+
+WHY port@2 AND NOT SOMETHING INVENTED
+--------------------------------------
+
+usb-connector.yaml fixes the numbering, and the SBU port is the one it names for
+exactly this:
+
+      port@0:  High Speed (HS), present in all connectors.
+      port@1:  Super Speed (SS), present in SS capable connectors.
+      port@2:  Sideband Use (SBU), present in USB-C. This describes the
+               alternate mode connection of which SBU is a part.
+    required:
+      - port@0
+              -- Documentation/devicetree/bindings/connector/usb-connector.yaml:195-212
+
+and its own worked example wires that port to a DisplayPort AUX endpoint on a
+board built the same way as this one -- "HS lines routed to companion PMIC, SS
+lines to USB3 PHY and SBU to DisplayPort":
+
+        port@2 {
+            reg = <2>;
+            usb_con_sbu: endpoint {
+                remote-endpoint = <&dp_aux>;
+            };
+        };
+              -- ibid:418-424
+
+That is what this board is: DP-AUXP/AUXN go straight to SBU1/SBU2 with no
+external mux and no redriver (`sch p12 L19-44`), while the four main lanes leave through COMB0 and
+are already described by the connector's `port@1`. So the SBU edge is a true
+description of the wiring, not a software hook wearing a graph edge's clothes.
+
+⚠ IT CARRIES NO VIDEO, and the comment in the node says so, because the next
+reader will otherwise assume port@2 is where the picture goes.
+
+THE ALTERNATIVE, AND WHY IT IS REFUSED
+---------------------------------------
+
+`displayport = <&edp0>` on the receptacle would also work -- dp_altmode_probe()
+prefers it over the port's own fwnode (displayport.c:800-804) -- and it is one
+line instead of two ports. It is refused because the property is in the code and
+in NO binding: usb-connector.yaml is `unevaluatedProperties: false` and
+documents only an `altmodes/displayport` CHILD NODE, which is not a property,
+and no device tree in 6.18.36 sets it. Writing it would mean inventing a
+property, which is the failure that grepping the driver for the property
+is meant to prevent, one step further on: here somebody DOES read it, but no
+schema accepts it. `arm64-dts-a733-display-engine-node-and-tcon-dp-edge`'s paragraph recording that debt is deleted rather than
+struck through, and replaced by the edge that settles it.
+
+WHAT ELSE READS THESE PORTS -- checked, not assumed
+----------------------------------------------------
+
+Following the same "grep the driver for it" check: a new endpoint on the connector is
+walked by the Type-C core when it looks for a mux and for an orientation
+switch: `fwnode_connection_find_match()` iterates every endpoint of the
+connector and hands each remote port parent to `typec_mux_match()` /
+`typec_switch_match()`. Both return NULL unless the remote node carries
+`mode-switch` / `orientation-switch` respectively
+(drivers/usb/typec/mux.c, both matchers open with that test). `edp0` carries
+neither -- only `combophy0` does, from `arm64-dts-a733-enable-dp-alt-mode-negotiation` -- so the new edge is invisible to
+that search and cannot displace the existing mux. Nothing else in
+`drivers/usb/typec/` walks the connector's graph.
+
+On the other side, `of_graph_get_remote_node(edp0, 1, 0)` resolves through
+`of_graph_get_remote_port_parent()` -> `of_graph_get_port_parent()`, which skips
+the `ports` container and returns the `connector` node itself
+(drivers/of/property.c) -- which is precisely the node that
+`device_get_named_child_node(tcpc_dev, "connector")` (tcpci.c:822) handed to
+TCPM, and therefore the fwnode `dp_altmode_probe()` will match on.
+
+fw_devlink: A NEW EDGE IS A NEW DEPENDENCY, AND THIS ONE IS A CYCLE
+--------------------------------------------------------------------
+
+`remote-endpoint` is one of fw_devlink's supplier bindings
+(drivers/of/property.c:1514-1518, `parse_remote_endpoint` returning
+`of_graph_get_remote_port_parent()` with `.get_con_dev =
+of_graph_get_port_parent`), so this edge makes `edp0` a consumer of the device
+that owns the receptacle -- the I2C TCPC, because the `connector` node itself
+binds nothing. Taken alone that would be the very coupling ``drm-a733-dp-enable-the-transmitter-output-before-training`` refuses: the
+DisplayPort transmitter waiting on the Type-C controller.
+
+It is not taken alone. The edge is described from both ends, as every OF graph
+edge is, so the receptacle is equally a consumer of `edp0`, and fw_devlink
+resolves the pair as a cycle: `__fw_devlink_relax_cycles()` marks both links
+FWLINK_FLAG_CYCLE and `fw_devlink_get_flags()` then downgrades them to
+FW_DEVLINK_FLAGS_PERMISSIVE | DL_FLAG_CYCLE (drivers/base/core.c:1706-1712,
+:1969-1990, :2139-2146), which orders nothing and gates no probe. The same shape
+already runs on this board: `edp0` <-> `tcon_tv1` (`arm64-dts-a733-display-engine-node-and-tcon-dp-edge`) and `usb_con` <->
+`combophy0` (`arm64-dts-a733-enable-r-i2c1-husb311-typec`) are both bidirectional and both probe.
+
+⬜ Observable, and it needs no display and no monitor: the boot log gains
+`Fixed dependency cycle(s) with ...` naming `displayport@5740000` and the
+connector (core.c:2143-2144). Refuted if `5740000.displayport` instead
+appears in /sys/kernel/debug/devices_deferred. ⚠ Even then the failure would be
+bounded -- the transmitter would probe after the TCPC rather than never -- which
+is why this is a note and not a blocker.
+
+WHAT THE VENDOR DOES INSTEAD
+-----------------------------
+
+The vendor's board DT describes no such edge, because its driver does not walk
+one: `sunxi_drm_edp.c:3406` takes its hot-plug source from
+`extcon_get_edev_by_phandle(dev, 0)`, i.e. an `extcon` phandle to a producer for
+`EXTCON_DISP_DP`. Mainline 6.18.36 has two such producers -- a Rockchip PHY and
+the ChromeOS EC -- and none in `drivers/usb/typec/`, so that phandle has nothing
+to point at on a mainline stack. The graph edge replaces it and describes real
+wiring while doing so, which the phandle did not.
+
+⬜ No binding schema, and no binding id: no display node in this tree has one,
+and this patch adds neither a clock nor a reset.
+
+WHAT IS VERIFIED
+-----------------
+
+✅ Applies at --fuzz=0 as part of the full series on a freshly unpacked 6.18.36.
+✅ The dtb builds and carries both endpoints and their phandle pair.
+⬜ NOT HW-PROVEN. A graph edge writes no register; on its own it changes
+   nothing, and without ``drm-a733-dp-enable-the-transmitter-output-before-training`` nothing walks it.
+
+THE FALSIFIER
+--------------
+
+It has none of its own -- its observable is ``drm-a733-dp-enable-the-transmitter-output-before-training``'s: with the monitor plugged
+into J4, `/sys/class/drm/card0-DP-1/status` reads `connected`, and it changes on
+unplug and on re-plug, with no debugfs verb written. ⚠ Not `/dev/fb0`, and not a
+picture: this hardware trains no link until the pixel path is up, which is a separate defect with a separate fix.
+
+Assisted-by: Claude
+
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -1743,23 +1743,30 @@
+ 			status = "okay";
+ 
+ 			/*
+-			 * The input edge, TCON_TV1 -> this transmitter. Only the
+-			 * other end is walked -- of_graph_get_remote_node() is
+-			 * called on the TCON -- but a graph edge exists only if
+-			 * both ends describe it, so this half is not optional.
++			 * Two edges: TCON_TV1 in on port@0, the Type-C
++			 * receptacle out on port@1.
+ 			 *
+-			 * ⬜ AND THE CONNECTOR IS STILL NOT DESCRIBED HERE. The
+-			 * Type-C receptacle's `displayport` property, which is
+-			 * what would let dp_altmode_probe() find this node's
+-			 * connector for out-of-band hot-plug, is in
+-			 * displayport.c:800-804 and in NO binding:
+-			 * usb-connector.yaml is `unevaluatedProperties: false`
+-			 * and documents only an `altmodes/displayport` CHILD
+-			 * NODE, which does not satisfy that lookup. `drm-a733-dp-register-a-drm-bridge` records
+-			 * the same debt from the driver side. It is closed by one
+-			 * observation once a connector exists -- plug the monitor
+-			 * and read /sys/class/drm/<card>-DP-1/status -- and not
+-			 * by adding a property no schema accepts.
++			 * The input half is walked only from the other end --
++			 * of_graph_get_remote_node() is called on the TCON --
++			 * but a graph edge exists only if both ends describe
++			 * it, so this half is not optional.
++			 *
++			 * The output half is what closes the hot-plug path, and
++			 * it is described here rather than with a `displayport`
++			 * property on the receptacle because that property is in
++			 * displayport.c:801 and in NO binding: usb-connector.yaml
++			 * is `unevaluatedProperties: false` and documents only an
++			 * `altmodes/displayport` CHILD NODE, which is not a
++			 * property. This driver walks the edge instead
++			 * (sun60i_dp_next_bridge_get()), publishes a
++			 * drm_aux_hpd_bridge on the node it lands on, and chains
++			 * it behind its own -- so drm_bridge_connector_init()
++			 * takes the RECEPTACLE's fwnode, which is the one
++			 * dp_altmode_probe() looks the connector up by.
++			 *
++			 * It carries no video. SBU is two AUX wires; the four
++			 * main lanes leave through COMB0 and are described by
++			 * port@1 of the connector, not this edge.
+ 			 */
+ 			ports {
+ 				#address-cells = <1>;
+@@ -1772,6 +1779,14 @@
+ 						remote-endpoint = <&tcon_tv1_out_edp0>;
+ 					};
+ 				};
++
++				edp0_out: port@1 {
++					reg = <1>;
++
++					edp0_out_con: endpoint {
++						remote-endpoint = <&usb_con_sbu>;
++					};
++				};
+ 			};
+ 		};
+ 
+@@ -2570,6 +2585,18 @@
+ 					 * and is inert here:
+ 					 * dwc3 only builds a role switch when
+ 					 * usb-role-switch is set, which it is not.
++					 *
++					 * port@2 is Sideband Use -- "the alternate
++					 * mode connection of which SBU is a part"
++					 * (`ports` schema) --
++					 * and on this board AUXP/AUXN reach SBU1/
++					 * SBU2 with no mux and no redriver between
++					 * (sch p12 L19-44), so the other end of it
++					 * is the DisplayPort transmitter itself.
++					 * It is what lets that transmitter find
++					 * this node and publish a bridge for it,
++					 * which is the only way an out-of-band
++					 * hot-plug can be matched to a connector.
+ 					 */
+ 					/*
+ 					 * Declare that this port itself supports
+@@ -2616,6 +2643,13 @@
+ 								remote-endpoint = <&combophy0_ss>;
+ 							};
+ 						};
++
++						port@2 {	/* Sideband Use */
++							reg = <2>;
++							usb_con_sbu: endpoint {
++								remote-endpoint = <&edp0_out_con>;
++							};
++						};
+ 					};
+ 				};
+ 			};

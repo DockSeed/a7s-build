@@ -1,0 +1,446 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] phy: allwinner: A733 combo-PHY -- bracket the DP rate table so a real consumer can call it
+
+`phy-allwinner-a733-combophy-dp-rate-2700` added a733_combophy_configure(), the phy_ops.configure slot that writes the
+163-word PMA rate table for DisplayPort. Its own header said the quiet part:
+"nothing in this tree calls phy_configure()". That stayed true on the real
+alt-mode path -- dwc3 uses init/power_on/set_mode only, and the only caller was
+the debugfs instrumentation of a DP debug patch this series does not carry ("the
+debug patch" below), behind CONFIG_PHY_SUN60I_A733_COMBO_DP_BRINGUP, default n,
+i.e. test kernels only.
+
+WHAT THAT COST, MEASURED
+------------------------
+
+Two things, both on the 8 GiB board on 2026-08-18:
+
+  - Without the table, FOUR lanes never train. Two do. With the debug patch
+    supplying the missing call, four lanes reach CR in one round and EQ in one
+    round, 77 77 01 01, all four symbol-error counters valid at zero, held over
+    20 s. The PMA diff
+    that found it: 26 registers differing against the vendor's live link, among
+    them idx 0xC010 = 0x51D9 against our 0x5100 -- the register `phy-allwinner-a733-combophy-dp-rate-2700`'s own header
+    names as the DP value against the USB3 one.
+  - Without it, no rate change is possible at all. RBR fails at ANY lane count,
+    including on lanes that manage HBR. Slower should be easier, so that is not
+    signal integrity: only LINK_BW_SET and DPCD 0x100 moved while the PMA stayed
+    at 2.7 Gbps.
+
+So the "caller problem" is not an architectural preference. It is the blocker.
+
+THIS PATCH IS THE PROVIDER HALF
+-------------------------------
+
+It does not add the caller -- `drm-a733-dp-configure-the-main-link-phy` does that, in the DisplayPort transmitter
+driver, which is where mainline and the vendor both put it. What it does is make
+phy_configure() safe and complete enough to BE called from there:
+
+  1. the rate and lane writes now sit inside `phy-allwinner-a733-combophy-dp-reset-sequence`'s reset bracket;
+  2. the "is this PHY DP's" gate moves off phy->attrs.mode, which a real
+     consumer cannot set without lying to dwc3;
+  3. phy_ops.validate is implemented, so a consumer's rate ladder can ask
+     before it acts;
+  4. phy_init() is required rather than assumed.
+
+1. THE BRACKET -- THE ONE THAT IS LOAD-BEARING
+----------------------------------------------
+
+The vendor writes the PMA rate table with the whole link held in reset:
+combo0_dp_set_rate() calls combo0_dp_phy_reset(combo0, false) before the table
+(bsp/drivers/phy/sunxi-cadence-combophy.c:901) and combo0_dp_phy_reset(combo0,
+true) after it (:1613). Read at source level, those two are exactly what `phy-allwinner-a733-combophy-dp-reset-sequence`
+ported: the `false` arm writes LINK_CTRL0 = 0, top_combo_reg + 0x4 = 0 and
+LINK_CTRL3 = 0 with a 1 ms settle, which is a733_combophy_dp_teardown() line for
+line; the `true` arm is the IDDQ clear plus the 0x001 -> 0x101 -> 0x131
+staircase and the three handshakes, which is a733_combophy_dp_reset_seq().
+
+Taking the 163 values without that sequence is not the sequence, and the price is
+recorded: writing the table by hand into a LIVE PHY on the 8 GiB board on 2026-08-18 ended in
+an `Asynchronous SError Interrupt` and a power-cycle. Nothing persistent was
+written; the lesson was.
+
+The bracket therefore goes HERE, in the provider, once -- not in each caller,
+where the next one forgets it. That also fixes the deviation the debug patch documented
+against itself: it reaches phy_configure() after `phy-allwinner-a733-combophy-dp-reset-sequence`'s staircase has
+already released the link, and its header says so and says the order "becomes
+`phy-allwinner-a733-combophy-dp-rate-2700`'s business" when a bracket lands. This is that bracket. The debug patch needs no
+change; the extra staircase run is idempotent, because `phy-allwinner-a733-combophy-dp-reset-sequence` writes absolute
+values.
+
+And it is what makes a rate change possible at all: on this PHY a rate change IS
+a teardown and a rebuild. A consumer that moved LINK_BW_SET and DPCD 0x100 while
+the PMA stayed put is precisely the RBR failure above.
+
+Ordering inside the bracket: lane word first, rate table last. That is the order
+the vendor reaches -- its .configure runs combo0_dp_set_lanes() before
+combo0_dp_set_rate() (:2381,:2385) -- with one deliberate difference, below.
+
+2. THE GATE MOVES TO dp_active
+------------------------------
+
+`phy-allwinner-a733-combophy-dp-rate-2700` refused unless phy->attrs.mode == PHY_MODE_DP. That check cannot survive a
+real consumer, and the reason is not style:
+
+  - attrs.mode is CONSUMER state. phy_set_mode_ext() records it even for a
+    provider with no .set_mode (drivers/phy/phy-core.c), and dwc3 sets it to a
+    USB mode on this very phy -- one struct phy, two consumers, because COMB0 is
+    one serdes.
+  - So a DisplayPort driver could only pass the check by writing PHY_MODE_DP over
+    dwc3's record behind its back. The debug patch does exactly that and has to
+    snapshot and restore it; a shipping driver should not have to.
+
+cp->dp_active is this driver's own answer to the same question and a stricter
+one: it is set only by the Type-C mux callback, only for the four-lane DP-only
+pin assignments C and E, and only after phy_init() has configured the PMA. It
+cannot be set from outside the driver at all. That is what now stops a stray
+phy_configure() from writing the DP rate table over a live 10 Gbps link.
+
+3. phy_ops.validate
+-------------------
+
+New. It shares the single function that decides what is implementable and touches
+no register, which is what include/linux/phy/phy.h demands of the slot: "It must
+not change any actual configuration of the PHY, so calling it as many times as
+deemed fit by the consumer must have no side effect."
+
+Its purpose is rate fallback. A consumer walking a rate ladder asks first and
+skips a rate we have no table for, instead of discovering it by tearing a working
+link down and failing to rebuild it.
+
+4. phy_init() IS REQUIRED, NOT ASSUMED
+--------------------------------------
+
+phy.h on phy_ops.configure: "phy_init() must have been called on the phy."
+cp->inited is this driver's answer, and it is now checked with its own message
+(-EAGAIN), because without it there is no PMA for PMA_CMN_READY to come up on.
+
+WHERE THE VENDOR DRIVER DIFFERS HERE, AND WHAT THIS PATCH DOES
+--------------------------------------------------------------
+
+The vendor's ARCHITECTURE on this path matches what this tree
+uses: it registers a real phy_ops with .configure/.validate taking union phy_configure_opts_dp, and
+its DisplayPort driver is a phy consumer that calls phy_configure()
+(bsp/drivers/drm/sunxi_device/sunxi_edp.c:604-641). We take that shape. The
+differences are in the details, and each one below was read in the vendor source:
+
+| vendor | ours |
+|---|---|
+| combo0_dp_set_rate() has `case 8100: break;` -- writes no table at all, then records 8100 as the current rate and returns 0. HBR3 is "configured" while the PMA holds the previous rate | one rate is implemented and every other is refused BY NAME, with the number that was asked for in the message |
+| its .validate returns 0 for every link rate, including that 8100, and only limits the lane count in the two-lane pin assignments | .validate answers the same question .configure will answer, from the same function, so the two cannot drift |
+| returns a bare `-1` from combo0_dp_set_rate() and combo0_dp_set_lanes() | -EOPNOTSUPP for a rate with no table, -EINVAL for a lane count the PMA word cannot encode, -EAGAIN before phy_init() |
+| writes the PMA lane word into a LIVE PMA, outside any bracket (its own set_lanes brackets only the re-configure, then writes 0x4011 after the release) | inside the bracket, with the rate table. A PMA write into a live PHY is what cost a board an SError; nothing says this word is exempt |
+| combo0_dp_set_ssc() sets ssc_en = 1 and has no else, so SSC can never be turned off again once asked for | SSC is refused outright until the ssc_en arm of the table is ported -- one state, not a latch |
+| overloads phy_set_mode_ext()'s submode with a private bitfield (orientation OR state << 2 OR hpd << 6), so a mainline-shaped consumer calling phy_set_mode_ext(PHY_MODE_DP, PHY_SUBMODE_DP) would be read as "orientation NONE, typec state SAFE, HPD 0" and tear the personality down | submode keeps the meaning phy-dp.h gives it. Orientation and pin assignment arrive through the Type-C switch and mux callbacks, which is where TCPM puts them |
+| never calls phy_init() on the combo PHY at all -- edp_phy_init() inits only aux_phy and dp_phy, and edp_phy_exit() carries the comment "// ignore combo phy, leave it until other module configure it" (sunxi_drm_edp.c:826-843) | phy_init() is required and checked; the consumer takes its own reference (`drm-a733-dp-configure-the-main-link-phy`) |
+
+Not answered by this patch, and not pretended otherwise: the vendor's swing and
+pre-emphasis path (combo0_dp_set_sw_pre) is still not ported, so set_voltages is
+refused. Link training cannot complete without it, and the defect list for the
+training path is owed by the patch that
+implements it, not by this one.
+
+WHAT IS NOT TOUCHED
+-------------------
+
+Not one line of the USB path. a733_combophy_reset_seq(), a733_combophy_init(),
+a733_combophy_exit(), a733_combophy_param_config() and the PMA tables `phy-allwinner-a733-add-serdes-combophy`
+landed are unchanged. Every line added or moved here is behind the set_rate /
+set_lanes flags of a DP configure request, and behind cp->dp_active, which a
+board that never enters a DP pin assignment never sets.
+
+The two forward declarations are the only structural change: `phy-allwinner-a733-combophy-dp-reset-sequence`'s bracket
+functions are defined after `phy-allwinner-a733-combophy-dp-rate-2700`'s table in this file, so .configure cannot see
+them. Declaring them costs six lines; moving 130 lines of `phy-allwinner-a733-combophy-dp-reset-sequence` would bury the
+change this patch actually makes.
+
+WHAT IT OWES
+------------
+
+  1. The four-lane result, reproduced WITHOUT CONFIG_PHY_SUN60I_A733_COMBO_DP_BRINGUP.
+     Observable: with a sink on J4 and the DP node's `link` file used (`drm-a733-dp-configure-the-main-link-phy`),
+     PMA idx 0xC010 reads 0x51D9 (32-bit read at 0x06C80000 + (0xC010 << 1) =
+     0x06C98020 shows it mirrored, 0x51D951D9), LINK_CTRL0 0x06C01000 reads
+     0x00000131 with a normal plug, LINK_STUS0 0x06C01900 reads 0x00000111,
+     DP_RAWS_TXDW 0x06C06004 reads 0x00000FF1, and DPCD 0x202/0x203 read 0x77
+     0x77 with 0x204 bit0 and 0x205 bit0 set after training by hand.
+     Falsified by: four lanes failing to train where the debug patch made them
+     train on 2026-08-18, or by the SError returning -- which would say the
+     bracket is not what the debug instrumentation's success rested on.
+  2. A SUPERSPEED RE-PROOF. RST_BUS_SERDES is shared, this is the driver that
+     owns COMB0, and the node the DP transmitter now references (`arm64-dts-a733-dp-main-link-phy`) is the one
+     HW-proven at 10 Gbps. Observable: on a boot with a DP sink NOT attached,
+     `lsusb -t` still shows a SuperSpeed device at 10000M and nothing in the DP
+     path has run. The negative control is the important half: with no DP pin
+     assignment entered, cp->dp_active is false and every phy_configure() is
+     refused with a message, so LINK_CTRL0 must stay 0x00000111.
+  3. A rate OTHER than 2700 Mb/s still cannot be applied, and that is now an
+     honest refusal instead of a silent no-op. Rate fallback becomes real when a
+     second PMA table is ported; the mechanism it needs is here.
+
+Built only by the automated build service, not hardware-proven: no kernel was built locally for this patch;
+it applies at fuzz 0 on the full series.
+
+Assisted-by: Claude
+
+diff --git a/drivers/phy/allwinner/phy-sun60i-a733-combophy.c b/drivers/phy/allwinner/phy-sun60i-a733-combophy.c
+--- a/drivers/phy/allwinner/phy-sun60i-a733-combophy.c
++++ b/drivers/phy/allwinner/phy-sun60i-a733-combophy.c
+@@ -820,6 +820,25 @@
+ #define  PMA_DP_LANE_CFG_2LANE		0x010C
+ #define  PMA_DP_LANE_CFG_1LANE		0x010E
+ 
++/* The only DP link rate this driver has a PMA table for. Anything else is
++ * refused by name rather than accepted and silently not applied -- the vendor's
++ * combo0_dp_set_rate() has `case 8100: break;`, which writes no table at all,
++ * records 8100 as the current rate and returns success.
++ */
++#define DP_LINK_RATE_HBR_MBPS		2700
++
++/*
++ * `phy-allwinner-a733-combophy-dp-reset-sequence`'s DP reset bracket, which lives further down this file. The vendor writes
++ * the PMA rate table with the whole link held in reset and releases it
++ * afterwards -- combo0_dp_set_rate() calls combo0_dp_phy_reset(false) before the
++ * table (sunxi-cadence-combophy.c:901) and combo0_dp_phy_reset(true) after it
++ * (:1613), and those two are exactly a733_combophy_dp_teardown() and
++ * a733_combophy_dp_reset_seq(). Declared rather than moved: shifting 130 lines
++ * of `phy-allwinner-a733-combophy-dp-reset-sequence` would bury the change this patch actually makes.
++ */
++static void a733_combophy_dp_teardown(struct a733_combophy *cp);
++static int a733_combophy_dp_reset_seq(struct a733_combophy *cp);
++
+ /*
+  * The two non-PMA writes the vendor performs before the PMA body, kept in that
+  * order. Both are confirmed by the same capture, from the link window rather
+@@ -865,34 +884,64 @@
+ }
+ 
+ /*
++ * Is this rate/lane request one the driver can carry out? Split out of
++ * .configure so that .validate can answer the same question with no side
++ * effects, which is what phy.h requires of it: "It must not change any actual
++ * configuration of the PHY, so calling it as many times as deemed fit by the
++ * consumer must have no side effect."
++ *
++ * That matters for rate fallback specifically. A consumer walking a rate ladder
++ * can ask here first and skip a rate we have no table for, instead of finding
++ * out by tearing a working link down and failing to rebuild it.
++ */
++static int a733_combophy_dp_check(const struct phy_configure_opts_dp *dp)
++{
++	if (dp->set_rate) {
++		if (dp->link_rate != DP_LINK_RATE_HBR_MBPS || dp->ssc)
++			return -EOPNOTSUPP;
++	}
++
++	if (dp->set_lanes) {
++		if (dp->lanes != 1 && dp->lanes != 2 && dp->lanes != 4)
++			return -EINVAL;
++	}
++
++	return 0;
++}
++
++/*
+  * phy_ops.configure is how a DisplayPort controller asks for a link rate and a
+- * lane count. Nothing in this tree calls it yet -- dwc3 does not, it uses
+- * init/power_on/set_mode only -- so the USB3 path is unchanged by this patch.
++ * lane count, and on the real alt-mode path that controller is the DP
++ * transmitter at 0x05740000 -- a phy consumer named in the DT, the shape both
++ * mainline and the vendor use (drivers/gpu/drm/bridge/synopsys/dw-dp.c,
++ * drivers/gpu/drm/msm/dp/dp_ctrl.c; vendor sunxi_edp.c:604-620). dwc3 never
++ * calls it: it uses init/power_on/set_mode only, so the SuperSpeed path does not
++ * reach a single line below.
+  *
+- * What is implemented is the rate table and the lane count, and nothing else:
+- * the swing/pre-emphasis tables (combo0_dp_set_sw_pre) and the DP reset bracket
+- * (combo0_dp_phy_reset, which the vendor runs before and after the rate write)
+- * are separate patches. So this cannot complete a DP link on its own, and it
+- * says so by refusing rather than by half-configuring.
++ * THE RATE AND LANE WRITES SIT INSIDE `phy-allwinner-a733-combophy-dp-reset-sequence`'s RESET BRACKET. The vendor's
++ * combo0_dp_set_rate() writes the table between combo0_dp_phy_reset(false) and
++ * (true), i.e. with LINK_CTRL0, LINK_CTRL3 and DP_RAWS_TXDW_CONV_CTRL zeroed and
++ * the staircase re-run afterwards. Taking the 163 values without that sequence
++ * is not the sequence: doing it by hand into a live PHY on the 8 GiB board on 2026-08-18
++ * ended in an asynchronous SError and a power-cycle. So the bracket is here,
++ * once, where every caller gets it -- rather than in each caller, where the next
++ * one forgets it.
++ *
++ * It is also what makes a rate change possible at all. A rate change IS a link
++ * teardown and rebuild on this PHY; a consumer that changed LINK_BW_SET and DPCD
++ * 0x100 while the PMA stayed at 2.7 Gbps is what an earlier
++ * measurement found: RBR fails at any lane count.
++ *
++ * What is still not implemented, and is refused rather than half-applied: the
++ * swing/pre-emphasis tables (combo0_dp_set_sw_pre), and every link rate except
++ * 2700 Mb/s.
+  */
+ static int a733_combophy_configure(struct phy *phy,
+ 				   union phy_configure_opts *opts)
+ {
+ 	struct a733_combophy *cp = phy_get_drvdata(phy);
+ 	struct phy_configure_opts_dp *dp = &opts->dp;
+-	int ret = 0;
+-
+-	/* COMB0 carries SuperSpeed or DP and never both, and this driver brings
+-	 * it up for USB. Refusing unless the consumer has claimed the PHY for DP
+-	 * is what stops a stray phy_configure() from writing the DP rate table
+-	 * over a live 10 Gbps link: phy_set_mode_ext() records the mode even for
+-	 * a driver with no .set_mode (drivers/phy/phy-core.c), and dwc3 sets it
+-	 * to one of the USB modes.
+-	 */
+-	if (phy->attrs.mode != PHY_MODE_DP) {
+-		dev_warn(cp->dev, "phy_configure() while not in DP mode\n");
+-		return -EINVAL;
+-	}
++	int ret;
+ 
+ 	if (dp->set_voltages) {
+ 		dev_warn_once(cp->dev,
+@@ -900,27 +949,129 @@
+ 		return -EOPNOTSUPP;
+ 	}
+ 
++	if (!dp->set_rate && !dp->set_lanes)
++		return 0;
++
++	/* -EOPNOTSUPP is the rate, -EINVAL the lane count. Each is named on its
++	 * own, and only the field the consumer actually set is printed: a
++	 * union phy_configure_opts is routinely left partly uninitialised by
++	 * its callers (dw-dp.c declares it on the stack and fills three
++	 * fields), so printing dp->lanes for a rate-only request would be
++	 * printing whatever was on that stack.
++	 */
++	ret = a733_combophy_dp_check(dp);
++	if (ret == -EOPNOTSUPP) {
++		dev_warn(cp->dev,
++			 "DP link rate %u Mb/s%s refused: only %u Mb/s without SSC has a PMA table\n",
++			 dp->link_rate, dp->ssc ? " with SSC" : "",
++			 DP_LINK_RATE_HBR_MBPS);
++		return ret;
++	}
++	if (ret) {
++		dev_warn(cp->dev,
++			 "DP lane count %u refused: the PMA lane word encodes 1, 2 or 4\n",
++			 dp->lanes);
++		return ret;
++	}
++
+ 	mutex_lock(&cp->lock);
+ 
+-	if (dp->set_rate) {
+-		if (dp->link_rate != 2700 || dp->ssc) {
+-			dev_warn(cp->dev,
+-				 "only DP link rate 2700 Mb/s without SSC is implemented (asked %u Mb/s%s)\n",
+-				 dp->link_rate, dp->ssc ? ", SSC" : "");
+-			ret = -EOPNOTSUPP;
+-			goto out;
+-		}
+-		a733_combophy_dp_rate_2700(cp);
++	/* phy.h on phy_ops.configure: "phy_init() must have been called on the
++	 * phy". cp->inited is this driver's own answer to that, and without it
++	 * there is no PMA for PMA_CMN_READY to come up on. The vendor never
++	 * calls phy_init() on this PHY at all -- its eDP driver takes
++	 * phy_power_on() and phy_configure() on a combo phy it leaves to
++	 * "other module" to initialise (sunxi_drm_edp.c:826-843, and the
++	 * comment in edp_phy_exit() says so in those words).
++	 */
++	if (!cp->inited) {
++		dev_warn(cp->dev,
++			 "phy_configure() before phy_init(): the PMA is not configured, refusing\n");
++		ret = -EAGAIN;
++		goto out;
+ 	}
+ 
+-	if (dp->set_lanes)
++	/* COMB0 carries SuperSpeed or DP and never both. dp_active is set only
++	 * by the Type-C mux callback, and only for the four-lane DP-only pin
++	 * assignments, after phy_init() -- so it is this driver's own answer to
++	 * "do the lanes belong to DisplayPort", and it is what stops a stray
++	 * phy_configure() from writing the DP rate table over a live 10 Gbps
++	 * link.
++	 *
++	 * It replaces a check on phy->attrs.mode, which could not survive a real
++	 * consumer: attrs.mode is CONSUMER state (phy_set_mode_ext() records it
++	 * even for a driver with no .set_mode, drivers/phy/phy-core.c), dwc3
++	 * sets it to a USB mode on this very phy, and a DP driver that wrote
++	 * PHY_MODE_DP into it would be overwriting dwc3's record behind its
++	 * back to satisfy a check the PHY can answer for itself.
++	 */
++	if (!cp->dp_active) {
++		dev_warn(cp->dev,
++			 "phy_configure() while the lanes are not DisplayPort's -- no DP pin assignment has been entered\n");
++		ret = -EINVAL;
++		goto out;
++	}
++
++	/* The bracket. Lane count first and the rate table last, which is the
++	 * order the vendor reaches (combo0_dp_set_lanes() then
++	 * combo0_dp_set_rate() in its .configure) -- with one difference: the
++	 * vendor writes the lane word into a LIVE PMA, outside any bracket. It
++	 * is inside ours, because a PMA write into a live PHY is what cost a
++	 * board an SError on 2026-08-18 and nothing says this word is exempt.
++	 */
++	a733_combophy_dp_teardown(cp);
++
++	if (dp->set_lanes) {
+ 		ret = a733_combophy_dp_set_lanes(cp, dp->lanes);
++		if (ret)
++			goto release;
++	}
++
++	if (dp->set_rate)
++		a733_combophy_dp_rate_2700(cp);
++
++release:
++	/* Always release, even if a write above failed: leaving the link in
++	 * reset would strand the PHY in a state no later call recovers, and
++	 * UM 18.2.6.8 requires POWER_STATE_REQ to return to 0 and be
++	 * re-requested, which the staircase does.
++	 */
++	if (a733_combophy_dp_reset_seq(cp) && !ret)
++		ret = -EIO;
+ 
+ out:
+ 	mutex_unlock(&cp->lock);
+ 	return ret;
+ }
+ 
++/*
++ * phy_ops.validate. Side-effect free by construction -- it shares the one
++ * function that decides what is implementable and touches no register. Its
++ * whole purpose is that a consumer's rate or lane fallback ladder can ask
++ * before it acts.
++ *
++ * The vendor has this slot too, with a looser answer: its
++ * sunxi_cadence_combo0_dp_phy_validate() returns 0 for every rate, including
++ * the 8100 its own .configure silently does not apply, and only limits the lane
++ * count in the two-lane pin assignments. Its caller then maps -EINVAL to "pass"
++ * (sunxi_drm_edp.c:846-868), so the one case it does reject is discarded again.
++ */
++static int a733_combophy_validate(struct phy *phy, enum phy_mode mode,
++				  int submode, union phy_configure_opts *opts)
++{
++	if (mode != PHY_MODE_DP)
++		return -EINVAL;
++
++	/* phy-dp.h defines exactly two: PHY_SUBMODE_DP and PHY_SUBMODE_EDP.
++	 * This board has no eDP panel -- the four lanes go to the Type-C
++	 * connector -- so eDP is refused rather than treated as a synonym.
++	 */
++	if (submode != PHY_SUBMODE_DP)
++		return -EINVAL;
++
++	return a733_combophy_dp_check(&opts->dp);
++}
++
+ /* combo0_usb_phy_reset(true): reset pulse, DP-lane conv, PLL enable, the
+  * POWER_STATE handshake, and the PMA_CMN_READY wait (+ one PMA nudge).
+  */
+@@ -1404,6 +1555,7 @@
+ 	.init		= a733_combophy_init,
+ 	.exit		= a733_combophy_exit,
+ 	.configure	= a733_combophy_configure,
++	.validate	= a733_combophy_validate,
+ 	.owner		= THIS_MODULE,
+ };
+ 

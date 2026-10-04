@@ -1,0 +1,305 @@
+From 2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Tue, 21 Jul 2026 16:30:00 +0200
+Subject: [PATCH v2] arm64: dts: a733: add cache geometry so cacheinfo uses the DT
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Give every cpu@N its L1 geometry and every L2/L3 node a size, a line size,
+a set count and `cache-unified`. Patch `arm64-dts-a733-cpu-topology` described the cache topology
+but left the geometry out, and without it the kernel ignores the DT
+description entirely.
+
+v1 -> v2: added `cache-sets` / `i-cache-sets` / `d-cache-sets`. v1 left
+them out because the associativity was unsourced; it has since been found
+in the Arm TRMs (below), so the sets are now computed, not guessed.
+
+WHAT THE BOOT TEST SHOWED, before this patch (2026-07-21, our chain, 8 GiB
+board RS504-D8):
+
+  [    0.049479] cacheinfo: Unable to detect cache hierarchy for CPU 0
+  cpu0 index2: level=2 type=Unified shared_cpu_list=0-7
+  cpu6 index2: level=2 type=Unified shared_cpu_list=0-7
+  size= ways_of_associativity= coherency_line_size= number_of_sets=
+
+WHAT IT SHOWS WITH v1 OF THIS PATCH (same board, same session):
+
+  dmesg | grep -c cacheinfo  ->  0        (the warning is gone)
+  cpu0 index2: level=2 type=Unified size=128K  shared_cpu_list=0
+  cpu6 index2: level=2 type=Unified size=256K  shared_cpu_list=6
+  cpu0 index3: level=3 type=Unified size=1024K shared_cpu_list=0-7
+
+So the private L2 that `arm64-dts-a733-cpu-topology` describes is now what the kernel actually
+sees, and the DSU L3 is correctly shared by all eight cores.
+
+WHY IT FAILED WITHOUT THE GEOMETRY, from the source in this tree:
+
+  * arch/arm64/kernel/cacheinfo.c: `ci_leaf_init()` sets only `level` and
+    `type`. arm64 never fills size/ways/sets/line-size from CCSIDR_EL1, so
+    geometry can only come from the DT. `arm64-dts-a733-cpu-topology`'s comment claiming the kernel
+    reads them from CCSIDR_EL1 was wrong.
+  * drivers/base/cacheinfo.c: when `cache_setup_of_node()` fails,
+    `cache_setup_properties()` sets `use_arch_info = true` (arm64 defines
+    `use_arch_cache_info()` as `true`). `cache_leaves_are_shared()` then
+    returns `level != 1` for every pair, i.e. every cache above L1 is
+    declared shared system-wide. It is sticky: later calls are gated on
+    `!use_arch_info`, so one early failure decides the whole boot.
+
+SIZES -- A733 UM v0.92 Figure 1-1, the SoC-level
+statement of what Allwinner configured:
+
+  Cortex-A55 x6   L1 I 32 KB   L1 D 32 KB   L2 128 KB
+  Cortex-A76 x2   L1 I 64 KB   L1 D 64 KB   L2 "265 KB"  [sic]
+  DSU             L3 1 MB
+
+ASSOCIATIVITY -- Arm Technical Reference Manuals for the cores this SoC
+integrates. These are fixed by the core design, not by the integrator:
+
+  Cortex-A55 TRM (ARM 100442, r1p0) sec. A6.1:
+    "4-way set associative L1 instruction cache", "4-way set associative
+    L1 data cache", 64-byte lines.
+  Cortex-A55 TRM sec. A7.1:
+    "An optional 4-way, set-associative L2 cache with a configurable size
+    of 64KB, 128KB or 256KB."
+  Cortex-A76 TRM (ARM 100798, r4p1) sec. A2.1.1 / A2.1.6:
+    "A 64KB, 4-way, set associative L1 instruction cache" and the same
+    for the L1 data cache -- not configurable on this core.
+  Cortex-A76 TRM sec. A7.1:
+    "An 8-way set associative L2 cache with a configurable size of 128KB,
+    256KB or 512KB."
+  DynamIQ Shared Unit TRM (ARM 100453, r4p1) sec. 3.1:
+    "The 256KB, 512KB, 1MB, 2MB, and 4MB caches are 16-way set
+    associative. All caches have a 64-byte line length."
+
+sets = size / (ways * line size), giving:
+
+  A55 L1 I/D  32 KB  / (4 * 64) = 128
+  A55 L2     128 KB  / (4 * 64) = 512
+  A76 L1 I/D  64 KB  / (4 * 64) = 256
+  A76 L2     256 KB  / (8 * 64) = 512
+  DSU L3       1 MB  / (16 * 64) = 1024
+
+Note the DSU associativity is size-dependent -- the same TRM paragraph
+makes the 1.5 MB and 3 MB configurations 12-way. 16-way is correct for
+the 1 MB this SoC carries, but it must not be copied blindly to another
+DSU part.
+
+THE A76 L2 "265 KB" IS A DOCUMENT ERROR. The Cortex-A76 offers 128, 256
+or 512 KB only (TRM sec. A7.1), so 265 KB cannot exist; it is a
+transposed digit. Entered here as 256 KB.
+
+WHAT IS STILL NOT PROVEN: which of the legal sizes the A733 actually
+implements for the A76 L2. The only source is the figure that contains
+the typo, and reading it back from sysfs would be circular -- that value
+comes from this very DT. The silicon answer is CCSIDR_EL1 with CSSELR_EL1
+selecting level 2 on an A76 core, which needs EL1 code. Until that register
+is read on an A76 core, 256 KB rests on the TRM's list of legal sizes; a
+different reading means this value must be corrected.
+
+Assisted-by: Claude
+---
+ .../sun60i-a733-cubie-a7s-minimal.dts         | 84 ++++++++++++++++++
+ 1 file changed, 84 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -54,6 +54,12 @@
+ 			compatible = "arm,cortex-a55";
+ 			reg = <0x000>;
+ 			enable-method = "psci";
++			d-cache-size = <32768>;
++			d-cache-line-size = <64>;
++			d-cache-sets = <128>;
++			i-cache-size = <32768>;
++			i-cache-line-size = <64>;
++			i-cache-sets = <128>;
+ 			next-level-cache = <&L2_0>;
+ 			cpu-idle-states = <&cpu_sleep_0_a55>;
+ 		};
+@@ -63,6 +69,12 @@
+ 			compatible = "arm,cortex-a55";
+ 			reg = <0x100>;
+ 			enable-method = "psci";
++			d-cache-size = <32768>;
++			d-cache-line-size = <64>;
++			d-cache-sets = <128>;
++			i-cache-size = <32768>;
++			i-cache-line-size = <64>;
++			i-cache-sets = <128>;
+ 			next-level-cache = <&L2_1>;
+ 			cpu-idle-states = <&cpu_sleep_0_a55>;
+ 		};
+@@ -72,6 +84,12 @@
+ 			compatible = "arm,cortex-a55";
+ 			reg = <0x200>;
+ 			enable-method = "psci";
++			d-cache-size = <32768>;
++			d-cache-line-size = <64>;
++			d-cache-sets = <128>;
++			i-cache-size = <32768>;
++			i-cache-line-size = <64>;
++			i-cache-sets = <128>;
+ 			next-level-cache = <&L2_2>;
+ 			cpu-idle-states = <&cpu_sleep_0_a55>;
+ 		};
+@@ -81,6 +99,12 @@
+ 			compatible = "arm,cortex-a55";
+ 			reg = <0x300>;
+ 			enable-method = "psci";
++			d-cache-size = <32768>;
++			d-cache-line-size = <64>;
++			d-cache-sets = <128>;
++			i-cache-size = <32768>;
++			i-cache-line-size = <64>;
++			i-cache-sets = <128>;
+ 			next-level-cache = <&L2_3>;
+ 			cpu-idle-states = <&cpu_sleep_0_a55>;
+ 		};
+@@ -90,6 +114,12 @@
+ 			compatible = "arm,cortex-a55";
+ 			reg = <0x400>;
+ 			enable-method = "psci";
++			d-cache-size = <32768>;
++			d-cache-line-size = <64>;
++			d-cache-sets = <128>;
++			i-cache-size = <32768>;
++			i-cache-line-size = <64>;
++			i-cache-sets = <128>;
+ 			next-level-cache = <&L2_4>;
+ 			cpu-idle-states = <&cpu_sleep_0_a55>;
+ 		};
+@@ -99,6 +129,12 @@
+ 			compatible = "arm,cortex-a55";
+ 			reg = <0x500>;
+ 			enable-method = "psci";
++			d-cache-size = <32768>;
++			d-cache-line-size = <64>;
++			d-cache-sets = <128>;
++			i-cache-size = <32768>;
++			i-cache-line-size = <64>;
++			i-cache-sets = <128>;
+ 			next-level-cache = <&L2_5>;
+ 			cpu-idle-states = <&cpu_sleep_0_a55>;
+ 		};
+@@ -119,6 +155,12 @@
+ 			compatible = "arm,cortex-a76";
+ 			reg = <0x600>;
+ 			enable-method = "psci";
++			d-cache-size = <65536>;
++			d-cache-line-size = <64>;
++			d-cache-sets = <256>;
++			i-cache-size = <65536>;
++			i-cache-line-size = <64>;
++			i-cache-sets = <256>;
+ 			next-level-cache = <&L2_6>;
+ 			cpu-idle-states = <&cpu_sleep_0_a76>;
+ 		};
+@@ -128,6 +170,12 @@
+ 			compatible = "arm,cortex-a76";
+ 			reg = <0x700>;
+ 			enable-method = "psci";
++			d-cache-size = <65536>;
++			d-cache-line-size = <64>;
++			d-cache-sets = <256>;
++			i-cache-size = <65536>;
++			i-cache-line-size = <64>;
++			i-cache-sets = <256>;
+ 			next-level-cache = <&L2_7>;
+ 			cpu-idle-states = <&cpu_sleep_0_a76>;
+ 		};
+@@ -215,55 +263,91 @@
+ 	 */
+ 	L2_0: l2-cache-0 {
+ 		compatible = "cache";
++		cache-size = <131072>;
++		cache-line-size = <64>;
++		cache-sets = <512>;
+ 		cache-level = <2>;
++		cache-unified;
+ 		next-level-cache = <&L3>;
+ 	};
+ 
+ 	L2_1: l2-cache-1 {
+ 		compatible = "cache";
++		cache-size = <131072>;
++		cache-line-size = <64>;
++		cache-sets = <512>;
+ 		cache-level = <2>;
++		cache-unified;
+ 		next-level-cache = <&L3>;
+ 	};
+ 
+ 	L2_2: l2-cache-2 {
+ 		compatible = "cache";
++		cache-size = <131072>;
++		cache-line-size = <64>;
++		cache-sets = <512>;
+ 		cache-level = <2>;
++		cache-unified;
+ 		next-level-cache = <&L3>;
+ 	};
+ 
+ 	L2_3: l2-cache-3 {
+ 		compatible = "cache";
++		cache-size = <131072>;
++		cache-line-size = <64>;
++		cache-sets = <512>;
+ 		cache-level = <2>;
++		cache-unified;
+ 		next-level-cache = <&L3>;
+ 	};
+ 
+ 	L2_4: l2-cache-4 {
+ 		compatible = "cache";
++		cache-size = <131072>;
++		cache-line-size = <64>;
++		cache-sets = <512>;
+ 		cache-level = <2>;
++		cache-unified;
+ 		next-level-cache = <&L3>;
+ 	};
+ 
+ 	L2_5: l2-cache-5 {
+ 		compatible = "cache";
++		cache-size = <131072>;
++		cache-line-size = <64>;
++		cache-sets = <512>;
+ 		cache-level = <2>;
++		cache-unified;
+ 		next-level-cache = <&L3>;
+ 	};
+ 
+ 	L2_6: l2-cache-6 {
+ 		compatible = "cache";
++		cache-size = <262144>;
++		cache-line-size = <64>;
++		cache-sets = <512>;
+ 		cache-level = <2>;
++		cache-unified;
+ 		next-level-cache = <&L3>;
+ 	};
+ 
+ 	L2_7: l2-cache-7 {
+ 		compatible = "cache";
++		cache-size = <262144>;
++		cache-line-size = <64>;
++		cache-sets = <512>;
+ 		cache-level = <2>;
++		cache-unified;
+ 		next-level-cache = <&L3>;
+ 	};
+ 
+ 	L3: l3-cache {
+ 		compatible = "cache";
++		cache-size = <1048576>;
++		cache-line-size = <64>;
++		cache-sets = <1024>;
+ 		cache-level = <3>;
++		cache-unified;
+ 	};
+ 
+ 	psci {
+-- 
+2.45.0

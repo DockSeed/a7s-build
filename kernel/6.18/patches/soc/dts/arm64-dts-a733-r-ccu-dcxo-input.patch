@@ -1,0 +1,49 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: a733: give the r_ccu the 26 MHz DCXO input
+
+The device tree half of `clk-sunxi-ng-a733-r-ccu-source-000-is-the-dcxo`. That patch points the R-CCU's source index 000 at
+a "dcxo" input in both parent tables, because the A733 UM gives index 000 as
+DCXO for AHBS, APBS0 and APBS1 alike (V0.92 4.2.5.1-4.2.5.3) and the DCXO is
+the 26 MHz crystal, not the 24 MHz SYS_CLK24M the node passes as "hosc".
+
+It is a separate patch only because of apply order: the r_ccu node is added by
+`arm64-dts-a733-aon-pinctrl-usb-host-vbus` and this hunk cannot exist before it. The clock it wires up is the 26 MHz
+fixed-clock `arm64-dts-a733-model-the-26mhz-dcxo` already added and the main CCU already consumes as "dcxo".
+
+Neither half does anything alone: without this one the driver asks for an input
+the node does not provide, and without `clk-sunxi-ng-a733-r-ccu-source-000-is-the-dcxo` the input sits unused. They are
+proven together.
+
+Measured before either half was written, on an A733 board: APBS1 is the only
+bus clock in this block with an externally observable consumer (the PMIC I2C),
+so its source field was moved 100 -> 000 -> 100 with FACTOR_M at 0 and the TWI
+divider untouched, and the same transfer timed in each state -- 1211, 1116,
+1218 us/byte against 1200 predicted at 24 MHz and 1107 at 26 MHz. Index 000 is
+the DCXO on silicon, not only in the manual.
+
+Falsifier: clk_summary must report r-apb0 at 26000000 with APBS0_CLK still
+0x00000000, and r-apb1 must stay at 24000000.
+
+No Signed-off-by: line. It was in the first draft of this header by mistake --
+an assistant must not certify a DCO, and `arm64-lib-clear_user-branch-to-the-loop-body`, `iommu-sun60i-add-the-allwinner-a733-iommu-driver` and `clk-sunxi-ng-a733-r-ccu-apbs-source-100-is-sys-clk24m` carry none either.
+Whether this tree wants the house line back on new patches is the maintainer's
+call, not something to settle in a patch header.
+
+Assisted-by: Claude
+---
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -2426,9 +2426,11 @@
+ 			reg = <0x0 0x07010000 0x0 0x250>;
+ 			clocks = <&osc24M>, <&osc32k>, <&iosc>,
+ 				 <&ccu CLK_PLL_PERI0_200M>,
+-				 <&ccu CLK_PLL_PERI0_300M>;
++				 <&ccu CLK_PLL_PERI0_300M>,
++				 <&dcxo26M>;
+ 			clock-names = "hosc", "losc", "iosc",
+-				      "pll-periph-200m", "pll-periph-300m";
++				      "pll-periph-200m", "pll-periph-300m",
++				      "dcxo";
+ 			#clock-cells = <1>;
+ 			#reset-cells = <1>;
+ 		};

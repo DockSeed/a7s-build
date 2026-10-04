@@ -1,0 +1,172 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] phy: allwinner: A733 combo-PHY -- refuse a redundant DP alt-mode entry
+
+[Recipe cut: the debug instrumentation and its state file are not carried; the
+two hunks that reported the new fields there are gone.]
+
+The Type-C mux callback ran the whole DP entry sequence every time it was
+called with a DP pin assignment, including when the lanes were already
+DisplayPort's and nothing had changed. It re-wrote the lane map and the four
+lane inverts and then ran `phy-allwinner-a733-combophy-dp-reset-sequence`'s reset staircase, which de-asserts
+phy0_reset_n on a link that is up.
+
+THAT THIS HAPPENS IS MEASURED, NOT SUSPECTED
+--------------------------------------------
+
+Mainline's DisplayPort alt-mode driver notifies unconditionally:
+dp_altmode_attention() calls dp_altmode_notify(dp) with no mode-changed test
+(drivers/usb/typec/altmodes/displayport.c), so typec_mux_set() is re-issued
+with the same TYPEC_DP_STATE_C on every Attention the partner sends.
+
+And the boot logs have carried the fingerprint all along without it
+being read: every healthy boot shows exactly TWO handover lines about 1.8 s
+apart -- 48.93 s / 50.74 s on 2026-08-18, 8.074 s / 9.886 s on 2026-08-20
+(1.812 s). The first is the Enter Mode, the second is the Attention path
+arriving here and re-running everything.
+
+Harmless before training. Underneath a CR/EQ window it fails the training of
+whoever is driving it -- and it fails the driver arm and the shell arm
+together, which is exactly the signature of the 2026-08-20 failure that
+this tree could not attribute (9 pass / 15 fail, both arms dead on one boot,
+both alive after a power cycle, nothing physical touched).
+
+WHAT THIS DOES
+--------------
+
+  - Remembers the mux state the entry sequence ran for (dp_entered_mode) and
+    refuses a repeat of the same one while dp_active, counting the refusals
+    and saying so in the log. A different pin assignment still enters; a
+    return to USB/SAFE still clears dp_active and lets the next entry through.
+  - HPD is deliberately NOT part of the test, because this callback does not
+    consume it: HPD travels to the DP driver, which retrains through
+    phy_configure(), and `phy-allwinner-a733-combophy-bracket-the-dp-rate-table` put the reset bracket inside phy_configure()
+    itself. A re-plug therefore still gets its staircase from the path that
+    owns it. That is the assumption this patch is most likely to be wrong
+    about, and the falsifier below tests exactly it.
+  - Records what a733_combophy_dp_reset_seq() answered (dp_handshake_ok) and
+    reports it in the debug instrumentation's state file, next to dp_active with its text
+    corrected. dp_active is left where it is and means what it meant -- "the
+    lanes belong to DisplayPort" -- because that is what the phy_configure()
+    guard and the teardown path need it to mean. What was wrong was not the
+    flag but reading it as a handshake outcome; the outcome now exists
+    separately, and it is the sequence's own return value, not an intention.
+  - The orientation path (typec_switch_set) records the same outcome, so a
+    staircase re-run there cannot leave a stale answer behind.
+
+THE PROOF THIS OWES
+-------------------
+
+  1. The disturbance witness, which is already instrumented: on a healthy
+     boot, handover lines counted before and after the training window. With this
+     patch a boot that used to show two handover lines must show one plus at
+     least one "requested again while it is already active" line, and the
+     count across a training window must stay flat.
+     Falsified by: two handover lines still appearing, i.e. the second call
+     carrying a different mode than the first.
+  2. A re-plug still brings the picture back. Unplug the DisplayPort cable at
+     the sink, plug it in again, and the link retrains without a reboot.
+     Falsified by: a black screen that a `echo 0 > link` recovers -- that
+     would mean the mux staircase was load-bearing for hotplug and this guard
+     took it away.
+  3. The link still trains from cold exactly as before: 26 passes and 0 failures on the training test, the
+     sink answering 77 77 01 01, a picture by eye.
+     Falsified by: any regression against
+     an earlier run on the same
+     fixture.
+  4. dp_handshake reads "completed" on a boot that trains, and "FAILED" on a
+     boot where the staircase does not complete -- the second half is the one
+     that makes it worth having, and it is only observable on a test kernel
+     (the state file belongs to the DP debug-instrumentation patch, which is not carried here and defaults to n).
+
+NOT PROVEN YET: that either defect caused the 2026-08-20 intermittency. Only
+that the path exists, that it is taken on every healthy boot, and that it can
+do what that failure looked like. Fixing it is worth doing on its own terms.
+
+Assisted-by: Claude
+
+diff --git a/drivers/phy/allwinner/phy-sun60i-a733-combophy.c b/drivers/phy/allwinner/phy-sun60i-a733-combophy.c
+--- a/drivers/phy/allwinner/phy-sun60i-a733-combophy.c
++++ b/drivers/phy/allwinner/phy-sun60i-a733-combophy.c
+@@ -236,6 +236,20 @@ struct a733_combophy {
+ 	 * a board that never enters DP alt mode never executes any of them.
+ 	 */
+ 	bool			dp_active;
++	/* The mux state the DP entry sequence last ran for, and how many
++	 * redundant repeats of it were refused. Mainline's DisplayPort
++	 * alt-mode driver notifies on every Attention with no mode-changed
++	 * test, so this callback is re-entered with the same pin assignment
++	 * while the link is up -- see a733_combophy_typec_mux_set().
++	 */
++	unsigned long		dp_entered_mode;
++	unsigned int		dp_reenter_refused;
++	/* What a733_combophy_dp_reset_seq() answered on that entry. dp_active
++	 * says the lanes belong to DisplayPort; this says the handshake behind
++	 * that claim completed. Two different questions, and a gate that reads
++	 * the first for the second reads an intention as an outcome.
++	 */
++	bool			dp_handshake_ok;
+ 	/* The DP lane map and lane inverts, and the USB values they displace.
+ 	 * Written when the mux hands the lanes to DisplayPort and put back when
+ 	 * it takes them away, so a port that never enters DP alt mode never
+@@ -1714,7 +1728,7 @@ static int a733_combophy_typec_set(struct typec_switch_dev *sw,
+ 	 * staircase. Guarded by dp_active, so a USB-only port never gets here.
+ 	 */
+ 	if (cp->dp_active)
+-		a733_combophy_dp_reset_seq(cp);
++		cp->dp_handshake_ok = !a733_combophy_dp_reset_seq(cp);
+ 	mutex_unlock(&cp->lock);
+ 
+ 	/* A non-zero return here aborts TCPM's attach, so failures are logged,
+@@ -1845,6 +1859,7 @@ static int a733_combophy_typec_mux_set(struct typec_mux_dev *mux,
+ 			 */
+ 			a733_combophy_dp_lanes_leave(cp);
+ 			cp->dp_active = false;
++			cp->dp_handshake_ok = false;
+ 			dev_info(cp->dev,
+ 				 "DP alt mode left, COMB0 links back in reset; SuperSpeed does not return without a phy_exit()/phy_init() cycle\n");
+ 		}
+@@ -1881,12 +1896,43 @@ static int a733_combophy_typec_mux_set(struct typec_mux_dev *mux,
+ 		goto out;
+ 	}
+ 
++	/* The lanes are already DisplayPort's and nothing about the request has
++	 * changed, so there is nothing to hand over. Re-running the entry from
++	 * here would take a working link down: dp_lanes_enter() rewrites the
++	 * lane map and inverts and dp_reset_seq() is the reset staircase,
++	 * which drops phy0_reset_n. If one of those arrives inside a CR/EQ
++	 * window it fails the training underneath whoever is driving it -- and
++	 * both arms at once, which is what a fixture defect looks like.
++	 *
++	 * That this arrives at all is not a hypothesis. dp_altmode_attention()
++	 * calls dp_altmode_notify() with no mode-changed test
++	 * (drivers/usb/typec/altmodes/displayport.c), so every Attention
++	 * re-issues typec_mux_set() with the same TYPEC_DP_STATE_C, and every
++	 * healthy boot logged carries exactly two handover lines about 1.8 s
++	 * apart. The second one is this path.
++	 *
++	 * A genuine change still gets through: a different pin assignment does
++	 * not match, and a return to USB/SAFE clears dp_active above. HPD is
++	 * not handled here at all -- it travels to the DP driver, which retrains
++	 * through phy_configure(), whose own reset bracket is where a re-plug
++	 * gets its staircase.
++	 */
++	if (cp->dp_active && mode == cp->dp_entered_mode) {
++		cp->dp_reenter_refused++;
++		dev_info(cp->dev,
++			 "DP alt mode pin assignment %c requested again while it is already active: link left alone (%u refused)\n",
++			 pin, cp->dp_reenter_refused);
++		goto out;
++	}
++
+ 	dev_info(cp->dev,
+ 		 "DP alt mode pin assignment %c: handing all four COMB0 lanes to DisplayPort\n",
+ 		 pin);
+ 	cp->dp_active = true;
++	cp->dp_entered_mode = mode;
+ 	a733_combophy_dp_lanes_enter(cp);
+-	if (a733_combophy_dp_reset_seq(cp))
++	cp->dp_handshake_ok = !a733_combophy_dp_reset_seq(cp);
++	if (!cp->dp_handshake_ok)
+ 		dev_err(cp->dev,
+ 			"DP link bring-up did not complete, see the handshake errors above\n");
+ 

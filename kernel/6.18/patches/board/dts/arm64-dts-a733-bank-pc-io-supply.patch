@@ -1,0 +1,103 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: a733: name bank PC's I/O supply
+
+The pinctrl driver derives each bank's pad withstand-voltage mode from that
+bank's `vcc-pX-supply`. Seven banks log
+
+    supply vcc-p{b,c,f,h,j} not found, using dummy regulator   (main pinctrl)
+    supply vcc-p{l,m} not found, using dummy regulator          (r-pinctrl)
+
+on every boot. Wire exactly one of them, the one where a rail is unambiguous
+and no new probe dependency appears.
+
+Bank PC is supplied from `VCC-PC` = CLDO5 at 1.8 V (from A733_PINOUT_V0.91 sheet "Pin Description" column "I/O Power
+Supply[7]"). The rail cannot be anything else: the C-LDOs are fed from the
+~2.5 V ETA3521 output, so 3.3 V is structurally out of reach.
+CLDO5 reads 1800 mV enabled on the 8 GiB board (register 0x33 = 0x0d), on the 6 GiB board and on
+a second 6 GiB board.
+
+Measured on the delivery image, the 8 GiB board, 2026-08-15:
+
+    GPIO_POW_MOD_SEL 0x02000040 = 0x01155550   PC field 5:4 = 01 (auto)
+    GPIO_POW_VAL     0x02000048 = 0x020BAC80   PC field 5:4 = 00 (1.8 V)
+
+UM V1.00 18.14.6.2 encodes PC, PE and PK as 00 = 1.8 V, 01 = 3.3 V, 10/11 =
+Invalid (PDF p. 1597-1599); the other banks keep 10 = 3.3 V, 11 = 1.8 V. Every
+3.3 V field (PD, PG, PH, PJ, VCCIO) reads 10, PF (told 1.8 V via
+GPIO_POW_VAL_SET_CTL bit 0 = 0) reads 11, and PC, PE and PK read 00. The
+detector therefore already sees 1.8 V on PC. What this patch changes is the
+mode: PC leaves auto and gets the withstand mode the named rail implies, and
+the dummy-regulator line for PC goes away.
+
+No new dependency: the eMMC node on this bank already consumes CLDO5 as its
+`vqmmc-supply` (patch `arm64-dts-allwinner-a733-emmc-real-pmic-rails`), so mmc2 cannot probe before CLDO5 registers
+either way. No new write either -- CLDO5 is `regulator-always-on`, carries no
+voltage window, and `sunxi_pmx_free()`'s `regulator_disable()` is refcounted
+against that.
+
+Requires `pinctrl-sunxi-a733-2-bit-pow-mod-sel-io-bias` (the A733 two-bit POW_MOD_SEL variant). Without it the A733 desc
+has no io-bias variant and this property is inert.
+
+The other six banks are deliberately not wired; the reasons are in the node
+comment, one per bank. The short version: PL is a hard circular dependency on
+the PMIC's own I2C bus, PF's rail is switchable and already owned by `mmc-sunxi-pad-io-voltage-switch-without-vqmmc`, PJ's
+node is held by a 0 ohm bridge rather than by the LDO the pinout names, PM
+needs a CLDO1 node that also carries VDD18-LPDDR, and PB/PH are already correct
+so wiring them would change nothing observable.
+
+Assisted-by: Claude
+---
+diff -uNr a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -652,6 +652,50 @@
+ 			interrupt-controller;
+ 			#interrupt-cells = <3>;
+ 
++			/*
++			 * Bank PC's pads are supplied from VCC-PC = CLDO5,
++			 * 1.8 V (per the pinout sheet; the eMMC
++			 * node already consumes the same rail as vqmmc). Naming
++			 * it here lets the pinctrl driver put PC's withstand
++			 * mode where the UM says it belongs.
++			 *
++			 * Measured on the delivery image, the 8 GiB board,
++			 * 2026-08-15: GPIO_POW_MOD_SEL 0x02000040 = 0x01155550,
++			 * PC's field 5:4 = 01 = auto, and GPIO_POW_VAL
++			 * 0x02000048 = 0x020BAC80, PC's field 5:4 = 00, which
++			 * UM V1.00 18.14.6.2 decodes as 1.8 V for PC, PE and PK
++			 * (V0.92 read it as Invalid). PE and PK read 00 as
++			 * well, every 3.3 V bank reads 10.
++			 *
++			 * Only PC is wired, and the other six banks that log
++			 * the dummy-regulator line are deliberately left alone:
++			 *
++			 *  - PL is fatal. Its consumer is r_i2c0 (PL0/PL1), the
++			 *    bus the PMIC itself sits on, and it requests its
++			 *    pins before the PMIC exists (1.3159 s against
++			 *    1.3253 s in the boot log). A vcc-pl-supply
++			 *    pointing at ALDO1 makes sunxi_pmx_request() return
++			 *    -EPROBE_DEFER for the I2C controller that has to
++			 *    probe first for ALDO1 to exist.
++			 *  - PF has no single rail: its supply is selectable
++			 *    (VCC18-PF / VCC-IO) and the SoC-side switch is
++			 *    already owned by GPIO_POW_VAL_SET_CTL, patch `mmc-sunxi-pad-io-voltage-switch-without-vqmmc`.
++			 *  - PJ and PD nominally hang off BLDO2, but R251 (0 R)
++			 *    binds the node to SWOUT1. BLDO2's own register
++			 *    reads 1800 mV on the 8 GiB board and 3300 mV on the 6 GiB board while
++			 *    both banks measure 3.3 V, so the LDO is the wrong
++			 *    phandle and the bridge is not describable in DT.
++			 *  - PM needs a CLDO1 node, and CLDO1 also carries
++			 *    VDD18-LPDDR. A regulator node without
++			 *    regulator-always-on is switched off by
++			 *    regulator_late_cleanup(), so getting that node
++			 *    wrong drops the LPDDR5 1.8 V rail.
++			 *  - PB and PH are already at 3.3 V and read back
++			 *    correctly; wiring them changes nothing observable,
++			 *    so they wait for a reason.
++			 */
++			vcc-pc-supply = <&reg_cldo5>;
++
+ 			uart0_pb_pins: uart0-pb-pins {
+ 				pins = "PB9", "PB10";
+ 				allwinner,pinmux = <2>;

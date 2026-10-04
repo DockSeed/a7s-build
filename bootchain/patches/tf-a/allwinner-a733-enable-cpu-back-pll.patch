@@ -1,0 +1,354 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Sat, 3 Oct 2026 17:12:25 +0200
+Subject: [PATCH] feat(allwinner): enable the A733 CPU_BACK_PLL at cold boot
+
+The kernel's CPU PLL controller relocks a cluster PLL by moving
+the cluster's clock mux off it and back. UM V1.00 5.1.4.1 "PLL Distribution"
+(printed p.243 / PDF p.264) gives every core and the cluster three backup
+sources: 26 MHz, CPU_BACK_PLL and a fixed peripheral rate. Today the park
+lands on the 26 MHz DCXO, because CPU_BACK_PLL is off: its control
+register reads 0x40104A00 (PLL_EN 0) -- boot0, BL31 and U-Boot all
+leave it at reset. The kernel can park on CPU_BACK_PLL when it is
+enabled and falls back to the DCXO when it is not. This patch enables it.
+
+WHERE, AND WHY BL31. bl31_platform_setup() runs once per cold boot on the
+boot core, after boot0 has programmed the cluster PLLs and before BL33, so
+before anything in the normal world can touch a CPU clock. It is also where
+the other SoC-specific clock setup in this TF-A already lives (the A64/H5 AHB
+tweaks in the same function), and EL3 is the owner of CPU power here (PSCI,
+the CPU ops). U-Boot proper has no CPU PLL code for this SoC at all: the only
+CPU_PLL_CFG writer in the tree is SPL's clock_a523_set_cpu_plls(), and boot0
+replaces SPL in this chain, so there is no "platform clock init" there to
+extend. A resident firmware stage also covers any BL33, not just ours. The
+call sits after generic_delay_timer_init(), which the lock poll needs.
+
+OPEN: WHERE THE ENABLE BELONGS. The only consumer of this PLL is the
+kernel's CPU clock driver, which parks the clusters on it during a
+relock. The clean place for the enable is that driver: it can prepare
+and enable its parking source through the clock framework before it
+reparents, and then nothing in the kernel depends on what a firmware
+stage did before it, whatever the BL33. That kernel change does not
+exist yet; until it does, the firmware keeps the enable described here,
+and this patch is to be dropped together with it.
+
+WHAT IS WRITTEN. CPU_PLL_CFG base 0x08870000 (UM V1.00 module list, printed
+p.249 / PDF p.270), CPU_BACK_PLL_CTRL_REG +0x0000 (UM V1.00 5.1.10.1, printed
+p.284-285 / PDF p.305-306): PLL_EN 31, PLL_LDO_EN 30, LOCK_ENABLE 29, LOCK
+28 (RO), PLL_OUTPUT_GATE 27, PLL_OUTPUT_DIV 22:20 (P0 = field + 1), PLL_N
+15:8 (N = field + 1), PLL_INPUT_DIV 1 (M1 = field + 1), rate =
+InputFreq * N / M1 / P0. Only the four enable bits are written. The factors
+stay at reset -- N 75, M1 1, P0 2, i.e. 26 MHz * 75 / 2 = 975 MHz on our
+26 MHz DCXO (the UM's default of 900 MHz is the same formula at 24 MHz),
+measured on silicon at 974.6 MHz (2026-09-23). If an earlier stage
+ever changes a factor, the PLL is left off rather than enabled at a rate
+nobody measured.
+
+SEQUENCE. UM V1.00 5.1.4.3, the first of its two PLL enable methods, the
+one the UM names for the startup phase (printed p.246 / PDF p.267), in
+short:
+
+  1. PLL_LDO_EN = 1.
+  2. PLL_OUTPUT_GATE = 1.
+  3. Program the factors N, M1, M0 and P.
+  4. PLL_EN = 1.
+  5. LOCK_ENABLE = 1.
+  6. Poll LOCK until it reads 1; the UM asks for that judgement three times.
+  7. Wait 20 us before anything uses the PLL.
+
+Step 3 writes nothing (reset factors). The three reads of step 6 follow the
+UM's rule for judging PLL lock (UM V1.00 4.1.4.2, printed p.27 / PDF p.48):
+LOCK is read 3 us apart, and three reads of 1 count as stable -- so LOCK is
+sampled every 3 us and must read 1 on three consecutive samples. Step 1 also clears
+LOCK_ENABLE, so step 5 is always a 0 -> 1 edge: LOCK is not cleared by
+PLL_EN = 0 (a run-time disable read back 0x50104A00, 2026-09-23). No
+cluster mux selects this PLL yet, so Method 1's glitch at gate-before-enable
+reaches nothing.
+
+Guards: runs only if PLL_EN reads 0 (idempotent; an already-running PLL is
+reported and left alone); the lock poll is bounded (20000 samples, >= 60 ms).
+On timeout the PLL is taken down in the UM's "Disable PLLs" order (gate,
+LOCK_ENABLE, PLL_EN), PLL_LDO_EN is restored to what it read before, one
+NOTICE line says so, and the boot continues; the kernel then parks on the
+DCXO as it does today. Every outcome prints one NOTICE line with the
+register before and after:
+
+  NOTICE:  BL31: CPU_BACK_PLL 0x40104a00 -> 0xf8104a00, enabled at reset factors
+
+(expected value: the vendor kernel's run-time enable reads 0xF8104A00.)
+
+WHERE THE VENDOR DRIVER DIFFERS. Read for reference only, not ported:
+radxa/allwinner-bsp drivers/clk/sunxi-ng/ccu-sun60iw2-cpupll.c. The boot
+firmware never enables the PLL; the vendor kernel does it at probe time,
+and differs from the UM and from this patch in these ways:
+- Rate: pll_cpu_back_clk is a ccu_nm with N at offset 0 and a 4-bit M at
+  bits 3:0, and no P0. The UM has N = field + 1, a 1-bit M1 at bit 1 (bits
+  0 and 4:2 reserved) and P0 at 22:20. Its clk_summary therefore reports
+  26 MHz * 74 = 1924 MHz for a PLL running at 975 -- off by 2x in the one
+  number a parking policy needs.
+- Sequence: PLL_EN, LDO_EN, LOCK_ENABLE and OUTPUT_GATE go in one write,
+  which is neither of the UM's two methods, followed by a single LOCK poll
+  (no three-read judgement, no 20 us). Before that it writes 1 to bit 26 and
+  waits for it to clear -- the linear PLLs' PLL_UPDATE, reserved in
+  CPU_BACK_PLL_CTRL_REG.
+- It also sets PAT0 bits 29/30 and PAT1 bit 31 on the back PLL (its
+  comments: "Triangular(3bit)" pattern, "lfm_en") with no step of either
+  enable method asking for it; we leave both pattern registers at reset.
+- Timeouts are WARN_ON and carry on with the PLL half-configured.
+- Its VCO-range table for a 26 MHz DCXO assigns n.min twice (the second was
+  meant to be n.max); moot for us, we never write N.
+What we do instead: enable in the firmware, once, by the UM's startup-phase
+method, at the reset rate, with a bounded, judged lock and a clean give-up.
+
+Assisted-by: Claude
+---
+ plat/allwinner/common/include/sunxi_private.h |   1 +
+ plat/allwinner/common/sunxi_bl31_setup.c      |  17 ++
+ .../sun60i_a733/include/sunxi_mmap.h          |   1 +
+ plat/allwinner/sun60i_a733/platform.mk        |   4 +
+ .../sun60i_a733/sunxi_cpu_back_pll.c          | 163 ++++++++++++++++++
+ 5 files changed, 186 insertions(+)
+ create mode 100644 plat/allwinner/sun60i_a733/sunxi_cpu_back_pll.c
+
+diff --git a/plat/allwinner/common/include/sunxi_private.h b/plat/allwinner/common/include/sunxi_private.h
+index b83e3acc9..79299fa63 100644
+--- a/plat/allwinner/common/include/sunxi_private.h
++++ b/plat/allwinner/common/include/sunxi_private.h
+@@ -58,6 +58,7 @@ static inline int sunxi_set_scpi_psci_ops(const plat_psci_ops_t **psci_ops)
+ int sunxi_validate_ns_entrypoint(uintptr_t ns_entrypoint);
+ 
+ int sunxi_pmic_setup(uint16_t socid, const void *fdt);
++void sunxi_cpu_back_pll_setup(void);
+ void sunxi_security_setup(void);
+ 
+ uint16_t sunxi_read_soc_id(void);
+diff --git a/plat/allwinner/common/sunxi_bl31_setup.c b/plat/allwinner/common/sunxi_bl31_setup.c
+index 3306f67c8..c8ea7d1c3 100644
+--- a/plat/allwinner/common/sunxi_bl31_setup.c
++++ b/plat/allwinner/common/sunxi_bl31_setup.c
+@@ -40,6 +40,15 @@ static console_t console;
+ 
+ static void *fdt;
+ 
++/*
++ * Only the A733 has a CPU_BACK_PLL that BL31 enables
++ * (sun60i_a733/sunxi_cpu_back_pll.c); every other platform links this no-op.
++ */
++#pragma weak sunxi_cpu_back_pll_setup
++void sunxi_cpu_back_pll_setup(void)
++{
++}
++
+ #if !USE_GIC_DRIVER
+ static const gicv2_driver_data_t sunxi_gic_data = {
+ 	.gicd_base = SUNXI_GICD_BASE,
+@@ -208,6 +217,14 @@ void bl31_platform_setup(void)
+ 	if (soc_id == SUNXI_SOC_A64 || soc_id == SUNXI_SOC_H5)
+ 		mmio_write_32(SUNXI_CCU_BASE + 0x5c, 0x1);
+ 
++	/*
++	 * A733: the CPU clusters' relock parking target. Needs the delay timer
++	 * (initialised above); runs once, before BL33 and so before anything
++	 * can switch a cluster onto it.
++	 */
++	if (soc_id == SUNXI_SOC_A733)
++		sunxi_cpu_back_pll_setup();
++
+ 	sunxi_pmic_setup(soc_id, fdt);
+ 
+ 	INFO("BL31: Platform setup done\n");
+diff --git a/plat/allwinner/sun60i_a733/include/sunxi_mmap.h b/plat/allwinner/sun60i_a733/include/sunxi_mmap.h
+index 481bef870..e2e330b81 100644
+--- a/plat/allwinner/sun60i_a733/include/sunxi_mmap.h
++++ b/plat/allwinner/sun60i_a733/include/sunxi_mmap.h
+@@ -42,5 +42,6 @@
+ #define SUNXI_R_I2C_BASE		0x07083000
+ #define SUNXI_CPUCFG_BASE		0x08000000
+ #define SUNXI_CLUSTERCFG_BASE		0x08860000
++#define SUNXI_CPU_PLL_CFG_BASE		0x08870000
+ 
+ #endif /* SUNXI_MMAP_H */
+diff --git a/plat/allwinner/sun60i_a733/platform.mk b/plat/allwinner/sun60i_a733/platform.mk
+index 3b9e6e367..f57854e34 100644
+--- a/plat/allwinner/sun60i_a733/platform.mk
++++ b/plat/allwinner/sun60i_a733/platform.mk
+@@ -54,6 +54,10 @@ include plat/allwinner/common/allwinner-common.mk
+ BL31_SOURCES		+=	lib/cpus/${ARCH}/cortex_a55.S		\
+ 				lib/cpus/${ARCH}/cortex_a76.S
+ 
++# CPU_BACK_PLL enabled once at cold boot, at its reset rate, as the CPU
++# clusters' parking target during a PLL relock (sunxi_cpu_back_pll.c).
++BL31_SOURCES		+=	${AW_PLAT}/${PLAT}/sunxi_cpu_back_pll.c
++
+ # Cortex-A55 r2p0
+ ERRATA_A55_1530923	:=	1
+ 
+diff --git a/plat/allwinner/sun60i_a733/sunxi_cpu_back_pll.c b/plat/allwinner/sun60i_a733/sunxi_cpu_back_pll.c
+new file mode 100644
+index 000000000..af1f062d4
+--- /dev/null
++++ b/plat/allwinner/sun60i_a733/sunxi_cpu_back_pll.c
+@@ -0,0 +1,163 @@
++/*
++ * Copyright (c) 2026, DockSeed. All rights reserved.
++ *
++ * SPDX-License-Identifier: BSD-3-Clause
++ */
++
++/*
++ * A733 (sun60iw2): enable CPU_BACK_PLL once at cold boot, at its reset rate.
++ *
++ * WHY. The kernel relocks a CPU cluster PLL by moving the cluster's clock mux
++ * off that PLL and back. UM V1.00 5.1.4.1 "PLL Distribution" (printed p.243 /
++ * PDF p.264) names the backup sources of every core and of the cluster as
++ * "26MHz, CPU_BACK_PLL" and a fixed peripheral rate; a park on the 26 MHz DCXO
++ * runs the cores at 26 MHz for the whole relock. CPU_BACK_PLL resets with
++ * PLL_EN = 0 and no earlier stage of this chain (boot0, BL31, U-Boot) turns it
++ * on, so it is not there to park on. This file turns it on.
++ *
++ * REGISTER. CPU_PLL_CFG base 0x08870000 (UM V1.00 5.1.5.x module list,
++ * printed p.249 / PDF p.270), CPU_BACK_PLL_CTRL_REG at +0x0000 (UM V1.00
++ * 5.1.10.1, printed p.284-285 / PDF p.305-306, default 0x4010_4A00):
++ *
++ *   31 PLL_EN  30 PLL_LDO_EN  29 LOCK_ENABLE  28 LOCK (RO)
++ *   27 PLL_OUTPUT_GATE  22:20 PLL_OUTPUT_DIV (P0 = field + 1)
++ *   15:8 PLL_N (N = field + 1)  1 PLL_INPUT_DIV (M1 = field + 1)
++ *   rate = InputFreq * N / M1 / P0
++ *
++ * The factors are never written. At reset they read N = 75, M1 = 1, P0 = 2:
++ * 26 MHz * 75 / 2 = 975 MHz on this board's DCXO (the UM's own default of
++ * 900 MHz is the same formula at 24 MHz). Measured on silicon at
++ * 974.6 MHz. If an earlier stage has changed any
++ * factor, the rate is no longer the one that was measured, and the PLL is left
++ * off rather than enabled at an unverified rate.
++ *
++ * SEQUENCE. UM V1.00 5.1.4.3, the first of its two PLL enable methods, the
++ * one the UM names for the startup phase (printed p.246 / PDF p.267), in
++ * short:
++ *
++ *   1. PLL_LDO_EN = 1.
++ *   2. PLL_OUTPUT_GATE = 1.
++ *   3. Program the factors N, M1, M0 and P.
++ *   4. PLL_EN = 1.
++ *   5. LOCK_ENABLE = 1.
++ *   6. Poll LOCK until it reads 1; the UM asks for that judgement three
++ *      times.
++ *   7. Wait 20 us before anything uses the PLL.
++ *
++ * Step 3 keeps the reset factors (see above). Step 6's three reads follow
++ * the UM's rule for judging PLL lock (UM V1.00 4.1.4.2, printed p.27 /
++ * PDF p.48): LOCK is read 3 us apart, and a PLL whose LOCK has read 1 three
++ * times counts as stable. So LOCK is sampled every 3 us and must read 1 three
++ * times in a row.
++ *
++ * LOCK is not cleared by PLL_EN = 0: after a run-time disable it read
++ * 0x50104A00 on silicon, PLL_EN 0 with LOCK still 1.
++ * Step 1 therefore also clears LOCK_ENABLE, so step 5 is always a 0 -> 1 edge
++ * of the lock detector -- the same "write 0 to LOCK_ENABLE, and then write 1"
++ * the UM asks for on a factor change (4.1.4.1, printed p.27 / PDF p.48). A
++ * cold boot reads LOCK = 0 (reset value), so this only matters if the PLL was
++ * ever enabled and disabled before this code runs.
++ *
++ * Nothing can be clocked from this PLL yet -- every cluster mux still selects
++ * its own PLL -- so Method 1's glitch window at gate-before-enable is not seen
++ * by anything.
++ *
++ * FAILURE. The poll is bounded. On timeout the PLL is taken back down in the
++ * order of the UM's "Disable PLLs" steps (gate, LOCK_ENABLE, PLL_EN) and
++ * PLL_LDO_EN is restored to what it read before; one NOTICE line says so and
++ * the boot goes on. The kernel then finds PLL_EN = 0 and falls back to the
++ * DCXO park, which is what it does today.
++ */
++
++#include <stdint.h>
++
++#include <common/debug.h>
++#include <drivers/delay_timer.h>
++#include <lib/mmio.h>
++#include <lib/utils_def.h>
++
++#include <sunxi_mmap.h>
++#include <sunxi_private.h>
++
++#define CPU_BACK_PLL_CTRL_REG		(SUNXI_CPU_PLL_CFG_BASE + 0x0000)
++
++#define CPU_BACK_PLL_EN			BIT_32(31)
++#define CPU_BACK_PLL_LDO_EN		BIT_32(30)
++#define CPU_BACK_PLL_LOCK_ENABLE	BIT_32(29)
++#define CPU_BACK_PLL_LOCK		BIT_32(28)
++#define CPU_BACK_PLL_OUTPUT_GATE	BIT_32(27)
++
++/* PLL_OUTPUT_DIV 22:20, PLL_N 15:8, PLL_INPUT_DIV 1, and their reset values. */
++#define CPU_BACK_PLL_FACTORS_MASK	U(0x0070FF02)
++#define CPU_BACK_PLL_FACTORS_RESET	U(0x00104A00)
++
++#define CPU_BACK_PLL_LOCK_READS		3	/* UM 4.1.4.2 */
++#define CPU_BACK_PLL_LOCK_STEP_US	3	/* UM 4.1.4.2 */
++#define CPU_BACK_PLL_LOCK_POLLS		20000	/* >= 60 ms, then give up */
++#define CPU_BACK_PLL_SETTLE_US		20	/* UM 5.1.4.3 Method 1 step 7 */
++
++void sunxi_cpu_back_pll_setup(void)
++{
++	uint32_t before = mmio_read_32(CPU_BACK_PLL_CTRL_REG);
++	uint32_t val = before;
++	unsigned int i, reads = 0;
++
++	if ((before & CPU_BACK_PLL_EN) != 0U) {
++		NOTICE("BL31: CPU_BACK_PLL 0x%08x, already enabled, left as is\n",
++		       before);
++		return;
++	}
++
++	if ((before & CPU_BACK_PLL_FACTORS_MASK) != CPU_BACK_PLL_FACTORS_RESET) {
++		NOTICE("BL31: CPU_BACK_PLL 0x%08x, factors not at reset, left off\n",
++		       before);
++		return;
++	}
++
++	/* Method 1 step 1; LOCK_ENABLE cleared so step 5 is a 0 -> 1 edge. */
++	val = (val | CPU_BACK_PLL_LDO_EN) & ~CPU_BACK_PLL_LOCK_ENABLE;
++	mmio_write_32(CPU_BACK_PLL_CTRL_REG, val);
++	/* Method 1 step 2 */
++	val |= CPU_BACK_PLL_OUTPUT_GATE;
++	mmio_write_32(CPU_BACK_PLL_CTRL_REG, val);
++	/* Method 1 step 3: N, M1, P0 stay at their reset values. */
++	/* Method 1 step 4 */
++	val |= CPU_BACK_PLL_EN;
++	mmio_write_32(CPU_BACK_PLL_CTRL_REG, val);
++	/* Method 1 step 5 */
++	val |= CPU_BACK_PLL_LOCK_ENABLE;
++	mmio_write_32(CPU_BACK_PLL_CTRL_REG, val);
++
++	/* Method 1 step 6, lock judged per UM 4.1.4.2: three reads, 3 us apart. */
++	for (i = 0U; (i < CPU_BACK_PLL_LOCK_POLLS) &&
++		     (reads < CPU_BACK_PLL_LOCK_READS); i++) {
++		udelay(CPU_BACK_PLL_LOCK_STEP_US);
++		if ((mmio_read_32(CPU_BACK_PLL_CTRL_REG) &
++		     CPU_BACK_PLL_LOCK) != 0U)
++			reads++;
++		else
++			reads = 0U;
++	}
++
++	if (reads < CPU_BACK_PLL_LOCK_READS) {
++		/* UM 5.1.4.3 "Disable PLLs" steps 1-3, then LDO as found. */
++		val &= ~CPU_BACK_PLL_OUTPUT_GATE;
++		mmio_write_32(CPU_BACK_PLL_CTRL_REG, val);
++		val &= ~CPU_BACK_PLL_LOCK_ENABLE;
++		mmio_write_32(CPU_BACK_PLL_CTRL_REG, val);
++		val &= ~CPU_BACK_PLL_EN;
++		mmio_write_32(CPU_BACK_PLL_CTRL_REG, val);
++		val = (val & ~CPU_BACK_PLL_LDO_EN) |
++		      (before & CPU_BACK_PLL_LDO_EN);
++		mmio_write_32(CPU_BACK_PLL_CTRL_REG, val);
++		NOTICE("BL31: CPU_BACK_PLL 0x%08x -> 0x%08x, no lock, left off\n",
++		       before, mmio_read_32(CPU_BACK_PLL_CTRL_REG));
++		return;
++	}
++
++	/* Method 1 step 7 */
++	udelay(CPU_BACK_PLL_SETTLE_US);
++
++	NOTICE("BL31: CPU_BACK_PLL 0x%08x -> 0x%08x, enabled at reset factors\n",
++	       before, mmio_read_32(CPU_BACK_PLL_CTRL_REG));
++}

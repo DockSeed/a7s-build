@@ -1,0 +1,169 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] mmc: sunxi: tune the HS400 data-strobe delay instead of assuming it
+
+In HS400 the card drives a data strobe next to the data lines and the controller
+latches on it, so the delay applied to that strobe decides whether a block is
+framed at all -- not how cleanly, whether. The A733 UM prescribes no value, and
+it should not: the right delay is a property of the board's routing and the card,
+not of the SoC. The vendor driver arrives at its value through a runtime retry
+loop rather than as a constant, which says the same thing.
+
+`mmc-sunxi-a733-hs400-data-strobe-delay-value` gave the field a value from a sweep because it previously had none at all --
+host->ds_dl was never assigned and reached SMHC_DS_DL as 0 out of kzalloc. That
+was the right emergency fix and the wrong permanent answer: a constant measured
+on one board with one card is a number that happens to work where it was taken.
+
+So measure it, on the board, every time. The core calls ->execute_hs400_tuning
+after the mode switch with the controller already in HS400 and the clock running,
+which is the only point where the delay line can be evaluated against real
+traffic. Each of the 64 candidate delays is scored by an actual EXT_CSD read: a
+data transfer over the same strobe, framed the same way, and short enough that
+the whole sweep costs milliseconds. This is what mtk-sd does
+(msdc_execute_hs400_tuning) and what the vendor achieves with its retries.
+
+Two details worth stating:
+
+- The delay line is a chain, not a phase ring. 63 does not border on 0, so the
+  window search does not wrap. Copying a phase-ring search here would invent a
+  window across the two ends that does not exist in hardware.
+- The midpoint of the widest passing run is chosen, not its first entry. That is
+  what buys margin against temperature and voltage drift, and it turns "it worked
+  once" into a value with a known distance to both edges. On the 8 GiB board the sweep found
+  a wide window with the driver's old value 0 outside it -- which is exactly the
+  failure this replaces.
+
+Returning an error refuses to run a bus that cannot frame a block. A slower eMMC
+is a nuisance; a silently corrupting one is not, and this failure was silent for
+days.
+
+CORRECTED 2026-09-19: this paragraph used to add that the error "makes the core
+fall back to HS200". It does not, and the wrong claim is deleted rather than
+struck through. mmc_init_card() sends the error from mmc_select_hs400() straight
+to free_card, so before an earlier fix an empty strobe window cost the whole card and not
+just the mode. That fix clears MMC_CAP2_HS400 before returning the error, which is
+what actually reaches HS200, and carries the control-flow reading in full.
+
+The cfg ds_dl from `mmc-sunxi-a733-hs400-data-strobe-delay-value` stays as the value programmed before tuning runs; the
+sweep overrides it. Keeping it means a controller whose tuning is skipped still
+starts from a measured value rather than from zero.
+
+The chosen window is logged at dev_dbg -- silent by default, and with
+CONFIG_DYNAMIC_DEBUG pinned it is one boot argument away when a board misbehaves.
+
+Builds W=1 clean. NOT hardware-proven yet: the test is a cold boot on the 8 GiB board
+showing the sweep pick a delay from inside the window found manually, followed by
+the same read/write/md5 verification that `mmc-sunxi-a733-hs400-data-strobe-delay-value` passed.
+
+Assisted-by: Claude
+---
+--- i/drivers/mmc/host/sunxi-mmc.c
++++ w/drivers/mmc/host/sunxi-mmc.c
+@@ -1388,21 +1388,108 @@ static int sunxi_mmc_card_busy(struct mmc_host *mmc)
+ {
+ 	struct sunxi_mmc_host *host = mmc_priv(mmc);
+ 
+ 	return !!(mmc_readl(host, REG_STAS) & SDXC_CARD_DATA_BUSY);
+ }
+ 
++/*
++ * HS400 data-strobe tuning.
++ *
++ * In HS400 the card drives a data strobe alongside the data lines and the
++ * controller latches on it, so the delay applied to that strobe decides whether
++ * a block is framed correctly at all. The A733 UM prescribes no value for it,
++ * and there is no reason it should: it is a property of this board's routing and
++ * this card, not of the SoC. A constant would be a guess that happens to work on
++ * the board it was measured on -- and the value the driver ran before this
++ * existed was not even a guess, it was an unassigned field that stayed 0.
++ *
++ * So measure it. The core calls this after the mode switch, with the controller
++ * already in HS400 and the clock running, which is the only point where the
++ * delay line can be evaluated against real traffic. Each candidate delay is
++ * scored by a real EXT_CSD read: a data transfer over the same strobe, framed
++ * the same way, and short enough that sweeping all 64 costs milliseconds. This
++ * mirrors what mtk-sd does (msdc_execute_hs400_tuning) and what the vendor
++ * driver arrives at through its retry loop.
++ *
++ * The delay line is a chain, not a phase ring: 63 does not border on 0, so the
++ * window search deliberately does not wrap. Picking the middle of the widest
++ * passing run rather than its first entry is what buys margin against
++ * temperature and voltage drift -- the difference between "it worked once on my
++ * board" and a value with a documented distance to both edges.
++ *
++ * Returning an error here makes the core fall back to HS200 rather than run a
++ * bus that cannot frame a block. That is the intended behaviour: a slower eMMC
++ * is a nuisance, a silently corrupting one is not.
++ */
++static int sunxi_mmc_execute_hs400_tuning(struct mmc_host *mmc,
++					  struct mmc_card *card)
++{
++	struct sunxi_mmc_host *host = mmc_priv(mmc);
++	int i, run_start = -1, run_len = 0, best_start = -1, best_len = 0;
++	u64 passed = 0;
++	u8 *ext_csd;
++	u32 rval;
++
++	for (i = 0; i <= SDXC_DS_DL_SW_MASK; i++) {
++		rval = mmc_readl(host, REG_DS_DL_REG);
++		rval &= ~SDXC_DS_DL_SW_MASK;
++		rval |= i | SDXC_CAL_DL_SW_EN;
++		mmc_writel(host, REG_DS_DL_REG, rval);
++
++		if (!mmc_get_ext_csd(card, &ext_csd)) {
++			passed |= BIT_ULL(i);
++			kfree(ext_csd);
++		}
++	}
++
++	for (i = 0; i <= SDXC_DS_DL_SW_MASK; i++) {
++		if (passed & BIT_ULL(i)) {
++			if (run_start < 0)
++				run_start = i;
++			run_len++;
++			if (run_len > best_len) {
++				best_len = run_len;
++				best_start = run_start;
++			}
++		} else {
++			run_start = -1;
++			run_len = 0;
++		}
++	}
++
++	if (!best_len) {
++		dev_err(mmc_dev(mmc),
++			"HS400: no data-strobe delay passes, falling back\n");
++		return -EIO;
++	}
++
++	host->ds_dl = best_start + best_len / 2;
++
++	rval = mmc_readl(host, REG_DS_DL_REG);
++	rval &= ~SDXC_DS_DL_SW_MASK;
++	rval |= host->ds_dl | SDXC_CAL_DL_SW_EN;
++	mmc_writel(host, REG_DS_DL_REG, rval);
++
++	dev_dbg(mmc_dev(mmc),
++		"HS400: data-strobe window %d..%d (%d wide), using %u [%016llx]\n",
++		best_start, best_start + best_len - 1, best_len, host->ds_dl,
++		passed);
++
++	return 0;
++}
++
+ static const struct mmc_host_ops sunxi_mmc_ops = {
+ 	.request	 = sunxi_mmc_request,
+ 	.set_ios	 = sunxi_mmc_set_ios,
+ 	.get_ro		 = mmc_gpio_get_ro,
+ 	.get_cd		 = mmc_gpio_get_cd,
+ 	.enable_sdio_irq = sunxi_mmc_enable_sdio_irq,
+ 	.start_signal_voltage_switch = sunxi_mmc_volt_switch,
+ 	.card_hw_reset	 = sunxi_mmc_hw_reset,
+ 	.card_busy	 = sunxi_mmc_card_busy,
++	.execute_hs400_tuning = sunxi_mmc_execute_hs400_tuning,
+ };
+ 
+ static const struct sunxi_mmc_clk_delay sunxi_mmc_clk_delays[] = {
+ 	[SDXC_CLK_400K]		= { .output = 180, .sample = 180 },
+ 	[SDXC_CLK_25M]		= { .output = 180, .sample =  75 },
+ 	[SDXC_CLK_50M]		= { .output =  90, .sample = 120 },

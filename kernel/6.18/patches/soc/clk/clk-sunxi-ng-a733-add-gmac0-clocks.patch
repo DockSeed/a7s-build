@@ -1,0 +1,119 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] clk: sunxi-ng: A733 (sun60iw2) add GMAC0 (Ethernet) clocks + resets
+
+Milestone-3 network prerequisite: the single A733 GMAC (GMAC0, a Synopsys
+DWC_ether_qos v5.30 core at 0x04500000, driving the RJ45 via an external
+Maxio MAE0621A RGMII PHY) needs its two bus clocks and its resets exported so
+the mainline dwmac-sun55i / stmmac stack can request them by name.
+
+What the mainline driver actually asks for (verified against stmmac_platform.c
++ dwmac-sun55i.c, not the vendor DT):
+  clocks:  "stmmaceth" (required)  -- the MAC application/bus clock; stmmac reads
+                                      its rate for the MDC / clk_csr divider.
+           "mbus"      (required by the sun55i glue: devm_clk_get_enabled)
+           "pclk"/"ptp_ref" are optional and intentionally not wired here (PTP
+                                      is not needed to bring the link up).
+  resets:  "stmmaceth" + "ahb" (both optional-shared).
+
+So this patch adds exactly two gates and two resets:
+
+  * CLK_BUS_GMAC0  = GMAC0_BGR bit0 (0x141C) -- the "stmmaceth" clock. Modelled
+    as an ahb-parented gate: on sunxi the MAC application clock IS the bus gate,
+    and its rate must equal the real bus rate for stmmac's MDC divider maths, so
+    parenting to ahb is correct, not a placeholder.
+  * CLK_MBUS_GMAC0 = MBUS_GATE bit11 (0x05E4) -- the AXI/MBUS clock the sun55i
+    glue enables. Enable-only: GMAC derives no rate from it (the RGMII TX clock
+    is generated inside the MAC). This minimal CCU does not model the MBUS root,
+    so the gate is parented to ahb as a stable always-on approximation; the only
+    consumer just enables it.
+  * RST_BUS_GMAC0     = 0x141C bit16 (GMAC0_RST)     -> DT "stmmaceth"
+  * RST_BUS_GMAC0_AXI = 0x141C bit17 (GMAC0_AXI_RST) -> DT "ahb"
+
+Register offsets and bit positions are from the A733 UM (GMAC0_BGR_REG 0x141C:
+bit0 GATING / bit16 GMAC0_RST / bit17 GMAC0_AXI_RST; MBUS_GATE_EN_REG 0x05E4
+bit11 GMAC0_MCLK_EN), cross-checked against a live sunxi_dump on the 8 GiB board
+(0x0200341C = 0x00030001 = both resets de-asserted + gate on; 0x020025E4 bit11
+= 1). No kernel/DT/BSP was used as a source for a value.
+
+Deliberately NOT added: the GMAC0 PHY 25 MHz reference clock (GMAC0_PHY_CLK_REG
+0x1410, output on pin PH15/EPHY-25M). On this board R99 is NC and the Maxio PHY
+runs off its own 25 MHz crystal (Y1), so the SoC-generated PHY clock is unused.
+Adding it would model a clock no consumer references.
+
+Based on drivers/clk/sunxi-ng/ccu-sun55i-a523.c, Copyright (C) 2023 Arm Ltd.
+
+Assisted-by: Claude
+---
+--- a/include/dt-bindings/clock/sun60i-a733-ccu.h
++++ b/include/dt-bindings/clock/sun60i-a733-ccu.h
+@@ -70,4 +70,7 @@
+ #define CLK_BUS_SERDES		53
+ #define CLK_MBUS_SERDES		54
+ 
++#define CLK_BUS_GMAC0		46
++#define CLK_MBUS_GMAC0		47
++
+ #endif /* _DT_BINDINGS_CLK_SUN60I_A733_CCU_H_ */
+--- a/include/dt-bindings/reset/sun60i-a733-ccu.h
++++ b/include/dt-bindings/reset/sun60i-a733-ccu.h
+@@ -29,4 +29,7 @@
+ #define RST_BUS_SERDES		19
+ #define RST_USB_2		20
+ 
++#define RST_BUS_GMAC0		17
++#define RST_BUS_GMAC0_AXI	18
++
+ #endif /* _DT_BINDINGS_RST_SUN60I_A733_CCU_H_ */
+--- a/drivers/clk/sunxi-ng/ccu-sun60iw2.c
++++ b/drivers/clk/sunxi-ng/ccu-sun60iw2.c
+@@ -410,6 +410,23 @@
+  */
+ static SUNXI_CCU_GATE_HWS(bus_serdes_clk,  "bus-serdes",  ahb_hws, 0x05C0, BIT(8),  0);
+ static SUNXI_CCU_GATE_HWS(mbus_serdes_clk, "mbus-serdes", ahb_hws, 0x05E0, BIT(28), 0);
++/*
++ * GMAC0 (Ethernet, DWC-EQoS core). Two enable-only bus gates:
++ *  - bus-gmac0:  GMAC0_BGR bit0 (0x141C) -- the "stmmaceth" clock. stmmac reads
++ *    its rate for the MDC/clk_csr divider, so parent it to ahb (the real bus
++ *    rate); on sunxi the MAC application clock is the bus gate.
++ *  - mbus-gmac0: MBUS_GATE bit11 (0x05E4) -- the AXI/MBUS clock the sun55i glue
++ *    requires ("mbus"). Enable-only; GMAC derives no rate from it (the RGMII TX
++ *    clock is generated inside the MAC). This minimal CCU does not model the
++ *    MBUS root, so it is parented to ahb as a stable always-on approximation.
++ * Offsets/bits from the A733 UM (GMAC0_BGR 0x141C: bit0 gate / bit16 GMAC0_RST /
++ * bit17 GMAC0_AXI_RST; MBUS_GATE 0x05E4 bit11 GMAC0_MCLK_EN), cross-checked on
++ * live silicon (the 8 GiB board: 0x141C=0x00030001, 0x05E4 bit11=1). The PHY 25 MHz ref
++ * (0x1410, pin PH15) is omitted: board R99 NC, the Maxio PHY uses its own
++ * crystal, so the SoC PHY clock is unused.
++ */
++static SUNXI_CCU_GATE_HWS(bus_gmac0_clk,  "bus-gmac0",  ahb_hws, 0x141C, BIT(0),  0);
++static SUNXI_CCU_GATE_HWS(mbus_gmac0_clk, "mbus-gmac0", ahb_hws, 0x05E4, BIT(11), 0);
+ 
+ /* ccu_common-based clocks (registered and reset-mapped by the core). */
+ static struct ccu_common *sun60iw2_ccu_clks[] = {
+@@ -453,6 +470,8 @@
+ 	&res_dcap_24m_clk.common,
+ 	&bus_serdes_clk.common,
+ 	&mbus_serdes_clk.common,
++	&bus_gmac0_clk.common,
++	&mbus_gmac0_clk.common,
+ };
+ 
+ static struct clk_hw_onecell_data sun60iw2_hw_clks = {
+@@ -510,6 +529,8 @@
+ 		[CLK_RES_DCAP_24M]	= &res_dcap_24m_clk.common.hw,
+ 		[CLK_BUS_SERDES]	= &bus_serdes_clk.common.hw,
+ 		[CLK_MBUS_SERDES]	= &mbus_serdes_clk.common.hw,
++		[CLK_BUS_GMAC0]		= &bus_gmac0_clk.common.hw,
++		[CLK_MBUS_GMAC0]	= &mbus_gmac0_clk.common.hw,
+ 	},
+ 	.num	= CLK_MBUS_SERDES + 1,
+ };
+@@ -534,6 +555,8 @@
+ 	[RST_BUS_OTG]		= { 0x1304, BIT(24) },
+ 	[RST_BUS_SERDES]	= { 0x13C4, BIT(16) },
+ 	[RST_USB_2]		= { 0x135C, BIT(16) },
++	[RST_BUS_GMAC0]		= { 0x141C, BIT(16) },
++	[RST_BUS_GMAC0_AXI]	= { 0x141C, BIT(17) },
+ };
+ 
+ static const struct sunxi_ccu_desc sun60iw2_ccu_desc = {

@@ -1,0 +1,219 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Thu, 17 Sep 2026 17:00:00 +0200
+Subject: [PATCH] arm64: dts: a733: put the display engine behind IOMMU1
+
+Name IOMMU1 master 2 in `iommus` on the mixer and on the display-engine
+(KMS) node. The engine then fetches through IOVAs, and any page of RAM --
+also above 4 GiB -- is reachable through its 32-bit layer address register
+without swiotlb.
+
+  master 2    DE0 is master 2 of IOMMU1 (A733 UM V0.92, chapter 10).
+              On the 8 GiB board on 2026-09-15 the vendor system ran
+              the display engine translating with IOMMU1 master 2's BYP at
+              0, and its layer and RCQ addresses walked through the page
+              table to buffers that equal the DE registers word for word.
+
+⚠ ON BOTH NODES, THE SAME MASTER. The GEM DMA helpers allocate against the
+KMS device and a PRIME import maps through it (drm_dev_dma_dev() returns
+drm->dev unless a driver sets another), while the mixer fetches -- and the mixer's
+own sun60i-de framebuffer is allocated against the mixer. Both have to live
+in one address space. Naming the same IOMMU in both places puts both devices
+into that IOMMU's one group (the driver uses
+generic_single_device_group()), so they share one default domain and one
+table. sun60i-kms.c already refuses to bind when only one of the two is
+behind an IOMMU.
+Mainline's sun8i-mixer gets there differently: it calls of_dma_configure()
+on the DRM device from the mixer's bind. 6.18 answers that with
+"late IOMMU probe at driver bind, something fishy here!" and a WARNING --
+seen on a second board whose vendor-derived DRM driver does exactly that. Describing it in the DT
+lets the core configure both devices before either binds.
+
+The comments that said this tree has no IOMMU are corrected where they
+stand: the mixer node's, sun60i-de.c's above sun60i_de_layer() ("OUR TREE HAS
+NO IOMMU SUPPORT AT ALL", "MUST NOT BE ADDED SPECULATIVELY") and
+sun60i-kms.c's above sun60i_kms_check_dma_domain() ("they would not arrive
+for this node"). The omission was right while no IOMMU driver existed
+(scanout from the physical 0xfe400000 on 2026-08-19); it is what capped
+scanout at 4 GiB. Comment-only in the two C files.
+
+VERIFIED HERE: applies with fuzz 0 on top of the full series; the dtb built
+with cpp + dtc carries iommus = <&iommu1 2> on /display-engine and on
+/soc/mixer@5100000 (phandle 0x1c = iommu@3910000).
+
+HARDWARE-PROVEN on the 8 GiB board 2026-09-18, test kernel beside the
+card's own kernel, same rootfs in both arms:
+  * iommu@3910000 logs "translating: L1 table at 0x0000000101e84000,
+    TTB 0x407a1" and "master 2 translating"; /sys/kernel/iommu_groups holds
+    display-engine and 5100000.mixer in group 0; IOMMU1 m2 BYP (0x03910804)
+    reads 0 and every other master 1; no fault line from either node; DP-1
+    stays connected at 1920x1200 with a picture.
+  * the VI0 layer address 0x05101018 reads 0xFD000000 -- an IOVA, against
+    the physical 0xF0C00000 the control kernel reads -- and walks from
+    IOMMU1's TTB through DTE 0x21549101 and PTE 0x0548910E to page
+    0x105489000, R and W set, above 4 GiB. The table scan: 9 valid L1
+    entries, 6750 mapped pages, all at or above 4 GiB.
+  * glmark2-es2-wayland for 60 s in a labwc session: zero swiotlb_bounced
+    events for display-engine and no "swiotlb buffer is full" in the whole
+    boot, against 294 events and four full-buffer lines on the same image
+    with the default kernel.
+
+CORRECTED HERE: an earlier version of this header named 'sun60i-de logs
+"scanout buffer at ... -- an IOVA"' as a falsifier. That line cannot appear in
+a KMS boot: it sits in sun60i_de_enable(), which is the debugfs bring-up path
+and owns its own framebuffer, while the KMS path allocates through the GEM DMA
+helpers and leaves de->fb NULL (sun60i-de.c, the comment above
+sun60i_de_enable()). The register readback above is the evidence instead, and
+it is the better one -- the kernel is the thing under test.
+
+NO PERFORMANCE CLAIM. glmark2 scored 72 on the default kernel and 63 in the
+measured run; three further runs on the same kernel and the same boot scored
+53, 50 and 77. The
+spread swallows the difference, governor and thermal state were uncontrolled,
+and the two arms do not render the same path -- the default kernel composites
+once swiotlb refuses a mapping.
+
+Assisted-by: Claude
+---
+
+diff --git a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -665,10 +665,23 @@ ramoops@60000000 {
+ 	 * two display outputs and could drive a second pipe,
+ 	 * but only disp0 -> TCON_TV1 -> DisplayPort has ever been on a board.
+ 	 * A second entry here would describe a pipeline nothing has proven.
++	 *
++	 * `iommus` HERE AS WELL AS ON THE MIXER, and it is the same master.
++	 * This node's device is the one the GEM DMA helpers allocate against
++	 * and the one a PRIME import maps through (drm_dev_dma_dev() returns
++	 * drm->dev unless a driver sets another); the mixer is the block that
++	 * fetches. Both have to see one address space, so both name IOMMU1
++	 * master 2, and the IOMMU driver puts every device of one IOMMU into
++	 * one group with one page table. sun60i-kms.c refuses to bind if only
++	 * one of the two is behind an IOMMU. Mainline's sun8i-mixer reaches
++	 * the same result by calling of_dma_configure() on the DRM device from
++	 * the mixer's bind, which 6.18 answers with "late IOMMU probe at
++	 * driver bind".
+ 	 */
+ 	display-engine {
+ 		compatible = "allwinner,sun60i-a733-display-engine";
+ 		allwinner,pipelines = <&mixer0>;
++		iommus = <&iommu1 2>;
+ 		status = "okay";
+ 	};
+ 
+@@ -1580,22 +1593,22 @@ ohci1: usb@4200400 {
+ 		 *                  driver DOES power-gate this domain it must then
+ 		 *                  treat the per-channel scaler coefficient SRAM as
+ 		 *                  uninitialised.
+-		 *   iommus         ✅ VINDICATED ON SILICON, 2026-08-19. The stated
+-		 *                  falsifier was "a scanout that fetches nothing from a
+-		 *                  physically-addressed buffer". It fetched: the engine
+-		 *                  scanned 1920x1200 from the PHYSICAL address
+-		 *                  0xfe400000 with no IOMMU bound, onto a monitor. So
+-		 *                  the omission is now correct by measurement rather
+-		 *                  than by caution. ⚠ And the vendor's own capture is
+-		 *                  NOT comparable on this point -- it runs the same path
+-		 *                  through sunxi-iommu-v2 as master 8, so its layer
+-		 *                  address 0xfc000000 is an IOVA, not a physical
+-		 *                  address. Whoever one day adds an IOMMU driver adds
+-		 *                  the property then.
++		 *
+ 		 *   DE_SYS_BGR, the AHB matrix gate, the MBUS matrix gate: all three
+ 		 *                  are in their working state at power-on and the
+ 		 *                  vendor writes none of them -- the CCU patch lists
+ 		 *                  them with their reset values.
++		 *
++		 * `iommus` IS HERE NOW, and what it replaces was measured, not
++		 * assumed: on 2026-08-19 this engine scanned 1920x1200 from the
++		 * PHYSICAL address 0xfe400000 with no IOMMU bound -- its IOMMU1
++		 * master resets in bypass. That scanout is limited to what a
++		 * 32-bit layer address reaches, and a GPU buffer above 4 GiB was
++		 * bounced through swiotlb or failed to import.
++		 * Master 2 of IOMMU1 is DE0; the
++		 * vendor's cell 8 is the same master in its one-node numbering
++		 * (6 masters per IOMMU, 6 + 2). The display-engine node above
++		 * names the same master, and says why.
+ 		 */
+ 		mixer0: mixer@5100000 {
+ 			compatible = "allwinner,sun60i-a733-de-mixer-0";
+@@ -1610,6 +1623,7 @@ mixer0: mixer@5100000 {
+ 			resets = <&ccu RST_BUS_DE0>;
+ 			assigned-clocks = <&ccu CLK_DE0>;
+ 			assigned-clock-parents = <&ccu CLK_DE_PLL3X>;
++			iommus = <&iommu1 2>;
+ 			status = "okay";
+ 
+ 			/*
+diff --git a/drivers/gpu/drm/sun60i/sun60i-de.c b/drivers/gpu/drm/sun60i/sun60i-de.c
+--- a/drivers/gpu/drm/sun60i/sun60i-de.c
++++ b/drivers/gpu/drm/sun60i/sun60i-de.c
+@@ -1145,16 +1145,16 @@ static void sun60i_de_blender_window(struct sun60i_de *de)
+  *     cannot, because 0xFC000000 there is an IOVA and whatever this driver
+  *     programs here is not. Do not "fix" a mismatch in this register against
+  *     the capture.
+- *  2. OUR TREE HAS NO IOMMU SUPPORT AT ALL -- no patch mentions one, no DT node
+- *     exists, no `iommus` property is anywhere in it -- so on our kernel the
+- *     DE's address reaches the bus UNTRANSLATED. That is correct if and only if
+- *     the IOMMU is genuinely in bypass or off for us, and NOTHING HAS VERIFIED
+- *     THAT. If it comes up translating with no mapping for master 8, the DE
+- *     fetches from nowhere and the symptom is a black screen with every
+- *     register reading back perfectly -- the exact failure shape that cost this
+- *     project a session on 2026-08-19. So the driver does not assume it: it
+- *     asks device_iommu_mapped() and SAYS which of the two it got, at enable
+- *     and in `state`.
++ *  2. WHETHER OUR ADDRESS IS AN IOVA DEPENDS ON THE DEVICE TREE. Without an
++ *     `iommus` property the DE's address reaches the bus untranslated -- its
++ *     IOMMU1 master resets in bypass, and on 2026-08-19 it was seen fetching from the
++ *     physical 0xfe400000. With `arm64-dts-a733-display-engine-behind-iommu1`'s `iommus = <&iommu1 2>` (IOMMU driver
++ *     `iommu-sun60i-add-the-allwinner-a733-iommu-driver`) it is an IOVA. A mismatch -- translating with no mapping for
++ *     master 2 -- fetches from nowhere, and the symptom is a black screen with
++ *     every register reading back perfectly, the failure shape that cost this
++ *     project a session on 2026-08-19. So the driver does not assume either:
++ *     it asks device_iommu_mapped() and SAYS which of the two it got, at
++ *     enable and in `state`.
+  *
+  * WHY THE DMA API RATHER THAN A HAND-ROLLED ADDRESS, and it is this exact case:
+  * dma_alloc_coherent() hands back a dma_addr_t, which is a physical address
+@@ -1162,11 +1162,12 @@ static void sun60i_de_blender_window(struct sun60i_de *de)
+  * `iommus` property exist -- with no change in this file. A hand-computed
+  * physical address would be silently wrong on that day.
+  *
+- * ⛔ AND THE `iommus` PROPERTY MUST NOT BE ADDED SPECULATIVELY. A phandle to an
+- * IOMMU node with no driver bound leaves this device deferring forever, so it
+- * arrives with a verified IOMMU driver or not at all. Mainline 6.18.36 does
+- * ship drivers/iommu/sun50i-iommu.c; whether it matches this SoC's
+- * sunxi-iommu-v2 is UNVERIFIED and this file assumes neither way.
++ * ⛔ THE `iommus` PROPERTY ARRIVES ONLY WITH ITS DRIVER. A phandle to an IOMMU
++ * node with no driver bound leaves this device deferring forever. Mainline's
++ * sun50i-iommu.c is the H6 layout and does not fit this SoC
++ * -- the driver is `iommu-sun60i-add-the-allwinner-a733-iommu-driver`'s sun60i-iommu.c, and `arm64-dts-a733-display-engine-behind-iommu1` adds the
++ * property together with it. The vendor's master id 8 is IOMMU1 master 2 in
++ * its one-node numbering.
+  */
+ static void sun60i_de_layer(struct sun60i_de *de)
+ {
+diff --git a/drivers/gpu/drm/sun60i/sun60i-kms.c b/drivers/gpu/drm/sun60i/sun60i-kms.c
+--- a/drivers/gpu/drm/sun60i/sun60i-kms.c
++++ b/drivers/gpu/drm/sun60i/sun60i-kms.c
+@@ -1039,11 +1039,14 @@ static int sun60i_kms_topology(struct device *dev,
+  * two agree; that is what `drm-a733-display-engine-dram-into-tcon-tv1` measured on 2026-08-19, scanning 1920x1200 from
+  * the physical 0xfe400000.
+  *
+- * The day an IOMMU driver and an `iommus` property arrive for the engine, they
+- * would not arrive for this node, and the address handed to the layer register
+- * would be a physical address where the engine expects an IOVA. The screen
+- * would go black with every register reading back correct -- the failure shape
+- * this pipe has already paid for twice. So the two are compared, once, at bind.
++ * With an IOMMU in the path (`iommu-sun60i-add-the-allwinner-a733-iommu-driver`, and `arm64-dts-a733-display-engine-behind-iommu1`'s `iommus = <&iommu1 2>` on the
++ * engine) both must be translated through the same table. `arm64-dts-a733-display-engine-behind-iommu1` therefore names
++ * the same IOMMU master on this node too, and the IOMMU driver puts both
++ * devices into one group with one domain. A device tree that gives the property
++ * to only one of the two would hand the layer register a physical address where
++ * the engine expects an IOVA, or the reverse: a black screen with every register
++ * reading back correct -- the failure shape this pipe has already paid for
++ * twice. So the two are compared, once, at bind.
+  */
+ static int sun60i_kms_check_dma_domain(struct device *master, struct device *de)
+ {

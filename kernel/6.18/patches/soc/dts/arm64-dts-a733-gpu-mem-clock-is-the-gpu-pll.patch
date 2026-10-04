@@ -1,0 +1,65 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: a733: the GPU's "mem" clock is PLL_GPU0, not the MBUS gate
+
+drm/powervr takes three clocks by name -- "core" (required), "sys" and
+"mem" (both optional) -- and does nothing with them but
+clk_prepare_enable() and disable. It never sets a rate: pvr_device.c has
+no clk_set_rate and no OPP or devfreq use at all, checked in the tree we
+build, not assumed.
+
+`arm64-dts-a733-add-the-gpu-node-disabled` wired "mem" to CLK_MBUS_GPU0. The
+tree where this driver actually binds on this SoC and renders -- a 6.18.19
+kernel built from Alex Cao's A733 BSP port for Linux 6.18
+(https://github.com/alexcaoys/allwinner-bsp, branch linux-6.18.y), the
+kernel behind the Fedora GPU desktop of 2026-06-25 -- wires it to
+CLK_PLL_GPU0 in configs/linux-6.18/sun60iw2p1.dtsi (the GPU node has been there
+since the file was added in commit b48ce2c542c5, Link below):
+
+	clocks = <&ccu CLK_GPU0>, <&ccu CLK_PLL_GPU0>, <&ccu CLK_BUS_GPU0>;
+	clock-names = "core", "mem", "sys";
+
+So on that tree, binding the driver turns the GPU PLL on. On ours it
+opens an MBUS master gate instead, and PLL_GPU0 is never enabled by
+anybody: PLL_GPU0_CTRL reads 0x41104500 on our image, PLL_EN (bit 31)
+clear and LOCK (bit 28) clear (field names from
+the A733 user manual, offset 0x00E0).
+
+This aligns the property with that tree. It does not touch the operating
+point: `arm64-dts-a733-enable-the-gpu-at-the-vendor-s-operating-point`'s reasoning stands unchanged -- GPUPLL cannot serve 600 MHz,
+its VCO floor is above the required 1200 MHz, so CLK_GPU0 keeps
+PLL_PERI0_600M as its assigned parent. "mem" here is a clock the driver
+switches on, not a parent.
+
+What is deliberately given up, because a port has to say what it drops:
+CLK_MBUS_GPU0 leaves the node, so nothing claims the GPU's MBUS master
+gate and clk_disable_unused() closes it. Measured on the 8 GiB board on 2026-09-07:
+without clk_ignore_unused, MBUS_MAT_CLK_GATING bit 16 reads 0 on our
+image and 1 on the vendor stack, and setting it by hand moves nothing --
+neither PWSR nor anything else observable. The reference tree does not
+name it either. If the GPU ever needs it as a master, it needs a claim
+that survives, and that is a separate patch with its own proof.
+
+⚠ Motivation, stated plainly so it is not mistaken for a fix: GPU_CORE
+does not power up on our stack and does on the vendor's, and this is the
+last documented difference left between our GPU node and the node in a
+tree where the same driver brings the same GPU up. It is a candidate, not
+a cause. The falsifier is one line: after boot with this applied,
+GPU_CORE PWSR reads 0x8 instead of 0x0. If it still reads 0x0, the
+difference is elsewhere and this patch is only a correctness fix for the
+"mem" name.
+
+Link: https://github.com/alexcaoys/allwinner-bsp/commit/b48ce2c542c57940febe0f7587d2cf79a1dcca12
+Assisted-by: Claude
+
+diff --git a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -2781,7 +2781,7 @@
+ 			compatible = "img,img-bxm-4-64", "img,img-rogue";
+ 			reg = <0x0 0x01800000 0x0 0x90000>;
+ 			interrupts = <GIC_SPI 63 IRQ_TYPE_LEVEL_HIGH>;
+-			clocks = <&ccu CLK_GPU0>, <&ccu CLK_MBUS_GPU0>,
++			clocks = <&ccu CLK_GPU0>, <&ccu CLK_PLL_GPU0>,
+ 				 <&ccu CLK_BUS_GPU0>;
+ 			clock-names = "core", "mem", "sys";
+ 			resets = <&ccu RST_BUS_GPU0>;

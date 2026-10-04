@@ -1,0 +1,96 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: a733: the Type-C connector is self-powered, and TCPM acts on it
+
+The connector node declares power-role, data-role, typec-power-opmode and
+source-pdos and has never declared `self-powered`. The property is not
+decoration: TCPM reads it and branches on it.
+
+    tcpm.c:5881   if (port->self_powered)
+    tcpm.c:5882       tcpm_set_cc(port, TYPEC_CC_OPEN);      /* real detach */
+    tcpm.c:5883   else
+    tcpm.c:5884       tcpm_set_cc(port, tcpm_rp_cc(port));
+
+port->self_powered comes from fwnode_property_read_bool(fwnode,
+"self-powered") at tcpm.c:7354, and the property is documented in
+Documentation/devicetree/bindings/connector/usb-connector.yaml.
+
+So PORT_RESET on this board never opens CC. The comment at tcpm.c:7067-7070
+describes that reset as the way to force a clean disconnect at startup so a
+partner that is still attached from the previous boot re-attaches properly;
+without the property it presents Rp instead, which the partner need not read
+as a detach at all.
+
+The value is a fact about the board, not a tuning knob: the A7S powers itself
+from the 65 W barrel jack, this port is a DFP that sources VBUS, and it never
+draws the board's power from a partner.
+
+WHY IT IS ITS OWN PATCH, AND WHAT IT DOES NOT CLAIM
+---------------------------------------------------
+
+It is one line and it is a frequency experiment, not a single-boot one. There
+is no register to read back that says "the reset opened CC"; what changes is
+how often a stale partner state survives a reboot. So this patch claims
+exactly one thing -- that a documented property TCPM acts on, and that is true
+of this board, is now in the node -- and it does not claim to fix the
+2026-08-20 intermittency. If the "no partner at all after a power cycle" case
+ stops appearing, that is
+evidence; if it appears again, this was not it.
+
+This is the "two sources, two jobs" class of mistake, for the third time: every
+hardware value in the node was right, and what was missing was a Linux-side
+expectation nobody grepped for. It cost three board cycles on Type-C in July
+and three on SD UHS in August. Reading tcpm.c for what it does with the
+fwnode costs nothing.
+
+THE PROOF THIS OWES
+-------------------
+
+  1. The property reaches the port: the node carries it in the live DT
+     (/proc/device-tree/.../connector/self-powered exists, zero-length).
+     Falsified by: the file being absent, i.e. the wrong node was edited.
+  2. Attach still works from cold, PD contract and DP alt mode entry unchanged -- the
+     TCPM log's VDM chain (Discover Identity -> SVIDs -> Modes -> Enter Mode
+     -> DP Status -> DP Configure) is what must not change.
+     Falsified by: a partner that no longer attaches, or an attach that stops
+     short of Enter Mode. Note that TWO "PD TX complete, status: 2" lines
+     appear on a fully working attach; they are not the regression.
+  3. A reboot with the sink attached the whole time still reaches DP alt mode.
+     That is the case the property changes the behaviour of.
+
+BUILD-TESTED ONLY when written. It needs a board, and its own witness is the TCPM log,
+which survives on a delivery kernel (CONFIG_DEBUG_FS is pinned) -- unlike the
+debug instrumentation state file. The log drains on read: capture it to a file first.
+
+Assisted-by: Claude
+
+diff --git a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -2559,6 +2559,27 @@
+ 					data-role = "host";
+ 					typec-power-opmode = "default";
+ 					/*
++					 * The board powers itself from the 65 W
++					 * barrel jack, never from this port, and
++					 * TCPM acts on the property: PORT_RESET
++					 * opens CC only when it is set --
++					 *
++					 *   tcpm.c:5881  if (port->self_powered)
++					 *   tcpm.c:5882      tcpm_set_cc(port, TYPEC_CC_OPEN);
++					 *   tcpm.c:5884  else tcpm_set_cc(port, tcpm_rp_cc(port));
++					 *
++					 * read from fwnode_property_read_bool()
++					 * at tcpm.c:7354 and documented in
++					 * usb-connector.yaml. Without it the
++					 * startup reset the comment at
++					 * tcpm.c:7067 describes as "a clean
++					 * disconnect" does not produce one here,
++					 * so a partner still attached from the
++					 * previous boot is never made to
++					 * re-attach.
++					 */
++					self-powered;
++					/*
+ 					 * USB-PD, because DisplayPort alt mode is
+ 					 * negotiated with structured VDMs and those
+ 					 * need a PD contract. `pd-disable` was here

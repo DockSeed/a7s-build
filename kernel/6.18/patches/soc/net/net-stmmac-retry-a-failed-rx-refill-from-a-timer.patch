@@ -1,0 +1,296 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] net: stmmac: retry a failed RX refill from a timer
+
+stmmac_rx_refill() allocates with GFP_ATOMIC | __GFP_NOWARN and stops at the
+first page it cannot get. Nothing retries it except the next RX poll. Once the
+DMA owns no descriptor it raises no RX interrupt, so that poll never comes: the
+queue stays stalled after memory is back, and only ndo_open refills the ring.
+On a MAC with hardware flow control the full MTL RX queue then keeps the link
+partner paused for as long as the stall lasts.
+
+This is our own fix, not a backport. Upstream has none (read 2026-09-27: not in
+6.18.54, torvalds master v7.3-rc4, or netdev's net-next test branch
+net-next-2026-09-27--06-00). The design is the one the netdev review asked for:
+
+  - "[PATCH net v4 2/2] net: stmmac: Prevent indefinite RX stall on buffer
+    exhaustion" (Sam Edwards, patchwork netdevbpf 14506044, changes requested)
+    returned the budget from stmmac_rx() while stmmac_rx_dirty() >=
+    STMMAC_RX_FILL_BATCH, so NAPI polled on.
+  - Jakub Kicinski on v3 (<20260331195927.3353cc6d@kernel.org>): "If the system
+    is OOMing having ksoftirq busy looping indefinitely is not going to be very
+    helpful. 1) only react if the fill level is below some critical threshold,
+    2) try to add some delay (timer)? before the retry". On v4
+    (<20260402080542.293e8729@kernel.org>): "I meant we need both a threshold,
+    and a delay". And (<20260402174049.0ac088cc@kernel.org>): "say we arm a
+    timer and let the IRQ be unmasked. The timer just runs napi_schedule().
+    napi_schedule() is thread-safe, if IRQ fires with the timer armed - no
+    problem."
+  - The first half of that series went in as 0bb05e6adfa9 ("net: stmmac:
+    Prevent NULL deref when RX memory exhausted", v7.1, in 6.18.53). Its text
+    keeps the stall open: "the driver simply *hopes* that the next
+    stmmac_rx_refill() succeeds, risking an indefinite stall of the receive
+    process if not." Its author's note on v6: the timer "as requested by
+    Jakub" is still to come.
+
+So: v4's threshold, plus the timer the review asked for instead of the busy
+loop.
+
+What the patch does:
+
+  - struct stmmac_channel gets rx_refill_timer, set up with the channel's
+    rx_napi in stmmac_napi_add(). The callback only calls napi_schedule().
+  - stmmac_napi_poll_rx(), when it is about to complete (work_done < budget)
+    and still owns the NAPI instance, checks stmmac_rx_dirty(). At
+    STMMAC_RX_FILL_BATCH (16) or more buffers missing it arms the timer for
+    STMMAC_RX_REFILL_RETRY_MS (50 ms). The RX interrupt is unmasked as before;
+    whichever of timer and interrupt comes first schedules the poll.
+  - __stmmac_disable_all_queues() deletes the timers after rx_napi is off, so
+    no retry is pending while NAPI is disabled. stmmac_enable_all_queues()
+    arms it at once for a queue still short of buffers: the tc offload path
+    disables and enables the queues without rebuilding the rings, and its
+    stall would otherwise outlive the call. Open rebuilds the rings and resume
+    resets their indices, so there the check finds nothing to do. The XSK
+    pool paths disable and enable rx_napi on their own and rebuild the ring;
+    a retry still pending there fires once into the disabled rx_napi, which
+    napi_schedule() ignores.
+  - The zero-copy path is untouched. Without need_wakeup, stmmac_rx_zc()
+    returns the budget when a refill fails, so NAPI polls on; with
+    need_wakeup it returns count and sets the XSK need_wakeup flag, so user
+    space kicks the queue (stmmac_main.c:5461-5470, 6.18.53). The note on
+    v6 of 0bb05e6adfa9: that path is not affected by this stall.
+
+Why the threshold catches every stall. stmmac_rx() leaves its loop for one of
+three reasons (stmmac_main.c, 6.18.53): the budget is used up, the next
+descriptor is still owned by the DMA, or the next entry is dirty_rx. After a
+refill that got every page, stmmac_rx_dirty() is 0. The first exit means NAPI
+polls again anyway. The second means the DMA still owns a descriptor, so the
+next frame raises an interrupt and the refill is tried again. Only the third
+leaves the DMA without a descriptor, and then stmmac_rx_dirty() is
+dma_rx_size - 1, at least 63 (DMA_MIN_RX_SIZE is 64), well above 16.
+
+Why 50 ms. msecs_to_jiffies(50) is 13 jiffies at our HZ=250, i.e. 52 ms --
+the same as forcedeth's OOM_REFILL (1 + HZ/20, forcedeth.c:475), the in-tree
+NIC that already retries an out-of-memory RX refill from a timer. virtio_net
+waits HZ/2 from a workqueue (virtio_net.c:2975), bcm63xx_enet HZ from a timer
+(bcm63xx_enet.c:277); both are slower. A shorter period buys nothing: while
+the refill fails the ring stays empty whatever the period, and once memory is
+back the queue restarts within one period. 10 ms would be 3 jiffies (12 ms)
+here and four times the polls under OOM. The cost at 50 ms is 20 polls per
+second per starved queue, each giving up at the first allocation that fails.
+That is not the busy loop the review rejected.
+
+What this patch does NOT fix. It ends the "for ever": the queue restarts
+once the refill succeeds again. It does not stop PAUSE during the memory
+shortage itself. While the refill fails the MTL RX queue stays full, and with
+TX flow control on (EHFC set) the MAC keeps sending PAUSE
+for as long as the shortage lasts. On 2026-09-27 MemAvailable stayed near 0
+for about 6 minutes. Whether that part needs its own change is open; the
+test boot measures how long such an episode lasts.
+
+Known risk, same thread. Russell King tested v4 on a Jetson Xavier (dwmac
+5.0, <ac6kfQ98Xjt3dCGj@shell.armlinux.org.uk>, 2026-04-02): the RX ring ran
+dry under iperf3, and after the ring was refilled and the tail pointer
+written the DMA did not restart -- RBU set, CURRDESAPTR equal to the tail,
+40 packets waiting in the MTL queue. He adds that it happens without the
+patches too (<ac6m2E6FIu4azGj0@shell.armlinux.org.uk>); dma_rmb() in the
+descriptor status reads helped but did not cure it
+(<adjrtRSepmac2hpN@shell.armlinux.org.uk>). Maxime Chevallier reports a
+similar RX stall on dwmac1000 (socfpga) with plain iperf3 on net-next,
+"not always reproducible, it may or may not show up when I run iperf3 after
+a fresh restart" -- no memory pressure is mentioned
+(<8f780d3f-c4ef-4976-ad0b-60718c29e06a@bootlin.com>). Sam Edwards' RK3588
+(dwmac 4.20) resumes after the same condition. Our core is 5.30. If it
+behaves like the Xavier, this patch refills the ring and the queue still
+does not move: that is the falsifier below.
+
+Options not taken:
+  - Returning the budget while the ring is short (v4 2/2): the busy loop.
+  - Treating RBU as an RX trigger: RBUE is not in the dwmac4 interrupt mask in
+    6.18.53 (DMA_CHAN_INTR_DEFAULT_MASK_4_10). Mainline enables it since
+    1b9707e6f1a9 (v7.1) for the counters only. For xgmac2 it was turned off
+    again ("net: stmmac: xgmac2: disable RBUE in default RX interrupt mask",
+    accepted 2026-06-09) because it gave an interrupt storm and "RBUE does not
+    provide OOM recovery". An RBU interrupt reruns the same refill with no
+    delay.
+  - Forcing TX pause off on the interface: it protects the link partner, not
+    the receive path. It stays the measurement's segment guard.
+
+Diagnostics, visible by default until the hardware record exists:
+  "RX queue N: D of S buffers missing, retrying the refill every 50 ms"
+  (netdev_warn) and "RX queue N refilled after K retries" (netdev_info).
+  The first is printed once per episode, only once the episode outlasts one
+  retry (STMMAC_RX_REFILL_LOG_RETRIES), and only under net_ratelimit(); the
+  second only for an episode whose first line was printed. So a ring that
+  hovers around the threshold cannot flood a 115200 baud console, and the
+  two lines always come in pairs. Their visibility goes down once the patch
+  is proven; the lines stay.
+
+Found on the 6 GiB board, image 6.18.53, 2026-09-27: end0
+stopped receiving about 18 s after an OOM burst and did not recover after the
+load ended. Its MAC sent 298 PAUSE frames in 10 s while the board was idle,
+until ip link set end0 down/up.
+
+Verified: applies at --fuzz=0 on the full series over 6.18.53, and
+drivers/net/ethernet/stmicro/stmmac/ builds with W=1.
+NOT verified on hardware.
+
+Expected on silicon, segment guarded (tx pause forced off), with the refill
+failure forced by a test-only patch (net-stmmac-inject-rx-refill-failures, not carried) or brought
+on by memory pressure: the warn line while the refill fails, then "refilled
+after K retries" once it succeeds again, end0 receiving again with no
+down/up, and DMA_CH0_Status RBU clear with the current RX descriptor != the
+RX tail pointer.
+Falsifier: the stall persisting after the "refilled" line (the tail pointer
+write does not resume the RX DMA on this core, as on the Xavier above: RBU
+still set, current == tail); or no warn line while end0 has stopped
+receiving and the ring was starved (then the stall is not this mechanism);
+or retries going on with memory available (the refill fails for another
+reason).
+
+For a comparison run without this
+patch: A7S_SKIP_PATCHES=net-stmmac-retry-a-failed-rx-refill-from-a-timer.
+
+Assisted-by: Claude
+---
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac.h
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac.h
+@@ -145,6 +145,9 @@
+ 	struct stmmac_priv *priv_data;
+ 	spinlock_t lock;
+ 	u32 index;
++	struct timer_list rx_refill_timer;
++	u32 rx_refill_retries;
++	bool rx_refill_logged;
+ };
+ 
+ struct stmmac_fpe_cfg {
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -84,6 +84,12 @@
+ #define STMMAC_TX_XSK_AVAIL		16
+ #define STMMAC_RX_FILL_BATCH		16
+ 
++/* Delay before an RX refill that ran out of memory is tried again, and the
++ * retry from which on the episode is logged (one retry is routine)
++ */
++#define STMMAC_RX_REFILL_RETRY_MS	50
++#define STMMAC_RX_REFILL_LOG_RETRIES	2
++
+ #define STMMAC_XDP_PASS		0
+ #define STMMAC_XDP_CONSUMED	BIT(0)
+ #define STMMAC_XDP_TX		BIT(1)
+@@ -135,6 +141,7 @@
+ static void stmmac_reset_rx_queue(struct stmmac_priv *priv, u32 queue);
+ static void stmmac_reset_tx_queue(struct stmmac_priv *priv, u32 queue);
+ static void stmmac_reset_queues_param(struct stmmac_priv *priv);
++static inline u32 stmmac_rx_dirty(struct stmmac_priv *priv, u32 queue);
+ static void stmmac_tx_timer_arm(struct stmmac_priv *priv, u32 queue);
+ static void stmmac_flush_tx_descriptors(struct stmmac_priv *priv, int queue);
+ static void stmmac_set_dma_operation_mode(struct stmmac_priv *priv, u32 txmode,
+@@ -218,6 +225,13 @@
+ 		if (queue < tx_queues_cnt)
+ 			napi_disable(&ch->tx_napi);
+ 	}
++
++	/* rx_napi is off; stmmac_enable_all_queues() re-arms a needed retry */
++	for (queue = 0; queue < rx_queues_cnt; queue++) {
++		timer_delete_sync(&priv->channel[queue].rx_refill_timer);
++		priv->channel[queue].rx_refill_retries = 0;
++		priv->channel[queue].rx_refill_logged = false;
++	}
+ }
+ 
+ /**
+@@ -262,8 +276,15 @@
+ 			continue;
+ 		}
+ 
+-		if (queue < rx_queues_cnt)
++		if (queue < rx_queues_cnt) {
++			/* A ring left short of buffers raises no RX interrupt */
++			bool starved = stmmac_rx_dirty(priv, queue) >=
++				       STMMAC_RX_FILL_BATCH;
++
+ 			napi_enable(&ch->rx_napi);
++			if (starved)
++				mod_timer(&ch->rx_refill_timer, jiffies);
++		}
+ 		if (queue < tx_queues_cnt)
+ 			napi_enable(&ch->tx_napi);
+ 	}
+@@ -5785,6 +5806,57 @@
+ 	return count;
+ }
+ 
++static void stmmac_rx_refill_timer(struct timer_list *t)
++{
++	struct stmmac_channel *ch = timer_container_of(ch, t, rx_refill_timer);
++
++	napi_schedule(&ch->rx_napi);
++}
++
++/**
++ * stmmac_rx_refill_retry - retry a failed RX refill after a delay
++ * @priv: driver private structure
++ * @ch: RX channel whose poll is about to complete
++ * Description: stmmac_rx_refill() stops at the first buffer it cannot
++ * allocate and is tried again only by the next RX poll. Once the DMA owns
++ * no descriptor it raises no RX interrupt, so that poll never comes and the
++ * queue stays stalled after memory is back. When the ring is short of
++ * STMMAC_RX_FILL_BATCH buffers or more, schedule the poll again after
++ * STMMAC_RX_REFILL_RETRY_MS instead of polling in a loop.
++ * An episode is logged once it outlasts one retry, and only under
++ * net_ratelimit(); its end is logged only if its start was.
++ * Must be called while the poll still owns the NAPI instance.
++ */
++static void stmmac_rx_refill_retry(struct stmmac_priv *priv,
++				   struct stmmac_channel *ch)
++{
++	u32 dirty = stmmac_rx_dirty(priv, ch->index);
++
++	if (likely(dirty < STMMAC_RX_FILL_BATCH)) {
++		if (unlikely(ch->rx_refill_retries)) {
++			if (ch->rx_refill_logged)
++				netdev_info(priv->dev,
++					    "RX queue %u refilled after %u retries\n",
++					    ch->index, ch->rx_refill_retries);
++			ch->rx_refill_retries = 0;
++			ch->rx_refill_logged = false;
++		}
++		return;
++	}
++
++	if (++ch->rx_refill_retries == STMMAC_RX_REFILL_LOG_RETRIES &&
++	    net_ratelimit()) {
++		netdev_warn(priv->dev,
++			    "RX queue %u: %u of %u buffers missing, retrying the refill every %u ms\n",
++			    ch->index, dirty, priv->dma_conf.dma_rx_size,
++			    STMMAC_RX_REFILL_RETRY_MS);
++		ch->rx_refill_logged = true;
++	}
++
++	mod_timer(&ch->rx_refill_timer,
++		  jiffies + msecs_to_jiffies(STMMAC_RX_REFILL_RETRY_MS));
++}
++
+ static int stmmac_napi_poll_rx(struct napi_struct *napi, int budget)
+ {
+ 	struct stmmac_channel *ch =
+@@ -5800,6 +5872,8 @@
+ 	u64_stats_update_end(&rxq_stats->napi_syncp);
+ 
+ 	work_done = stmmac_rx(priv, budget, chan);
++	if (work_done < budget)
++		stmmac_rx_refill_retry(priv, ch);
+ 	if (work_done < budget && napi_complete_done(napi, work_done)) {
+ 		unsigned long flags;
+ 
+@@ -7391,6 +7465,8 @@
+ 
+ 		if (queue < priv->plat->rx_queues_to_use) {
+ 			netif_napi_add(dev, &ch->rx_napi, stmmac_napi_poll_rx);
++			timer_setup(&ch->rx_refill_timer,
++				    stmmac_rx_refill_timer, 0);
+ 		}
+ 		if (queue < priv->plat->tx_queues_to_use) {
+ 			netif_napi_add_tx(dev, &ch->tx_napi,

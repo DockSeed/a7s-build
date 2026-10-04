@@ -1,0 +1,280 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Sat, 3 Oct 2026 17:14:46 +0200
+Subject: [PATCH] feat(allwinner): A733: every core requires DSU cluster power,
+ and say so at boot
+
+First step towards a cluster idle state on the A733. No power behaviour
+changes.
+
+WHY THIS FIRST. The DSU's CLUSTERPWRDN_EL1 bit 0, "Cluster power
+required", resets to 0: "cluster power is not required even when all
+cores are powered down" (Arm DSU TRM 100453 r0p2, B1.14; the A733's DSU
+is r4p1, CLUSTERIDR 0x41). It is banked per core, and CLUSTERPWRSTAT_EL1
+bit 0 is the combined value (B1.15). Today that does not matter: the DSU
+PPU at 0x07051000 reads PWPR 0x01040108, PWR_POLICY ON with PWR_DYN_EN
+set, and with dynamic transitions the policy is a floor (Arm DEN0051E
+5.2.1), so the cluster never leaves ON. A cluster state needs that floor
+lowered, and from then on any moment in which all eight cores sit in the
+core-level idle state could power the cluster down behind an OS that was
+promised core-level latencies. So before the floor moves, every core
+states that it requires cluster power: the boot core at cold boot, every
+core on CPU_ON and on return from CPU_SUSPEND. Only a core that asks for
+a cluster state will clear its bit, in a later change.
+
+WHAT IS READ. Once, on the boot core, before any other core is
+released: the DSU PPU's PWPR, PWSR, DISR, IMR and ISR (DEN0051E Table
+5-1), CPU_DSU_PLL_GATING_REG (CPU_PLL_CFG + 0x3020, A733 UM V1.00
+5.1.10.38; bit 4 DSU_PPU_SW_GATE_EN), CLU_DSU_STATUS_REG (CLUSTER_CFG
+0x08860000 + 0x8030, UM 5.1.9.26), and CLUSTERPWRDN_EL1 /
+CLUSTERPWRSTAT_EL1 before and after the write. Both system registers are
+accessible at EL3 without an enable (B1.14/B1.15 access tables). Each
+core's first CPU_ON after cold boot also prints CLUSTERPWRSTAT before
+and after its own write (at runtime, so only with a runtime console at
+NOTICE level).
+
+WHAT THE VENDOR DOES. The vendor's A733 SCP firmware (ARISC ar100s,
+cpucfg-sun60iw2p1/sunxi_cpu_ops.c) takes the cluster down only in system
+suspend: it clears cpu0's HOTPLUG_POWERMODE and polls the DSU PPU until
+it leaves ON, and on a 10000-poll timeout toggles the cluster reset
+(C0_RST_CTRL bit 0). It never writes CLUSTERPWRDN, the DSU PPU policy or
+DSU_PPU_SW_GATE_EN. This change does not carry the reset-on-timeout;
+nothing here waits on the cluster.
+
+Build switch SUNXI_DSU_CLUSTER_ADVISORY, default 0 for every Allwinner
+platform, 1 for the A733.
+
+Assisted-by: Claude
+---
+ plat/allwinner/common/allwinner-common.mk     |  10 ++
+ plat/allwinner/common/include/sunxi_private.h |  16 +++
+ plat/allwinner/common/sunxi_native_pm.c       |   2 +
+ plat/allwinner/common/sunxi_pm.c              |   5 +-
+ plat/allwinner/sun60i_a733/platform.mk        |   6 +
+ .../allwinner/sun60i_a733/sunxi_dsu_cluster.c | 116 ++++++++++++++++++
+ 6 files changed, 154 insertions(+), 1 deletion(-)
+ create mode 100644 plat/allwinner/sun60i_a733/sunxi_dsu_cluster.c
+
+diff --git a/plat/allwinner/common/allwinner-common.mk b/plat/allwinner/common/allwinner-common.mk
+index adff56aa1..8ac7b2475 100644
+--- a/plat/allwinner/common/allwinner-common.mk
++++ b/plat/allwinner/common/allwinner-common.mk
+@@ -82,6 +82,16 @@ endif
+ BL31_SOURCES		+=	${AW_PLAT}/${PLAT}/sunxi_cpu_suspend.c
+ endif
+ 
++# SUNXI_DSU_CLUSTER_ADVISORY=1: every core states "cluster power required" in
++# the DSU's CLUSTERPWRDN_EL1 whenever it comes up, and the boot core prints the
++# cluster's power state. Needs a per-SoC sunxi_dsu_cluster.c; DynamIQ parts only.
++SUNXI_DSU_CLUSTER_ADVISORY	?=	0
++$(call assert_boolean,SUNXI_DSU_CLUSTER_ADVISORY)
++$(eval $(call add_define,SUNXI_DSU_CLUSTER_ADVISORY))
++ifeq (${SUNXI_DSU_CLUSTER_ADVISORY},1)
++BL31_SOURCES		+=	${AW_PLAT}/${PLAT}/sunxi_dsu_cluster.c
++endif
++
+ # EL3 stack per core in bytes, 0 = the default 0x1000 / PLATFORM_CORE_COUNT.
+ SUNXI_PLAT_STACK_SIZE		?=	0
+ $(call assert_numeric,SUNXI_PLAT_STACK_SIZE)
+diff --git a/plat/allwinner/common/include/sunxi_private.h b/plat/allwinner/common/include/sunxi_private.h
+index 79299fa63..9e634df42 100644
+--- a/plat/allwinner/common/include/sunxi_private.h
++++ b/plat/allwinner/common/include/sunxi_private.h
+@@ -35,6 +35,22 @@ void sunxi_cpu_suspend_setup(uintptr_t sec_entrypoint);
+ bool sunxi_cpu_can_suspend(unsigned int core);
+ #endif
+ 
++#if SUNXI_DSU_CLUSTER_ADVISORY
++/*
++ * Per SoC: the DSU cluster power advisory (CLUSTERPWRDN_EL1). Setup runs once
++ * on the boot core at cold boot; core_up on every core each time it comes up.
++ */
++void sunxi_dsu_cluster_setup(void);
++void sunxi_dsu_cluster_core_up(void);
++#else
++static inline void sunxi_dsu_cluster_setup(void)
++{
++}
++static inline void sunxi_dsu_cluster_core_up(void)
++{
++}
++#endif
++
+ #if SUNXI_PSCI_USE_NATIVE
+ void sunxi_set_native_psci_ops(const plat_psci_ops_t **psci_ops);
+ #else
+diff --git a/plat/allwinner/common/sunxi_native_pm.c b/plat/allwinner/common/sunxi_native_pm.c
+index d36812c4e..edc430f86 100644
+--- a/plat/allwinner/common/sunxi_native_pm.c
++++ b/plat/allwinner/common/sunxi_native_pm.c
+@@ -45,6 +45,7 @@ static void sunxi_pwr_domain_off(const psci_power_state_t *target_state)
+ 
+ static void sunxi_pwr_domain_on_finish(const psci_power_state_t *target_state)
+ {
++	sunxi_dsu_cluster_core_up();
+ #if !USE_GIC_DRIVER
+ 	gicv2_pcpu_distif_init();
+ 	gicv2_cpuif_enable();
+@@ -152,6 +153,7 @@ static void sunxi_pwr_domain_suspend(const psci_power_state_t *target_state)
+ static void sunxi_pwr_domain_suspend_finish(
+ 		const psci_power_state_t *target_state)
+ {
++	sunxi_dsu_cluster_core_up();
+ }
+ #endif /* SUNXI_PSCI_NATIVE_SUSPEND */
+ 
+diff --git a/plat/allwinner/common/sunxi_pm.c b/plat/allwinner/common/sunxi_pm.c
+index ec7e3b20f..c53f7a46c 100644
+--- a/plat/allwinner/common/sunxi_pm.c
++++ b/plat/allwinner/common/sunxi_pm.c
+@@ -85,7 +85,10 @@ int plat_setup_psci_ops(uintptr_t sec_entrypoint,
+ 		 * including which cores ended up able to offer the state.
+ 		 */
+ 		sunxi_cpu_suspend_setup(sec_entrypoint);
+-#else
++#endif
++		/* Before any other core is released; see sunxi_dsu_cluster.c. */
++		sunxi_dsu_cluster_setup();
++#if !SUNXI_PSCI_NATIVE_SUSPEND
+ 		INFO("PSCI: Suspend is unavailable\n");
+ #endif
+ 	}
+diff --git a/plat/allwinner/sun60i_a733/platform.mk b/plat/allwinner/sun60i_a733/platform.mk
+index 5cc65ee6d..a93995f99 100644
+--- a/plat/allwinner/sun60i_a733/platform.mk
++++ b/plat/allwinner/sun60i_a733/platform.mk
+@@ -36,6 +36,12 @@ SUNXI_PSCI_USE_NATIVE := 1
+ # PPUs in the CPUIDLE block, with no SCP (sunxi_cpu_suspend.c).
+ SUNXI_PSCI_NATIVE_SUSPEND := 1
+ 
++# DSU cluster power advisory: every core writes CLUSTERPWRDN_EL1 = 1
++# ("cluster power required", DSU TRM 100453 B1.14; resets to 0) when it comes
++# up, and the boot core prints the DSU PPU, CPU_DSU_PLL_GATING_REG and
++# CLUSTERPWRSTAT_EL1 at cold boot (sunxi_dsu_cluster.c).
++SUNXI_DSU_CLUSTER_ADVISORY := 1
++
+ # EL3 stack per core. The common default, 0x1000 shared by eight cores =
+ # 512 B each, is not enough for the CPU_SUSPEND path as soon as anything on
+ # it prints (gcc -fcallgraph-info=su on the link-time optimised release
+diff --git a/plat/allwinner/sun60i_a733/sunxi_dsu_cluster.c b/plat/allwinner/sun60i_a733/sunxi_dsu_cluster.c
+new file mode 100644
+index 000000000..5e2a3ee2f
+--- /dev/null
++++ b/plat/allwinner/sun60i_a733/sunxi_dsu_cluster.c
+@@ -0,0 +1,116 @@
++/*
++ * Copyright (c) 2026, DockSeed. All rights reserved.
++ *
++ * SPDX-License-Identifier: BSD-3-Clause
++ */
++
++/*
++ * The A733's DSU cluster power advisory, and a readout of the cluster's power
++ * state. First step towards a cluster idle state; changes no power behaviour.
++ *
++ * Why the advisory has to be set before anything else: CLUSTERPWRDN_EL1 bit 0
++ * ("Cluster power required") resets to 0, which tells the power controller on
++ * CLUSTERPACTIVE that cluster power is NOT required once all cores are down
++ * (Arm DSU TRM 100453 r0p2, B1.14; our DSU is r4p1, CLUSTERIDR 0x41). The
++ * register is banked per core; CLUSTERPWRSTAT_EL1 bit 0 is the combined value
++ * (B1.15). Today the DSU PPU (0x07051000) keeps PWR_POLICY = ON with
++ * PWR_DYN_EN = 1, which with dynamic transitions is a floor (Arm DEN0051E
++ * 5.2.1), so the cluster never leaves ON whatever the advisory says. The next
++ * step lowers that floor; from then on a moment in which all eight cores sit
++ * in the core-level idle state could take the cluster down behind an OS that
++ * was promised core-level latencies. So every core states "cluster power
++ * required" whenever it comes up -- cold boot on the boot core, CPU_ON and
++ * CPU_SUSPEND return on every core -- and only a core that asks for a cluster
++ * state will clear it (not in this change).
++ *
++ * What this reads at cold boot, all read-only, and why:
++ *   DSU PPU PWPR/PWSR/DISR/IMR/ISR  0x07051000 + 0x000/0x008/0x010/0x030/0x038,
++ *                                   DEN0051E Table 5-1; the DSU instance of the
++ *                                   nine PPUs in the CPUIDLE block
++ *   CPU_DSU_PLL_GATING_REG          CPU_PLL_CFG 0x08870000 + 0x3020, A733 UM V1.00
++ *                                   5.1.10.38; bit 4 DSU_PPU_SW_GATE_EN, bit 0
++ *                                   DSU_CLK_GATING
++ *   CLU_DSU_STATUS_REG              CLUSTER_CFG + 0x8030, UM 5.1.9.26;
++ *                                   MEM_PRDYN [4:0]
++ *   CLUSTERPWRDN_EL1 / CLUSTERPWRSTAT_EL1   DSU TRM B1.14 / B1.15, S3_0_C15_C3_6 /
++ *                                   S3_0_C15_C3_7, accessible at EL3 without
++ *                                   an enable (B1.14 access table)
++ * Each core's first CPU_ON after cold boot also prints CLUSTERPWRSTAT before
++ * and after its own write. A core that has not written yet holds the reset 0
++ * while the boot core holds 1, so that pair settles how the banked bits
++ * combine -- the TRM says "a combined version" and does not say whether any
++ * core or every core has to require power. That print happens at runtime,
++ * so it reaches the UART only with a runtime console at NOTICE level.
++ */
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#include <arch.h>
++#include <arch_helpers.h>
++#include <common/debug.h>
++#include <lib/mmio.h>
++#include <plat/common/platform.h>
++#include <platform_def.h>
++
++#include <sunxi_mmap.h>
++#include <sunxi_private.h>
++
++#define A733_PPU_DSU			(SUNXI_R_CPUCFG_BASE + U(0x1000))
++#define PPU_PWPR			U(0x000)
++#define PPU_PWSR			U(0x008)
++#define PPU_DISR			U(0x010)
++#define PPU_IMR				U(0x030)
++#define PPU_ISR				U(0x038)
++
++#define A733_CPU_DSU_PLL_GATING		(SUNXI_CPU_PLL_CFG_BASE + U(0x3020))
++#define A733_CLU_DSU_STATUS		(SUNXI_CLUSTERCFG_BASE + U(0x8030))
++
++/* DSU TRM 100453 B1.15, op0 3 op1 0 CRn 15 CRm 3 op2 7. */
++#define A733_CLUSTERPWRSTAT_EL1		S3_0_C15_C3_7
++
++DEFINE_RENAME_SYSREG_READ_FUNC(clusterpwrstat_el1, A733_CLUSTERPWRSTAT_EL1)
++
++/* Cores that have printed their first-CPU_ON line; each writes only its own. */
++static bool first_on_reported[PLATFORM_CORE_COUNT];
++
++/* Every core, every time it comes up. */
++void sunxi_dsu_cluster_core_up(void)
++{
++	unsigned int core = plat_my_core_pos();
++	uint64_t stat_before = 0U;
++	bool report = !first_on_reported[core];
++
++	if (report) {
++		stat_before = read_clusterpwrstat_el1();
++	}
++	write_clusterpwrdn_el1(DSU_CLUSTER_PWR_ON);
++	isb();
++	if (report) {
++		first_on_reported[core] = true;
++		NOTICE("DSU: cpu%u cluster power required, CLUSTERPWRSTAT %llx->%llx\n",
++		       core, (unsigned long long)stat_before,
++		       (unsigned long long)read_clusterpwrstat_el1());
++	}
++}
++
++
++/* Boot core, once, at cold boot, before any other core is released. */
++void sunxi_dsu_cluster_setup(void)
++{
++	uint64_t pwrdn = read_clusterpwrdn_el1();
++	uint64_t stat = read_clusterpwrstat_el1();
++
++	sunxi_dsu_cluster_core_up();
++
++	NOTICE("DSU: PPU PWPR %08x PWSR %08x DISR %08x IMR %08x ISR %08x, PLL_GATING %08x, DSU_STATUS %08x, CLUSTERPWRDN %llx, CLUSTERPWRSTAT %llx->%llx\n",
++	       mmio_read_32(A733_PPU_DSU + PPU_PWPR),
++	       mmio_read_32(A733_PPU_DSU + PPU_PWSR),
++	       mmio_read_32(A733_PPU_DSU + PPU_DISR),
++	       mmio_read_32(A733_PPU_DSU + PPU_IMR),
++	       mmio_read_32(A733_PPU_DSU + PPU_ISR),
++	       mmio_read_32(A733_CPU_DSU_PLL_GATING),
++	       mmio_read_32(A733_CLU_DSU_STATUS),
++	       (unsigned long long)pwrdn, (unsigned long long)stat,
++	       (unsigned long long)read_clusterpwrstat_el1());
++}

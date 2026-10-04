@@ -1,0 +1,239 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] mmc: sunxi: a landed knob for the HS400 data-strobe delay
+
+The HS400 strobe sweep scores every candidate delay with mmc_get_ext_csd() --
+a READ. The deficit this tree is chasing is in writes. This adds the
+instrument that lets one board session produce the write-scored curve, because
+the write-scored sweep itself cannot live in the kernel.
+
+THE OBJECTIVE MISMATCH
+----------------------
+`mmc-sunxi-tune-the-hs400-data-strobe-delay` sweeps SMHC_DS_DL 0..63 and keeps the midpoint of the widest run of
+delays for which mmc_get_ext_csd() succeeds. That is a read of 512 bytes framed
+by the card's data strobe, and it is the right objective for read data.
+
+In HS400 the card drives the data strobe for more than read data: every written
+block is answered by a CRC status token on DAT0, and the controller has a
+register for how it detects that token (SMHC_CSDC, the CRC status detect control,
+set to the HS400 code by `mmc-sunxi-add-a733-emmc-hs400`). A per-block status that the write path waits on
+is exactly where a per-block cost would live, and the measurement says the cost
+is per block:
+
+  the 8 GiB board, DV4032, HS400 200 MHz 8 bit, 1 MiB requests, mmc_request_start ->
+  mmc_request_done:  ours 7084.6 us, vendor 6240.1 us
+  per 512-byte block: 3.459 us against 3.047 us, with the raw bus time at
+  200 MHz DDR x8 being 1.28 us.
+
+And the two stacks sit at different points of the delay line:
+
+  SMHC_DS_DL 0x148   ours 0x00000B8B   vendor 0x00000282
+
+decoded with UM 11.3.8.38 (same field layout as SMHC_SAMP_DL, 11.3.8.37):
+[5:0] software delay, [7] software enable, [13:8] read-only runtime state. So
+ours runs software delay 11 with the enable set, the vendor runs 2 -- and both
+read back their own value in [13:8], which is what says the writes landed.
+
+WHY THE FIX IS NOT "SCORE IT WITH A WRITE"
+------------------------------------------
+Scoring a write means writing to the card. A host driver running inside
+->execute_hs400_tuning has no scratch area it may spend: the callback runs
+during card init, before any partition table is known, and every sector belongs
+to somebody. There is no safe in-kernel write objective, so this patch does not
+invent one.
+
+WHAT IT ADDS INSTEAD
+--------------------
+One sysfs attribute per sunxi-mmc platform device, hs400_ds_dl, RW, -ENODEV on
+controllers without the strobe path:
+
+    read:  "<driver value> cfg <cfg default> reg 0x<SMHC_DS_DL as it reads>"
+    write: 0..63, sets host->ds_dl and, when the bus is in HS400, the register
+
+so the curve is one shell loop:
+
+    for i in $(seq 0 63); do
+        echo $i > /sys/bus/platform/drivers/sunxi-mmc/4022000.mmc/hs400_ds_dl
+        <fixed raw-region write benchmark>
+    done
+
+Three things make it an instrument rather than a poke:
+
+- The access is taken with pm_runtime_get_sync() and the driver's own spinlock.
+  ⚠ mmc_claim_host() is NOT usable here: it is declared in
+  drivers/mmc/core/core.h, a core-internal header that host drivers do not
+  include, and no in-tree host driver calls it (6.18.36). The
+  register block is runtime gated and reads all-zero when idle; the earlier
+  attempt at this curve (`mmc-sunxi-a733-hs400-data-strobe-delay-value`'s header) was taken by writing the register
+  between transfers and had to be recorded as NOT conclusive precisely because
+  some of those writes may never have landed. Reading the register back in the
+  same claimed section is what removes that doubt.
+- host->ds_dl is set too, not only the register, so the value survives the
+  runtime suspend/resume that reprograms the HS400 timing from host state
+  (sunxi_mmc_runtime_resume -> sunxi_mmc_set_clk -> sunxi_mmc_hs400_enable).
+- The store logs what it set and what the register then read, so the serial
+  capture carries the curve's x-axis even if the benchmark's output is lost.
+
+It does not replace the sweep: the sweep still runs at every init and still
+picks the read-scored midpoint. This overrides it afterwards, for the life of
+the mode.
+
+WHERE THE VALUES COME FROM
+--------------------------
+Register and field layout: a733-um-v0.92, 11.3.8.38 (SMHC_DS_DL, offset 0x0148,
+default 0x0000_2000) and 11.3.8.37 for the identically shaped SMHC_SAMP_DL.
+The two register values and the per-block timings are silicon readback on the 8 GiB board
+under load, dated 2026-09-19, with the card identified as SanDisk iNAND
+SDINBDV4-32G (DV4032, eMMC 5.1). No value comes from any kernel.
+
+VERIFIED / NOT VERIFIED
+-----------------------
+- Applies clean at fuzz 0 on a fresh unpack with the series in order: yes.
+- Builds: NOT claimed, not built here.
+- Silicon: NOT proven, and this patch's whole purpose is one session that
+  produces the curve. The observable that falsifies it as an instrument: write
+  a delay, read the attribute back, and the "reg" field must show that delay in
+  [5:0] with bit 7 set while the bus is in HS400. If the register does not
+  follow the write, the knob is not landing and the curve taken with it would
+  be worth nothing -- which is exactly the failure the earlier sweep could not
+  rule out.
+  The observable that falsifies the hypothesis behind it: a full 0..63 write
+  curve on the 8 GiB board whose maximum sits at the same delay the read-scored sweep
+  picks. Then the objective mismatch is not real and the read-scored sweep can
+  stay as it is.
+
+Assisted-by: Claude
+---
+--- a/drivers/mmc/host/sunxi-mmc.c
++++ b/drivers/mmc/host/sunxi-mmc.c
+@@ -3027,12 +3027,131 @@
+ 	RUNTIME_PM_OPS(sunxi_mmc_runtime_suspend, sunxi_mmc_runtime_resume, NULL)
+ };
+ 
++/*
++ * The HS400 data-strobe delay, as a knob -- the instrument for the one
++ * measurement the in-kernel sweep cannot take.
++ *
++ * sunxi_mmc_execute_hs400_tuning() scores each of the 64 delays with
++ * mmc_get_ext_csd(), which is a READ. That is the right objective for framing
++ * read data and the wrong one for the write path, and the write path is where
++ * this board loses: 139.1 MiB/s against the vendor stack's 152.5 on the same
++ * card, with the whole difference inside mmc_request_start ->
++ * mmc_request_done. In HS400 the card drives the strobe for its CRC status
++ * token as well as for read data, so the delay that best centres a read is not
++ * necessarily the delay that best centres the per-block status the write path
++ * waits on -- and the sweep lands on 11 where the vendor runs 2.
++ *
++ * A write-scored sweep cannot live in this callback: scoring a write means
++ * writing to the card, and there is no scratch area a host driver may spend.
++ * What can live here is the knob that lets a session produce the curve:
++ *
++ *     for i in $(seq 0 63); do
++ *         echo $i > /sys/bus/platform/drivers/sunxi-mmc/<dev>/hs400_ds_dl
++ *         <raw-region write benchmark, fixed size, fixed offset>
++ *     done
++ *
++ * Writing it sets host->ds_dl as well as the register, so the value survives
++ * the runtime suspend/resume that reprograms the HS400 timing from host state;
++ * reading it back reports the driver's value, the cfg default and the register
++ * as it actually reads, because the previous attempt at this curve was taken by
++ * poking the register between transfers and could not tell a write that landed
++ * from one that did not (`mmc-sunxi-a733-hs400-data-strobe-delay-value`'s header says so). The register access is taken
++ * with the controller resumed and the host claimed, which is what makes that
++ * difference.
++ *
++ * The knob does not replace the sweep. The sweep still runs and still picks the
++ * read-scored midpoint at every init; this overrides it afterwards, for as long
++ * as the mode lasts.
++ */
++static ssize_t hs400_ds_dl_show(struct device *dev,
++				struct device_attribute *attr, char *buf)
++{
++	struct mmc_host *mmc = dev_get_drvdata(dev);
++	struct sunxi_mmc_host *host = mmc_priv(mmc);
++	unsigned long flags;
++	u32 reg;
++	int ret;
++
++	if (!host->cfg->can_hs400)
++		return -ENODEV;
++
++	ret = pm_runtime_get_sync(host->dev);
++	if (ret < 0) {
++		pm_runtime_put_autosuspend(host->dev);
++		return ret;
++	}
++
++	spin_lock_irqsave(&host->lock, flags);
++	reg = mmc_readl(host, REG_DS_DL_REG);
++	spin_unlock_irqrestore(&host->lock, flags);
++
++	pm_runtime_put_autosuspend(host->dev);
++
++	return sysfs_emit(buf, "%u cfg %u reg 0x%08x\n",
++			  host->ds_dl, host->cfg->ds_dl, reg);
++}
++
++static ssize_t hs400_ds_dl_store(struct device *dev,
++				 struct device_attribute *attr,
++				 const char *buf, size_t count)
++{
++	struct mmc_host *mmc = dev_get_drvdata(dev);
++	struct sunxi_mmc_host *host = mmc_priv(mmc);
++	u32 val, reg;
++	unsigned long flags;
++	int ret;
++
++	if (!host->cfg->can_hs400)
++		return -ENODEV;
++
++	ret = kstrtou32(buf, 0, &val);
++	if (ret)
++		return ret;
++	if (val > SDXC_DS_DL_SW_MASK)
++		return -ERANGE;
++
++	ret = pm_runtime_get_sync(host->dev);
++	if (ret < 0) {
++		pm_runtime_put_autosuspend(host->dev);
++		return ret;
++	}
++
++	spin_lock_irqsave(&host->lock, flags);
++	host->ds_dl = val;
++	if (mmc->ios.timing == MMC_TIMING_MMC_HS400) {
++		reg = mmc_readl(host, REG_DS_DL_REG);
++		reg &= ~SDXC_DS_DL_SW_MASK;
++		reg |= val | SDXC_CAL_DL_SW_EN;
++		mmc_writel(host, REG_DS_DL_REG, reg);
++		reg = mmc_readl(host, REG_DS_DL_REG);
++	} else {
++		reg = 0;
++	}
++	spin_unlock_irqrestore(&host->lock, flags);
++
++	pm_runtime_put_autosuspend(host->dev);
++
++	dev_info(mmc_dev(mmc),
++		 "HS400: data-strobe delay set to %u by sysfs, register reads 0x%08x\n",
++		 val, reg);
++
++	return count;
++}
++static DEVICE_ATTR_RW(hs400_ds_dl);
++
++static struct attribute *sunxi_mmc_attrs[] = {
++	&dev_attr_hs400_ds_dl.attr,
++	NULL,
++};
++ATTRIBUTE_GROUPS(sunxi_mmc);
++
+ static struct platform_driver sunxi_mmc_driver = {
+ 	.driver = {
+ 		.name	= "sunxi-mmc",
+ 		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
+ 		.of_match_table = sunxi_mmc_of_match,
+ 		.pm = pm_ptr(&sunxi_mmc_pm_ops),
++		.dev_groups = sunxi_mmc_groups,
+ 	},
+ 	.probe		= sunxi_mmc_probe,
+ 	.remove		= sunxi_mmc_remove,

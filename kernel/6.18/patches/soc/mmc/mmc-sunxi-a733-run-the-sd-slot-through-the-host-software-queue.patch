@@ -1,0 +1,80 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] mmc: sunxi: a733: run the SD slot through the host software queue
+
+What. Set can_hsq on the A733 SD cfg (sun60i_a733_mmc_cfg, SMHC0). With it
+mmc_hsq_init() runs at probe, sd.c turns the queue on when it attaches the
+card (sd.c:1587, "Host Software Queue enabled"; not for SDUC cards), and the
+block layer issues SD reads and writes through mmc_blk_hsq_issue_rw_rq().
+Everything the queue needs is already in this driver and proven on the eMMC
+(`mmc-sunxi-a733-emmc-host-software-queue`): completions go through mmc_hsq_finalize_request(), a write still
+busy after 10 s fails for block-layer recovery, queue suspend/resume in
+runtime PM. This patch only lets the SD slot reach it.
+
+Why. On the legacy path the SD runs one request at a time and every
+write ends in a chain on the submitter: hard IRQ on CPU0 -> wake the
+submitter -> mmc_blk_card_busy() sends a CMD13 -> second IRQ -> second
+wake-up -> only then mmc_start_request() of the next request
+(block.c:2361-2396, 2039-2060). `mmc-sunxi-a733-hardware-busy-wait` made the host wait out the card's busy,
+so that CMD13 always finds the card ready; it is pure turnaround, and its
+cost scales with the clock of whichever A55 runs the submitter:
+
+  the 8 GiB board, 2026-09-23, copy-free O_DIRECT 4 MiB writer,
+  1 GiB, A55 floor 247 against 1196 MHz:
+    SD, 1 writer   62.5-65.0 against 63.8-67.4 MB/s (~3 %)
+    SD, 2 writers  62.5-65.0 against 65.1-66.0 MB/s (~2 %)
+    eMMC (hsq, `mmc-sunxi-a733-emmc-host-software-queue`), 2 writers 151.7-154.7 against 152.9-157.9 MiB/s
+
+With the queue the next request starts from the completion of the one
+before (mmc_hsq_post_request -> mmc_hsq_pump_requests), in the IRQ path,
+and the block layer sends no CMD13 after a write (mmc_blk_hsq_req_done(),
+block.c:2122). The submitter's wake-ups leave the critical path. That is
+the lever the image's A55 cpufreq floor (scripts/build.sh, tmpfiles) stood
+in for; the floor is to go once this is measured.
+
+Why SD was left out before. `mmc-sunxi-a733-emmc-host-software-queue` followed the vendor, who enables hsq on the
+eMMC node only (cap-hsq on sdc2, none on sdc0); no technical reason is given
+there or in the vendor tree. Mainline runs hsq on removable SD slots:
+mtk-sd and sdhci-sprd, the two other users of MMC_HSQ.
+
+What the vendor does instead. It keeps the SD on the legacy path but waits
+the write busy on DAT0 inside its own IRQ path before completing
+(sunxi-mmc.c, sunxi_check_r1_ready_may_sleep via the IRQ thread), so its
+CMD13 also always finds the card ready -- the same result as `mmc-sunxi-a733-hardware-busy-wait`, with the
+same one-request-at-a-time turnaround left in place. Nothing taken; this
+covers the turnaround the vendor leaves.
+
+Risks, SD-specific, read in 6.18.36:
+- Card removal: the SD slot has card detect. mmc_sd_detect() -> removal
+  goes through mmc_remove_card() with the queue's cqe_off/disable as on the
+  other hsq hosts; not exercised on silicon here (root is on this card).
+- Retune (SDR104): hsq requests start through mmc_cqe_start_req(), which
+  runs the core's retune hold/release like the legacy path.
+- The busy hold for a write rises from 1 s to 10 s (SDXC_HSQ_WRITE_BUSY_
+  TIMEOUT_MS), matching what the core's CMD13 poll would have allowed.
+
+Proof wanted (the 8 GiB board, own label, against the same image's default kernel):
+"mmc0: Host Software Queue enabled" at attach; the copy-free writer's
+247/1196 MHz gap at one writer at or below the two-writer figure above;
+no CMD13 between SD write requests; 256 MiB
+pattern verify OK and 0 mmc errors; 4k reads unchanged within spread; cold
+boot at SDR104 with root on the card. Falsifier: the one-writer gap stays at
+~3 %, or any error line or verify mismatch.
+
+Assisted-by: Claude
+---
+--- a/drivers/mmc/host/sunxi-mmc.c
++++ b/drivers/mmc/host/sunxi-mmc.c
+@@ -2887,6 +2887,13 @@
+ 	.needs_new_timings = true,
+ 	.fifoth = 0x300f00f0,
+ 	.can_wait_busy = true,
++	/*
++	 * The SD slot runs the host software queue too: the next request starts
++	 * from the completion of the one before instead of after a wake-up of
++	 * the submitter and a CMD13 poll. sd.c turns it on at attach,
++	 * except for SDUC cards. can_wait_busy above is what makes it safe.
++	 */
++	.can_hsq = true,
+ };
+ 
+ static const struct sunxi_mmc_cfg sun60i_a733_emmc_cfg = {

@@ -1,0 +1,122 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: a733: describe PWM0 and PWM1
+
+The controllers themselves, and nothing about any board's use of them. This is
+SoC description: every A733 has these two blocks at these addresses with these
+clocks, whether or not anything is wired to a pin.
+
+  PWM0  0x02527000  INTID 67 = GIC SPI 35
+  PWM1  0x02528000  INTID 68 = GIC SPI 36
+
+Bases and interrupts from the A733 user manual (V0.92, memory map and
+interrupt list). The aperture is a 4 KiB module
+but the documented registers stop at 0x364 -- PCR(9) at 0x0100 + 9 * 0x0040 plus
+0x24 for the last capture register -- so the node maps 0x400, the same shape the
+THS node uses.
+
+Three clocks and one reset. "bus" is the PWMn_BGR gate added by `clk-sunxi-ng-a733-add-pwm0-pwm1-gates-and-resets`; without it
+the aperture is dead, because bit 0's reset value is 0 = "Mask". "hosc" and
+"apb" are not driver bookkeeping, they are the two inputs the block's own
+PCCR.CLK_SRC mux selects between (UM 18.7.8.7), so both
+must be reachable phandles.
+
+⚠ "hosc" is osc24M, the SYS_CLK24M net that the UM fixes at 24 MHz
+-- not dcxo26M. On this SoC those are different nets, and the wrong one
+here would make every programmed period 8 % short with nothing anywhere
+reporting it. The DCXO reaches the CPU PLLs and the always-on S_PWM, not this
+block.
+
+Both nodes are `status = "disabled"`. That is the SoC/board line: whether a PWM
+channel ever reaches a pin is a board decision, so the pinctrl state and the
+"okay" live in the board's own section, and a design that drives nothing with
+PWM inherits these two nodes and adds nothing. The driver holds up its end --
+probe maps registers, takes clocks, de-asserts the reset and writes no PER, PCGR
+or PCR bit -- so even an enabled controller with no consumer leaves pins alone.
+
+⚠ This tree still has a single .dts rather than a SoC .dtsi plus a board .dts,
+so "SoC section" and "board section" are places in one file rather than two
+files. These nodes go in the soc {} block with the rest of the SoC; the fan and
+its cooling map go at the end with the board's other overrides. When the file is
+split, this patch's content belongs entirely in the .dtsi and 0922's entirely in
+the board file; the split is the correct fix and is not this patch's job.
+
+S_PWM at 0x07023000 is deliberately not described. Its register file is
+documented as identical, but its clock sources are not (DCXO / RTC_32K / RC16M /
+SYS_CLK24M), which means a CLK_SRC encoding that has not
+been read. A guessed compatible would bind a driver that computes every period
+against the wrong rate and reports success.
+
+Verified in the decompiled dtb: both nodes present, disabled, with three clock
+phandles each resolving to the CCU gate, sys24M-clk and the CCU's APB0.
+
+HW proof pending: two pwmchips appear under /sys/class/pwm once the board
+section enables one, and 0x02002784 / 0x0200278C read 0x00010001.
+
+Assisted-by: Claude
+---
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -1479,6 +1479,63 @@
+ 			#thermal-sensor-cells = <1>;
+ 		};
+ 
++		/*
++		 * PWM0 and PWM1. Ten channels each; the documented registers end
++		 * at 0x364 (0x0100 + 9 * 0x0040 + 0x24) so 0x400 covers the block
++		 * (bases from the memory map of the A733 user manual V0.92,
++		 * IRQs from its interrupt list -- PWM0 is INTID 67 =
++		 * GIC SPI 35, PWM1 is INTID 68 = GIC SPI 36. The driver added with
++		 * these nodes does not use the interrupt (it implements no
++		 * capture); the line exists in the silicon, so it is described.
++		 *
++		 * Three clocks, because this block selects its own source. "bus"
++		 * is the PWMn_BGR gate, whose reset default is masked. "hosc" and
++		 * "apb" are the two inputs PCCR.CLK_SRC picks between (UM 18.7.8.7,
++		 * A733 user manual), so both have to be named phandles: the
++		 * driver asks each one for its rate and takes whichever leaves the
++		 * most counter steps in the requested period.
++		 *
++		 * ⚠ "hosc" is osc24M -- the SYS_CLK24M net, fixed at 24 MHz
++		 * (A733 user manual). NOT dcxo26M. The 26 MHz crystal feeds the CPU
++		 * PLLs and the always-on S_PWM; wiring it here would make every
++		 * period 8 % short and nothing would report it.
++		 *
++		 * Disabled on purpose, and this node is SoC description only:
++		 * whether a PWM channel reaches a pin at all is a board decision,
++		 * so the pinctrl state and the "okay" belong in the board's own
++		 * section. An A733 design that drives nothing with PWM takes these
++		 * two nodes and adds nothing; one that muxes PJ27 to something
++		 * else is not disturbed, because the driver writes no PER, PCGR or
++		 * PCR bit at probe.
++		 *
++		 * S_PWM at 0x07023000 is deliberately absent. Same register file,
++		 * different clock sources (DCXO / RTC_32K / RC16M / SYS_CLK24M,
++		 * A733 user manual), therefore a different CLK_SRC encoding
++		 * that has not been read. A guessed compatible would bind a driver
++		 * that computes every period against the wrong rate.
++		 */
++		pwm0: pwm@2527000 {
++			compatible = "allwinner,sun60i-a733-pwm";
++			reg = <0x0 0x02527000 0x0 0x400>;
++			interrupts = <GIC_SPI 35 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&ccu CLK_BUS_PWM0>, <&osc24M>, <&ccu CLK_APB0>;
++			clock-names = "bus", "hosc", "apb";
++			resets = <&ccu RST_BUS_PWM0>;
++			#pwm-cells = <3>;
++			status = "disabled";
++		};
++
++		pwm1: pwm@2528000 {
++			compatible = "allwinner,sun60i-a733-pwm";
++			reg = <0x0 0x02528000 0x0 0x400>;
++			interrupts = <GIC_SPI 36 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&ccu CLK_BUS_PWM1>, <&osc24M>, <&ccu CLK_APB0>;
++			clock-names = "bus", "hosc", "apb";
++			resets = <&ccu RST_BUS_PWM1>;
++			#pwm-cells = <3>;
++			status = "disabled";
++		};
++
+ 		gmac0: ethernet@4500000 {
+ 			compatible = "allwinner,sun60iw2-gmac200",
+ 				     "snps,dwmac-5.30a";

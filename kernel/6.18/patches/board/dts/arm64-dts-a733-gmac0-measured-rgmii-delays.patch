@@ -1,0 +1,73 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: a733: add the measured RGMII delays to gmac0
+
+Patch `arm64-dts-a733-add-gmac0-ethernet` set phy-mode = "rgmii-id" on the assumption that the Maxio driver
+adds the whole RGMII clock delay at the PHY, and it flagged that choice as the
+one item still to validate at a real 1000M link. Validated now, on hardware, and
+the assumption does not hold.
+
+With the MAC delay fields of GMAC_CFG left at zero the link trains normally --
+"Link is Up - 1Gbps/Full - flow control rx/tx" -- but not a single frame
+survives the data path: udhcpc gets no lease ("broadcasting discover / no
+lease") and ping loses 100 %. Link training only exercises autonegotiation, so
+"link up" says nothing about RGMII timing.
+
+Sweeping the MAC TX delay on the running board, RX held at the vendor's 10
+(8 GiB board, mainline 6.18.36, 2026-07-21, gateway on a gigabit switch):
+
+	GMAC_CFG    TX     result
+	0x00000146   0     100 % packet loss
+	0x00001146   4     100 % packet loss
+	0x00001d46   7       0 % packet loss
+	0x00011146  12       0 % packet loss   (the vendor value)
+
+700 ps is therefore the smallest working setting, and it matters that it works:
+the mainline glue programs ETXDC through SYSCON_ETXDC_MASK = GENMASK(12, 10),
+three bits, so it cannot express the vendor's 12 at all -- that would need the
+ETXDC_H bits 17:16, which the driver does not model. Had only 12 worked this
+would have been a driver patch instead of a DT one.
+
+RX keeps the vendor's 1000 ps; it was not swept independently, so it is carried
+over rather than claimed as minimal.
+
+Verified under load at TX 700 / RX 1000: 40/40 pings at 0 % loss, and a 41 MB
+HTTP transfer whose sha256 matched the source byte for byte.
+
+phy-mode stays "rgmii-id", which is the mode the measurement was taken in, and
+the PHY side was read back rather than assumed. Patch `net-phy-add-maxio-mae0621a-driver`'s config_init ORs
+TX_DELAY (bits 6,7) and RX_DELAY (bits 4,5) into page 0xd96 register 0 for
+PHY_INTERFACE_MODE_RGMII_ID, so that register should read 0x11f0 once the driver
+has run. A clause-22 read driven straight through MAC_MDIO_Address/Data on the
+running board returns 0x00001140: bits 6, 8 and 12 set, bit 7 clear and both RX
+bits clear. The PHY-side delay write therefore does not land, which is why the
+MAC has to carry the whole delay -- and it is a bug in `net-phy-add-maxio-mae0621a-driver` in its own right,
+tracked separately. Should that write ever start working, these two values must
+be re-measured, not kept.
+
+Assisted-by: Claude
+---
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -1392,6 +1392,22 @@
+ 			pinctrl-names = "default";
+ 			pinctrl-0 = <&rgmii0_pins>;
+ 			phy-mode = "rgmii-id";
++			/*
++			 * Measured on hardware 2026-07-21 (8 GiB board, 1000M
++			 * link to the switch): the PHY-side delay implied by
++			 * "rgmii-id" does NOT carry the link on its own. With
++			 * GMAC_CFG delays at zero the link trains at 1 Gbps but
++			 * no frame survives -- DHCP gets no lease and every ping
++			 * is lost. Sweeping the MAC TX delay at RX = 10 gave
++			 * 100 % loss at TX 0 and TX 4, and 0 % loss at TX 7 and
++			 * TX 12 (the vendor value). 700 ps is the lowest setting
++			 * that works and stays inside the 3-bit ETXDC field the
++			 * mainline glue can program; RX follows the vendor at
++			 * 1000 ps. Verified under load: 40/40 pings and a 41 MB
++			 * HTTP transfer that matched sha256 byte for byte.
++			 */
++			tx-internal-delay-ps = <700>;
++			rx-internal-delay-ps = <1000>;
+ 			phy-handle = <&ext_rgmii_phy>;
+ 			phy-supply = <&reg_swout1>;
+ 			status = "okay";

@@ -1,0 +1,119 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: allwinner: A733 mmc0 SD UHS SDR104
+
+License: GPL-2.0-only OR MIT (DT patch).
+
+Turn on SD UHS (SDR50 / SDR104, 1.8 V signalling) on the A733 SD slot
+(mmc0 / SMHC0, bank PF), driven by the PF I/O-voltage power-source pinconf
+added in patch `pinctrl-sunxi-a733-pf-io-voltage-power-source` -- no variable vqmmc regulator.
+
+Pin groups
+----------
+Split the PF pin group into two states that carry the signalling voltage
+as a power-source pinconf (microvolts, the driver's unit contract):
+ - mmc0_pins (default): PF0..PF5, pinmux 2, function mmc0, 3.3 V.
+ - mmc0_pins_1v8: identical pins/mux/function, 1.8 V.
+
+mmc0 controller node
+--------------------
+ - pinctrl-names = "default", "sdmmc-3v3", "sdmmc-1v8". The two voltage names
+   are the documented Tegra pair (nvidia,tegra20-sdhci.yaml: "pad configuration
+   for 3.3 V / 1.8 V"), which is exactly the semantics here. `mmc-sunxi-pad-io-voltage-switch-without-vqmmc` is what makes
+   sunxi-mmc.c look them up; before it, this file had no pinctrl reference at
+   all and an earlier revision of this patch invented a "sdmmc-1v8" name that
+   nothing in the tree read. That cost three board sessions.
+ - REMOVE vqmmc-supply. It was a fixed 3.3 V rail; mmc_regulator_set_vqmmc()
+   would fail the 1.8 V request and sunxi_mmc_volt_switch() returns -EIO.
+   With vqmmc absent the driver skips the regulator path and the 1.8 V
+   switch is done purely by the sdmmc-1v8 pinctrl state -> power-source ->
+   GPIO_POW_VAL_SET_CTL (0x0070). vmmc-supply (card power) is kept as-is.
+ - add sd-uhs-sdr50 + sd-uhs-sdr104; keep cap-sd-highspeed.
+ - max-frequency 150 MHz -> 200 MHz (SDR104).
+
+⚠ **This is the half that broke the card on 2026-07-29.** With the pads still
+at 3.3 V -- because the power-source property reached no driver, see `pinctrl-sunxi-parse-the-generic-power-source-property` --
+advertising sd-uhs-sdr50/sdr104 made the mmc core switch the card to 1.8 V
+signalling against 3.3 V pads, and the SD stopped enumerating entirely. Three
+boots of one kernel isolated it: both patches = no card, `pinctrl-sunxi-a733-pf-io-voltage-power-source` + pre-patch DT =
+card fine, `arm64-dts-allwinner-a733-sd-uhs-sdr104` minus the two sd-uhs lines = card fine. So the driver half, the
+vqmmc removal, the sdmmc-1v8 state and 200 MHz are all harmless; these two
+capability lines are the trigger, and they are only safe once the pads actually
+follow.
+
+**Test this in two steps, not one.** The kernel stage can be pointed at another
+series file (A7S_KERNEL_SERIES), so the control kernel is a build with
+`arm64-dts-allwinner-a733-sd-uhs-sdr104` left out: it answers "does the register move
+at all" without risking the card. Only when GPIO_POW_VAL_SET_CTL is observed
+changing with the sdmmc-1v8 state does the full series get a boot. If the card
+disappears again, the pads are still not following and the caps come back out.
+
+Evidence for the 1.8 V mechanism: GPIO_POW_VAL_SET_CTL (0x0070) + A733
+UM v0.92 (VCC_PF_PWR_VOL_SEL, 0=1.8V/1=3.3V) + silicon readback on two 6 GiB boards,
+2026-07-29 (0x0070 = 0x0 at SDR104). Pins/IRQ/CD/rails are unchanged from
+patch `arm64-dts-allwinner-a733-add-sd-emmc` (already silicon-derived on the 6 GiB board and the 8 GiB board).
+
+HW-effect PENDING: a green build / clean dtc is not proof of the hardware
+effect. Unproven until a board test on the 8 GiB board shows the SD card negotiating
+SDR104 at 1.8 V through these states, with 0x0070 reading 0x0 during 1.8 V
+signalling.
+
+Assisted-by: Claude
+---
+diff --git a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+index 75b4da2dd..a9b29f371 100644
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -561,6 +561,17 @@ mmc0_pins: mmc0-pins {
+ 				       "PF3", "PF4", "PF5";
+ 				allwinner,pinmux = <2>;
+ 				function = "mmc0";
++				/* 3.3 V default signalling. Microvolts. */
++				power-source = <3300000>;
++			};
++
++			mmc0_pins_1v8: mmc0-pins-1v8 {
++				pins = "PF0", "PF1", "PF2",
++				       "PF3", "PF4", "PF5";
++				allwinner,pinmux = <2>;
++				function = "mmc0";
++				/* 1.8 V UHS signalling. Microvolts. */
++				power-source = <1800000>;
+ 			};
+ 
+ 			/*
+@@ -777,15 +788,32 @@ mmc0: mmc@4020000 {
+ 			resets = <&ccu RST_BUS_SMHC0>;
+ 			reset-names = "ahb";
+ 			interrupts = <GIC_SPI 161 IRQ_TYPE_LEVEL_HIGH>;
+-			pinctrl-names = "default";
++			/*
++			 * The mmc core selects the "sdmmc-1v8" state (`mmc-sunxi-pad-io-voltage-switch-without-vqmmc` looks it up by
++			 * name, sunxi-mmc.c pinctrl_lookup_state) during UHS
++			 * negotiation; its power-source pinconf drives the SoC PF
++			 * voltage bit (GPIO_POW_VAL_SET_CTL) to 1.8 V, and back to
++			 * 3.3 V with the default state. No variable vqmmc rail.
++			 */
++			pinctrl-names = "default", "sdmmc-3v3", "sdmmc-1v8";
+ 			pinctrl-0 = <&mmc0_pins>;
++			pinctrl-1 = <&mmc0_pins>;
++			pinctrl-2 = <&mmc0_pins_1v8>;
+ 			vmmc-supply = <&reg_vcc3v3>;
+-			vqmmc-supply = <&reg_vcc3v3>;
++			/*
++			 * No vqmmc-supply on purpose. A fixed 3.3 V vqmmc makes
++			 * mmc_regulator_set_vqmmc() fail the 1.8 V request and
++			 * sunxi_mmc_volt_switch() returns -EIO; with it absent the
++			 * driver skips the regulator path and the 1.8 V switch is
++			 * done purely by the sdmmc-1v8 pinctrl state above.
++			 */
+ 			cd-gpios = <&pio 5 6 GPIO_ACTIVE_HIGH>;	/* PF6 = pin 166; card-in reads HIGH on this board */
+ 			bus-width = <4>;
+-			max-frequency = <150000000>;
++			max-frequency = <200000000>;
+ 			cap-sd-highspeed;
+ 			cap-mmc-highspeed;
++			sd-uhs-sdr50;
++			sd-uhs-sdr104;
+ 			#address-cells = <1>;
+ 			#size-cells = <0>;
+ 			status = "okay";

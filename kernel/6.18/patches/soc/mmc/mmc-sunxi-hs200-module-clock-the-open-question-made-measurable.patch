@@ -1,0 +1,285 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] mmc: sunxi: HS200 module clock -- the open question, made measurable
+
+HS200 may be running at half the card clock the driver reports, exactly as
+SDR104 did until `mmc-sunxi-sd-sdr104-module-clock-and-fifoth`. This patch puts HS200 on the doubling branch so that one
+board session settles it, and it says plainly that the manual does not settle
+it, because it does not.
+
+WHAT THE UM CARRIES, AND WHAT IT DOES NOT
+-----------------------------------------
+Asked directly of a733-um-v0.92 and answered directly:
+
+- SMHC_NTSR[31] MODE_SEL, 11.3.8.23, offset 0x005C, default 0x8171_0000:
+  0 selects the old sample/output timing mode, 1 the new one (default 1).
+  That is the entire entry. It is a sample and output *timing* selector.
+  No frequency, no ratio.
+- 11.3.5.6 (the phase-offset section for command and data) uses MODE_SEL and
+  HS400_NEW_SAM_EN as step 1 of choosing *phase offsets*, and Table 11-9 then
+  splits the DDR4 row into a 1x mode (0x5c[31]=0) and a 2x mode (0x5c[31]=1)
+  and the HS400 row into a 1x mode (0x5c[0]=0) and a 2x mode (0x5c[0]=1). The SDR row
+  and the DDR8 row carry no 1x/2x split at all.
+- SMHC_CLKDIV[7:0] CCLK_DIV, 11.3.8.2: divides the source
+  clock by 2*n (n = 0..255); the field must be 0 whenever HS400_MD_EN is set.
+- The one place a factor of two between the card-clock time base and real time
+  is documented is the SMHC_TMOUT note, 11.3.8.3: the effective timeout is only half
+  of the programmed value in three cases: DDR8 mode; DDR4 with
+  SMHC_NTSR[MODE_SELEC](0x5C[31]) high; HS400 with
+  SMHC_NTSR[HS400_NEW_SAMPLE_EN](0x5C[0]) high. The timeout is counted in card
+  clock periods, so the halving means the counter runs at twice the card
+  clock in those three cases.
+
+**HS200 is SDR and is in none of the three.** So there is no UM line that
+carries the mechanism for HS200, and this header does not invent one. What the
+UM does establish is that the halving exists as a concept in this controller and
+that it is enumerated by mode, not implied by MODE_SEL in general.
+
+WHAT SILICON CARRIES
+--------------------
+HS200 itself was measured on the 8 GiB board on 2026-09-19, for the first time on this
+board, from a boot label whose only difference from the delivery one is a DT
+with mmc-hs400-1_8v removed:
+
+    dmesg                     mmc0: new HS200 MMC card at address 0001
+    debugfs mmc0/ios          clock 200000000, actual clock 200000000,
+                              timing spec 9 (mmc HS200), 1.80 V
+    CCU SMHC2_CLK  0x02002D20 = 0x81000003   -> 200 MHz module clock
+    SMHC_CLKDIV    0x04022004 = 0x00010000   CCLK_ENB=1, CCLK_DIV=0
+    SMHC_NTSR      0x0402205C = 0x81710000   MODE_SEL[31]=1, new timing ON
+    EMMC_DSBD      0x0402210C = 0x00000000   HS400_MD_EN=0 (correct for HS200)
+    raw-region benchmark, 2 GiB raw region behind eMMC p3, performance, cpu7:
+                              seqwrite 1 MiB  83.8 MiB/s, verify_bad = 0
+                              seqread  1 MiB  88.4 MiB/s
+
+All registers read under load, because the block reads zero when the module
+clock is gated. So: module clock 200 MHz, new timing mode on, CCLK_DIV 0, and
+the driver believing the card clock is 200 MHz.
+
+88.4 MiB/s on an 8-bit bus is 93 % of the ceiling at a 100 MHz card clock and
+46 % of the ceiling at 200 MHz, on a card and controller that reach roughly
+70 % of the HS400 ceiling in the harder mode. A 100 MHz card clock fits; a
+200 MHz one would require the simpler mode to be half as efficient as the
+harder one. That is an inference from a throughput number, not a reading of the
+card clock, and it is stated as one.
+
+The second piece of silicon is one SDR mode on this controller family that has
+already been measured and did need the doubling: the 8 GiB board, 2026-08-08, SD slot in
+SDR104, from `mmc-sunxi-sd-sdr104-module-clock-and-fifoth` --
+
+    SMHC0_CLK 0x81000001   M=1, 200 MHz module    45.1 MB/s
+    SMHC0_CLK 0x81000000   M=0, 400 MHz module    80.6 MB/s
+
+same card, same slot, same method, and mmc->actual_clock read 200 MHz in both.
+45.1 MB/s is 4-bit at 100 MHz; 80.6 is 4-bit at 200. That is the new timing path
+halving an SDR mode's clock -- the mechanism this patch assumes for HS200, from
+a measurement on a different instance in a different mode, not from the manual.
+
+Taken together: HS200 has been running at a 100 MHz card clock on an 8-bit bus,
+a 100 MB/s ceiling, while the driver, the debugfs ios file and every number
+taken from them said 200 MHz and 200 MB/s.
+
+WHAT THIS CHANGES
+-----------------
+One term in the doubling condition, plus the instrument that makes the answer
+readable: a dev_info naming the module clock, the divider, the resulting card
+clock and CCLK_DIV, printed for the modes where a divider is claimed at all.
+mmc->actual_clock cannot serve that purpose -- it is rate/div and therefore
+reports what the driver believes, which is how SDR104 hid for six weeks.
+
+WHAT THIS DELIBERATELY DOES NOT TOUCH: SMHC_NTSR[31] AND THE 2x CLOCK
+---------------------------------------------------------------------
+Silicon under load on the 8 GiB board reads SMHC_NTSR 0x81710000 for us against 0x01710000
+for the vendor: ours is the UM reset default with MODE_SEL = 1 (new timing),
+the vendor deviates to MODE_SEL = 0 (old timing) and writes this eMMC faster.
+That is not changed here and must not be changed on its own, because MODE_SEL
+and the divider are one setting in two registers: clearing MODE_SEL selects the
+1x sample/output timing, and every mode this function doubles the module clock
+for is doubled on the assumption of the 2x path. Clearing one without the other
+leaves the card clocked at twice or half its intended rate with no error
+anywhere.
+
+A board experiment that touches it has to move all of the following together,
+in one kernel, and read all of them back at the register under load:
+
+  1. SMHC_NTSR[31] MODE_SEL     1 -> 0
+  2. the div/clock doubling in this function, for the mode under test, 2 -> 1
+     (so the module clock stays at the card clock)
+  3. SMHC_CLKDIV[7:0] CCLK_DIV  -- stays 0 in HS400 (the UM forbids anything
+     else while HS400_MD_EN is set) and is the knob that would otherwise have
+     to absorb the change in the other modes
+  4. SMHC_DRV_DL[17] DAT_DRV_PH_SEL and [16] CMD_DRV_PH_SEL -- Table 11-9
+     gives different phase offsets for the 1x and 2x rows, so the drive phase
+     that is correct at 2x is not the one that is correct at 1x
+  5. the data-strobe sweep (HS400) and the sample-delay sweep, both of which
+     are functions of the module clock and must be allowed to re-run; no
+     constant from a 2x run may be carried into a 1x run
+
+and it has to be judged on a *write* benchmark, because that is where the
+deficit is. Anything less than all five is not an experiment, it is a boot that
+happens to survive.
+
+WHERE THE VALUES COME FROM
+--------------------------
+UM facts cited above (a733-um-v0.92, 11.3.8.2, 11.3.8.3, 11.3.8.23, 11.3.5.6 /
+Table 11-9). The SDR104 numbers are from `mmc-sunxi-sd-sdr104-module-clock-and-fifoth`'s silicon run on the 8 GiB board,
+2026-08-08. The NTSR readback was taken on the board.
+No value is taken from any kernel.
+
+VERIFIED / NOT VERIFIED
+-----------------------
+- Applies clean at fuzz 0 on a fresh unpack with the series in order: yes.
+- Builds: NOT claimed, not built here.
+- Silicon: NOT proven, and this patch is written so that one session proves or
+  refutes it. The falsifier, on the 8 GiB board, eMMC forced to HS200 (U-Boot:
+  "fdt rm /soc/mmc@4022000 mmc-hs400-1_8v"), both arms from one image with
+  A7S_SKIP_PATCHES set to this patch's name:
+
+    * read SMHC2_CLK at the CCU under load -- the block is runtime gated and
+      reads all-zero when idle -- and record M and the source select;
+    * record sequential read and write MiB/s from the same raw-region
+      benchmark used for the earlier measurement.
+
+  With the patch, SMHC2_CLK must move from 0x81000003 to a 400 MHz module clock
+  and the console must print "module 400000000 Hz / 2 = card 200000000 Hz".
+  The row that decides is the throughput: read must leave 88.4 MiB/s and move
+  toward 150-180. If it does not move, HS200 was already running at 200 MHz,
+  this patch is wrong -- revert it -- and the SMHC_TMOUT enumeration was the
+  correct reading after all. Write (83.8 MiB/s) is the second row and the one
+  raised in an earlier bug report; it may move less, because the write path's per-block cost is
+  a separate question from the bus rate.
+
+ISSUE
+-----
+"Correct and fast in HS400 and in HS200" cannot be claimed while
+nobody knows what the HS200 card clock is.
+
+AMENDED: THE LINE PRINTS ON A CHANGE, NOT ON EVERY CALL
+-------------------------------------------------------
+The HS200 arm is HW-proven (the 8 GiB board, 2026-09-19), so the line
+stays and its visibility goes down. Runtime PM
+autosuspends the host after 50 ms and sunxi_mmc_runtime_resume() re-runs
+sunxi_mmc_set_clk() with unchanged ios on every wake-up, so the line reached
+the 115200-baud console about 1200 times per 100 min of uptime. Measured on
+the 8 GiB board on 2026-09-23, first 4 KiB O_DIRECT read after a 1 s pause,
+median: 12.5 ms with runtime PM auto and console loglevel 7, 2.5 ms with
+runtime PM held on, 2.6 ms with PM auto and loglevel 5. The ~10 ms is the
+synchronous console write; the resume itself costs ~0.1-0.2 ms.
+
+The host now keeps the last timing, card clock and CCLK_DIV it saw. The line
+is dev_info when any of the three differs from the last call and dev_dbg
+otherwise (dyndbg func sunxi_mmc_clk_set_rate brings every call back).
+Runtime PM behaviour is not changed.
+
+Amendment verified: applies at fuzz 0 in series on a fresh 6.18.36 unpack.
+Not proven on silicon. Falsifier: after boot the clk line appears once per
+real change of timing/clock, not per resume; the first read after a pause is
+~2.5 ms with console loglevel 7.
+
+Assisted-by: Claude
+---
+--- a/drivers/mmc/host/sunxi-mmc.c
++++ b/drivers/mmc/host/sunxi-mmc.c
+@@ -462,6 +462,16 @@
+ 	unsigned int	samp_dl_clock;
+ 
+ 	/*
++	 * What the "clk:" line in sunxi_mmc_clk_set_rate() last saw: the
++	 * timing, the resulting card clock and CCLK_DIV. Runtime resume
++	 * re-runs that function with unchanged ios on every wake-up, so only
++	 * a change is worth dev_info.
++	 */
++	unsigned char	clk_last_timing;
++	long		clk_last_rate;
++	u32		clk_last_cclk_div;
++
++	/*
+ 	 * Hardware busy wait (cfg->can_wait_busy). busy_wait is set while a
+ 	 * request has finished on the bus and the card still holds DAT0;
+ 	 * busy_seq tells busy_work which wait it was started for, because the
+@@ -1580,7 +1590,45 @@
+ 	     * 1x and nobody checked whether SDR104 had the same defect.
+ 	     */
+ 	    ios->timing == MMC_TIMING_UHS_SDR104 ||
+-	    ios->timing == MMC_TIMING_UHS_SDR50) {
++	    ios->timing == MMC_TIMING_UHS_SDR50 ||
++	    /*
++	     * HS200 is the same question one more mode over, and the UM does
++	     * not answer it. The only place the A733 UM documents a factor of
++	     * two between the card-clock time base and real time is the
++	     * SMHC_TMOUT note (11.3.8.3): the effective timeout is only half of
++	     * the programmed value in three cases, DDR8 mode, DDR4 with SMHC_NTSR[MODE_SELEC]
++	     * (0x5C[31]) high, and HS400 with
++	     * SMHC_NTSR[HS400_NEW_SAMPLE_EN](0x5C[0]) high. HS200 is SDR and
++	     * appears in none of the three, and MODE_SEL itself is described
++	     * purely as a sample/output *timing* selector (11.3.8.23) with no
++	     * frequency or ratio attached.
++	     *
++	     * What says HS200 belongs here is silicon, on this controller
++	     * family and on an SDR mode: the 8 GiB board, 2026-08-08, SD in SDR104 with
++	     * SMHC0_CLK 0x81000001 (200 MHz module) delivered 45.1 MB/s and
++	     * with 0x81000000 (400 MHz module) 80.6 MB/s on the same card,
++	     * while mmc->actual_clock read 200 MHz in both cases (`mmc-sunxi-sd-sdr104-module-clock-and-fifoth`). The
++	     * halving is therefore not a DDR property; it is what the new
++	     * timing path does on the way to the card.
++	     *
++	     * HS200 itself, measured on the 8 GiB board on 2026-09-19 with a
++	     * boot label whose only difference is the removed mmc-hs400-1_8v
++	     * property in DT: SMHC2_CLK
++	     * reads 0x81000003 under load, a 200 MHz module clock, while
++	     * /sys/kernel/debug/mmc0/ios reports a 200 MHz card clock -- the
++	     * same shape of disagreement SDR104 had -- and the raw-region
++	     * benchmark returns 88.4 MiB/s read and 83.8 MiB/s write. On an
++	     * 8-bit bus that is 93 % of the ceiling at a 100 MHz card clock
++	     * and 46 % of the ceiling at 200 MHz, on a card that reaches
++	     * ~70 % of its HS400 ceiling. Consistent with 100 MHz, not with
++	     * 200.
++	     *
++	     * Consistent is not proof, which is why this line is the
++	     * experiment and not a fact: with it the module clock is 400 MHz
++	     * and the card clock 200, and A7S_SKIP_PATCHES gives the other
++	     * arm. The commit message names the same falsifier.
++	     */
++	    ios->timing == MMC_TIMING_MMC_HS200) {
+ 		div = 2;
+ 		clock <<= 1;
+ 	}
+@@ -1683,6 +1731,39 @@
+ 	/* And we just enabled our clock back */
+ 	mmc->actual_clock = rate;
+ 
++	/*
++	 * The instrument for the paragraph above, and for every future
++	 * argument about this divider. mmc->actual_clock is rate/div, so it
++	 * tells a reader what the driver believes and nothing about what the
++	 * module clock is doing -- which is exactly how SDR104 ran at half its
++	 * reported clock for six weeks (`mmc-sunxi-sd-sdr104-module-clock-and-fifoth`). Print both sides and the
++	 * divider that separates them, for the modes where a divider is
++	 * claimed at all.
++	 *
++	 * The HS200 arm is settled on silicon (the 8 GiB board, 2026-09-19), so the
++	 * visibility went down, not the line: dev_info only when the timing,
++	 * the card clock or CCLK_DIV differ from the last call, dev_dbg
++	 * otherwise. Runtime resume (autosuspend 50 ms) calls this with the
++	 * same ios after every I/O pause; at console loglevel 7 each dev_info
++	 * was ~10 ms of synchronous 115200-baud output on the first request
++	 * after the pause (the 8 GiB board, 2026-09-23).
++	 */
++	if (div != 1) {
++		if (ios->timing != host->clk_last_timing ||
++		    rate != host->clk_last_rate ||
++		    clkdiv - 1 != host->clk_last_cclk_div)
++			dev_info(mmc_dev(mmc),
++				 "clk: timing %d, module %ld Hz / %u = card %ld Hz, CCLK_DIV %u\n",
++				 ios->timing, rate * div, div, rate, clkdiv - 1);
++		else
++			dev_dbg(mmc_dev(mmc),
++				"clk: timing %d, module %ld Hz / %u = card %ld Hz, CCLK_DIV %u\n",
++				ios->timing, rate * div, div, rate, clkdiv - 1);
++	}
++	host->clk_last_timing = ios->timing;
++	host->clk_last_rate = rate;
++	host->clk_last_cclk_div = clkdiv - 1;
++
+ 	return 0;
+ }
+ 

@@ -1,0 +1,186 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Fri, 2 Oct 2026 07:00:00 +0200
+Subject: [PATCH] arm64: dts: a733: add I2S/PCM0-4, OWA and DMIC, and the I2S0/OWA header pins
+
+Describe the A733 audio blocks, all disabled: the Cubie A7S has no codec,
+no jack and no microphone, so a board
+or an overlay enables what it wires.
+
+- Bases: DMIC 0x02531000, I2S0-4 0x02532000 + n*0x1000,
+  OWA 0x02537000.
+- Interrupts: I2S0-3 SPI 42-45, I2S4 SPI 29, OWA SPI
+  46, DMIC SPI 47. The vendor DT gives the I2S nodes no interrupt; the
+  binding requires one and the driver requests it.
+- DMA (UM V1.00 ch13 Table 13-2): OWA port 2, I2S0-4
+  ports 3-7, DMIC port 9, one port per block for both directions.
+- Clocks and resets from clk-sunxi-ng-a733-audio-plls-module-clocks-gates-and-resets.
+
+Pins: I2S0 is MCLK PB4, BCLK PB5, LRCK PB6, DOUT0 PB7, DIN0 PB8, function
+3; OWA0-OUT is PB8, function 6, so I2S0 and OWA
+exclude each other on the header. BCLK reaches J11 and the rest J6;
+which header pin carries which signal is not
+cited. No node references the groups yet.
+
+I2S3 and I2S4 feed the HDMI/eDP audio path internally (UM chapter 17);
+routing them to the DisplayPort transmitter is a separate step.
+
+Verified: applies, builds, the dtb carries the nodes. Silicon effect is
+owed per block and not claimed here; what this board cannot show
+(DMIC with no microphone, OWA with no receiver) is recorded as open.
+
+Assisted-by: Claude
+---
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -864,6 +864,32 @@ uart0_pb_pins: uart0-pb-pins {
+ 				function = "uart0";
+ 			};
+ 
++			/*
++			 * I2S0 on the headers: MCLK PB4, BCLK PB5, LRCK PB6,
++			 * DOUT0 PB7, DIN0 PB8, all function 3 (A733 user manual,
++			 * PB4-PB8 pin tables). BCLK reaches J11, the other four
++			 * J6 (which header pin carries which
++			 * signal is not cited). PB9/PB10 would carry DIN2/DOUT2
++			 * but are the UART0 console.
++			 */
++			i2s0_pb_pins: i2s0-pb-pins {
++				pins = "PB4", "PB5", "PB6", "PB7", "PB8";
++				allwinner,pinmux = <3>;
++				function = "i2s0";
++			};
++
++			/*
++			 * OWA0 shares PB7/PB8 with I2S0 (function 6: PB7
++			 * OWA0-IN, PB8 OWA0-OUT), so the two are exclusive on
++			 * the header. TX only: mainline sun4i-spdif has no
++			 * receive path.
++			 */
++			owa_pb_pins: owa-pb-pins {
++				pins = "PB8";
++				allwinner,pinmux = <6>;
++				function = "owa";
++			};
++
+ 			uart1_pg_pins: uart1-pg-pins {
+ 				pins = "PG6", "PG7";
+ 				allwinner,pinmux = <2>;
+@@ -2536,6 +2562,117 @@ dma: dma-controller@4601000 {
+ 			#dma-cells = <1>;
+ 		};
+ 
++		/*
++		 * Audio blocks (ch17; bases and interrupts
++		 * from the A733 user manual: I2S0-3 SPI 42-45, I2S4 SPI 29, OWA SPI 46,
++		 * DMIC SPI 47). The I2S register file is the R329's, field for
++		 * field (ch17 register list), plus an ASRC block
++		 * at 0x80 on I2S2 that resets disabled and that the driver's
++		 * regmap does not reach. OWA is the H616's S/PDIF block, DMIC the
++		 * H6's. All disabled: the board has no codec, no jack and no
++		 * microphone; a board or overlay enables what it wires.
++		 *
++		 * I2S3 and I2S4 feed the HDMI/eDP audio path internally (ch17
++		 * A733 user manual); nothing here routes them yet.
++		 */
++		i2s0: i2s@2532000 {
++			compatible = "allwinner,sun60i-a733-i2s",
++				     "allwinner,sun50i-r329-i2s";
++			reg = <0x0 0x02532000 0x0 0x1000>;
++			interrupts = <GIC_SPI 42 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&ccu CLK_BUS_I2S0>, <&ccu CLK_I2S0>;
++			clock-names = "apb", "mod";
++			resets = <&ccu RST_BUS_I2S0>;
++			dmas = <&dma 3>, <&dma 3>;
++			dma-names = "rx", "tx";
++			#sound-dai-cells = <0>;
++			status = "disabled";
++		};
++
++		i2s1: i2s@2533000 {
++			compatible = "allwinner,sun60i-a733-i2s",
++				     "allwinner,sun50i-r329-i2s";
++			reg = <0x0 0x02533000 0x0 0x1000>;
++			interrupts = <GIC_SPI 43 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&ccu CLK_BUS_I2S1>, <&ccu CLK_I2S1>;
++			clock-names = "apb", "mod";
++			resets = <&ccu RST_BUS_I2S1>;
++			dmas = <&dma 4>, <&dma 4>;
++			dma-names = "rx", "tx";
++			#sound-dai-cells = <0>;
++			status = "disabled";
++		};
++
++		i2s2: i2s@2534000 {
++			compatible = "allwinner,sun60i-a733-i2s",
++				     "allwinner,sun50i-r329-i2s";
++			reg = <0x0 0x02534000 0x0 0x1000>;
++			interrupts = <GIC_SPI 44 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&ccu CLK_BUS_I2S2>, <&ccu CLK_I2S2>;
++			clock-names = "apb", "mod";
++			resets = <&ccu RST_BUS_I2S2>;
++			dmas = <&dma 5>, <&dma 5>;
++			dma-names = "rx", "tx";
++			#sound-dai-cells = <0>;
++			status = "disabled";
++		};
++
++		i2s3: i2s@2535000 {
++			compatible = "allwinner,sun60i-a733-i2s",
++				     "allwinner,sun50i-r329-i2s";
++			reg = <0x0 0x02535000 0x0 0x1000>;
++			interrupts = <GIC_SPI 45 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&ccu CLK_BUS_I2S3>, <&ccu CLK_I2S3>;
++			clock-names = "apb", "mod";
++			resets = <&ccu RST_BUS_I2S3>;
++			dmas = <&dma 6>, <&dma 6>;
++			dma-names = "rx", "tx";
++			#sound-dai-cells = <0>;
++			status = "disabled";
++		};
++
++		i2s4: i2s@2536000 {
++			compatible = "allwinner,sun60i-a733-i2s",
++				     "allwinner,sun50i-r329-i2s";
++			reg = <0x0 0x02536000 0x0 0x1000>;
++			interrupts = <GIC_SPI 29 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&ccu CLK_BUS_I2S4>, <&ccu CLK_I2S4>;
++			clock-names = "apb", "mod";
++			resets = <&ccu RST_BUS_I2S4>;
++			dmas = <&dma 7>, <&dma 7>;
++			dma-names = "rx", "tx";
++			#sound-dai-cells = <0>;
++			status = "disabled";
++		};
++
++		owa: spdif@2537000 {
++			compatible = "allwinner,sun60i-a733-spdif",
++				     "allwinner,sun50i-h616-spdif";
++			reg = <0x0 0x02537000 0x0 0x400>;
++			interrupts = <GIC_SPI 46 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&ccu CLK_BUS_OWA>, <&ccu CLK_OWA_TX>;
++			clock-names = "apb", "spdif";
++			resets = <&ccu RST_BUS_OWA>;
++			dmas = <&dma 2>;
++			dma-names = "tx";
++			#sound-dai-cells = <0>;
++			status = "disabled";
++		};
++
++		dmic: dmic@2531000 {
++			compatible = "allwinner,sun60i-a733-dmic",
++				     "allwinner,sun50i-h6-dmic";
++			reg = <0x0 0x02531000 0x0 0x400>;
++			interrupts = <GIC_SPI 47 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&ccu CLK_BUS_DMIC>, <&ccu CLK_DMIC>;
++			clock-names = "bus", "mod";
++			resets = <&ccu RST_BUS_DMIC>;
++			dmas = <&dma 9>;
++			dma-names = "rx";
++			#sound-dai-cells = <0>;
++			status = "disabled";
++		};
++
+ 		gmac0: ethernet@4500000 {
+ 			compatible = "allwinner,sun60iw2-gmac200",
+ 				     "snps,dwmac-5.30a";

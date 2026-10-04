@@ -1,0 +1,21 @@
+# Builder packages for the shared machinery: scripts/inner.sh, scripts/lib/common.sh.
+#
+# Format of every container/packages.d/*.txt: one Debian package per line,
+# optionally arch-qualified (libc6:arm64); '#' starts a comment. A trailing
+# [amd64] or [arm64] limits the line to builders of that architecture.
+# After a change the maintainers update the lock (container/packages.lock);
+# the image build refuses a package list that does not match it.
+
+ca-certificates
+curl
+git
+xz-utils
+zstd
+file
+util-linux          # unshare --map-users=all (util-linux >= 2.39)
+mount
+
+# arm64 emulation on an amd64 builder: qemu-aarch64 for the private binfmt_misc
+# instance, and an arm64 program to test it with (the loader of libc6:arm64).
+qemu-user-static [amd64]
+libc6:arm64 [amd64]

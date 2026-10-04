@@ -1,0 +1,150 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: a733: SD pad drive strength
+
+The SD falls out of SDR104 into high speed in roughly three of twelve cold
+starts, silently: the 64-byte status read of the CMD6 SWITCH fails with
+`RD DCE EBE` (data CRC plus end-bit error) at 3.3 V / 50 MHz, the core
+re-initialises and settles for high speed. Throughput drops 46 -> 12 MB/s and
+nothing above the driver says a word. Observed on 2026-08-07.
+
+The one measured difference against a stack whose SDR104 is stable -- the
+vendor 6.6.98 kernel running the same card in the same socket -- is the pad
+drive strength. Read back from silicon on 2026-08-07:
+
+    vendor   PF_DRV0 = 0x01000200   PF_PUL0 = 0x00002555
+    ours     PF_DRV0 = 0x01222222   PF_PUL0 = 0x00000555
+
+Decoded (4 bits per pin; PF0=D1, PF1=CMD, PF2=CLK, PF3=D0, PF4=D3, PF5=D2,
+PF6=CD): the vendor drives *only*
+CLK at level 2 and leaves CMD and the data
+lines at level 0. We drive all six at level 2 -- not by intent but by omission:
+our DT said nothing about drive strength, so U-Boot's setting survived into
+Linux. Overdriven data lines ring, and a ringing edge is exactly what an end-bit
+error sees.
+
+The vendor also biases PF6 (card detect) down while ours floats -- and that part
+is NOT in this patch, because trying it failed on hardware and the board said
+why: PF6 is already claimed by the mmc driver through cd-gpios, so pinctrl
+cannot take it, and "gpio_in" is not a valid mux value for this DT-table
+driver. The messages, verbatim from the failing boot:
+
+    /soc/pinctrl@2000000/mmc0-cd-pin: invalid mux value for pin PF6
+    pin PF6 already requested by 4020000.mmc; cannot claim for 2000000.pinctrl
+    sunxi-mmc 4020000.mmc: probe with driver sunxi-mmc failed with error -22
+
+That first version did not degrade the SD -- it removed it: the host never
+probed, Linux saw only the eMMC. Caught on the first boot. A card-detect bias,
+if it is ever wanted, has to come from somewhere other than a second pinctrl
+claim on the same pin.
+
+So this patch splits mmc0's pins the way `arm64-dts-allwinner-a733-emmc-pad-drive-bias` splits the eMMC's, for the same
+reason -- different signal classes need different pads -- and sets the values
+the vendor demonstrably runs: CLK at 30 mA (register level 2), CMD and data at
+10 mA (level 0), pull-ups as before. Both pad states
+(3.3 V default and the 1.8 V UHS state from `mmc-sunxi-pad-io-voltage-switch-without-vqmmc`) get the same treatment; a
+drive strength that only applied to one of them would change under the voltage
+switch.
+
+Linux states drive strength in mA and pinctrl-sunxi maps 10/20/30/40 onto
+register levels 0/1/2/3 (same note as in `arm64-dts-allwinner-a733-emmc-pad-drive-bias`).
+
+Not yet proven: this is one measured difference, not a demonstrated cause. The
+observable that would settle it is ten cold starts with SDR104
+timing and SD read throughput holding ten times out of ten, against the
+three-in-twelve failure rate measured on 2026-08-07.
+
+Assisted-by: Claude
+---
+
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -556,24 +556,74 @@
+ 				function = "uart0";
+ 			};
+ 
++			/*
++			 * SD splits CLK from CMD+data because the vendor drives
++			 * them differently, and the difference is measurable on
++			 * this board. Read back from silicon 2026-08-07 while
++			 * the vendor 6.6.98 stack ran the same card at SDR104:
++			 *
++			 *   PF_DRV0 = 0x01000200   (only PF2/CLK at level 2,
++			 *                           CMD and data at level 0)
++			 *   PF_PUL0 = 0x00002555   (pull-up on PF0..PF5,
++			 *                           pull-DOWN on PF6 = card detect)
++			 *
++			 * Ours read PF_DRV0 = 0x01222222: every SD pin at level
++			 * 2, because our DT said nothing about drive strength
++			 * and U-Boot's setting simply survived. That is the one
++			 * measured difference against a stack whose SDR104 is
++			 * stable, and it matches the failure signature: an
++			 * intermittent "RD DCE EBE" (data CRC + end-bit error)
++			 * on the 64-byte CMD6 SWITCH status read at 50 MHz,
++			 * after which the core re-inits and settles for high
++			 * speed -- silently, in ~3 of 12 cold starts
++			 * (measured 2026-08-07). Overdriven data lines ring; a
++			 * ringing edge is exactly what an end-bit error sees.
++			 *
++			 * Linux states drive strength in mA and pinctrl-sunxi
++			 * maps 10/20/30/40 mA onto register levels 0/1/2/3
++			 * (`arm64-dts-allwinner-a733-emmc-pad-drive-bias` carries the same note for the eMMC).
++			 */
++			mmc0_clk_pins: mmc0-clk-pins {
++				pins = "PF2";
++				allwinner,pinmux = <2>;
++				function = "mmc0";
++				drive-strength = <30>;	/* level 2, as the vendor */
++				bias-pull-up;
++				power-source = <3300000>;
++			};
++
+ 			mmc0_pins: mmc0-pins {
+-				pins = "PF0", "PF1", "PF2",
++				pins = "PF0", "PF1",
+ 				       "PF3", "PF4", "PF5";
+ 				allwinner,pinmux = <2>;
+ 				function = "mmc0";
++				drive-strength = <10>;	/* level 0, as the vendor */
++				bias-pull-up;
+ 				/* 3.3 V default signalling. Microvolts. */
+ 				power-source = <3300000>;
+ 			};
+ 
++			mmc0_clk_pins_1v8: mmc0-clk-pins-1v8 {
++				pins = "PF2";
++				allwinner,pinmux = <2>;
++				function = "mmc0";
++				drive-strength = <30>;
++				bias-pull-up;
++				power-source = <1800000>;
++			};
++
+ 			mmc0_pins_1v8: mmc0-pins-1v8 {
+-				pins = "PF0", "PF1", "PF2",
++				pins = "PF0", "PF1",
+ 				       "PF3", "PF4", "PF5";
+ 				allwinner,pinmux = <2>;
+ 				function = "mmc0";
++				drive-strength = <10>;
++				bias-pull-up;
+ 				/* 1.8 V UHS signalling. Microvolts. */
+ 				power-source = <1800000>;
+ 			};
+ 
++
+ 			/*
+ 			 * eMMC splits into three groups because the three
+ 			 * signal classes need different pad settings. Values
+@@ -796,9 +846,9 @@
+ 			 * 3.3 V with the default state. No variable vqmmc rail.
+ 			 */
+ 			pinctrl-names = "default", "sdmmc-3v3", "sdmmc-1v8";
+-			pinctrl-0 = <&mmc0_pins>;
+-			pinctrl-1 = <&mmc0_pins>;
+-			pinctrl-2 = <&mmc0_pins_1v8>;
++			pinctrl-0 = <&mmc0_pins>, <&mmc0_clk_pins>;
++			pinctrl-1 = <&mmc0_pins>, <&mmc0_clk_pins>;
++			pinctrl-2 = <&mmc0_pins_1v8>, <&mmc0_clk_pins_1v8>;
+ 			vmmc-supply = <&reg_vcc3v3>;
+ 			/*
+ 			 * No vqmmc-supply on purpose. A fixed 3.3 V vqmmc makes

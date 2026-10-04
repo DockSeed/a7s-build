@@ -1,0 +1,204 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] mmc: sunxi: stop claiming the controller cannot do enhanced strobe
+
+The probe masks MMC_CAP2_HS400_ES out unconditionally, with a comment stating
+that enhanced strobe "has no hardware support on this controller". That claim is
+wrong -- the A733 user manual names the mode -- and the code is what everybody
+reads. The claim is deleted, not softened.
+
+THE CONTRADICTION
+-----------------
+- drivers/mmc/host/sunxi-mmc.c, sunxi_mmc_probe():
+  "Enhanced strobe has no hardware support on this controller and is never
+  offered." followed by mmc->caps2 &= ~MMC_CAP2_HS400_ES;
+- this tree's DT so far: the A733 UM lacks the phrase "enhanced strobe" but
+  names the mode at SMHC_CQE_CTRL (0x1A0) bit 8 DS_SAMP_RESP_EN; the DT got
+  mmc-hs400-1_8v rather than mmc-hs400-enhanced-strobe for lack of a documented
+  path, not because the hardware lacks the feature.
+
+Those two say different things, and the second is the one that matches the UM.
+
+WHAT THE UM CARRIES
+-------------------
+a733-um-v0.92, 11.3.8.41, offset 0x01A0, SMHC_CQE_CTRL, default 0x0000_0003:
+
+  [8] DS_SAMP_RESP_EN  R/W  0x0  data-strobe response-sampling enable,
+                                  meant for CQE operation in HS400
+                                  enhanced-strobe mode
+
+That is the only occurrence of the mode in the SMHC chapter. What it settles:
+the controller has an enhanced-strobe mode and one named control for it. What
+it does not settle: whether that bit is the whole configuration with the command
+queue off. This patch keeps those two apart instead of resolving the second by
+assumption.
+
+THE CARD SIDE, for completeness: EXT_CSD[184] STROBE_SUPPORT = 0x01 on the
+board card (SanDisk iNAND SDINBDV4-32G / DV4032). So the card advertises it and only the host
+was refusing.
+
+WHAT THIS CHANGES
+-----------------
+- The comment now says what is true: no documented ES path outside CQE, which
+  is not the same as no hardware.
+- MMC_CAP2_HS400_ES is masked out on controllers without the strobe path
+  (together with MMC_CAP2_HS400, which was already masked there) and left alone
+  otherwise -- so the capability is decided by the DT. mmc_of_parse() sets it
+  only for mmc-hs400-enhanced-strobe, and the A733 DT does not carry that
+  property, so on this board nothing changes: ES stays off, by default, and
+  turning it on is one DT line plus a boot.
+- ->hs400_enhanced_strobe is implemented and writes exactly the one bit the UM
+  names, in both directions. The core calls it twice: once from mmc_power_up()
+  with ios->enhanced_strobe false, to guarantee the controller is out of ES
+  before the card is switched into it, and once from mmc_select_hs400es() with
+  it true. Writing both directions is what makes the first call mean something.
+- It logs the register back after the write, because if the bit does not stick
+  the whole experiment is void and that should be visible on the first boot,
+  not after a benchmark.
+
+WHAT IS NOT DONE, AND WHY
+-------------------------
+- The DT property is not added. The DT is out of scope for this patch by
+  agreement, and adding it would make an unproven mode the default on a board
+  whose eMMC is the delivery medium.
+- No CQE is enabled. DS_SAMP_RESP_EN lives in the CQE control register but is a
+  sample-path bit; nothing here touches CQE_CLR_DTC_EN or CQE_CLR_CC_EN, which
+  keep their reset values. CQE itself is out of scope and a separate piece of work --
+  the card has CMDQ_DEPTH = 0x1f and CMDQ_SUPPORT = 0x01 with CMDQ_MODE_EN = 0.
+- The data-strobe sweep is not skipped in ES mode. ES aligns the card's
+  *response* to the strobe; SMHC_DS_DL still delays the strobe the controller
+  samples read data on, so the sweep still has something to find. Whether the
+  window widens to the point of being uninteresting is a measurement, and the
+  sweep prints its window, so the first ES boot answers it for free.
+
+VERIFIED / NOT VERIFIED
+-----------------------
+- Applies clean at fuzz 0 on a fresh unpack with the series in order: yes.
+- Builds: NOT claimed, not built here.
+- Silicon: NOT proven, in two separate senses.
+  1. That this patch changes nothing on this board: a cold boot on the 8 GiB board whose
+     eMMC still negotiates plain HS400 and whose log contains no "enhanced
+     strobe" line at all. If an ES line appears without a DT change,
+     mmc_of_parse is not the only thing setting the capability and this patch
+     is wrong.
+  2. That the mode works, which needs the DT property and is deliberately not
+     taken here: with mmc-hs400-enhanced-strobe added, the observable is a boot
+     that reaches HS400 through mmc_select_hs400es() -- the ES path runs
+     instead of the HS200-then-HS400 path, so the log loses the HS200 tuning
+     line -- with SMHC_CQE_CTRL reading 0x00000103 under load and the
+     read/write/md5 integrity run passing. If the card then fails
+     mmc_switch_status() after the ES switch, the bit is not sufficient outside
+     CQE and that is the answer the UM would not give.
+
+ISSUE
+-----
+Enhanced strobe matters because it would take the strobe-response delay out of
+the write path's per-block cost.
+
+Assisted-by: Claude
+---
+--- a/drivers/mmc/host/sunxi-mmc.c
++++ b/drivers/mmc/host/sunxi-mmc.c
+@@ -85,6 +85,7 @@
+ #define SDXC_REG_EMMC_DSBD	0x10C /* eMMC DDR Start Bit Detect Control */
+ #define SDXC_REG_ECMD		0x138 /* Extended Command (UM 11.3.8.34) */
+ #define SDXC_REG_ERESP		0x13C /* Extended Response (CMD23's R1) */
++#define SDXC_REG_CQE_CTRL	0x1A0 /* CQE Control (UM 11.3.8.41) */
+ 
+ /* HS400 data-strobe fields (A733 UM 11.3, V5P3X controller) */
+ #define SDXC_HS400_MD_EN		BIT(31)	  /* EMMC_DSBD: HS400 mode enable */
+@@ -97,6 +98,7 @@
+ #define SDXC_CSDC_HS400			0x6	  /* CSDC: HS400 speed mode */
+ #define SDXC_CSDC_OTHER			0x3	  /* CSDC: non-HS400 speed mode */
+ #define SDXC_DS_DL_SW_MASK		0x3f	  /* DS_DL: 6-bit SW delay */
++#define SDXC_DS_SAMP_RESP_EN		BIT(8)	  /* CQE_CTRL: sample the response on DS */
+ 
+ /* SMHC_ECMD, UM 11.3.8.34: with the bit set, the controller sends CMD23 by
+  * itself ahead of the command in SMHC_CMD; a soft reset clears the bit.
+@@ -2152,6 +2154,49 @@
+ }
+ 
+ /*
++ * HS400 enhanced strobe.
++ *
++ * With enhanced strobe the card returns its command responses aligned to the
++ * data strobe as well as its data, which is what removes the response side of
++ * the delay question. The one control the A733 UM names for it is
++ * SMHC_CQE_CTRL (11.3.8.41, offset 0x01A0, default 0x0000_0003) bit 8
++ * DS_SAMP_RESP_EN, the data-strobe response-sampling enable, which is meant to
++ * be set for CQE operation in HS400 enhanced-strobe mode.
++ *
++ * Two things that statement does and does not say, kept apart on purpose:
++ *
++ * - It names the mode, so the controller has one. The string "enhanced strobe"
++ *   appears nowhere else in the UM and there is no general ES enable outside
++ *   this register, but "not documented outside the CQE chapter" is not "the
++ *   hardware cannot do it", and the code used to claim the second.
++ * - It is written for CQE. Whether the same bit is the whole story with the
++ *   command queue off is NOT in the UM, and this driver does not pretend it
++ *   knows. That is why the capability is not switched on here: it is left to
++ *   the DT, and our DT does not ask for it.
++ *
++ * The rest of the HS400 register recipe is unchanged and still comes from
++ * sunxi_mmc_hs400_enable(), which the core reaches through mmc_set_timing()
++ * on the ES path exactly as on the plain HS400 path.
++ */
++static void sunxi_mmc_hs400_enhanced_strobe(struct mmc_host *mmc,
++					    struct mmc_ios *ios)
++{
++	struct sunxi_mmc_host *host = mmc_priv(mmc);
++	u32 rval;
++
++	rval = mmc_readl(host, REG_CQE_CTRL);
++	if (ios->enhanced_strobe)
++		rval |= SDXC_DS_SAMP_RESP_EN;
++	else
++		rval &= ~SDXC_DS_SAMP_RESP_EN;
++	mmc_writel(host, REG_CQE_CTRL, rval);
++
++	dev_info(mmc_dev(mmc), "HS400 enhanced strobe %s, SMHC_CQE_CTRL 0x%08x\n",
++		 ios->enhanced_strobe ? "on" : "off",
++		 mmc_readl(host, REG_CQE_CTRL));
++}
++
++/*
+  * HS400 data-strobe tuning.
+  *
+  * In HS400 the card drives a data strobe alongside the data lines and the
+@@ -2379,6 +2424,7 @@
+ 	.card_hw_reset	 = sunxi_mmc_hw_reset,
+ 	.card_busy	 = sunxi_mmc_card_busy,
+ 	.execute_hs400_tuning = sunxi_mmc_execute_hs400_tuning,
++	.hs400_enhanced_strobe = sunxi_mmc_hs400_enhanced_strobe,
+ };
+ 
+ static const struct sunxi_mmc_clk_delay sunxi_mmc_clk_delays[] = {
+@@ -2924,12 +2970,25 @@
+ 	/*
+ 	 * HS400 is only wired up on controllers that carry the data-strobe
+ 	 * delay path (cfg->can_hs400). Elsewhere, mask it out so a stray
+-	 * mmc-hs400-1_8v in the DT is ignored. Enhanced strobe has no
+-	 * hardware support on this controller and is never offered.
++	 * mmc-hs400-1_8v or mmc-hs400-enhanced-strobe in the DT is ignored.
++	 *
++	 * Enhanced strobe is no longer refused unconditionally. The claim that
++	 * stood here -- that the controller has no hardware support for it --
++	 * is deleted, not qualified: the A733 UM names the mode at
++	 * SMHC_CQE_CTRL (0x01A0) bit 8 DS_SAMP_RESP_EN, meant for CQE use in
++	 * HS400 enhanced-strobe mode (11.3.8.41), and the
++	 * omission was always a decision for lack of a documented
++	 * path, not a claim that the hardware lacks the feature.
++	 * The card on this board
++	 * advertises it (EXT_CSD[184] STROBE_SUPPORT = 0x01).
++	 *
++	 * What decides is now the DT: mmc_of_parse() sets MMC_CAP2_HS400_ES
++	 * only for mmc-hs400-enhanced-strobe, and our DT does not carry it, so
++	 * this board's behaviour is unchanged. A board that writes the
++	 * property gets ->hs400_enhanced_strobe and the one bit the UM names.
+ 	 */
+ 	if (!host->cfg->can_hs400)
+-		mmc->caps2 &= ~MMC_CAP2_HS400;
+-	mmc->caps2 &= ~MMC_CAP2_HS400_ES;
++		mmc->caps2 &= ~(MMC_CAP2_HS400 | MMC_CAP2_HS400_ES);
+ 
+ 	host->ds_dl = host->cfg->ds_dl;
+ 

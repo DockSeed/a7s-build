@@ -1,0 +1,213 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] clk: sunxi-ng: a733: park the DSU on PERI0_600M during a relock
+
+What. The DSU clock mux gains its encoding 101, PERI0_600M, as a third
+parent, wired from the main CCU as the CPU CCU's optional second input
+"peri0-600m". When it is wired and runs at 600 MHz, the DSU's relock
+notifier parks the DSU there instead of on CPU_SLOW_CLK (the 26 MHz
+DCXO). probe() holds the clock enabled, so the park target cannot be gated
+underneath the DSU. Without the DT input the DSU parks on the DCXO as
+before.
+
+New dependency: the CPU CCU now also consumes a main-CCU clock. Both are
+platform drivers ordered by fw_devlink; the main CCU has no reference back,
+so there is no cycle, but a main CCU that fails to probe now also holds
+back the CPU clocks and with them cpufreq -- before this patch they waited
+on the RTC CCU only.
+
+Why. Until now nothing changed the DSU rate, so its park was never used.
+The DSU devfreq driver later in this series changes it whenever the CPU
+policies move. The DSU clocks the L3 cache and the snoop filter of all
+eight cores; parked on the DCXO, every one of those changes would hold
+the whole memory side at 26 MHz for the relock -- about 250 us for a
+cluster PLL on the DCXO, most of it software running at 26 MHz.
+
+Sources:
+  - UM V1.00 5.1.10.37 (CPU_DSU_PLL_CLK_REG, 0x301c) bits 26:24:
+    000/001/010 CPU_SLOW_CLK, 011 CPU_DSU_PLL/P, 100 CPU0PLL,
+    101 PERI0_600M; the mux switches glitch-free and
+    can be reconfigured dynamically.
+  - UM 5.1.4.1: the cluster's primary source is CPU_DSU_PLL;
+    its backup sources are the 26 MHz DCXO, CPU_BACK_PLL and 600 MHz. 101
+    is the only one of the three the DSU mux offers besides the DCXO.
+  - The park never runs the DSU faster than the rail allows: 600 MHz is
+    below 780 MHz, where boot0 leaves the DSU at DCDC5's 800 mV floor.
+
+Verified, 8 GiB board (speed bin 5), 2026-09-29, register level before this
+patch existed: 780 -> 600 -> relock -> back,
+repeated for 910 and 1066 MHz, 18 switches under a running system with no
+kernel log line and stress-ng --verify clean after each switch. The 600 MHz
+arm itself ran for the whole A/B of 2026-09-25 (6 GiB board). Builds at
+W=1 with no warning; the dtb carries both clocks.
+
+Verified on silicon through the kernel path, 8 GiB board, 6.18.54 test
+kernel with the devfreq driver, 2026-09-29: probe prints "DSU parks on
+PERI0_600M during a relock"; ccu_a733_park_nb_cb logs every DSU change,
+median 48 us parked (5 changes, max 48.4 us); 14 816 changes in 10 min
+under stress-ng --verify, failed 0, no kernel log line. The park
+itself is too short to sample the mux from userspace; the DCXO park
+of the DSU was never timed for comparison.
+
+Vendor comparison: the vendor driver gives all three CPU muxes one parent
+list ending in "pll-cpu-back", which for the DSU names the wrong source
+for encoding 101 (it is PERI0_600M there); it never changes the DSU rate,
+so it never parks it.
+
+Assisted-by: Claude
+---
+ .../clock/allwinner,sun60i-a733-cpu-ccu.yaml  | 12 +++++-
+ .../sun60i-a733-cubie-a7s-minimal.dts         |  8 +++-
+ drivers/clk/sunxi-ng/ccu-sun60i-a733-cpu.c    | 42 +++++++++++++++----
+ 3 files changed, 50 insertions(+), 12 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/clock/allwinner,sun60i-a733-cpu-ccu.yaml b/Documentation/devicetree/bindings/clock/allwinner,sun60i-a733-cpu-ccu.yaml
+index 14a17da44..069bbe686 100644
+--- a/Documentation/devicetree/bindings/clock/allwinner,sun60i-a733-cpu-ccu.yaml
++++ b/Documentation/devicetree/bindings/clock/allwinner,sun60i-a733-cpu-ccu.yaml
+@@ -31,12 +31,19 @@ properties:
+     maxItems: 1
+ 
+   clocks:
++    minItems: 1
+     items:
+       - description: Digitally Controlled Crystal Oscillator (26 MHz on the A733)
++      - description:
++          PERI0_600M from the main CCU, the DSU clock mux's encoding 101.
++          Used only as the DSU's park source while its PLL relocks; without
++          it the DSU parks on the DCXO.
+ 
+   clock-names:
++    minItems: 1
+     items:
+       - const: dcxo
++      - const: peri0-600m
+ 
+ required:
+   - "#clock-cells"
+@@ -49,13 +56,14 @@ additionalProperties: false
+ 
+ examples:
+   - |
++    #include <dt-bindings/clock/sun60i-a733-ccu.h>
+     #include <dt-bindings/clock/sun60i-a733-rtc-ccu.h>
+ 
+     clock-controller@8870000 {
+         compatible = "allwinner,sun60i-a733-cpu-ccu";
+         reg = <0x08870000 0x3038>;
+-        clocks = <&rtc_ccu CLK_RTC_DCXO>;
+-        clock-names = "dcxo";
++        clocks = <&rtc_ccu CLK_RTC_DCXO>, <&ccu CLK_PLL_PERI0_600M>;
++        clock-names = "dcxo", "peri0-600m";
+         #clock-cells = <1>;
+     };
+ 
+diff --git a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+index 1eb2e9510..bf5db2f99 100644
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -3172,8 +3172,12 @@ rtc_ccu: clock-controller@709015c {
+ 		cpupll_ccu: clock-controller@8870000 {
+ 			compatible = "allwinner,sun60i-a733-cpu-ccu";
+ 			reg = <0x0 0x08870000 0x0 0x3038>;
+-			clocks = <&rtc_ccu CLK_RTC_DCXO>;
+-			clock-names = "dcxo";
++			/*
++			 * peri0-600m: the DSU mux's encoding 101, where the DSU
++			 * parks while its PLL relocks.
++			 */
++			clocks = <&rtc_ccu CLK_RTC_DCXO>, <&ccu CLK_PLL_PERI0_600M>;
++			clock-names = "dcxo", "peri0-600m";
+ 			#clock-cells = <1>;
+ 		};
+ 
+diff --git a/drivers/clk/sunxi-ng/ccu-sun60i-a733-cpu.c b/drivers/clk/sunxi-ng/ccu-sun60i-a733-cpu.c
+index 675f60993..e9a6d3d63 100644
+--- a/drivers/clk/sunxi-ng/ccu-sun60i-a733-cpu.c
++++ b/drivers/clk/sunxi-ng/ccu-sun60i-a733-cpu.c
+@@ -524,10 +524,12 @@ A733_CPU_PLL(pll_cpu_dsu_clk, "pll-cpu-dsu",
+  * muxes the same parent list ending in "pll-cpu-back", which is wrong for the
+  * DSU. Encoding 100 is omitted here for both: on L/B it is a tap of the
+  * peripheral PLL that lives in the main CCU and would need a DT input we would
+- * never select, and on the DSU it is a different source again.
++ * never select, and on the DSU it is a different source again. The DSU's 101,
++ * PERI0_600M, is a DT input ("peri0-600m") and only ever the park target of a
++ * DSU relock (see the notifiers below).
+  */
+ static const u8 a733_cpu_core_mux_table[] = { 0, 3, 5 };
+-static const u8 a733_cpu_dsu_mux_table[] = { 0, 3 };
++static const u8 a733_cpu_dsu_mux_table[] = { 0, 3, 5 };
+ 
+ static const struct clk_parent_data cpu_l_parents[] = {
+ 	{ .fw_name = "dcxo" },				/* 000 CPU_SLOW_CLK */
+@@ -542,8 +544,9 @@ static const struct clk_parent_data cpu_b_parents[] = {
+ };
+ 
+ static const struct clk_parent_data cpu_dsu_parents[] = {
+-	{ .fw_name = "dcxo" },
+-	{ .hw = &pll_cpu_dsu_clk.common.hw },
++	{ .fw_name = "dcxo" },				/* 000 CPU_SLOW_CLK  */
++	{ .hw = &pll_cpu_dsu_clk.common.hw },		/* 011 CPU_DSU_PLL/P */
++	{ .fw_name = "peri0-600m" },			/* 101 PERI0_600M    */
+ };
+ 
+ /*
+@@ -662,11 +665,20 @@ A733_CPU_MUX_NB(cpu_dsu_mux_nb, cpu_dsu_clk);
+  * both the +1 on N and P0. Silicon: 974.6 MHz, and the cluster's EXT_DIVP does
+  * not divide it -- a park from a /2 OPP still runs at 975 MHz.
+  *
+- * The DSU keeps the DCXO: its mux has no CPU_BACK_PLL input in our table
+- * (encoding 101 is PERI0_600M there, see above); the DSU is handled separately.
++ * The DSU has no CPU_BACK_PLL input; its encoding 101 is PERI0_600M, which
++ * the UM lists as a cluster backup source (5.1.4.1; the primary
++ * source is CPU_DSU_PLL, the others are the 26 MHz DCXO and
++ * CPU_BACK_PLL). The DSU parks there when the DT
++ * wires it: every DSU relock would otherwise hold L3 and the snoop filter of
++ * all eight cores at 26 MHz for the whole relock. 600 MHz is below 780 MHz,
++ * the DSU rate boot0 leaves at DCDC5's 800 mV floor, so the park never runs
++ * the DSU faster than the rail allows. probe() holds the clock enabled, so the
++ * park target cannot be gated underneath the DSU.
+  */
+ #define A733_CPU_MUX_IDX_BACK_PLL	2
+ #define A733_CPU_PARK_MAX_RATE		1014000000UL
++#define A733_DSU_MUX_IDX_PERI0_600M	2
++#define A733_DSU_PARK_RATE		600000000UL
+ 
+ /*
+  * How long a cluster really sits on the bypass: PRE_RATE_CHANGE to
+@@ -720,9 +732,9 @@ static int sun60i_a733_cpu_ccu_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+ 	unsigned int n_min, n_max;
+-	unsigned long dcxo_rate, back_rate;
++	unsigned long dcxo_rate, back_rate, peri_rate;
+ 	void __iomem *reg;
+-	struct clk *dcxo;
++	struct clk *dcxo, *peri;
+ 	unsigned int i;
+ 	u32 val;
+ 	int ret;
+@@ -791,10 +803,24 @@ static int sun60i_a733_cpu_ccu_probe(struct platform_device *pdev)
+ 		a733_cpu_pll_commons[i]->max_rate = dcxo_rate * n_max;
+ 	}
+ 
++	peri = devm_clk_get_optional_enabled(dev, "peri0-600m");
++	if (IS_ERR(peri))
++		return dev_err_probe(dev, PTR_ERR(peri),
++				     "cannot get the peri0-600m park source\n");
++
+ 	ret = devm_sunxi_ccu_probe(dev, reg, &sun60i_a733_cpu_ccu_desc);
+ 	if (ret)
+ 		return ret;
+ 
++	peri_rate = clk_get_rate(peri);
++	if (peri_rate == A733_DSU_PARK_RATE) {
++		cpu_dsu_mux_nb.bypass_index = A733_DSU_MUX_IDX_PERI0_600M;
++		dev_info(dev, "DSU parks on PERI0_600M during a relock\n");
++	} else {
++		dev_warn(dev, "peri0-600m %s (%lu Hz), DSU parks on the DCXO\n",
++			 peri ? "not at 600 MHz" : "not wired", peri_rate);
++	}
++
+ 	back_rate = clk_hw_get_rate(&pll_cpu_back_clk.hw);
+ 	if (clk_hw_is_enabled(&pll_cpu_back_clk.hw) && back_rate &&
+ 	    back_rate <= A733_CPU_PARK_MAX_RATE) {

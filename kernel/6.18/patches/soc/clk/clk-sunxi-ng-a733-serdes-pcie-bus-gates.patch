@@ -1,0 +1,192 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] clk: sunxi-ng: A733 add the PCIe bus gates and the COMB1 reference-clock gate
+
+`clk-sunxi-ng-a733-add-serdes-subsystem-clocks` mapped the SERDES_SUBSYS_APP page and modelled only the USB3 register at
+0x0008, saying in its own header that the PCIe gates at 0x0004 would follow with
+the PCIe milestone rather than let a second device fight for the page. This is
+that follow-up, plus one register `clk-sunxi-ng-a733-add-serdes-subsystem-clocks` did not reach.
+
+  0x0004 SUBSYS_PCIE_BGR   bit18 PCIE_SLV_ACLK_EN, bit17 PCIE_MST_ACLK_EN,
+                           bit16 PCIE_HCLK_EN, bit1 PCIE_PERSTN
+  0x00f0 SUBSYS_DBG_CTRL   bit29 COMB1_PHY_REFCLK_GATE, 0 = off, 1 = on
+
+Both from the A733 UM V1.00, SERDES subsystem chapter, over base 0x06C00000.
+Two AXI clocks for PCIe because the controller is both a slave the CPU writes
+into and a master that reads memory, plus one AHB clock for its register side;
+parents are the bus-matrix gates one level up, the arrangement `clk-sunxi-ng-a733-add-serdes-subsystem-clocks` already
+uses for USB3.
+
+The reference-clock gate is the one worth arguing about. The UM files it under
+"debug control", which makes it look like the PHY driver's business, but it
+gates the reference clock COMB1's PMA PLL runs from -- a clock. Modelling it
+here keeps the page with the provider that owns it, instead of having the PHY
+driver reach into a register window belonging to another device. Its parent is
+the RTC DCXO gate for COMB1, because that is what the reference is derived from
+(UM RTC chapter 9.1.5.5); on this board that oscillator runs at 26 MHz, not 24.
+
+Consequences for the node, both in here because they exist only for these gates:
+the window grows from 0x10 to 0x100 so it reaches 0x00f0, and the node gains
+dcxo-serdes1 as a third input.
+
+bit1 PCIE_PERSTN is NOT exported. It is the controller's internal PERST
+generator; on this board PERST reaches the device over a GPIO instead, and the
+bit reads 0 while a link is trained. An id with no consumer is dead text in a
+binding header we would then carry forever -- the same reason `clk-sunxi-ng-a733-npu-pll-module-clock-and-resets` leaves
+NPU_SRAM_RST out.
+
+No CLK_IGNORE_UNUSED on any of these, unlike the USB3 pair. That flag exists in
+`clk-sunxi-ng-a733-add-serdes-subsystem-clocks` because the USB3 consumer is a module whose glue pulses the controller
+reset BEFORE enabling clocks. The PCIe host driver claims its gates and owns its
+reset ordering, so there is no window for clk_disable_unused() to close a gate a
+consumer still needs -- and a flag that is not needed hides the next ordering
+bug rather than the current one.
+
+The provider's .num moves from 2 to 6. It is a hard ceiling: leave it behind and
+every new index fails at runtime while the build stays green.
+
+Silicon context, not proof: the 6 GiB board under the vendor stack with a trained link reads
+0x00070000 at 0x0004. Under our tree the same register reads 0x00000000, which
+is what a subsystem with no PCIe driver looks like.
+
+Verified: compile-check passes, dtb included. No hardware effect on its own --
+the gates have no consumer until the PCIe node lands.
+
+Assisted-by: Claude
+
+diff --git a/include/dt-bindings/clock/sun60i-a733-serdes-ccu.h b/include/dt-bindings/clock/sun60i-a733-serdes-ccu.h
+--- a/include/dt-bindings/clock/sun60i-a733-serdes-ccu.h
++++ b/include/dt-bindings/clock/sun60i-a733-serdes-ccu.h
+@@ -3,13 +3,21 @@
+  * A733 (sun60iw2) SERDES subsystem clock indices.
+  *
+  * SERDES_SUBSYS_APP at 0x06C00000 gates the bus clocks of the devices sitting
+- * behind the two combo-PHYs: USB3 at offset 0x0008, PCIe at 0x0004. Only the
+- * USB3 pair is modelled here; the PCIe gates are added with the PCIe milestone.
++ * behind the two combo-PHYs: USB3 at offset 0x0008, PCIe at 0x0004.
++ *
++ * SUBSYS_PCIE_BGR bit1 (PCIE_PERSTN, the controller's internal PERST
++ * generator) is deliberately not exported. On this board PERST reaches the
++ * device over a GPIO, and the bit reads 0 while a link is up -- an id nobody
++ * claims would be dead text in a binding header we then keep forever.
+  */
+ #ifndef _DT_BINDINGS_CLK_SUN60I_A733_SERDES_CCU_H_
+ #define _DT_BINDINGS_CLK_SUN60I_A733_SERDES_CCU_H_
+ 
+ #define CLK_USB3_ACLK		0
+ #define CLK_USB3_HCLK		1
++#define CLK_PCIE_SLV_ACLK	2
++#define CLK_PCIE_MST_ACLK	3
++#define CLK_PCIE_HCLK		4
++#define CLK_COMBPHY1_REFCLK	5
+ 
+ #endif
+diff --git a/drivers/clk/sunxi-ng/ccu-sun60i-a733-serdes.c b/drivers/clk/sunxi-ng/ccu-sun60i-a733-serdes.c
+--- a/drivers/clk/sunxi-ng/ccu-sun60i-a733-serdes.c
++++ b/drivers/clk/sunxi-ng/ccu-sun60i-a733-serdes.c
+@@ -62,6 +62,8 @@
+ #include <dt-bindings/clock/sun60i-a733-serdes-ccu.h>
+ #include <dt-bindings/reset/sun60i-a733-serdes-ccu.h>
+ 
++#define SUN60I_A733_SUBSYS_PCIE_BGR_REG		0x0004
++#define SUN60I_A733_SUBSYS_DBG_CTRL_REG		0x00F0
+ #define SUN60I_A733_SUBSYS_USB3P1_BGR_REG	0x0008
+ 
+ /*
+@@ -103,17 +105,67 @@
+ 			   SUN60I_A733_SUBSYS_USB3P1_BGR_REG, BIT(16),
+ 			   CLK_IGNORE_UNUSED);
+ 
++/*
++ * The same arrangement one register down, for PCIe: SUBSYS_PCIE_BGR at 0x0004
++ * with bit18 SLV_ACLK_EN, bit17 MST_ACLK_EN and bit16 HCLK_EN (A733 UM V1.00
++ * ch18-02, SERDES_SUBSYS_APP over base 0x06C00000). Two AXI clocks, because the
++ * controller is both a slave the CPU writes into and a master that reads
++ * memory, and one AHB clock for its register side.
++ *
++ * No CLK_IGNORE_UNUSED here, unlike the USB3 pair. Their consumer is the PCIe
++ * host driver, which claims all three and owns the reset ordering itself, so
++ * there is no window in which clk_disable_unused() can close a gate the
++ * consumer still needs. On the 6 GiB board with a trained link the register reads
++ * 0x00070000 -- that is the vendor stack's
++ * state, i.e. the target, not a proof of this code.
++ */
++static SUNXI_CCU_GATE_DATA(pcie_slv_aclk_clk, "pcie-slv-aclk",
++			   sun60i_a733_serdes_mbus_parent,
++			   SUN60I_A733_SUBSYS_PCIE_BGR_REG, BIT(18), 0);
++static SUNXI_CCU_GATE_DATA(pcie_mst_aclk_clk, "pcie-mst-aclk",
++			   sun60i_a733_serdes_mbus_parent,
++			   SUN60I_A733_SUBSYS_PCIE_BGR_REG, BIT(17), 0);
++static SUNXI_CCU_GATE_DATA(pcie_hclk_clk, "pcie-hclk",
++			   sun60i_a733_serdes_ahb_parent,
++			   SUN60I_A733_SUBSYS_PCIE_BGR_REG, BIT(16), 0);
++
++/*
++ * SUBSYS_DBG_CTRL 0x00F0 bit29 COMB1_PHY_REFCLK_GATE: 0 gates the reference
++ * clock off, 1 turns it on; default 0 (A733 UM V1.00, 18.2.6.3). Despite living
++ * in a register the UM files under debug control, this is the gate on the
++ * reference clock COMB1's PMA PLL runs from, so it belongs to the clock
++ * provider and not to the PHY reaching into a page it does not own.
++ *
++ * Parent is the RTC DCXO gate for COMB1, because that is what the reference
++ * clock is derived from -- the DCXO feeds the combo PHYs (A733 UM V1.00 RTC
++ * chapter 9.1.5.5), and on this board it runs at 26 MHz, not 24.
++ */
++static const struct clk_parent_data sun60i_a733_serdes_dcxo1_parent[] = {
++	{ .fw_name = "dcxo-serdes1" },
++};
++static SUNXI_CCU_GATE_DATA(combphy1_refclk_clk, "combphy1-refclk",
++			   sun60i_a733_serdes_dcxo1_parent,
++			   SUN60I_A733_SUBSYS_DBG_CTRL_REG, BIT(29), 0);
++
+ static struct ccu_common *sun60i_a733_serdes_ccu_clks[] = {
+ 	&usb3_aclk_clk.common,
+ 	&usb3_hclk_clk.common,
++	&pcie_slv_aclk_clk.common,
++	&pcie_mst_aclk_clk.common,
++	&pcie_hclk_clk.common,
++	&combphy1_refclk_clk.common,
+ };
+ 
+ static struct clk_hw_onecell_data sun60i_a733_serdes_ccu_hw_clks = {
+ 	.hws	= {
+ 		[CLK_USB3_ACLK]	= &usb3_aclk_clk.common.hw,
+ 		[CLK_USB3_HCLK]	= &usb3_hclk_clk.common.hw,
++		[CLK_PCIE_SLV_ACLK] = &pcie_slv_aclk_clk.common.hw,
++		[CLK_PCIE_MST_ACLK] = &pcie_mst_aclk_clk.common.hw,
++		[CLK_PCIE_HCLK]	= &pcie_hclk_clk.common.hw,
++		[CLK_COMBPHY1_REFCLK] = &combphy1_refclk_clk.common.hw,
+ 	},
+-	.num	= 2,
++	.num	= 6,
+ };
+ 
+ /*
+diff --git a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -2055,15 +2055,22 @@
+ 		 */
+ 		serdes_ccu: clock-controller@6c00000 {
+ 			compatible = "allwinner,sun60i-a733-serdes-ccu";
+-			reg = <0x0 0x06c00000 0x0 0x10>;
++			/*
++			 * 0x100, not 0x10: the PCIe bus gates sit at 0x0004 and
++			 * the COMB1 reference-clock gate at 0x00f0, so the
++			 * window has to reach past the USB3 register this node
++			 * started with.
++			 */
++			reg = <0x0 0x06c00000 0x0 0x100>;
+ 			/*
+ 			 * The two bus-matrix gates that feed the whole SERDES
+ 			 * block: AHB 0x05C0 bit8 and
+ 			 * MBUS 0x05E0 bit28. They are the upstream of the
+ 			 * per-device gates in this page.
+ 			 */
+-			clocks = <&ccu CLK_BUS_SERDES>, <&ccu CLK_MBUS_SERDES>;
+-			clock-names = "ahb", "mbus";
++			clocks = <&ccu CLK_BUS_SERDES>, <&ccu CLK_MBUS_SERDES>,
++				 <&rtc_ccu CLK_RTC_DCXO_SERDES1>;
++			clock-names = "ahb", "mbus", "dcxo-serdes1";
+ 			resets = <&ccu RST_BUS_SERDES>;
+ 			#clock-cells = <1>;
+ 			#reset-cells = <1>;

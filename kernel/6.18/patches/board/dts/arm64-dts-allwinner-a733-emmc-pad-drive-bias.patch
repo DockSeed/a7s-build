@@ -1,0 +1,140 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: allwinner: A733 eMMC pad drive strength and bias
+
+The eMMC pins run at their pad reset defaults: no pull on the data lines and
+the weakest-but-one drive strength on the clock. HS400 reads are fine that way,
+writes are not (patches `mmc-sunxi-add-a733-emmc-hs400` and `arm64-dts-allwinner-a733-emmc-hs400`: "data error, sending stop command" on
+the first bulk write, then the eMMC wedges until a power cycle). This sets the
+pads to what the vendor stack uses on this board.
+
+Where the values come from: the board was booted into the vendor image from
+eMMC, which drives that same part at HS400/200 MHz as its live root filesystem
+-- a write-capable reference on our silicon. Read back 2026-07-24 (and independently
+re-measured a second time):
+
+  PC_DRV0 = 0x11311133   UM default 0x11111111
+  PC_PUL0 = 0x54555546   UM default 0x00005140
+  PC_PUL1 = 0x00000001   UM default 0x00000000
+
+Decoded against the UM bit fields -- PUL is 2 bits per pin, 01 = pull-up,
+10 = pull-down; DRV is a 2-bit field on a 4-bit stride -- the vendor delta
+is exactly:
+
+  PC0  SDC2-DS   level 3, pull-down
+  PC1  SDC2-RST  level 3, pull-up
+  PC5  SDC2-CLK  level 3, pull-up
+  PC6  SDC2-CMD  level 1 (= reset default), pull-up
+  PC8..PC16  D0..D7  level 1 (= reset default), pull-up
+
+so CMD and the eight data lines get no drive-strength property here: their
+reset default already is what the vendor runs them at. Note PC16 (SDC2-D7) is
+the one data line whose bias lives in PUL1, not PUL0.
+
+On the units: the UM does not specify drive strength in milliamperes anywhere.
+It specifies output impedance -- level 0 = r0, level 1 = r0/2, level 2 = r0/3,
+level 3 = r0/4, with r0 typically 100 ohm at 1.8 V (A733 user manual), so
+level 3 is about 25 ohm on this 1.8 V bank (bank PC is supplied by the PMIC's
+CLDO5). "drive-strength = <40>" is the
+Linux binding's mA convention, which pinctrl-sunxi converts back to register
+value 3 (drivers/pinctrl/sunxi/pinctrl-sunxi.c: "0: 10mA 1: 20mA 2: 30mA
+3: 40mA"). The mA figure is a kernel abstraction, not a UM number.
+
+Why this is the write-side suspect, and not the read side: the card returns a
+CRC status token on DAT0 after every write, which is the only bus turnaround in
+the transfer -- the host releases the line, the card takes it, and it floats in
+between. Without a pull-up the controller samples that window against an
+undefined level. A read has no such turnaround. Likewise the clock: on a write
+the card latches our data against our clock, so the edge rate binds directly,
+whereas on a read the card derives its data strobe from that same clock and the
+two shift together.
+
+This supersedes an earlier DRV_DL hypothesis, which the same
+readback disproves: the vendor writes fine with SMHC_DRV_DL at 0x00010000, the
+silicon reset default we already leave alone.
+
+NOT PROVEN ON HARDWARE. This is a register-diff hypothesis with a mechanism,
+not a measured fix -- it changes pad settings only, and the write test that
+decides it has not run yet. The question stays open until it does.
+
+Assisted-by: Claude
+---
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -560,18 +560,60 @@
+ 				pins = "PF0", "PF1", "PF2",
+ 				       "PF3", "PF4", "PF5";
+ 				allwinner,pinmux = <2>;
+ 				function = "mmc0";
+ 			};
+ 
++			/*
++			 * eMMC splits into three groups because the three
++			 * signal classes need different pad settings. Values
++			 * are the ones the vendor stack runs on this board at
++			 * HS400/200 MHz, read back from silicon on 2026-07-24
++			 * (PC_DRV0=0x11311133, PC_PUL0=0x54555546,
++			 * PC_PUL1=0x00000001).
++			 * Bank PC is the eMMC bank.
++			 *
++			 * CMD and the eight data lines keep the pad reset
++			 * default of 20 mA (register 1) -- which is what the
++			 * vendor leaves them at -- so they carry no
++			 * drive-strength property at all.
++			 */
+ 			mmc2_pins: mmc2-pins {
+-				pins = "PC0", "PC1", "PC5", "PC6",
++				pins = "PC6",
+ 				       "PC8", "PC9", "PC10", "PC11",
+ 				       "PC13", "PC14", "PC15", "PC16";
+ 				allwinner,pinmux = <3>;
+ 				function = "mmc2";
++				bias-pull-up;
++			};
++
++			/*
++			 * CLK and RST at 40 mA (register value 3). On a write
++			 * the card latches our data against our clock, so the
++			 * clock edge rate binds directly; on a read the card
++			 * derives its strobe from that same clock and the two
++			 * shift together.
++			 */
++			mmc2_clk_pins: mmc2-clk-pins {
++				pins = "PC1", "PC5";
++				allwinner,pinmux = <3>;
++				function = "mmc2";
++				drive-strength = <40>;
++				bias-pull-up;
++			};
++
++			/*
++			 * The data strobe is driven by the card, and is the
++			 * one eMMC pin the vendor pulls down rather than up.
++			 */
++			mmc2_ds_pins: mmc2-ds-pins {
++				pins = "PC0";
++				allwinner,pinmux = <3>;
++				function = "mmc2";
++				drive-strength = <40>;
++				bias-pull-down;
+ 			};
+ 		};
+ 
+ 		ccu: clock-controller@2002000 {
+ 			compatible = "allwinner,sun60i-a733-ccu";
+ 			reg = <0x0 0x02002000 0x0 0x2000>;
+@@ -756,13 +798,14 @@
+ 			clocks = <&ccu CLK_BUS_SMHC2>, <&ccu CLK_SMHC2>;
+ 			clock-names = "ahb", "mmc";
+ 			resets = <&ccu RST_BUS_SMHC2>;
+ 			reset-names = "ahb";
+ 			interrupts = <GIC_SPI 163 IRQ_TYPE_LEVEL_HIGH>;
+ 			pinctrl-names = "default";
+-			pinctrl-0 = <&mmc2_pins>;
++			pinctrl-0 = <&mmc2_pins>, <&mmc2_clk_pins>,
++				    <&mmc2_ds_pins>;
+ 			vmmc-supply = <&reg_vcc3v3>;
+ 			vqmmc-supply = <&reg_vcc1v8>;
+ 			bus-width = <8>;
+ 			max-frequency = <150000000>;
+ 			non-removable;
+ 			cap-mmc-highspeed;

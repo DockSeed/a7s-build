@@ -1,0 +1,61 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] mmc: sunxi: report what the block layer actually hands the IDMAC
+
+Every statement about descriptor count in this series so far has been a
+calculation from max_seg_size, not a measurement. That number is an upper
+bound the driver advertises; what the block layer really produces depends on
+how the pages fall, and for direct I/O over scattered pages it is usually one
+4 KiB segment per page regardless of what we allow.
+
+The difference matters. If segments are 4 KiB in practice, then we already
+fetch as often as the vendor does, the "128 against 256 descriptors per MiB"
+contrast is an artefact of the calculation, and buf_size never takes the zero
+value that Table 11-5 documents as "skip this descriptor". If they are 8 KiB,
+both of those are real. Both stories fit the evidence we have, which is why
+this is worth one line of measurement rather than another round of reasoning.
+
+So log it: segment count, smallest and largest segment, how many sit exactly at
+max_len, and the transfer size, once per request. Silent by default and one
+boot argument away, like the rest of the diagnostics in this driver:
+
+    dyndbg="func sunxi_mmc_init_idma_des +p"
+
+Guarded by IS_ENABLED(CONFIG_DYNAMIC_DEBUG) so the loop disappears entirely
+where dynamic debug is not built in.
+
+Assisted-by: Claude
+---
+--- a/drivers/mmc/host/sunxi-mmc.c
++++ b/drivers/mmc/host/sunxi-mmc.c
+@@ -431,6 +431,31 @@
+ 				    host->cfg->idma_des_shift);
+ 	}
+ 
++	/*
++	 * What the block layer actually handed us, as opposed to the maximum
++	 * we advertised. Descriptor count and segment size decide how often
++	 * the IDMAC has to fetch from memory mid-transfer, and that is one of
++	 * the few things that can leave gaps in the card-side data stream.
++	 * Silent unless asked for: dyndbg="func sunxi_mmc_init_idma_des +p".
++	 */
++	if (IS_ENABLED(CONFIG_DYNAMIC_DEBUG)) {
++		unsigned int lo = UINT_MAX, hi = 0, atmax = 0;
++
++		for (i = 0; i < data->sg_len; i++) {
++			unsigned int len = data->sg[i].length;
++
++			lo = min(lo, len);
++			hi = max(hi, len);
++			if (len == max_len)
++				atmax++;
++		}
++		dev_dbg(mmc_dev(host->mmc),
++			"idma: %u segs, %u..%u bytes, %u at max_len %d, %u bytes total\n",
++			data->sg_len, lo, hi, atmax, max_len,
++			data->blocks * data->blksz);
++		i = data->sg_len;
++	}
++
+ 	pdes[0].config |= cpu_to_le32(SDXC_IDMAC_DES0_FD);
+ 	pdes[i - 1].config |= cpu_to_le32(SDXC_IDMAC_DES0_LD |
+ 					  SDXC_IDMAC_DES0_ER);

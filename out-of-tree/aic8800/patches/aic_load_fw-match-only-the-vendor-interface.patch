@@ -1,0 +1,116 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] aic_load_fw: match only the vendor interface, and decline with -ENODEV
+
+Two defects, one symptom. On the delivery image every boot logs
+
+  aic_load_fw 2-1.1:1.0: probe with driver aic_load_fw failed with error -1
+  aic_load_fw 2-1.1:1.1: probe with driver aic_load_fw failed with error -1
+  aic_load_fw 2-1.1:1.2: probe with driver aic_load_fw failed with error -1
+
+at dev_err level, right where the WiFi/BT subsystem comes up -- and yet WiFi
+and Bluetooth both work. It reads as a failed radio and is not one.
+
+Why three lines. aicwf_usb_id_table matched with USB_DEVICE(), which sets only
+USB_DEVICE_ID_MATCH_DEVICE (include/linux/usb.h:1015), i.e. idVendor+idProduct
+and nothing about the interface. USB binds per interface, so usb_probe_interface()
+calls the loader's probe once for every interface of a matching device. After the
+firmware upload the part re-enumerates as a69c:8d81 with bNumInterfaces=3 --
+two Bluetooth interfaces at class/subclass/protocol e0/01/01 for btusb, and one
+vendor-specific ff/ff/ff for aic8800_fdrv -- so the loader is asked three times
+and refuses three times.
+
+Why a shout instead of a decline. The refusal returned a bare -1. That is -EPERM
+(include/uapi/asm-generic/errno-base.h:5), and drivers/base/dd.c:643-660 gives
+-ENODEV and -ENXIO their own arm -- logged as dev_dbg "rejects match" -- while
+everything else falls into the default arm and is logged as dev_err. So a
+deliberate "not mine" was spelled as a driver failure.
+
+The fix, and why it is the driver's own rule rather than a new claim about the
+hardware: aic_load_fw only ever drives the vendor-specific interface. Its own
+aicwf_parse_usb() enforces that, rejecting anything that is not ff/ff/ff with
+"non WLAN interface" and -ENODEV, for every part id without exception. Matching
+the whole device can therefore never gain the loader an interface it would keep;
+it can only cost probe calls it must refuse. The table is narrowed to
+USB_DEVICE_AND_INTERFACE_INFO(..., 0xff, 0xff, 0xff) -- exactly what the vendor's
+own aic8800_fdrv already does for 8801/8d81/8d41/8800DC/8d81x2 -- and the one
+remaining legitimate refusal (vendor interface of a loaded part, fw_loaded == 1)
+returns -ENODEV.
+
+What this deliberately does NOT change: the fw_loaded == 0 path, where the module
+is loaded while the part is already at its post-download id and rwnx_send_reboot()
+has to push it back into download mode. That path runs on the vendor interface,
+which still matches.
+
+Measured on the board, 2026-08-15, delivery image:
+  - 2-1.1 is a69c:8d81, bDeviceClass ef, bNumInterfaces 3
+  - 2-1.1:1.0 e0/01/01 -> btusb, 2-1.1:1.1 e0/01/01 -> btusb,
+    2-1.1:1.2 ff/ff/ff -> aic8800_fdrv
+  - the loader's own probe print names the id it was called with:
+    "aicwf_usb_probe vid:0xA69C pid:0x8D81 icl:0x0 isc:0x0 ipr:0x0", three times,
+    icl/isc/ipr all zero because USB_DEVICE() leaves those match fields unset.
+
+Not a leak and not a race: the refusal returns before the first kzalloc, and
+usb_probe_interface()'s err path (drivers/usb/core/driver.c) already rebalances
+intfdata, LPM and runtime-PM and leaves the interface UNBOUND for the next driver
+-- which is how btusb and aic8800_fdrv bind it today. This patch removes noise
+and a mis-declared match; it does not change what ends up bound.
+
+SPDX-License-Identifier: GPL-2.0-only
+
+Assisted-by: Claude
+
+diff --git a/src/USB/driver_fw/drivers/aic8800/aic_load_fw/aicwf_usb.c b/src/USB/driver_fw/drivers/aic8800/aic_load_fw/aicwf_usb.c
+index bd6c6a5..794b5fd 100644
+--- a/src/USB/driver_fw/drivers/aic8800/aic_load_fw/aicwf_usb.c
++++ b/src/USB/driver_fw/drivers/aic8800/aic_load_fw/aicwf_usb.c
+@@ -1688,7 +1688,13 @@ static int aicwf_usb_probe(struct usb_interface *intf, const struct usb_device_i
+ 	    id->idProduct == USB_DEVICE_ID_AIC_8800D41 ||
+ 	    id->idProduct == USB_DEVICE_ID_AIC_8800D81X2 ||
+ 	    id->idProduct == USB_DEVICE_ID_AIC_8800D89X2)){
+-		return -1;
++		/* Firmware is up and the part re-enumerated under its loaded id;
++		 * this interface belongs to aic8800_fdrv now. -ENODEV is the
++		 * kernel's word for "matched but not mine": drivers/base/dd.c
++		 * logs it as dev_dbg "rejects match", where a bare -1 (= -EPERM)
++		 * falls into the default arm and is shouted as a dev_err.
++		 */
++		return -ENODEV;
+ 	}
+ 
+     usb_dev = kzalloc(sizeof(struct aic_usb_dev), GFP_ATOMIC);
+@@ -1840,17 +1846,25 @@ static int aicwf_usb_reset_resume(struct usb_interface *intf)
+     return aicwf_usb_resume(intf);
+ }
+ #endif
++/* aic_load_fw drives exactly one interface: the vendor-specific one. Its own
++ * aicwf_parse_usb() says so -- it rejects anything that is not ff/ff/ff with
++ * "non WLAN interface". Matching the whole device therefore buys nothing and
++ * costs a probe call per interface the loader can only refuse: the D81 (and
++ * every other post-download identity) exposes two Bluetooth interfaces at
++ * e0/01/01 that belong to btusb. Narrowing the match is what aic8800_fdrv
++ * already does for the same part ids.
++ */
+ static struct usb_device_id aicwf_usb_id_table[] = {
+-    {USB_DEVICE(USB_VENDOR_ID_AIC, USB_DEVICE_ID_AIC)},
+-    {USB_DEVICE(USB_VENDOR_ID_AIC, USB_DEVICE_ID_AIC_8801)},
+-    {USB_DEVICE(USB_VENDOR_ID_AIC, USB_DEVICE_ID_AIC_8800D80)},
+-    {USB_DEVICE(USB_VENDOR_ID_AIC, USB_DEVICE_ID_AIC_8800D81)},
+-    {USB_DEVICE(USB_VENDOR_ID_AIC, USB_DEVICE_ID_AIC_8800D40)},
+-    {USB_DEVICE(USB_VENDOR_ID_AIC, USB_DEVICE_ID_AIC_8800D41)},
+-    {USB_DEVICE(USB_VENDOR_ID_AIC_V2, USB_DEVICE_ID_AIC_8800D80X2)},
+-    {USB_DEVICE(USB_VENDOR_ID_AIC_V2, USB_DEVICE_ID_AIC_8800D81X2)},
+-    {USB_DEVICE(USB_VENDOR_ID_AIC_V2, USB_DEVICE_ID_AIC_8800D89X2)},
+-    {USB_DEVICE(USB_VENDOR_ID_AIC_V2, USB_DEVICE_ID_AIC_8800D40X2)},
++    {USB_DEVICE_AND_INTERFACE_INFO(USB_VENDOR_ID_AIC, USB_DEVICE_ID_AIC, 0xff, 0xff, 0xff)},
++    {USB_DEVICE_AND_INTERFACE_INFO(USB_VENDOR_ID_AIC, USB_DEVICE_ID_AIC_8801, 0xff, 0xff, 0xff)},
++    {USB_DEVICE_AND_INTERFACE_INFO(USB_VENDOR_ID_AIC, USB_DEVICE_ID_AIC_8800D80, 0xff, 0xff, 0xff)},
++    {USB_DEVICE_AND_INTERFACE_INFO(USB_VENDOR_ID_AIC, USB_DEVICE_ID_AIC_8800D81, 0xff, 0xff, 0xff)},
++    {USB_DEVICE_AND_INTERFACE_INFO(USB_VENDOR_ID_AIC, USB_DEVICE_ID_AIC_8800D40, 0xff, 0xff, 0xff)},
++    {USB_DEVICE_AND_INTERFACE_INFO(USB_VENDOR_ID_AIC, USB_DEVICE_ID_AIC_8800D41, 0xff, 0xff, 0xff)},
++    {USB_DEVICE_AND_INTERFACE_INFO(USB_VENDOR_ID_AIC_V2, USB_DEVICE_ID_AIC_8800D80X2, 0xff, 0xff, 0xff)},
++    {USB_DEVICE_AND_INTERFACE_INFO(USB_VENDOR_ID_AIC_V2, USB_DEVICE_ID_AIC_8800D81X2, 0xff, 0xff, 0xff)},
++    {USB_DEVICE_AND_INTERFACE_INFO(USB_VENDOR_ID_AIC_V2, USB_DEVICE_ID_AIC_8800D89X2, 0xff, 0xff, 0xff)},
++    {USB_DEVICE_AND_INTERFACE_INFO(USB_VENDOR_ID_AIC_V2, USB_DEVICE_ID_AIC_8800D40X2, 0xff, 0xff, 0xff)},
+     {}
+ };
+ 

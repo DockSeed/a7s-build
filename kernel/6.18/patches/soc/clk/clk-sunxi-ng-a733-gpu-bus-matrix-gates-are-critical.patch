@@ -1,0 +1,102 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] clk: sunxi-ng: a733: the GPU's bus-matrix gates are critical
+
+`clk-sunxi-ng-a733-gpu-pll-module-clock-bus-gates-and-reset` registers the GPU's two bus-matrix master gates with flags 0:
+
+	SUNXI_CCU_GATE_HWS(ahb_gpu0_clk,  "ahb-gpu0",  ahb_hws, 0x05C0, BIT(7),  0);
+	SUNXI_CCU_GATE_HWS(mbus_gpu0_clk, "mbus-gpu0", ahb_hws, 0x05E0, BIT(16), 0);
+
+so clk_disable_unused() closes both on any boot without clk_ignore_unused.
+Measured on the 8 GiB board, 2026-09-07: AHB_MAT_CLK_GATING bit 7 and MBUS_MAT_CLK_GATING
+bit 16 both read 0 under our kernel and 1 under the vendor's, on the same board
+in the same session.
+
+A downstream tree that carries a working mainline drm/powervr on this SoC,
+Alex Cao's A733 BSP port for Linux 6.18
+(https://github.com/alexcaoys/allwinner-bsp, branch linux-6.18.y), keeps
+them on, in its copy of the vendor's drivers/clk/sunxi-ng/ccu-sun60iw2.c
+(the same flags are in Radxa's vendor BSP,
+https://github.com/radxa/allwinner-bsp, branch cubie-aiot-v1.4.6):
+
+	gpu0_ahb_gate_clk   "gpu0-ahb-gate"  0x05C0 BIT(7)  CLK_IS_CRITICAL
+	gpu0_mbus_gate_clk  "gpu0-mbus-gate" 0x05E0 BIT(16) CLK_IS_CRITICAL
+
+and keeps every other bus-matrix master open as well, with CLK_IS_CRITICAL or
+CLK_IGNORE_UNUSED. A master port the GPU needs to reach memory is not
+something to close because nothing has claimed it yet.
+
+⚠ **This is load-bearing, and an earlier draft of this header said the
+opposite.** It said these gates were not the blocker, on the grounds that opening both gates by
+hand leaves GPU_CORE at PWSR = 0x0. That observation is correct and the
+conclusion drawn from it was wrong: the gates are not what powers the domain,
+they are what lets the firmware reach memory afterwards.
+
+Measured on the 8 GiB board on 2026-09-07, after the domain had been brought up: the driver
+binds, loads powervr/rogue_36.56.104.183_v1.fw, and then fails with
+"[drm] *ERROR* Firmware failed to boot" -- with AHB_MAT reading 0x1101037F
+(bit 7 clear) and MBUS_MAT reading 0xF1045803 (bit 16 clear), exactly the state
+clk_disable_unused leaves. With both bits set and the domain up, the same
+modprobe gives
+
+  powervr 1800000.gpu: [drm] loaded firmware powervr/rogue_36.56.104.183_v1.fw
+  powervr 1800000.gpu: [drm] FW version v1.1 (build 6976702 OS)
+  [drm] Initialized powervr 1.0.0 for 1800000.gpu on minor 1
+
+and /dev/dri/renderD128 appears. So a GPU that has power but no master port is a
+GPU whose firmware cannot boot.
+
+⚠ Scope note on the key fields, because the neighbouring finding is easy to
+overstate. That reference models these two gates as key-protected
+(AHB_MASTER_KEY_VALUE 0x010000FF, MBUS_MASTER_KEY_VALUE 0x41055800) and mainline
+has no such feature. It does not matter here: SUNXI_CCU_GATE_HWS is a
+read-modify-write and both key fields are already set in the live registers, so
+they survive the write. Checked at silicon -- a bit-7 write to 0x05C0 with and
+without the key produced the identical readback. The key IS real on GPU0_CLK,
+where a mux write without bit 27 is dropped and with it is taken, and `clk-sunxi-ng-a733-gpu-pll-module-clock-bus-gates-and-reset`
+already models that correctly with CCU_FEATURE_UPDATE_BIT.
+
+Falsifier: after boot without clk_ignore_unused, AHB_MAT bit 7 and MBUS_MAT
+bit 16 both read 1, and USB3/PCIe -- the other masters in those two registers --
+are unaffected.
+
+VERIFICATION
+--------------------------------------------------------------------------------
+- applies: patch -p1 --fuzz=0 in the full ordered series (local, 2026-09-07).
+- builds: a test kernel of this series -- the kernel that produced the HW result below.
+- HW: proven 2026-09-07 on the 8 GiB board, with a test build of this series. Booted without clk_ignore_unused
+  and with no register written from userspace, AHB_MAT reads 0x110103FF (bit 7
+  set) and MBUS_MAT 0xF1055803 (bit 16 set), and the firmware boots instead of
+  reporting "Firmware failed to boot": "[drm] Initialized powervr 1.0.0 for
+  1800000.gpu", /dev/dri/renderD128 present, GPU_CORE PWSR = 0x8.
+- ⚠ Half of the second falsifier is measured, half cannot be on this board:
+  USB3 is up on the same boot ("Host supports USB 3.1 Enhanced SuperSpeed",
+  devices enumerate through xhci-hcd), so holding these gates does not cost the
+  other consumer. ⬜ PCIe stays open here for a physical reason, not an
+  oversight: the 8 GiB board has no endpoint, /sys/bus/pci/devices is empty. It closes on a
+  board that has one (the 6 GiB board carries NVMe).
+
+Assisted-by: Claude
+
+diff --git a/drivers/clk/sunxi-ng/ccu-sun60iw2.c b/drivers/clk/sunxi-ng/ccu-sun60iw2.c
+--- a/drivers/clk/sunxi-ng/ccu-sun60iw2.c
++++ b/drivers/clk/sunxi-ng/ccu-sun60iw2.c
+@@ -1642,7 +1642,8 @@
+ 	},
+ };
+ 
+-static SUNXI_CCU_GATE_HWS(ahb_gpu0_clk,  "ahb-gpu0",  ahb_hws, 0x05C0, BIT(7),  0);
++static SUNXI_CCU_GATE_HWS(ahb_gpu0_clk,  "ahb-gpu0",  ahb_hws, 0x05C0, BIT(7),
++			  CLK_IS_CRITICAL);
+ 
+ static const struct clk_hw *ahb_gpu0_hws[] = { &ahb_gpu0_clk.common.hw };
+ 
+@@ -1665,7 +1666,8 @@
+  * with CLK_IGNORE_UNUSED, not a rate or a reset change.
+  */
+ static SUNXI_CCU_GATE_HWS(bus_gpu0_clk,  "bus-gpu0",  ahb_gpu0_hws, 0x0B24, BIT(0), 0);
+-static SUNXI_CCU_GATE_HWS(mbus_gpu0_clk, "mbus-gpu0", ahb_hws, 0x05E0, BIT(16), 0);
++static SUNXI_CCU_GATE_HWS(mbus_gpu0_clk, "mbus-gpu0", ahb_hws, 0x05E0, BIT(16),
++			  CLK_IS_CRITICAL);
+ 
+ /* ccu_common-based clocks (registered and reset-mapped by the core). */
+ static struct ccu_common *sun60iw2_ccu_clks[] = {

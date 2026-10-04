@@ -1,0 +1,177 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] mmc: sunxi: the A733 SD ran SDR104 at half its clock
+
+The SD card on this board negotiated SDR104 and delivered 45.1 MB/s where
+the vendor stack reaches 89.0 on the same card in the same slot. It was
+running at half the card clock the whole time, and nothing above the
+driver could see it.
+
+WHY IT WAS INVISIBLE
+
+`mmc->actual_clock` is set to `rate / div`, and `div` is 2 only for DDR52
+and HS400. For SDR104 it is 1, so `actual_clock` reports the *module*
+clock as the card clock. `/sys/kernel/debug/mmc0/ios` said 200 MHz, the
+module clock really was 200 MHz, and the card was clocked at 100.
+
+Measured on the 8 GiB board on 2026-08-08, at the register and under load, because
+the block is runtime-gated and reads all-zero when idle:
+
+    SMHC0_CLK 0x81000001   M=1, 200 MHz module   45.1 MB/s
+    SMHC0_CLK 0x81000000   M=0, 400 MHz module   80.6 MB/s
+
+Same card, same slot, same method (O_DIRECT, 1 MiB, caches dropped).
+`actual_clock` read 200 MHz in **both** cases.
+
+WHY THE EXISTING BRANCH DID NOT COVER IT
+
+The doubling branch was justified for DDR: "the card drives data on both
+clock edges, so the controller has to move two bytes per card clock".
+That argument does not apply to SDR104, which is single data rate -- and
+so SDR was left out. The actual reason for the doubling is different: the
+new timing mode divides the module clock by two on its way to the card
+regardless of the mode. Once that is the reason, SDR50 and SDR104 need it
+for the same cause as DDR52 and HS400.
+
+This is ``mmc-sunxi-hs400-module-clock-at-twice-the-card-clock`` one mode over. That patch found HS400 running at 1x on
+exactly this controller family and fixed it; nobody then asked whether the
+SD had the same defect. It did, for six weeks.
+
+THE SECOND HALF: THE SD HAD NO CONFIG OF ITS OWN
+
+`mmc@4020000` carries `compatible = "allwinner,sun60i-a733-mmc",
+"allwinner,sun20i-d1-mmc"`, and the first string has **no consumer
+anywhere in the tree** -- `grep -rn "sun60i-a733-mmc" drivers/ include/`
+returns nothing. So the SD bound `sun20i_d1_cfg` and inherited its FIFO
+configuration: `SDXC_FIFOTH_DEFAULT = 0x20070008`, whose `BSIZE_OF_TRANS`
+field (bits 30:28) is 2 = 8 transfers.
+
+The A733 UM writes `0x300F00F0` in all six of its programming flows, read
+and write alike, and 11.3.6.1 states they use SMHC0-2 as the example --
+so the recommendation covers this controller. That value is
+`BSIZE_OF_TRANS = 3` = 16 transfers. `0x20070008` appears **nowhere** in
+the UM (counted: 6 occurrences of the former, 0 of the latter).
+
+This patch gives the SD a cfg of its own with the UM's value, which also
+makes that dead compatible live.
+
+WHAT EACH HALF IS WORTH, MEASURED SEPARATELY
+
+    fifoth alone   44.5 MB/s   (against 45.1 before -- no change)
+    fifoth + clock 80.6 MB/s
+
+So the clock is what moved it. `FIFOTH = 0x300F00F0` was confirmed at the
+register under load in the first of those runs, so that arm was a real
+test and not a no-op: the burst size doubled and the throughput did not.
+The value is kept because the UM prescribes it for this controller, not
+because it was shown to help.
+
+VERIFIED
+
+  * `SMHC0_CLK = 0x81000000` under load, i.e. 400 MHz module clock, read
+    from the CCU at `0x02002d00` while a transfer was in flight
+  * `FIFOTH = 0x300F00F0` under load at `0x04020040`
+  * 45.1 -> 80.6 MB/s, a factor of 1.79, moving us from 51 % to 90.6 % of
+    the vendor's 89.0 on the same card
+  * full series applies `--fuzz=0`; the driver builds
+
+NOT VERIFIED
+
+  * **The residual 9 %.** 80.6 against 89.0 is not explained. It may be the
+    FIFO burst finally mattering now that the clock is right, or something
+    not yet looked at. One observable: build with the clock fix but the old
+    `fifoth` and compare -- that isolates the burst at the corrected clock,
+    which the runs above could not.
+  * **SDR50 is changed and untested.** No SDR50 card was on the board. The
+    same reasoning applies to it, and the same reasoning is what was wrong
+    for SDR104 before this patch, so it is a prediction rather than a
+    result.
+  * No cold-start series yet. ``arm64-dts-a733-sd-pad-drive-strength`` needed 20 runs to establish SDR104 is
+    stable; this changes the clock those runs were taken at.
+
+Assisted-by: Claude
+---
+--- a/drivers/mmc/host/sunxi-mmc.c
++++ b/drivers/mmc/host/sunxi-mmc.c
+@@ -994,7 +994,28 @@
+ 	if ((ios->timing == MMC_TIMING_MMC_DDR52 &&
+ 	     (host->use_new_timings ||
+ 	      ios->bus_width == MMC_BUS_WIDTH_8)) ||
+-	    ios->timing == MMC_TIMING_MMC_HS400) {
++	    ios->timing == MMC_TIMING_MMC_HS400 ||
++	    /*
++	     * SDR50/SDR104 need it too, and the reason is not the one above:
++	     * these are single data rate, so the "two bytes per card clock"
++	     * argument does not apply. What applies is that the new timing
++	     * mode divides the module clock by two on its way to the card,
++	     * whatever the mode -- so at div = 1 the card ran at half the
++	     * rate the driver believed.
++	     *
++	     * Measured on the 8 GiB board, 2026-08-08, and the register is the proof:
++	     * SMHC0_CLK 0x81000001 (M=1, 200 MHz module) gave 45.1 MB/s,
++	     * SMHC0_CLK 0x81000000 (M=0, 400 MHz module) gives 80.6 MB/s on
++	     * the same card, same slot, same method. mmc->actual_clock read
++	     * 200 MHz in BOTH cases, because it is rate/div and div was 1 --
++	     * so ios reported the module clock as the card clock and nothing
++	     * above the driver could see the difference.
++	     *
++	     * This is `mmc-sunxi-hs400-module-clock-at-twice-the-card-clock` one mode over. That patch found HS400 running at
++	     * 1x and nobody checked whether SDR104 had the same defect.
++	     */
++	    ios->timing == MMC_TIMING_UHS_SDR104 ||
++	    ios->timing == MMC_TIMING_UHS_SDR50) {
+ 		div = 2;
+ 		clock <<= 1;
+ 	}
+@@ -1656,6 +1677,44 @@
+ 	.needs_new_timings = true,
+ };
+ 
++/*
++ * The SD controller (SMHC0) had no config of its own and fell through to
++ * sun20i_d1_cfg, because the compatible its DT node carries --
++ * "allwinner,sun60i-a733-mmc" -- has no consumer anywhere in the tree. That
++ * was invisible: the node binds, the card enumerates, SDR104 negotiates, and
++ * nothing reports which cfg won.
++ *
++ * What it cost is the FIFO configuration. Without .fifoth the driver writes
++ * SDXC_FIFOTH_DEFAULT = 0x20070008, whose BSIZE_OF_TRANS field (bits 30:28)
++ * is 2 = 8 transfers. The A733 UM programming guidelines write 0x300F00F0 in
++ * every one of their six flows, read and write alike, and 11.3.6.1 states
++ * they use SMHC0-2 as the example -- so the recommendation covers this
++ * controller, not just the eMMC. That value encodes BSIZE_OF_TRANS = 3 =
++ * 16 transfers. With a 32-bit FIFO word that is 64 bytes per bus transaction
++ * against our 32. 0x20070008 appears nowhere in the UM.
++ *
++ * Measured on the 8 GiB board (2026-08-08): 45.1 MB/s asymptotic against the vendor
++ * stack's 89.0 on the same card in the same slot, with the module clock
++ * verified at 200 MHz in SMHC0_CLK and CLKCR under load. Expressed per bus
++ * transaction both stacks issue about the same number: 45.1 MB/s / 32 B =
++ * 1.409 M/s, 89.0 MB/s / 64 B = 1.391 M/s -- 1.3 % apart. That is the
++ * signature of a fixed per-burst cost with half the payload, which is what
++ * this cfg exists to correct.
++ *
++ * Everything else matches sun20i_d1_cfg, which is what SMHC0 has been running
++ * on: same descriptor geometry, same calibration capability. can_hs400 and
++ * ds_dl stay absent because this is the SD slot, and can_auto_cmd23 stays
++ * absent because that is a separate change with its own proof.
++ */
++static const struct sunxi_mmc_cfg sun60i_a733_mmc_cfg = {
++	.idma_des_size_bits = 13,
++	.idma_des_shift = 2,
++	.can_calibrate = true,
++	.mask_data0 = true,
++	.needs_new_timings = true,
++	.fifoth = 0x300f00f0,
++};
++
+ static const struct sunxi_mmc_cfg sun60i_a733_emmc_cfg = {
+ 	.idma_des_size_bits = 13,
+ 	.idma_des_shift = 2,
+@@ -1697,6 +1756,7 @@
+ 	{ .compatible = "allwinner,sun50i-a100-mmc", .data = &sun20i_d1_cfg },
+ 	{ .compatible = "allwinner,sun50i-a100-emmc", .data = &sun50i_a100_emmc_cfg },
+ 	{ .compatible = "allwinner,sun50i-h616-mmc", .data = &sun50i_h616_cfg },
++	{ .compatible = "allwinner,sun60i-a733-mmc", .data = &sun60i_a733_mmc_cfg },
+ 	{ .compatible = "allwinner,sun60i-a733-emmc", .data = &sun60i_a733_emmc_cfg },
+ 	{ /* sentinel */ }
+ };

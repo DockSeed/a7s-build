@@ -1,0 +1,76 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] mmc: sunxi: program the auto-CMD12 argument instead of leaving it at 0xFFFF
+
+WHY
+---
+SMHC_A12A (offset 0x058) holds the argument the controller sends with an
+auto-CMD12. A733 UM 11.3.8.22: A12A, the Auto CMD12 argument, R/W, and the
+reset value is 0x0000_FFFF, not 0. No sunxi driver has ever written it -- in
+this tree the only occurrence of SDXC_REG_A12A is its #define -- so the
+controller emits CMD12 with 0xFFFF as its argument.
+
+CMD12 STOP_TRANSMISSION takes a zero argument; from eMMC 4.41 bit 0 of that
+argument selects the HPI flavour of the command, and 0xFFFF has it set.
+
+WHERE THE VALUES COME FROM
+--------------------------
+Register and reset value: A733 UM 11.3.8.22 (offset 0x058, default 0xFFFF).
+Silicon readback on the 8 GiB board, 2026-09-19, after a clean 64 MiB HS400 read with the
+controller pinned awake:
+
+    SMHC2 (eMMC) 0x0402_2058 = 0x0000FFFF
+    SMHC0 (SD)   0x0402_0058 = 0x00000000
+
+The SD instance reads 0 because the boot loader drove that controller, not
+because anything initialised it. Neither value comes from a kernel.
+
+WHAT IT CHANGES
+---------------
+One write of 0 in sunxi_mmc_init_host(), beside the other one-time register
+setup. Nothing else moves.
+
+WHAT IT DOES NOT CLAIM
+----------------------
+It does not claim to fix an observed failure. Measured the same day: a clean
+HS400 read produces CMD18 with R1 = 0x900, i.e. bit 22 ILLEGAL_COMMAND clear,
+so nothing is currently going wrong on this path. Two reasons it is still
+right: `mmc-sunxi-a733-emmc-hardware-auto-cmd23` gave the eMMC hardware auto-CMD23, so auto-CMD12 only fires on
+transfers the core issues without an sbc, and on the SD controller -- which
+runs auto-CMD12 on every multi-block transfer -- the register is correct today
+only by accident of the boot loader.
+
+VERIFIED / NOT VERIFIED
+-----------------------
+- Applies clean at fuzz 0 on a fresh unpack with the series in order: yes.
+- Builds: not asserted here.
+- Silicon: NOT proven. The observable: 0x0402_2058 reads 0x00000000 after boot
+  instead of 0x0000FFFF, and the SD and eMMC controllers read the same value.
+  What would falsify the reasoning rather than the write: an auto-CMD12 whose
+  R1 still shows bit 22 set with the argument at 0.
+
+ISSUE
+-----
+Defect open since 2026-07.
+
+Assisted-by: Claude
+---
+--- a/drivers/mmc/host/sunxi-mmc.c
++++ b/drivers/mmc/host/sunxi-mmc.c
+@@ -585,6 +585,17 @@
+ 	mmc_writel(host, REG_RINTR, 0xffffffff);
+ 	/* Debug register? undocumented */
+ 	mmc_writel(host, REG_DBGC, 0xdeb);
++	/*
++	 * Auto-CMD12 argument. The register resets to 0x0000_FFFF on this
++	 * controller (A733 UM 11.3.8.22, the register that holds the
++	 * argument of the automatic CMD12) and no sunxi
++	 * driver has ever written it, so every auto-stop the controller
++	 * generates carries 0xFFFF where CMD12 takes zero. Read back on the 8 GiB board
++	 * 2026-09-19 after a clean HS400 read: SMHC2 0x0000FFFF, SMHC0
++	 * 0x00000000 -- the SD instance sits at 0 only because the boot loader
++	 * drove it, which is luck, not initialisation.
++	 */
++	mmc_writel(host, REG_A12A, 0);
+ 	/* Enable CEATA support */
+ 	mmc_writel(host, REG_FUNS, SDXC_CEATA_ON);
+ 	/* Set DMA descriptor list base address */

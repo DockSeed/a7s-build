@@ -1,0 +1,124 @@
+From: Feng Zhang <feng@radxa.com>
+Date: Tue, 2 Dec 2025 07:31:19 +0000
+Subject: [PATCH] aic8800: build with the vendor packager's own log level default (LOGERROR)
+
+Ported to radxa-pkg/aic8800 5.0+git20260123.5f7be68d-8. The measurements below
+were taken on the previous pin, 4.0+git20250410.b99ca8b6-5; file:line references
+are to the 5.0 tag.
+
+Measured on the board, one cold boot, 2026-08-23: 995 kernel
+lines, 384 of them from this driver -- 39 % of the boot -- and `dmesg -x` puts
+every single one of the 384 at KERN_WARNING, although the text calls itself
+"AICWFDBG(LOGINFO)". The rest of the system in that same boot: 467 info, 99 warn,
+16 notice, 8 debug, 3 err. Setting aicwf_dbg_level=0 at runtime dropped a WiFi
+re-association from ~40 kernel lines to 5, of which 0 were AICWFDBG.
+
+Why they are warnings, not info. AICWFDBG() assembles its own format string and
+gives it no KERN_ prefix:
+
+    #define AICWF_LOG "AICWFDBG("
+    #define AICWFDBG(level, args, arg...)   \
+    do {    \
+        if (aicwf_dbg_level & level) {  \
+            printk(AICWF_LOG#level")\t" args, ##arg); \
+        }   \
+    } while (0)
+
+-- src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/aicwf_debug.h:17-24, and the
+same macro in aic_load_fw/aicwf_debug.h. A printk() whose format
+carries no KERN_ level is emitted at default_message_loglevel
+(kernel/printk/printk.c:67, via include/linux/printk.h:49 ->
+CONFIG_MESSAGE_LOGLEVEL_DEFAULT), which is 4 = KERN_WARNING both by kernel default
+(lib/Kconfig.debug:75-79) and in our .config. "LOGINFO" is this driver's private
+name for a gate bit in aicwf_dbg_level, never a syslog priority; the two were
+never connected. So the priority cannot be fixed from the outside, and a
+`loglevel=` on the command line silences the whole system or nothing.
+
+What the level means. src/.../aic8800_fdrv/aicwf_debug.h:6-12 -- LOGERROR 0x1,
+LOGINFO 0x2, LOGTRACE 0x4, LOGDEBUG 0x8, LOGDATA 0x10, LOGSTEER 0x20, LOGFW 0x200
+(the last two are new in 5.0 and absent from aic_load_fw's copy) -- and the macro
+tests `aicwf_dbg_level & level`, so it is a bitmask, not a threshold. The two
+modules carry two separate variables with two different compiled-in defaults:
+aic8800_fdrv 0x203 = LOGERROR|LOGINFO|LOGFW (rwnx_main.c:551) and aic_load_fw
+0xf = LOGERROR|LOGINFO|LOGDEBUG|LOGTRACE (aic_bluetooth_main.c:23).
+
+LOGFW gates one call site, rwnx_rx_handle_print() (rwnx_msg_rx.c:1757), which
+prints the firmware's own log text when fwlog_en is set. With the bit off those
+lines are not printed; the pr_err("FWLOG-OVFL: ...") just above it, taken when
+fwlog_en is unset, is not gated and still prints.
+
+This patch is not ours. It is debian/patches/fix-Lower-the-debugging-log-level.patch
+by Feng Zhang <feng@radxa.com>, 2025-12-02, taken from the SAME pinned tree we
+build (AIC8800_COMMIT df4c783b663eba1956579c681acd5e45f25c671d, listed in
+debian/patches/series; its revision in that tag drops LOGFW as well) with the
+PCIE and SDIO hunks dropped because we build neither. We miss it only because stage_fetch_wifi clones the git tree and applies
+our patches, and never runs the packaging's quilt series -- so we build the raw
+vendor source where Radxa's own package does not.
+
+Measured against a board that runs Radxa's package: on the vendor Debian install
+of an A7S, `cat /sys/module/aic8800_fdrv/parameters/aicwf_dbg_level` and the same
+for aic_load_fw both read 1, with no modprobe.d entry anywhere on that system --
+i.e. that value is the compiled-in default this patch restores, and it has been
+in service there for months.
+
+Effect, counted against the boot log of 2026-08-15
+(418 AICWFDBG lines):
+409 LOGINFO and 5 LOGDEBUG stop being emitted, 4 LOGERROR remain. Nothing that
+reports a fault is lost: LOGERROR (0x1) stays set, and every genuine error path
+in the driver uses it. Raising it again needs no rebuild --
+`module_param(aicwf_dbg_level, int, 0660)` on both modules, so
+/etc/modprobe.d/*.conf, a modprobe argument, or a write to
+/sys/module/<mod>/parameters/aicwf_dbg_level all work at any time.
+
+Side effect that matters here beyond noise: at LOGINFO the driver prints the SSID
+in clear text on every association --
+"rwnx_send_sm_connect_req ... connect to <ssid>(<len>) channel:<mhz> auth_type:<n>"
+(rwnx_msg_tx.c:3832) and "cfg80211_unlink <ssid>" (rwnx_msg_rx.c:1171 and :1178).
+Both are LOGINFO, so both go away with this patch; the remaining SSID prints in
+the driver are LOGDEBUG (rwnx_msg_rx.c:780, rwnx_main.c:3395,
+aicwf_wext_linux.c:990) and are off at this default too. That takes a live network
+name out of every dmesg, screenshot and log this project attaches to a report.
+
+Rejected alternative: teaching AICWFDBG a real KERN_ prefix (token-paste a
+per-level AICWF_KERN_##level into the format). It is a two-file change and every
+one of the 1585 call sites in the 5.0 tag passes a bare LOGxxx token, so it would work -- but it
+fixes only the priority. The 409 lines and the SSID would still be there, just at
+KERN_INFO, and it would be a delta of our own to carry forward at every vendor
+bump instead of a line the vendor already maintains.
+
+Note: aic_load_fw/aic_bluetooth_main.c uses CRLF line endings, so this patch
+carries CR bytes. Keep it byte-exact.
+
+SPDX-License-Identifier: GPL-2.0-only
+
+Signed-off-by: Feng Zhang <feng@radxa.com>
+Link: https://github.com/radxa-pkg/aic8800/blob/df4c783b663eba1956579c681acd5e45f25c671d/debian/patches/fix-Lower-the-debugging-log-level.patch
+[ adapted: the PCIE and SDIO hunks dropped, this recipe builds only the USB driver ]
+Assisted-by: Claude
+
+diff --git a/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/rwnx_main.c b/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/rwnx_main.c
+index 221961b..e670259 100644
+--- a/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/rwnx_main.c
++++ b/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/rwnx_main.c
+@@ -548,7 +548,7 @@ static const int rwnx_hwq2uapsd[NL80211_NUM_ACS] = {
+ struct semaphore aicwf_deinit_sem;
+ atomic_t aicwf_deinit_atomic;
+ 
+-int aicwf_dbg_level = LOGERROR|LOGINFO|LOGFW;
++int aicwf_dbg_level = LOGERROR;
+ module_param(aicwf_dbg_level, int, 0660);
+ #ifdef CONFIG_DYNAMIC_PWR
+ int dynamic_pwr = 1;
+diff --git a/src/USB/driver_fw/drivers/aic8800/aic_load_fw/aic_bluetooth_main.c b/src/USB/driver_fw/drivers/aic8800/aic_load_fw/aic_bluetooth_main.c
+index 1b337c2..495e192 100644
+--- a/src/USB/driver_fw/drivers/aic8800/aic_load_fw/aic_bluetooth_main.c
++++ b/src/USB/driver_fw/drivers/aic8800/aic_load_fw/aic_bluetooth_main.c
+@@ -20,7 +20,7 @@ int adap_test = 0;
+ char paringid[100];
+ int n_para = 1;
+ int ble_scan_wakeup_reboot_time = 1000;
+-int aicwf_dbg_level = LOGERROR|LOGINFO|LOGDEBUG|LOGTRACE;
++int aicwf_dbg_level = LOGERROR;
+ int flash_erase_len = 0x400000;
+ uint32_t ad_data_filter_mask = 0;
+ uint32_t gpio_num = 2;//default select gpiob2 for fw_wakeup_host

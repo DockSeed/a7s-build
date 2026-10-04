@@ -1,0 +1,110 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: a733: give the DisplayPort transmitter the main-link PHY
+
+One property pair on one node: the DisplayPort transmitter gains a second phy
+reference, the COMB0 combo-PHY that carries the four main-link lanes.
+
+	phys = <&aux_hpd>, <&combophy0>;
+	phy-names = "aux-phy", "dp";
+
+WHY IT WAS NOT THERE, AND WHY IT IS NOW
+---------------------------------------
+
+`arm64-dts-a733-displayport-transmitter` left it out on purpose and said why: "reproducing it would mean giving the
+HW-proven USB3 combo-PHY node a second phy cell for no present consumer. The
+main link joins when something drives it." `drm-a733-dp-configure-the-main-link-phy` is that consumer -- it calls
+phy_configure() with a union phy_configure_opts_dp, which is how a DisplayPort
+controller asks a serdes for a link rate and a lane count, and without a phandle
+it has nothing to call it on.
+
+No second phy cell was needed after all: combophy0 has `#phy-cells = <0>`, and
+the generic PHY framework lets two consumers hold the same struct phy. That is
+what the hardware is -- COMB0 carries SuperSpeed or DisplayPort and never both,
+one serdes, arbitrated inside the PHY by the Type-C mux. dwc3 keeps its
+`phys = <&u2phy>, <&combophy0>` unchanged.
+
+WHAT THIS DOES NOT DO
+---------------------
+
+It does not give the DisplayPort node the lanes. Which personality COMB0 carries
+stays the Type-C mux's decision, driven by TCPM from the alt-mode negotiation;
+the PHY refuses a configure until the mux has actually entered a DP-only pin
+assignment. The reference buys exactly one thing: a transmitter that can ask.
+
+It also takes no clock, no reset and no power away from anything. A phandle in
+`phys` causes nothing on its own -- `drm-a733-dp-configure-the-main-link-phy` takes phy_init() on it, which the
+framework refcounts, so the combo-PHY's own .exit still runs only when the last
+consumer leaves.
+
+NAMING
+------
+
+"dp" is the name mainline gives this phy on a DisplayPort controller node
+(drivers/gpu/drm/bridge/synopsys/dw-dp.c and the msm DP controller both use
+phy-names = "dp"). The vendor calls the same two entries "combo-phy" and
+"aux-phy" (bsp/drivers/drm/sunxi_drm_edp.c:2898-2911); the second name already
+matches, and the first follows mainline rather than the vendor because there is
+no reason to carry a private name into a public tree.
+
+There is no dt-binding document for `allwinner,sun60i-a733-dp` yet -- the node
+is described in-tree only. That is unchanged by this patch and is named here
+rather than left to be discovered: the binding is owed by whichever patch first
+sends this compatible upstream.
+
+WHAT IT OWES
+------------
+
+  1. The dtb carries the second phandle: `fdtget -t x <dtb> /soc/displayport@5740000 phys`
+     returns two cells, and `phy-names` returns "aux-phy dp". Also: the driver
+     must log no "main-link phy" probe error, i.e. the name resolves.
+  2. A SUPERSPEED RE-PROOF, because this points a second consumer at the node
+     that is HW-proven at 10 Gbps and RST_BUS_SERDES is shared. Observable: with
+     no DP sink attached, `lsusb -t` still shows a SuperSpeed device at 10000M.
+  3. dtc emits no new warning against the pre-patch build.
+
+Build-tested only -- not hardware-proven.
+
+Assisted-by: Claude
+
+diff --git a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -1327,10 +1327,23 @@
+ 		 * reachable -- with the gate alone the whole window reads zero,
+ 		 * measured, so the reset is not a formality here.
+ 		 *
+-		 * phys: the AUX differential pair runs to the Type-C SBU pins through
+-		 * its own analog front end (`phy-allwinner-a733-aux-hpd-phy` and `arm64-dts-a733-aux-hpd-phy-node`), not through COMB0. COMB0
+-		 * carries the four main-link lanes and is reached through the Type-C
+-		 * mux instead, so it is deliberately absent from this list.
++		 * phys: two, and they are two different wires. "aux-phy" is the AUX
++		 * differential pair, which runs to the Type-C SBU pins through its
++		 * own analog front end (`phy-allwinner-a733-aux-hpd-phy` and `arm64-dts-a733-aux-hpd-phy-node`). "dp" is the main link: the four
++		 * COMB0 lanes, whose serdes is the combo-PHY that also serves USB3.
++		 *
++		 * Naming the combo-PHY here does NOT give this node the lanes. Which
++		 * personality COMB0 carries stays the Type-C mux's decision, driven
++		 * by TCPM from the alt-mode negotiation; what the reference buys is
++		 * the one thing a DisplayPort transmitter must be able to do and
++		 * could not before -- ask the PHY for a link rate and a lane count
++		 * through phy_configure(), the way every DP controller in mainline
++		 * does. The PHY refuses that call until the mux has actually handed
++		 * the lanes over, so the SuperSpeed link cannot be taken by this
++		 * node.
++		 *
++		 * The vendor's node has the same two entries under different names
++		 * ("combo-phy" and "aux-phy", sunxi_drm_edp.c:2898-2911).
+ 		 *
+ 		 * No supplies. The vendor's `vdd-edp`/`vcc-edp` are panel rails and
+ 		 * this board has no panel; the rail that does feed this path is
+@@ -1344,8 +1357,8 @@
+ 			clocks = <&ccu CLK_BUS_EDP>;
+ 			clock-names = "bus";
+ 			resets = <&ccu RST_BUS_EDP>;
+-			phys = <&aux_hpd>;
+-			phy-names = "aux-phy";
++			phys = <&aux_hpd>, <&combophy0>;
++			phy-names = "aux-phy", "dp";
+ 			status = "okay";
+ 		};
+ 

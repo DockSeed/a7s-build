@@ -1,0 +1,146 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] clk: sunxi-ng: A733 (sun60iw2) add the USB2.0 clocks and resets
+
+Milestone-3 prerequisite: the USB2.0 controllers need their bus gates,
+OHCI 12 MHz clocks, and PHY/EHCI/OHCI resets. Adds them for USB0 (the
+USB2.0 DRD/OTG) and USB1 (the USB2.0 Host).
+
+The A733 lays USB out per-controller -- the H3/H6 idiom, NOT the A523's
+consolidated BGR at 0xa8c. USB0 has USB0_CLK_REG 0x1300 + USB0_BGR 0x1304;
+USB1 has USB1_CLK_REG 0x1308 + USB1_BGR 0x130C (A733 user manual).
+So the A523 driver's register offsets cannot be
+reused; the offsets and bit positions here are the A733 UM's, and each was
+cross-checked against a live sunxi_dump on the 8 GiB board:
+
+  USB0_CLK 0x1300 = 0x40000000  -> PHY_RSTN(30)=1
+  USB0_BGR 0x1304 = 0x01000100  -> DEVICE rst(24)+gate(8) set (DRD in device mode)
+  USB1_CLK 0x1308 = 0xc0000000  -> CLKEN(31)+PHY_RSTN(30) (host OHCI 12M + phy up)
+  USB1_BGR 0x130C = 0x00110011  -> EHCI/OHCI rst(20/16)+gate(4/0) (host fully up)
+
+Every set bit lands exactly on a UM-defined field, confirming the map.
+
+Modelled after the per-port sun50i-h6 CCU: each USBx_CLK_REG bit31 gates
+the OHCI 12 MHz clock, sourced from osc12M (hosc / 2) -- the CLK12M_SEL
+field (25:24) is left at its reset default, as on the H6. bit30 is the USB
+PHY reset. Each USBx_BGR carries the EHCI/OHCI(/device) bus gates and
+resets. The USB PHYs take osc24M directly in DT, so no CCU PHY-clock gate
+is modelled (the shared 24 MHz PHY reference at 0x1340 reads enabled at
+reset). The USB3.1 combo (xHCI) is a later milestone.
+
+Based on drivers/clk/sunxi-ng/ccu-sun50i-h6.c and ccu-sun55i-a523.c.
+
+Assisted-by: Claude
+---
+--- a/include/dt-bindings/clock/sun60i-a733-ccu.h
++++ b/include/dt-bindings/clock/sun60i-a733-ccu.h
+@@ -54,4 +54,13 @@
+ #define CLK_BUS_SMHC1		36
+ #define CLK_BUS_SMHC2		37
+ 
++#define CLK_OSC12M		38
++#define CLK_USB_OHCI0		39
++#define CLK_USB_OHCI1		40
++#define CLK_BUS_OHCI0		41
++#define CLK_BUS_OHCI1		42
++#define CLK_BUS_EHCI0		43
++#define CLK_BUS_EHCI1		44
++#define CLK_BUS_OTG		45
++
+ #endif /* _DT_BINDINGS_CLK_SUN60I_A733_CCU_H_ */
+--- a/include/dt-bindings/reset/sun60i-a733-ccu.h
++++ b/include/dt-bindings/reset/sun60i-a733-ccu.h
+@@ -19,4 +19,12 @@
+ #define RST_BUS_SMHC1		8
+ #define RST_BUS_SMHC2		9
+ 
++#define RST_USB_PHY0		10
++#define RST_USB_PHY1		11
++#define RST_BUS_OHCI0		12
++#define RST_BUS_OHCI1		13
++#define RST_BUS_EHCI0		14
++#define RST_BUS_EHCI1		15
++#define RST_BUS_OTG		16
++
+ #endif /* _DT_BINDINGS_RST_SUN60I_A733_CCU_H_ */
+--- a/drivers/clk/sunxi-ng/ccu-sun60iw2.c
++++ b/drivers/clk/sunxi-ng/ccu-sun60iw2.c
+@@ -321,6 +321,33 @@
+ static SUNXI_CCU_GATE_HWS(bus_smhc1_clk, "bus-smhc1", ahb_hws, 0x0D1C, BIT(0), 0);
+ static SUNXI_CCU_GATE_HWS(bus_smhc2_clk, "bus-smhc2", ahb_hws, 0x0D2C, BIT(0), 0);
+ 
++/*
++ * USB2.0. The A733 lays USB out per-controller (H3/H6 idiom), NOT the A523's
++ * consolidated 0xa8c BGR: USB0 has USB0_CLK_REG 0x1300 + USB0_BGR 0x1304,
++ * USB1 has USB1_CLK_REG 0x1308 + USB1_BGR 0x130C (A733 user manual,
++ * 22579/22658; bit positions silicon-confirmed on the 8 GiB board). USB0 = the USB2.0
++ * DRD/OTG (carries a device path, hence a BUS_OTG gate + DEVICE reset), USB1 =
++ * the USB2.0 Host. The USB3.1 combo (xHCI) is a later milestone.
++ *
++ * Each USBx_CLK_REG bit31 gates the OHCI 12 MHz clock (source = hosc/2, as on
++ * the H6 family; the CLK12M_SEL field 25:24 is left at its reset default); its
++ * bit30 is the USB PHY reset (in the reset map below). Each USBx_BGR carries
++ * the EHCI/OHCI(/device) bus gates (bits 4/0[/8]) and resets (bits 20/16[/24]).
++ * The USB PHYs take osc24M directly in DT, so no CCU PHY-clock gate is modelled
++ * (the shared 24 MHz PHY reference at 0x1340 is enabled at reset).
++ */
++static CLK_FIXED_FACTOR_FW_NAME(osc12M_clk, "osc12M", "hosc", 2, 1, 0);
++static const struct clk_hw *osc12M_hws[] = { &osc12M_clk.hw };
++
++static SUNXI_CCU_GATE_HWS(usb_ohci0_clk, "usb-ohci0", osc12M_hws, 0x1300, BIT(31), 0);
++static SUNXI_CCU_GATE_HWS(usb_ohci1_clk, "usb-ohci1", osc12M_hws, 0x1308, BIT(31), 0);
++
++static SUNXI_CCU_GATE_HWS(bus_otg_clk,   "bus-otg",   ahb_hws, 0x1304, BIT(8), 0);
++static SUNXI_CCU_GATE_HWS(bus_ehci0_clk, "bus-ehci0", ahb_hws, 0x1304, BIT(4), 0);
++static SUNXI_CCU_GATE_HWS(bus_ohci0_clk, "bus-ohci0", ahb_hws, 0x1304, BIT(0), 0);
++static SUNXI_CCU_GATE_HWS(bus_ehci1_clk, "bus-ehci1", ahb_hws, 0x130C, BIT(4), 0);
++static SUNXI_CCU_GATE_HWS(bus_ohci1_clk, "bus-ohci1", ahb_hws, 0x130C, BIT(0), 0);
++
+ /* ccu_common-based clocks (registered and reset-mapped by the core). */
+ static struct ccu_common *sun60iw2_ccu_clks[] = {
+ 	&pll_ref_clk.common,
+@@ -349,6 +376,13 @@
+ 	&bus_smhc0_clk.common,
+ 	&bus_smhc1_clk.common,
+ 	&bus_smhc2_clk.common,
++	&usb_ohci0_clk.common,
++	&usb_ohci1_clk.common,
++	&bus_otg_clk.common,
++	&bus_ehci0_clk.common,
++	&bus_ohci0_clk.common,
++	&bus_ehci1_clk.common,
++	&bus_ohci1_clk.common,
+ };
+ 
+ static struct clk_hw_onecell_data sun60iw2_hw_clks = {
+@@ -391,8 +425,16 @@
+ 		[CLK_BUS_SMHC0]		= &bus_smhc0_clk.common.hw,
+ 		[CLK_BUS_SMHC1]		= &bus_smhc1_clk.common.hw,
+ 		[CLK_BUS_SMHC2]		= &bus_smhc2_clk.common.hw,
++		[CLK_OSC12M]		= &osc12M_clk.hw,
++		[CLK_USB_OHCI0]		= &usb_ohci0_clk.common.hw,
++		[CLK_USB_OHCI1]		= &usb_ohci1_clk.common.hw,
++		[CLK_BUS_OHCI0]		= &bus_ohci0_clk.common.hw,
++		[CLK_BUS_OHCI1]		= &bus_ohci1_clk.common.hw,
++		[CLK_BUS_EHCI0]		= &bus_ehci0_clk.common.hw,
++		[CLK_BUS_EHCI1]		= &bus_ehci1_clk.common.hw,
++		[CLK_BUS_OTG]		= &bus_otg_clk.common.hw,
+ 	},
+-	.num	= CLK_BUS_SMHC2 + 1,
++	.num	= CLK_BUS_OTG + 1,
+ };
+ 
+ static struct ccu_reset_map sun60iw2_ccu_resets[] = {
+@@ -406,6 +448,13 @@
+ 	[RST_BUS_SMHC0]		= { 0x0D0C, BIT(16) },
+ 	[RST_BUS_SMHC1]		= { 0x0D1C, BIT(16) },
+ 	[RST_BUS_SMHC2]		= { 0x0D2C, BIT(16) },
++	[RST_USB_PHY0]		= { 0x1300, BIT(30) },
++	[RST_USB_PHY1]		= { 0x1308, BIT(30) },
++	[RST_BUS_OHCI0]		= { 0x1304, BIT(16) },
++	[RST_BUS_OHCI1]		= { 0x130C, BIT(16) },
++	[RST_BUS_EHCI0]		= { 0x1304, BIT(20) },
++	[RST_BUS_EHCI1]		= { 0x130C, BIT(20) },
++	[RST_BUS_OTG]		= { 0x1304, BIT(24) },
+ };
+ 
+ static const struct sunxi_ccu_desc sun60iw2_ccu_desc = {

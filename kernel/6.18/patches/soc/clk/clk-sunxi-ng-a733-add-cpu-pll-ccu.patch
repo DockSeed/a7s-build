@@ -1,0 +1,1185 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] clk: sunxi-ng: a733: add the CPU PLL clock controller (CPU_PLL_CFG)
+
+Mainline 6.18.36 has no CPU clock for this SoC family at all — not for the
+A523, not for the A733. This adds one: a driver for the CPU_PLL_CFG block at
+0x08870000, which holds the four CPU PLLs and the three glitch-free CPU clock
+muxes, and which every later DVFS patch (`arm64-dts-a733-cpu-clocks-from-cpu-ccu` cpu@N clocks, `arm64-dts-a733-cpu-opp-tables-and-supply` OPPs) depends
+on. Without it the two clusters sit on whatever boot0 left behind — 1014 MHz on
+both, register-confirmed on two boards, while the A76 pair is specified to 2002.
+
+What the hardware actually is
+-----------------------------
+
+  DCXO 26 MHz -> [ /P ] -> [ x N ] -> [ /(M0*M1) ] -> [ /EXT_DIVP ] --+
+                 \_______ CPU_x_PLL_CTRL_REG +0x00 _______/  CLK_REG  |
+                                   |                          +0x1C   |
+                            lock detector, bit 28                      v
+  CPU_SLOW_CLK (= the DCXO) --------------------------------> mux [26:24] -> cores
+
+Four PLLs (UM 5.1.4.1 "PLL Distribution"): CPU_BACK at
++0x0000, CPU_L at +0x1000 (cores 0-5, A55), CPU_B at +0x2000 (cores 6-7, A76),
+CPU_DSU at +0x3000 (the DynamIQ cluster, and via +0x301c[9:0] also AXI, GIC and
+APB). CPU_L/B/DSU are linear PLLs sharing one register layout; CPU_BACK is a
+generic PLL with a different one.
+
+The interesting part is how a CPU changes its own speed without falling over
+while executing the very code that reprograms it. Two properties of this block
+make it possible, and both are in the UM, not inferred:
+
+  * the mux is glitch-free. The descriptions of all three CLK registers
+    (UM 5.1.10.13, 5.1.10.24, 5.1.10.37) state that it switches without
+    glitches and may be reconfigured at run time. A running core can be moved between
+    two running sources without ever seeing a runt pulse.
+  * mux encoding 000 is CPU_SLOW_CLK, and CPU_SLOW_CLK_SEL_REG (+0x3034, UM
+    5.1.10.42) selects 00 = DCXO / 01 = CLK32K / 10 = CLK16M_RC. At the reset
+    default the bypass is the 26 MHz crystal itself: always running, never
+    needs to be relocked, and fast enough that a core parked on it keeps
+    servicing interrupts.
+
+So a rate change is: park the cores on the DCXO, pull the PLL out of lock and
+reprogram it, wait for lock, park the cores back. The core never executes a
+single instruction from a PLL that is mid-relock. It just runs at 26 MHz for the
+~100 us the PLL needs (20 us of which the UM mandates outright).
+
+Decision 1: relock by muxing away, not by relocking a live PLL
+--------------------------------------------------------------
+
+The vendor BSP never switches the mux. It pins it to encoding 011 in probe()
+and relocks the running PLL underneath the cores, trusting the linear frequency
+modulation ramp to keep every edge legal. This driver does the opposite, and the
+argument is from the UM plus register readback, not from taste:
+
+  1. The UM says this mux exists for exactly this, in the register descriptions cited above,
+     and it names CPU_SLOW_CLK as the cluster's backup clock source
+     (5.1.4.1: the primary source of cores 0-5 is CPU_L_PLL; their backups are
+     the 26 MHz oscillator, CPU_BACK_PLL and a 1.2 GHz source).
+  2. The ramp the vendor depends on is not armed by the firmware. On the 8 GiB board, under
+     our own mainline kernel, CPU_L_PLL_LFM_REG (+0x1018) reads 0x40000001:
+     PLL_LFM_EN (bit 31) = 0, PLL_LFM_RSTN = 1, STEP = 1 — the reset defaults.
+     Only the vendor *driver* turns LFM on; on the 6 GiB board, which runs a BSP-derived
+     kernel, the same register reads 0xc0000100. A mainline driver that relocks
+     a live PLL without first replicating the vendor's PAT0/PAT1/LFM setup would
+     be doing an unramped frequency jump under eight running cores.
+  3. Mainline's own answer for this exact situation is ccu_mux_notifier_register()
+     (drivers/clk/sunxi-ng/ccu_mux.c), used by ccu-sun50i-a64.c, ccu-sun8i-h3.c,
+     ccu-sun50i-h616.c, ccu-sun20i-d1.c and five more. Doing something else here
+     would need a reason, and there isn't one.
+  4. On this project, relocking a live PLL is the known root cause of a GPU
+     freeze class.
+
+CPU_BACK_PLL is *not* used as the bypass, even though the UM lists it as a
+backup source: boot0 leaves it switched off (PLL_EN = 0 in the +0x0000 readback
+on the 8 GiB board), and the UM warns that switching a PLL on or off while the
+system runs disturbs the other PLLs and can make the system unstable.
+The DCXO is free; the BACK PLL would have to be bought.
+
+Because the bypass is only as safe as CPU_SLOW_CLK_SEL_REG says it is, probe()
+reads that register and refuses to register any clock at all if it is not 00.
+Losing cpufreq is survivable; parking eight cores on 32 kHz is not. Both
+reference boards read 0x00000000 there. This is also why the reg mapping must
+reach 0x3038, not 0x3034 — the register sits *at* 0x3034.
+
+ccu_pll_notifier_register() is deliberately not stacked on top. That helper
+gates and ungates a PLL after a rate change to force a relock; here the
+gate-off / reprogram / lock / gate-on cycle is already the UM's own sequence
+inside set_rate(), and a second gate cycle would land *after* the mux notifier
+had restored the mux — i.e. it would manufacture the very output glitch it
+exists to prevent.
+
+Decision 2: the two P's are modelled separately, and EXT_DIVP lives inside the
+PLL clock
+------------------------------------------------------------------------------
+
+There are two dividers called P and they are not the same thing:
+
+  PLL_P     CPU_x_PLL_CTRL_REG[19:16], P = field + 1. A *pre*-divider inside the
+            loop; it divides the reference before the multiplier and therefore
+            moves the VCO.
+  EXT_DIVP  CPU_x_PLL_CLK_REG[17:16], 00=/1 01=/2 10=/4. A *post*-divider
+            outside the loop, in a different register, sharing that register
+            with the mux. The UM names the mux source it produces "CPU_L_PLL/P"
+            — the mux never sees the raw PLL output.
+
+Mainline ccu_nkmp assumes N and P share one register and has no p_reg, so it
+cannot express this. (The vendor solved that with a private p_reg field, and
+then modelled only EXT_DIVP as "p" and PLL_P not at all.) This driver adds a
+small local type instead, struct ccu_a733_cpu_pll, which carries the CTRL
+register in ccu_common and the CLK register in a separate divp_reg, names both
+fields, and keeps PLL_P = M0 = M1 = 1 by construction — set_rate() writes all
+three fields on every transition, recalc_rate() reports whatever is really in
+them, and probe() warns if the firmware left something else behind (both boards:
+all three fields 0).
+
+Keeping M0 = M1 = 1 is not laziness, it removes a genuine ambiguity: the UM
+states the 480..2260 MHz window twice, once against the VCO (bit-31 note:
+the VCO frequency should lie between 480 MHz and 2.26 GHz,
+VCO = InputFreq*N/P) and once against the output (PLL_N note:
+"480MHz<=InputFreq*N/P/(M0*M1)<=2260MHz"). Those two only coincide when
+M0*M1 == 1. And with a 26 MHz reference, N alone spans 494..2236 MHz in 26 MHz
+steps; every extra degree of freedom would only create second encodings of rates
+N already reaches, which is how a determine_rate() becomes non-deterministic.
+
+EXT_DIVP is folded into the PLL clock rather than exposed as a ccu_div child,
+and that is a correctness requirement, not a simplification. clk_change_rate()
+in drivers/clk/clk.c sends POST_RATE_CHANGE for a clock *before* it descends
+into that clock's children. A separate divider child would therefore be
+reprogrammed only after the mux notifier had already put the cores back on the
+PLL — so on every transition that changes EXT_DIVP (i.e. every entry into and
+exit from the lowest operating point) the cores would run one intermediate
+frequency that no OPP has a voltage for. Writing both registers inside one
+set_rate(), while the cores sit on the DCXO, closes that window completely.
+
+Decision 3: the PLL_UPDATE handshake stays private to this driver
+------------------------------------------------------------------
+
+N is a "manual update type" parameter: writing CTRL[15:8] does nothing until
+PLL_UPDATE (bit 26, R/WAC: write 1 to apply the configuration; the bit clears itself) is set
+and has self-cleared (UM 5.1.4.2). Mainline sunxi-ng has no such feature; its
+existing CCU_FEATURE_UPDATE_BIT is a hardcoded BIT(27) applied inside the mux
+and divider helpers, which is a different bit doing a different job.
+
+A feature flag in the shared library was considered and rejected. What has to
+happen around the N write is not "also set a bit" — it is a nine-step procedure
+(output gate off, lock detector off, program N/P/M0/M1, program EXT_DIVP in the
+second register, lock detector on, update, poll update, poll lock, 20 us, output
+gate on). No existing sunxi-ng set_rate() has a shape that one flag could bend
+into that, so a shared flag would mean a new shared code path used by exactly
+one driver — while putting a new branch into ccu_mult/ccu_nkmp/ccu_div, which
+fifteen in-tree SoCs run through. A driver-local clk_ops touches no shared file
+and has zero regression surface for any other Allwinner part. If the A523 or a
+later sun60i turns out to have the same block, the normal kernel move is to add
+the second user first and generalise then; this type is written so that lifting
+it into ccu_lpll.c later is a rename.
+
+The set_rate() sequence follows the UM's *enable* ordering for the handshake,
+because the UM's own pre-divider-modulation step list is internally
+inconsistent: it writes PLL_UPDATE twice (steps 5 and 6) and then waits for
+LOCK_STATUS to be cleared, which cannot be a terminal condition. The enable
+sequence in the same section is unambiguous — set PLL_UPDATE, wait for
+PLL_UPDATE to clear, wait for LOCK, 20 us — so that is what is implemented, with
+a single update, which also trivially satisfies the 1 us minimum spacing
+between two updates.
+
+PLL_EN and PLL_LDO_EN are never written. The UM advises against enabling or
+disabling the PLLs during use and recommends clearing PLL_OUTPUT_GATE in
+PLL_CTRL when a clock is not needed. So the
+driver's enable/disable ops are PLL_OUTPUT_GATE (bit 27), nothing else.
+
+Mux parents
+-----------
+
+The 3-bit mux encoding is sparse and is *not* the same for the DSU as for the
+two core clusters (UM 5.1.10.13 / 5.1.10.24 / 5.1.10.37):
+
+  L/B:  000,001,010 CPU_SLOW_CLK · 011 own PLL/P · 100 PERI0PLL_DIV2 · 101 CPU_BACK_PLL
+  DSU:  000,001,010 CPU_SLOW_CLK · 011 own PLL/P · 100 CPU0PLL       · 101 PERI0_600M
+
+so it is modelled with a ccu_mux table: {0, 3, 5} for L/B, {0, 3} for the DSU.
+Encoding 100 is left out of both — on L/B it is a tap of the peripheral PLL in
+the main CCU, which would mean a cross-CCU DT input for a source we never
+select. The vendor driver gives all three muxes one shared parent list ending in
+"pll-cpu-back", which is simply wrong for the DSU.
+
+The muxes carry CLK_SET_RATE_NO_REPARENT, and that is load-bearing rather than
+decorative: without it clk_mux_determine_rate_flags() walks every parent and
+keeps the fastest rate <= the request, so a rate request could silently move the
+cores onto the 26 MHz bypass or onto the (disabled) BACK PLL. With it the
+request is forwarded to the parent that is actually selected
+(clk_core_determine_rate_no_reparent()), i.e. always the cluster's own PLL, and
+the only thing that ever moves the mux is the notifier. CLK_SET_RATE_PARENT then
+carries the request down from cpu@N, per the contract with patch `arm64-dts-a733-cpu-clocks-from-cpu-ccu`.
+
+All seven clocks are CLK_IS_CRITICAL. Nothing in the consumer path calls
+clk_prepare_enable() on them, so without it clk_disable_unused() would close
+PLL_OUTPUT_GATE on the PLL the running cores are muxed to.
+
+CPU_BACK_PLL, and a vendor value that is wrong
+-----------------------------------------------
+
+CPU_BACK_PLL is modelled read-only (recalc_rate + is_enabled, no set_rate, no
+enable/disable) because nothing here routes it anywhere and boot0 leaves it off.
+It is modelled at all so that its rate is described truthfully. Its format is
+f = InputFreq * N / M1 / P0 with N = PLL_N + 1, P0 = OUTPUT_DIV[22:20] + 1,
+M1 = INPUT_DIV[1] + 1 (UM 5.1.10.1). With the 26 MHz DCXO (`clk-sunxi-ng-a733-rtc-ccu-add-dcxo`), 0x40104A00
+on the 8 GiB board and 0xf8104a00 on the 6 GiB board both decode to 26 * 75 / 1 / 2 = 975 MHz. The
+UM's default note is no witness for the input: V0.92 says 975 MHz "When DCXO
+is 26MHz", V1.00 says 900 MHz "When DCXO is 24MHz" (PDF p. 305), same fields. The
+vendor driver applies the *linear* PLL's raw-N formula to this register and
+reports 1924 MHz; clk_summary on a BSP kernel inherits that error. The BIAS
+register offset differs too (BACK at +0x10 with PLL_CP = 0x15, the three linear
+PLLs at +0x0c with PLL_CP = 0x05) — the first silicon hint that this is a
+different block.
+
+Where every value came from
+---------------------------
+
+Spec: A733 user manual v0.92.
+  5.1.4.1  PLL distribution, per-cluster backup sources
+  5.1.4.2  enable / disable / pre-divider-modulation steps,
+                                PLL_UPDATE semantics, the 1 us update interval
+  5.1.10.1       CPU_BACK_PLL_CTRL_REG fields
+  5.1.10.6       CPU_L_PLL_CTRL_REG fields, VCO window, N raw,
+                                N legal set 4/5/8/9/10/12-255, default 0x14
+  5.1.10.13      CPU_L_PLL_CLK_REG: mux encodings, "glitch-free",
+                                EXT_DIVP encodings
+  5.1.10.17      CPU_L_PLL_CTRL_STAT_REG (+0x2c), read-only
+                                mirror of the configuration actually in effect
+  5.1.10.37      CPU_DSU_PLL_CLK_REG, incl. the AXI/GIC/APB fields
+  5.1.10.42      CPU_SLOW_CLK_SEL_REG @ +0x3034
+  the memory map of the A733 user manual               CPU_PLL_CFG base 0x08870000, size 64K
+
+Silicon, register readback, two boards:
+  the 8 GiB board (bin 0x05), our own mainline 6.18.36, devmem, dataset of 2026-07-22:
+    +0x0000 0x40104A00  BACK: PLL_EN=0, N=75, P0=2, M1=1 -> 975 MHz, off
+    +0x1000 0xF8802700  CPU_L   N=0x27=39 -> 1014 MHz
+    +0x2000 0xF8802700  CPU_B   N=0x27=39 -> 1014 MHz
+    +0x3000 0xF8801E00  CPU_DSU N=0x1E=30 ->  780 MHz
+    +0x1018 0x40000001  LFM_EN = 0 (reset default: boot0 does not arm the ramp)
+    +0x101c/+0x201c 0x03000000  mux 011, EXT_DIVP /1
+    +0x301c 0x03000105          mux 011, EXT_DIVP /1, AXI/GIC/APB all /2 = 390 MHz
+  the 6 GiB board (bin 0x04), BSP-derived kernel, sunxi_dump, read today 2026-07-22:
+    +0x0000 0xf8104a00  BACK enabled and locked, N=75, P0=2 -> 975 MHz at the
+                        26 MHz DCXO, this time with the PLL actually running.
+    +0x1000 0xf8802700  CPU_L  1014 MHz     +0x2000 0xf8804d00  CPU_B N=77 -> 2002 MHz
+    +0x3000 0xf8801e00  CPU_DSU 780 MHz     +0x301c 0x03000105
+    +0x1018 0xc0000100  LFM_EN = 1 — turned on by the vendor driver, not by boot0
+    +0x3034 0x00000000  CPU_SLOW_CLK_SEL = 00 = DCXO (the bypass this driver arms)
+    0x07090160 0x983FB0F7  XO_CTRL0, DCXO_ST[15:14] = 0b10 = 26 MHz, byte-identical
+                        to the 8 GiB board
+  On both boards and in every one of the six CTRL readbacks above, PLL_P[19:16],
+  PLL_M0[21:20] and PLL_M1[3:0] read 0, i.e. P = M0 = M1 = 1. That is the single
+  assumption the rate model rests on, and it is measured, not assumed.
+
+Rate model, checked against the register-derived operating points:
+  determine_rate() searches N over the VCO window and EXT_DIVP over {1,2,4},
+  preferring /1 on ties. Fed the twelve frequencies the two boards were caught
+  running, it reproduces every (N, EXT_DIVP) pair exactly — 416 = 32 with /2
+  (26*16 would put the VCO 64 MHz under the floor), then 30/39/46/54/58/62/66/
+  69/73/75/77 with /1 for 780..2002. It also lands 1300 MHz on N = 50, the point
+  another board was register-caught running.
+
+Vendor BSP ccu-sun60iw2-cpupll.c was read for ideas and used as evidence for
+nothing. Three of its statements are contradicted here: the BACK PLL formula
+(1924 vs 975 MHz), the DSU mux parent list, and "p" being PLL_P.
+
+Not vendor behaviour, and why it is safe
+-----------------------------------------
+
+The reachable set is wider than the vendor ladder: 26 MHz * N for N in 19..86
+(494..2236 MHz), the same divided by 2 (247..1118 MHz in 13 MHz steps) and by 4.
+Two of those are worth having and cost nothing electrically, because they are
+*below* the lowest frequency any bin already runs at 800 mV:
+
+  494 MHz  N=19, EXT_DIVP /1, VCO 494 MHz — legal, 14 MHz above the floor
+  247 MHz  N=19, EXT_DIVP /2, VCO 494 MHz — and 247 < 288 MHz is precisely the
+           case the UM gives EXT_DIVP for (outputs below 288 MHz)
+
+Both are a lower frequency at a voltage silicon already sustains at 1014 MHz, so
+they need no new voltage and no new evidence beyond the register model. Whether
+they become OPPs is patch `nvmem-cpufreq-a733-speed-bin-from-efuse`'s call and needs the bin table; this patch only
+makes them expressible. Nothing above 2002 MHz is proposed: 2028..2236 MHz are
+arithmetically reachable and inside the VCO window, but there is no voltage
+evidence for them in any bin, and the absolute ceiling stands untouched (global
+maximum across all nine vendor bins 1050 mV, datasheet absolute maximum for
+VDD-CPUB/VDD-CPUL 1.2 V).
+
+Contract with the patches that build on this one
+------------------------------------------------
+
+  `clk-sunxi-ng-a733-rtc-ccu-add-dcxo` provides the parent: CLK_RTC_DCXO = 2, registered as "dcxo". This driver
+       takes it by clock-name and derives the whole N range from its rate, so a
+       19.2 or 24 MHz part needs no code change.
+  `arm64-dts-a733-cpu-clocks-from-cpu-ccu` must add the controller node with reg size >= 0x3038 and point cpu@N at
+       CLK_CPU_L / CLK_CPU_B — the muxes, not the raw PLLs. Pointing at a PLL
+       would make the mux-based relock impossible.
+  `arm64-dts-a733-cpu-opp-tables-and-supply` owns the OPP table, opp-supported-hw and cpu-supply; `nvmem-cpufreq-a733-speed-bin-from-efuse` owns the bin.
+
+Verified / not verified
+------------------------
+
+Verified: builds. drivers/clk/sunxi-ng/ccu-sun60i-a733-cpu.o compiles clean
+(arm64 cross, W=1, no warnings) against 6.18.36 with `clk-sunxi-ng-add-A733-sun60iw2-minimal-ccu` to `clk-sunxi-ng-a733-rtc-ccu-add-dcxo` applied;
+CONFIG_SUN60I_A733_CPU_CCU=y after olddefconfig; the built object contains the
+compatible "allwinner,sun60i-a733-cpu-ccu" and the clock names pll-cpu-l/b/dsu,
+pll-cpu-back, cpu-l/b/dsu. checkpatch clean. The rate search was verified against
+the twelve register-derived operating points listed above. dt_binding_check was
+NOT run — dtschema is not installed on this host; the YAML parses and follows
+allwinner,sun55i-a523-ccu.yaml.
+
+Not verified: nothing in this patch has been executed on silicon. No board runs
+this driver yet, and the register writes it performs have deliberately never
+been made — writing the CPU PLL block on a running board means reprogramming the
+clock under the kernel doing the writing.
+
+The one observable that would falsify it: with `arm64-dts-a733-cpu-clocks-from-cpu-ccu` and `arm64-dts-a733-cpu-opp-tables-and-supply` in place, command
+cluster L to 1404 MHz and read the block back. CPU_L_PLL_CTRL_REG (0x08871000)
+bits[15:8] must be 0x36 (N = 54) *and* CPU_L_PLL_CTRL_STAT_REG (0x0887102c),
+the read-only mirror of the configuration actually in effect, must read the same
+0x36, with bit 28 (LOCK) set and bit 26 (PLL_UPDATE) clear; CPU_L_PLL_CLK_REG
+(0x0887101c) must read bits[26:24] = 0b011 and bits[17:16] = 0b00. If the
+PLL_UPDATE handshake is wrong, CTRL and CTRL_STAT disagree — CTRL holds 0x36 and
+CTRL_STAT still holds the old N — and no other observable distinguishes
+"written" from "applied". If the mux notifier is wrong, the failure is a hang at
+the moment of the transition, not a wrong readback. sysfs is not an acceptable
+witness for either: on these boards scaling_cur_freq has already been caught
+reporting 2002 MHz while the PLL register held N = 32.
+
+Assisted-by: Claude
+
+--- /dev/null
++++ b/include/dt-bindings/clock/sun60i-a733-cpu-ccu.h
+@@ -0,0 +1,27 @@
++/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
++/*
++ * Clock indices for the Allwinner A733 (sun60iw2) CPU PLL CCU (CPU_PLL_CFG,
++ * 0x08870000).
++ *
++ * CLK_PLL_CPU_L/B/DSU are the linear PLLs *after* their EXT_DIVP post-divider,
++ * i.e. exactly the signal the A733 UM calls "CPU_x_PLL/P" where it lists the
++ * sources of the CPU clock mux. CLK_CPU_L/B/DSU are those muxes. A consumer
++ * that wants to set a CPU frequency asks the mux, not the PLL: the mux carries
++ * CLK_SET_RATE_PARENT and is what the driver is allowed to park on the DCXO
++ * while the PLL behind it relocks.
++ *
++ * Indices are appended to, never renumbered.
++ */
++#ifndef _DT_BINDINGS_CLK_SUN60I_A733_CPU_CCU_H_
++#define _DT_BINDINGS_CLK_SUN60I_A733_CPU_CCU_H_
++
++#define CLK_PLL_CPU_L		0
++#define CLK_PLL_CPU_B		1
++#define CLK_PLL_CPU_DSU		2
++#define CLK_PLL_CPU_BACK	3
++
++#define CLK_CPU_L		4
++#define CLK_CPU_B		5
++#define CLK_CPU_DSU		6
++
++#endif /* _DT_BINDINGS_CLK_SUN60I_A733_CPU_CCU_H_ */
+--- /dev/null
++++ b/Documentation/devicetree/bindings/clock/allwinner,sun60i-a733-cpu-ccu.yaml
+@@ -0,0 +1,62 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/clock/allwinner,sun60i-a733-cpu-ccu.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Allwinner A733 CPU PLL Clock Control Unit
++
++maintainers:
++  - DockSeed <dockseed@proton.me>
++
++description: >
++  The A733 (sun60iw2) keeps the CPU clocks out of the main CCU, in a block of
++  its own at 0x08870000 that the manual calls CPU_PLL_CFG. It holds four PLLs
++  (CPU_BACK, CPU_L for cores 0-5, CPU_B for cores 6-7 and CPU_DSU for the
++  DynamIQ cluster) and one glitch-free clock mux per cluster.
++
++  The block has no resets and no bus gates, so it exposes clocks only.
++
++  The mapping must cover CPU_SLOW_CLK_SEL_REG at offset 0x3034, which selects
++  what the muxes' bypass input actually is; a size of 0x3038 is the minimum.
++
++properties:
++  "#clock-cells":
++    const: 1
++
++  compatible:
++    const: allwinner,sun60i-a733-cpu-ccu
++
++  reg:
++    maxItems: 1
++
++  clocks:
++    items:
++      - description: Digitally Controlled Crystal Oscillator (26 MHz on the A733)
++
++  clock-names:
++    items:
++      - const: dcxo
++
++required:
++  - "#clock-cells"
++  - compatible
++  - reg
++  - clocks
++  - clock-names
++
++additionalProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/clock/sun60i-a733-rtc-ccu.h>
++
++    clock-controller@8870000 {
++        compatible = "allwinner,sun60i-a733-cpu-ccu";
++        reg = <0x08870000 0x3038>;
++        clocks = <&rtc_ccu CLK_RTC_DCXO>;
++        clock-names = "dcxo";
++        #clock-cells = <1>;
++    };
++
++...
+--- /dev/null
++++ b/drivers/clk/sunxi-ng/ccu-sun60i-a733-cpu.c
+@@ -0,0 +1,728 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Allwinner A733 (sun60iw2) CPU PLL clock control unit, CPU_PLL_CFG @0x08870000.
++ *
++ * Copyright (c) 2026 DockSeed A733 Debian mainline track
++ *
++ * The block holds four PLLs and three CPU clock muxes:
++ *
++ *   +0x0000 CPU_BACK_PLL   generic PLL, f = ref * (N+1) / M1 / P0   (975 MHz)
++ *   +0x1000 CPU_L_PLL      linear PLL, feeds core0..core5 (Cortex-A55)
++ *   +0x2000 CPU_B_PLL      linear PLL, feeds core6/core7  (Cortex-A76)
++ *   +0x3000 CPU_DSU_PLL    linear PLL, feeds the DynamIQ cluster (L3/AXI/GIC/APB)
++ *
++ * (A733 UM v0.92 5.1.4.1 "PLL Distribution", the A733 user manual.)
++ *
++ * Signal chain for one cluster, reference edge to core:
++ *
++ *   DCXO 26 MHz --> [ /P ] --> [ x N ] --> [ /(M0*M1) ] --> [ /EXT_DIVP ] --+
++ *                   \______ CPU_x_PLL_CTRL_REG +0x00 ______/  CLK_REG +0x1C |
++ *                                     |                                     |
++ *                              lock detector (bit28)                        |
++ *                                                                           v
++ *   CPU_SLOW_CLK (DCXO) ------------------------------------> mux [26:24] --> cores
++ *
++ * Two facts make this block programmable at all while the cores execute the
++ * code that reprograms it:
++ *
++ *  1) The mux is glitch-free. The UM states for all three CLK registers
++ *     that it switches without glitches and may be reconfigured at run time
++ *     (5.1.10.13 CPU_L_PLL_CLK_REG, 5.1.10.24 CPU_B_PLL_CLK_REG, 5.1.10.37
++ *     CPU_DSU_PLL_CLK_REG). So a running core can
++ *     be moved between two running sources without ever seeing a short pulse.
++ *  2) Mux input 000 is CPU_SLOW_CLK, and CPU_SLOW_CLK_SEL_REG (+0x3034) selects
++ *     00 = DCXO / 01 = CLK32K / 10 = CLK16M_RC. With the reset default (00) the
++ *     bypass is the 26 MHz crystal itself, which never stops and never needs to
++ *     be relocked. probe() reads that register and refuses to register any clock
++ *     at all if it is not 00, because a bypass to 32 kHz is a hang, and losing
++ *     cpufreq is a survivable outcome where that is not. The mapping therefore
++ *     has to reach 0x3038, not 0x3034.
++ *
++ * A rate change therefore runs as: park the cores on the DCXO, take the PLL out
++ * of lock and reprogram it, wait for lock, park the cores back. The core keeps
++ * fetching and retiring instructions the whole time; it just does so at 26 MHz
++ * for the ~100 us the PLL needs. Nothing is ever asked to run from a PLL that
++ * is mid-relock.
++ *
++ * The vendor BSP (ccu-sun60iw2-cpupll.c) does the opposite: it pins the mux to
++ * index 3 in probe() and then relocks the live PLL under the running cores,
++ * relying on the linear-frequency-modulation ramp to keep the edges legal. That
++ * is not modelled here. Mainline's own answer for this situation is
++ * ccu_mux_notifier_register() (ccu-sun50i-a64.c, ccu-sun8i-h3.c,
++ * ccu-sun50i-h616.c ...), the UM documents the mux as glitch-free and
++ * dynamically switchable, and on this SoC relocking a live PLL is the known
++ * root cause of a GPU freeze class. Register readback also shows the LFM the
++ * vendor relies on is *not* armed by the boot loader: on the 8 GiB board under our own
++ * kernel CPU_L_PLL_LFM_REG (+0x1018) reads 0x40000001, i.e. PLL_LFM_EN (bit31)
++ * = 0, the reset default. Only the vendor driver turns it on (the 6 GiB board, which runs
++ * a BSP-derived kernel, reads 0xc0000100 in the same register). A relock
++ * strategy that depends on a ramp the firmware does not arm is a strategy that
++ * fails closed on a pristine mainline boot.
++ *
++ * Values here come from the A733 UM v0.92 and from register readback on real
++ * silicon; see the patch header for the per-value evidence table. The vendor
++ * driver was read for ideas only and is wrong in at least three places (its
++ * CPU_BACK_PLL formula, its DSU mux parent list, and its "P" - see below).
++ */
++
++#include <linux/bitfield.h>
++#include <linux/clk.h>
++#include <linux/clk-provider.h>
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/log2.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++
++#include <dt-bindings/clock/sun60i-a733-cpu-ccu.h>
++
++#include "ccu_common.h"
++#include "ccu_gate.h"
++#include "ccu_mux.h"
++
++/* Register offsets, UM 5.1.5.5 "CPU_PLL_CFG Register List". */
++#define A733_PLL_CPU_BACK_CTRL_REG	0x0000
++#define A733_PLL_CPU_L_CTRL_REG		0x1000
++#define A733_PLL_CPU_B_CTRL_REG		0x2000
++#define A733_PLL_CPU_DSU_CTRL_REG	0x3000
++#define A733_CPU_L_CLK_REG		0x101c
++#define A733_CPU_B_CLK_REG		0x201c
++#define A733_CPU_DSU_CLK_REG		0x301c
++#define A733_CPU_SLOW_CLK_SEL_REG	0x3034
++
++/*
++ * CPU_L/B/DSU_PLL_CTRL_REG, UM 5.1.10.6.
++ *   f   = InputFreq * N / P / (M0 * M1)
++ *   VCO = InputFreq * N / P,  480 MHz <= VCO <= 2260 MHz
++ * PLL_N is used raw (N = PLL_N, no +1); P, M0 and M1 are field+1.
++ */
++#define A733_PLL_EN			BIT(31)
++#define A733_PLL_LDO_EN			BIT(30)
++#define A733_PLL_LOCK_ENABLE		BIT(29)
++#define A733_PLL_LOCK			BIT(28)
++#define A733_PLL_OUTPUT_GATE		BIT(27)
++#define A733_PLL_UPDATE			BIT(26)
++#define A733_PLL_M0			GENMASK(21, 20)
++#define A733_PLL_P			GENMASK(19, 16)
++#define A733_PLL_N			GENMASK(15, 8)
++#define A733_PLL_M1			GENMASK(3, 0)
++
++#define A733_PLL_VCO_MIN		480000000UL
++#define A733_PLL_VCO_MAX		2260000000UL
++/* "PLL N is 4/5/8/9/10/12-255" - the 480 MHz floor keeps us in the dense part. */
++#define A733_PLL_N_MIN			12
++#define A733_PLL_N_MAX			255
++
++/* CPU_x_PLL_CLK_REG, UM 5.1.10.13 / 5.1.10.24 / 5.1.10.37. */
++#define A733_CPU_CLK_SEL		GENMASK(26, 24)
++#define A733_CPU_EXT_DIVP		GENMASK(17, 16)
++
++/* CPU_SLOW_CLK_SEL_REG, UM 5.1.10.42. */
++#define A733_CPU_SLOW_CLK_SEL		GENMASK(1, 0)
++#define A733_CPU_SLOW_CLK_SEL_DCXO	0
++
++/* CPU_BACK_PLL_CTRL_REG, UM 5.1.10.1: f = InputFreq * N / M1 / P0. */
++#define A733_BACK_PLL_OUTPUT_DIV	GENMASK(22, 20)	/* P0 = field + 1 */
++#define A733_BACK_PLL_N			GENMASK(15, 8)	/* N  = field + 1 */
++#define A733_BACK_PLL_INPUT_DIV		BIT(1)		/* M1 = field + 1 */
++
++/*
++ * The two P's are different fields in different registers and are deliberately
++ * not merged:
++ *
++ *   PLL_P    CPU_x_PLL_CTRL_REG[19:16], a *pre*-divider inside the loop. It
++ *            divides the reference before the multiplier, so it moves the VCO.
++ *   EXT_DIVP CPU_x_PLL_CLK_REG[17:16], a *post*-divider outside the loop. The
++ *            UM names the mux source it produces "CPU_L_PLL/P", i.e. the mux
++ *            never sees the raw PLL output, it sees the divided one.
++ *
++ * The driver keeps PLL_P (and M0, M1) at 1 and varies only N and EXT_DIVP.
++ * Reason: with a 26 MHz reference, N alone covers 494..2236 MHz in 26 MHz steps
++ * and every additional degree of freedom only creates second encodings of rates
++ * N can already express - which would make determine_rate() non-deterministic
++ * without buying a single new frequency. Keeping M0 = M1 = 1 has a second
++ * benefit: the UM states the 480..2260 MHz window twice, once against the VCO
++ * (bit31 note) and once against the output (PLL_N note), and those two
++ * statements only coincide when M0 * M1 == 1. With M0 = M1 = 1 there is no
++ * ambiguity left to get wrong.
++ *
++ * The vendor driver models "p" as _SUNXI_CCU_DIV(16, 2) with a private p_reg
++ * pointing at 0x101c - that is EXT_DIVP, and PLL_P is not modelled by it at all.
++ *
++ * EXT_DIVP is folded into the PLL clock rather than exposed as a separate
++ * ccu_div child. It has to be: clk_change_rate() (drivers/clk/clk.c) sends
++ * POST_RATE_CHANGE for a clock *before* it descends into that clock's children,
++ * so a separate divider child would be reprogrammed only after the mux notifier
++ * had already put the cores back on the PLL - which means the cores would run
++ * one intermediate frequency (new N with the old EXT_DIVP) that nobody asked
++ * for and no OPP has a voltage for. Programming both fields inside one
++ * set_rate(), while the cores are parked on the DCXO, removes that window
++ * entirely.
++ */
++
++struct ccu_a733_cpu_pll {
++	u16			divp_reg;
++	struct ccu_common	common;
++};
++
++static inline struct ccu_a733_cpu_pll *hw_to_ccu_a733_cpu_pll(struct clk_hw *hw)
++{
++	struct ccu_common *common = hw_to_ccu_common(hw);
++
++	return container_of(common, struct ccu_a733_cpu_pll, common);
++}
++
++struct ccu_a733_cpu_pll_cfg {
++	u32	n;
++	u32	divp;
++};
++
++/* UM: EXT_DIVP 00 = /1, 01 = /2, 10 = /4, 11 reserved. */
++static const u32 ccu_a733_cpu_pll_divp[] = { 1, 2, 4 };
++
++static void ccu_a733_rmw(struct ccu_common *common, u16 reg, u32 mask, u32 val)
++{
++	unsigned long flags;
++	u32 tmp;
++
++	spin_lock_irqsave(common->lock, flags);
++	tmp = readl(common->base + reg);
++	tmp &= ~mask;
++	tmp |= val & mask;
++	writel(tmp, common->base + reg);
++	spin_unlock_irqrestore(common->lock, flags);
++}
++
++/*
++ * Pick the (N, EXT_DIVP) pair giving the highest rate <= @rate. N is searched
++ * only inside the VCO window, so an illegal setting cannot be selected: 416 MHz
++ * for instance is unreachable with EXT_DIVP = /1 (26 * 16 = 416 MHz would put
++ * the VCO 64 MHz below the floor) and is found as N = 32 with EXT_DIVP = /2 -
++ * exactly what boot0 and the vendor stack program on both reference boards.
++ * EXT_DIVP is tried in ascending order and ties keep the earlier hit, so /1 wins
++ * whenever a rate is reachable both ways (780 MHz = 30x/1 and = 60x/2).
++ */
++static unsigned long ccu_a733_cpu_pll_find(unsigned long parent,
++					   unsigned long rate,
++					   struct ccu_a733_cpu_pll_cfg *cfg)
++{
++	unsigned int n_min, n_max, n, i;
++	unsigned long best = 0;
++
++	if (!parent)
++		return 0;
++
++	n_min = max_t(unsigned int, A733_PLL_N_MIN,
++		      DIV_ROUND_UP(A733_PLL_VCO_MIN, parent));
++	n_max = min_t(unsigned int, A733_PLL_N_MAX, A733_PLL_VCO_MAX / parent);
++	if (n_min > n_max)
++		return 0;
++
++	for (i = 0; i < ARRAY_SIZE(ccu_a733_cpu_pll_divp); i++) {
++		for (n = n_min; n <= n_max; n++) {
++			unsigned long tmp = parent * n / ccu_a733_cpu_pll_divp[i];
++
++			if (tmp > rate)
++				break;
++			if (tmp > best) {
++				best = tmp;
++				cfg->n = n;
++				cfg->divp = ccu_a733_cpu_pll_divp[i];
++			}
++		}
++	}
++
++	if (!best) {
++		/* Below the floor: hand out the lowest legal setting. */
++		cfg->n = n_min;
++		cfg->divp = ccu_a733_cpu_pll_divp[ARRAY_SIZE(ccu_a733_cpu_pll_divp) - 1];
++		best = parent * cfg->n / cfg->divp;
++	}
++
++	return best;
++}
++
++static unsigned long ccu_a733_cpu_pll_recalc_rate(struct clk_hw *hw,
++						  unsigned long parent_rate)
++{
++	struct ccu_a733_cpu_pll *pll = hw_to_ccu_a733_cpu_pll(hw);
++	u32 ctrl, clk, divp_sel;
++	unsigned long div;
++	u64 rate;
++
++	ctrl = readl(pll->common.base + pll->common.reg);
++	clk = readl(pll->common.base + pll->divp_reg);
++
++	divp_sel = FIELD_GET(A733_CPU_EXT_DIVP, clk);
++	if (divp_sel >= ARRAY_SIZE(ccu_a733_cpu_pll_divp)) {
++		WARN_ONCE(1, "%s: reserved EXT_DIVP encoding %u\n",
++			  clk_hw_get_name(hw), divp_sel);
++		divp_sel = 0;
++	}
++
++	/* N raw, P/M0/M1 are field+1 - report what the register really says. */
++	div = (FIELD_GET(A733_PLL_P, ctrl) + 1) *
++	      (FIELD_GET(A733_PLL_M0, ctrl) + 1) *
++	      (FIELD_GET(A733_PLL_M1, ctrl) + 1) *
++	      ccu_a733_cpu_pll_divp[divp_sel];
++
++	rate = (u64)parent_rate * FIELD_GET(A733_PLL_N, ctrl);
++	do_div(rate, div);
++
++	return rate;
++}
++
++static int ccu_a733_cpu_pll_determine_rate(struct clk_hw *hw,
++					   struct clk_rate_request *req)
++{
++	struct ccu_a733_cpu_pll_cfg cfg;
++	unsigned long rate;
++
++	rate = ccu_a733_cpu_pll_find(req->best_parent_rate, req->rate, &cfg);
++	if (!rate)
++		return -EINVAL;
++
++	req->rate = rate;
++
++	return 0;
++}
++
++/*
++ * UM 5.1.4.2 (pre-divider frequency modulation) - the documented sequence
++ * for changing a linear PLL when the LFM ramp is not in use, which is our case
++ * (PLL_LFM_EN reads 0 out of boot0, see the file header).
++ *
++ * The UM's step list for this sequence is internally inconsistent: it writes
++ * PLL_UPDATE twice (steps 5 and 6) and then waits for LOCK_STATUS to be
++ * cleared, which cannot be a terminal condition. The enable sequence in the
++ * same section is unambiguous about the same handshake: set PLL_UPDATE, wait
++ * for PLL_UPDATE to clear, wait for LOCK to read 1, then allow 20 us for the
++ * PLL to come up. That ordering is what is
++ * implemented, with a single update, which also satisfies the 1 us minimum
++ * spacing between two updates.
++ *
++ * PLL_EN and PLL_LDO_EN are never touched. The UM advises against
++ * enabling or disabling the PLLs during use, because that disturbs the
++ * other PLLs and can make the system unstable. When a clock is not
++ * needed, it recommends clearing PLL_OUTPUT_GATE in PLL_CTRL
++ * instead.
++ */
++static int ccu_a733_cpu_pll_set_rate(struct clk_hw *hw, unsigned long rate,
++				     unsigned long parent_rate)
++{
++	struct ccu_a733_cpu_pll *pll = hw_to_ccu_a733_cpu_pll(hw);
++	struct ccu_common *common = &pll->common;
++	struct ccu_a733_cpu_pll_cfg cfg;
++	u32 reg;
++
++	if (!ccu_a733_cpu_pll_find(parent_rate, rate, &cfg))
++		return -EINVAL;
++
++	/* 1. Stop driving the mux from this PLL. */
++	ccu_a733_rmw(common, common->reg, A733_PLL_OUTPUT_GATE, 0);
++
++	/* 2. Silence the lock detector while the loop is pulled off frequency. */
++	ccu_a733_rmw(common, common->reg, A733_PLL_LOCK_ENABLE, 0);
++
++	/* 3. N, and P = M0 = M1 = 1 (all three field encodings of "1" are 0). */
++	ccu_a733_rmw(common, common->reg,
++		     A733_PLL_N | A733_PLL_P | A733_PLL_M0 | A733_PLL_M1,
++		     FIELD_PREP(A733_PLL_N, cfg.n));
++
++	/*
++	 * 4. EXT_DIVP, in the *other* register. It has to be in place before the
++	 *    output gate reopens, otherwise the mux would see the new VCO through
++	 *    the old post-divider.
++	 */
++	ccu_a733_rmw(common, pll->divp_reg, A733_CPU_EXT_DIVP,
++		     FIELD_PREP(A733_CPU_EXT_DIVP, ilog2(cfg.divp)));
++
++	/* 5. Lock detector back on. */
++	ccu_a733_rmw(common, common->reg, A733_PLL_LOCK_ENABLE,
++		     A733_PLL_LOCK_ENABLE);
++
++	/*
++	 * 6./7. Hand the new N to the PLL and wait for the R/WAC bit to clear
++	 *       itself. Until it does, the register holds the requested value but
++	 *       the loop still runs on the old one - CPU_x_PLL_CTRL_STAT_REG
++	 *       (+0x2c) is the read-only mirror that shows which one is in effect.
++	 */
++	ccu_a733_rmw(common, common->reg, A733_PLL_UPDATE, A733_PLL_UPDATE);
++	WARN_ON(readl_relaxed_poll_timeout_atomic(common->base + common->reg,
++						  reg, !(reg & A733_PLL_UPDATE),
++						  1, 10000));
++
++	/* 8. Wait for the loop to report lock. */
++	ccu_helper_wait_for_lock(common, A733_PLL_LOCK);
++
++	/* 9. UM: the PLL is usable 20 us after it locks. */
++	udelay(20);
++
++	/*
++	 * 10. Release the output to the mux. Done unconditionally: if the loop
++	 *     failed to lock (WARNed above) the cores are about to be muxed back
++	 *     here by the POST_RATE_CHANGE notifier no matter what, and a
++	 *     wrong-frequency clock is survivable where no clock at all is not.
++	 */
++	ccu_a733_rmw(common, common->reg, A733_PLL_OUTPUT_GATE,
++		     A733_PLL_OUTPUT_GATE);
++
++	return 0;
++}
++
++static int ccu_a733_cpu_pll_enable(struct clk_hw *hw)
++{
++	struct ccu_a733_cpu_pll *pll = hw_to_ccu_a733_cpu_pll(hw);
++
++	return ccu_gate_helper_enable(&pll->common, A733_PLL_OUTPUT_GATE);
++}
++
++static void ccu_a733_cpu_pll_disable(struct clk_hw *hw)
++{
++	struct ccu_a733_cpu_pll *pll = hw_to_ccu_a733_cpu_pll(hw);
++
++	ccu_gate_helper_disable(&pll->common, A733_PLL_OUTPUT_GATE);
++}
++
++static int ccu_a733_cpu_pll_is_enabled(struct clk_hw *hw)
++{
++	struct ccu_a733_cpu_pll *pll = hw_to_ccu_a733_cpu_pll(hw);
++
++	return ccu_gate_helper_is_enabled(&pll->common, A733_PLL_OUTPUT_GATE);
++}
++
++static const struct clk_ops ccu_a733_cpu_pll_ops = {
++	.enable		= ccu_a733_cpu_pll_enable,
++	.disable	= ccu_a733_cpu_pll_disable,
++	.is_enabled	= ccu_a733_cpu_pll_is_enabled,
++
++	.recalc_rate	= ccu_a733_cpu_pll_recalc_rate,
++	.determine_rate	= ccu_a733_cpu_pll_determine_rate,
++	.set_rate	= ccu_a733_cpu_pll_set_rate,
++};
++
++/*
++ * CPU_BACK_PLL is a generic PLL with a different register layout, it is left
++ * switched off by boot0 (PLL_EN = 0 on the 8 GiB board under our own kernel), and nothing
++ * in this driver routes it anywhere. It is modelled read-only so that its rate
++ * is described truthfully instead of being absent or wrong: the vendor driver
++ * applies the linear-PLL raw-N formula to it and reports 1924 MHz, while both
++ * reference boards read N = 75, P0 = 2, i.e. 26 * 75 / 2 = 975 MHz at the 26 MHz
++ * DCXO. The UM's default note is no witness: V0.92 names 975 MHz at 26 MHz,
++ * V1.00 900 MHz at 24 MHz, for the same fields.
++ *
++ * No .enable/.disable on purpose - see the UM note quoted in set_rate() about
++ * enabling and disabling PLLs while the system runs. It still carries
++ * CLK_IS_CRITICAL, uniformly with the other six clocks in this block; for this
++ * one it is belt-and-braces, because a clock with no .disable op is something
++ * clk_disable_unused() has nothing to call on in the first place.
++ */
++static unsigned long ccu_a733_back_pll_recalc_rate(struct clk_hw *hw,
++						   unsigned long parent_rate)
++{
++	struct ccu_common *common = hw_to_ccu_common(hw);
++	u32 reg = readl(common->base + common->reg);
++	u64 rate;
++
++	rate = (u64)parent_rate * (FIELD_GET(A733_BACK_PLL_N, reg) + 1);
++	do_div(rate, (FIELD_GET(A733_BACK_PLL_INPUT_DIV, reg) + 1) *
++		     (FIELD_GET(A733_BACK_PLL_OUTPUT_DIV, reg) + 1));
++
++	return rate;
++}
++
++static int ccu_a733_back_pll_is_enabled(struct clk_hw *hw)
++{
++	struct ccu_common *common = hw_to_ccu_common(hw);
++	u32 reg = readl(common->base + common->reg);
++
++	return (reg & (A733_PLL_EN | A733_PLL_OUTPUT_GATE)) ==
++	       (A733_PLL_EN | A733_PLL_OUTPUT_GATE);
++}
++
++static const struct clk_ops ccu_a733_back_pll_ops = {
++	.is_enabled	= ccu_a733_back_pll_is_enabled,
++	.recalc_rate	= ccu_a733_back_pll_recalc_rate,
++};
++
++static const struct clk_parent_data a733_dcxo[] = {
++	{ .fw_name = "dcxo" },
++};
++
++static struct ccu_common pll_cpu_back_clk = {
++	.reg		= A733_PLL_CPU_BACK_CTRL_REG,
++	.hw.init	= CLK_HW_INIT_PARENTS_DATA("pll-cpu-back", a733_dcxo,
++						   &ccu_a733_back_pll_ops,
++						   CLK_IS_CRITICAL),
++};
++
++/*
++ * CLK_IS_CRITICAL on every clock in this block. Nothing in the consumer path
++ * (cpufreq-dt via the cpu@N clocks of patch `arm64-dts-a733-cpu-clocks-from-cpu-ccu`) calls clk_prepare_enable() on
++ * them, so without it clk_disable_unused() would walk in at late_initcall and
++ * close PLL_OUTPUT_GATE on the PLL the running cores are muxed to.
++ */
++#define A733_CPU_PLL(_struct, _name, _ctrl, _clk)			\
++	static struct ccu_a733_cpu_pll _struct = {			\
++		.divp_reg	= _clk,					\
++		.common		= {					\
++			.reg		= _ctrl,			\
++			.hw.init	= CLK_HW_INIT_PARENTS_DATA(	\
++					_name, a733_dcxo,		\
++					&ccu_a733_cpu_pll_ops,		\
++					CLK_IS_CRITICAL),		\
++		},							\
++	}
++
++A733_CPU_PLL(pll_cpu_l_clk, "pll-cpu-l",
++	     A733_PLL_CPU_L_CTRL_REG, A733_CPU_L_CLK_REG);
++A733_CPU_PLL(pll_cpu_b_clk, "pll-cpu-b",
++	     A733_PLL_CPU_B_CTRL_REG, A733_CPU_B_CLK_REG);
++A733_CPU_PLL(pll_cpu_dsu_clk, "pll-cpu-dsu",
++	     A733_PLL_CPU_DSU_CTRL_REG, A733_CPU_DSU_CLK_REG);
++
++/*
++ * The mux encoding is 3 bits wide but not dense, and it is *not* the same for
++ * the DSU as for the two core clusters:
++ *
++ *   L/B:  000/001/010 CPU_SLOW_CLK · 011 own PLL/P · 100 PERI0PLL_DIV2 · 101 CPU_BACK_PLL
++ *   DSU:  000/001/010 CPU_SLOW_CLK · 011 own PLL/P · 100 CPU0PLL      · 101 PERI0_600M
++ *
++ * (UM 5.1.10.13 / 5.1.10.24 / 5.1.10.37.) The vendor driver gives all three
++ * muxes the same parent list ending in "pll-cpu-back", which is wrong for the
++ * DSU. Encoding 100 is omitted here for both: on L/B it is a tap of the
++ * peripheral PLL that lives in the main CCU and would need a DT input we would
++ * never select, and on the DSU it is a different source again.
++ */
++static const u8 a733_cpu_core_mux_table[] = { 0, 3, 5 };
++static const u8 a733_cpu_dsu_mux_table[] = { 0, 3 };
++
++static const struct clk_parent_data cpu_l_parents[] = {
++	{ .fw_name = "dcxo" },				/* 000 CPU_SLOW_CLK */
++	{ .hw = &pll_cpu_l_clk.common.hw },		/* 011 CPU_L_PLL/P   */
++	{ .hw = &pll_cpu_back_clk.hw },			/* 101 CPU_BACK_PLL  */
++};
++
++static const struct clk_parent_data cpu_b_parents[] = {
++	{ .fw_name = "dcxo" },
++	{ .hw = &pll_cpu_b_clk.common.hw },
++	{ .hw = &pll_cpu_back_clk.hw },
++};
++
++static const struct clk_parent_data cpu_dsu_parents[] = {
++	{ .fw_name = "dcxo" },
++	{ .hw = &pll_cpu_dsu_clk.common.hw },
++};
++
++/*
++ * CLK_SET_RATE_NO_REPARENT is load-bearing, not decoration:
++ * clk_mux_determine_rate_flags() without it walks every parent and keeps the
++ * fastest rate <= the request, which would let a rate request silently move the
++ * cores onto the 26 MHz bypass or onto CPU_BACK_PLL. With it, the request is
++ * forwarded to the parent that is actually selected
++ * (clk_core_determine_rate_no_reparent()), i.e. always to the cluster's own PLL,
++ * and the only thing that ever moves the mux is the notifier below.
++ * CLK_SET_RATE_PARENT then carries the rate request from cpu@N (patch `arm64-dts-a733-cpu-clocks-from-cpu-ccu`)
++ * down to that PLL.
++ */
++#define A733_CPU_MUX(_struct, _name, _parents, _table, _reg)		\
++	static struct ccu_mux _struct = {				\
++		.mux	= _SUNXI_CCU_MUX_TABLE(24, 3, _table),		\
++		.common	= {						\
++			.reg		= _reg,				\
++			.hw.init	= CLK_HW_INIT_PARENTS_DATA(	\
++					_name, _parents, &ccu_mux_ops,	\
++					CLK_SET_RATE_PARENT |		\
++					CLK_SET_RATE_NO_REPARENT |	\
++					CLK_IS_CRITICAL),		\
++		},							\
++	}
++
++A733_CPU_MUX(cpu_l_clk, "cpu-l", cpu_l_parents,
++	     a733_cpu_core_mux_table, A733_CPU_L_CLK_REG);
++A733_CPU_MUX(cpu_b_clk, "cpu-b", cpu_b_parents,
++	     a733_cpu_core_mux_table, A733_CPU_B_CLK_REG);
++A733_CPU_MUX(cpu_dsu_clk, "cpu-dsu", cpu_dsu_parents,
++	     a733_cpu_dsu_mux_table, A733_CPU_DSU_CLK_REG);
++
++static struct ccu_common *sun60i_a733_cpu_ccu_clks[] = {
++	&pll_cpu_back_clk,
++	&pll_cpu_l_clk.common,
++	&pll_cpu_b_clk.common,
++	&pll_cpu_dsu_clk.common,
++	&cpu_l_clk.common,
++	&cpu_b_clk.common,
++	&cpu_dsu_clk.common,
++};
++
++static struct clk_hw_onecell_data sun60i_a733_cpu_ccu_hw_clks = {
++	.hws	= {
++		[CLK_PLL_CPU_L]		= &pll_cpu_l_clk.common.hw,
++		[CLK_PLL_CPU_B]		= &pll_cpu_b_clk.common.hw,
++		[CLK_PLL_CPU_DSU]	= &pll_cpu_dsu_clk.common.hw,
++		[CLK_PLL_CPU_BACK]	= &pll_cpu_back_clk.hw,
++		[CLK_CPU_L]		= &cpu_l_clk.common.hw,
++		[CLK_CPU_B]		= &cpu_b_clk.common.hw,
++		[CLK_CPU_DSU]		= &cpu_dsu_clk.common.hw,
++	},
++	.num	= CLK_CPU_DSU + 1,
++};
++
++static const struct sunxi_ccu_desc sun60i_a733_cpu_ccu_desc = {
++	.ccu_clks	= sun60i_a733_cpu_ccu_clks,
++	.num_ccu_clks	= ARRAY_SIZE(sun60i_a733_cpu_ccu_clks),
++
++	.hw_clks	= &sun60i_a733_cpu_ccu_hw_clks,
++};
++
++/*
++ * One notifier per cluster. PRE_RATE_CHANGE on a PLL moves that cluster's mux
++ * to table entry 0 = encoding 000 = CPU_SLOW_CLK = the DCXO, POST_RATE_CHANGE
++ * moves it back to whatever it was (encoding 011 on every board seen so far).
++ * The register write bypasses the clk framework, so CLK_SET_RATE_NO_REPARENT
++ * does not block it and the framework's cached parent index stays valid because
++ * the original index is restored before the lock is dropped.
++ *
++ * delay_us = 1 is >= 26 clock cycles of a 26 MHz bypass, matching the "> 8 clock
++ * cycles" the in-tree A64 driver budgets for the same glitch-free mux.
++ *
++ * ccu_pll_notifier_register() is deliberately *not* used on top. That helper
++ * gates and ungates the PLL after the rate change to force it to re-lock; here
++ * the gate-off / reprogram / lock / gate-on is already the UM's own sequence
++ * inside set_rate(), and a second gate cycle would land after the mux was
++ * restored - i.e. it would create the very output glitch it exists to prevent.
++ */
++#define A733_CPU_MUX_NB(_struct, _mux)					\
++	static struct ccu_mux_nb _struct = {				\
++		.common		= &(_mux).common,			\
++		.cm		= &(_mux).mux,				\
++		.delay_us	= 1,					\
++		.bypass_index	= 0,					\
++	}
++
++A733_CPU_MUX_NB(cpu_l_mux_nb, cpu_l_clk);
++A733_CPU_MUX_NB(cpu_b_mux_nb, cpu_b_clk);
++A733_CPU_MUX_NB(cpu_dsu_mux_nb, cpu_dsu_clk);
++
++static const u16 a733_cpu_pll_ctrl_regs[] = {
++	A733_PLL_CPU_L_CTRL_REG,
++	A733_PLL_CPU_B_CTRL_REG,
++	A733_PLL_CPU_DSU_CTRL_REG,
++};
++
++static struct ccu_common *a733_cpu_pll_commons[] = {
++	&pll_cpu_l_clk.common,
++	&pll_cpu_b_clk.common,
++	&pll_cpu_dsu_clk.common,
++};
++
++static int sun60i_a733_cpu_ccu_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	unsigned int n_min, n_max;
++	unsigned long dcxo_rate;
++	void __iomem *reg;
++	struct clk *dcxo;
++	unsigned int i;
++	u32 val;
++	int ret;
++
++	reg = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(reg))
++		return PTR_ERR(reg);
++
++	dcxo = devm_clk_get(dev, "dcxo");
++	if (IS_ERR(dcxo))
++		return dev_err_probe(dev, PTR_ERR(dcxo),
++				     "cannot get the dcxo reference\n");
++
++	dcxo_rate = clk_get_rate(dcxo);
++	if (!dcxo_rate)
++		return dev_err_probe(dev, -EINVAL, "dcxo reference rate is 0\n");
++
++	/*
++	 * The bypass the notifiers mux to is CPU_SLOW_CLK, and
++	 * CPU_SLOW_CLK_SEL_REG decides what that is: 00 DCXO, 01 CLK32K,
++	 * 10 CLK16M_RC. Parking eight cores on 32 kHz is not a survivable
++	 * bypass, so refuse to provide CPU clocks at all rather than arm a
++	 * relock path that cannot come back. The reset default is 00 and both
++	 * reference boards read 00.
++	 */
++	val = FIELD_GET(A733_CPU_SLOW_CLK_SEL,
++			readl(reg + A733_CPU_SLOW_CLK_SEL_REG));
++	if (val != A733_CPU_SLOW_CLK_SEL_DCXO)
++		return dev_err_probe(dev, -ENODEV,
++				     "CPU_SLOW_CLK is not the DCXO (sel %u), refusing to arm the bypass\n",
++				     val);
++
++	/*
++	 * Everything below assumes PLL_P = M0 = M1 = 1; set_rate() enforces it
++	 * on every transition and recalc_rate() reports the truth either way, so
++	 * a firmware that left something else behind is a warning, not a fault.
++	 * Both reference boards read all three fields as 0.
++	 */
++	for (i = 0; i < ARRAY_SIZE(a733_cpu_pll_ctrl_regs); i++) {
++		val = readl(reg + a733_cpu_pll_ctrl_regs[i]);
++		if (val & (A733_PLL_P | A733_PLL_M0 | A733_PLL_M1))
++			dev_warn(dev,
++				 "CPU PLL @+0x%04x came up with P/M0/M1 != 1 (0x%08x)\n",
++				 a733_cpu_pll_ctrl_regs[i], val);
++	}
++
++	/*
++	 * Publish the reachable window, derived from the actual reference rather
++	 * than hardcoded: N is bounded by the 480..2260 MHz VCO limits, the top
++	 * end is N_max with EXT_DIVP = /1 and the bottom end N_min with /4. At
++	 * 26 MHz that is 123.5 MHz .. 2236 MHz.
++	 */
++	n_min = max_t(unsigned int, A733_PLL_N_MIN,
++		      DIV_ROUND_UP(A733_PLL_VCO_MIN, dcxo_rate));
++	n_max = min_t(unsigned int, A733_PLL_N_MAX,
++		      A733_PLL_VCO_MAX / dcxo_rate);
++	if (n_min > n_max)
++		return dev_err_probe(dev, -EINVAL,
++				     "no legal PLL_N for a %lu Hz reference\n",
++				     dcxo_rate);
++
++	for (i = 0; i < ARRAY_SIZE(a733_cpu_pll_commons); i++) {
++		a733_cpu_pll_commons[i]->min_rate =
++			dcxo_rate * n_min /
++			ccu_a733_cpu_pll_divp[ARRAY_SIZE(ccu_a733_cpu_pll_divp) - 1];
++		a733_cpu_pll_commons[i]->max_rate = dcxo_rate * n_max;
++	}
++
++	ret = devm_sunxi_ccu_probe(dev, reg, &sun60i_a733_cpu_ccu_desc);
++	if (ret)
++		return ret;
++
++	/* Mux the cores off a PLL while it is being reprogrammed. */
++	ccu_mux_notifier_register(pll_cpu_l_clk.common.hw.clk, &cpu_l_mux_nb);
++	ccu_mux_notifier_register(pll_cpu_b_clk.common.hw.clk, &cpu_b_mux_nb);
++	ccu_mux_notifier_register(pll_cpu_dsu_clk.common.hw.clk, &cpu_dsu_mux_nb);
++
++	dev_info(dev, "A733 CPU PLLs on a %lu Hz reference, N %u..%u\n",
++		 dcxo_rate, n_min, n_max);
++
++	return 0;
++}
++
++static const struct of_device_id sun60i_a733_cpu_ccu_ids[] = {
++	{ .compatible = "allwinner,sun60i-a733-cpu-ccu" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, sun60i_a733_cpu_ccu_ids);
++
++static struct platform_driver sun60i_a733_cpu_ccu_driver = {
++	.probe	= sun60i_a733_cpu_ccu_probe,
++	.driver	= {
++		.name			= "sun60i-a733-cpu-ccu",
++		.suppress_bind_attrs	= true,
++		.of_match_table		= sun60i_a733_cpu_ccu_ids,
++	},
++};
++module_platform_driver(sun60i_a733_cpu_ccu_driver);
++
++MODULE_IMPORT_NS("SUNXI_CCU");
++MODULE_DESCRIPTION("Allwinner A733 (sun60iw2) CPU PLL CCU");
++MODULE_LICENSE("GPL");
+--- a/drivers/clk/sunxi-ng/Kconfig
++++ b/drivers/clk/sunxi-ng/Kconfig
+@@ -64,12 +64,17 @@
+ 
+ config SUN60I_A733_RTC_CCU
+ 	tristate "Support for the Allwinner A733 RTC CCU"
+ 	default ARCH_SUNXI
+ 	depends on ARM64 || COMPILE_TEST
+ 
++config SUN60I_A733_CPU_CCU
++	tristate "Support for the Allwinner A733 CPU PLL CCU"
++	default ARCH_SUNXI
++	depends on ARM64 || COMPILE_TEST
++
+ config SUN55I_A523_CCU
+ 	tristate "Support for the Allwinner A523/T527 CCU"
+ 	default ARCH_SUNXI
+ 	depends on ARM64 || COMPILE_TEST
+ 
+ config SUN55I_A523_MCU_CCU
+--- a/drivers/clk/sunxi-ng/Makefile
++++ b/drivers/clk/sunxi-ng/Makefile
+@@ -36,6 +36,7 @@
+ obj-$(CONFIG_SUN60I_A733_CCU)	+= ccu-sun60iw2.o
+ obj-$(CONFIG_SUN60I_A733_R_CCU)	+= ccu-sun60iw2-r.o
+ obj-$(CONFIG_SUN60I_A733_RTC_CCU)	+= ccu-sun60i-a733-rtc.o
++obj-$(CONFIG_SUN60I_A733_CPU_CCU)	+= ccu-sun60i-a733-cpu.o
+ obj-$(CONFIG_SUN55I_A523_CCU)	+= sun55i-a523-ccu.o
+ obj-$(CONFIG_SUN55I_A523_MCU_CCU)	+= sun55i-a523-mcu-ccu.o
+ obj-$(CONFIG_SUN55I_A523_R_CCU)	+= sun55i-a523-r-ccu.o

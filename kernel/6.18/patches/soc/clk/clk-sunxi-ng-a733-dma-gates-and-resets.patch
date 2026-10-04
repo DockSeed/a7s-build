@@ -1,0 +1,129 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Fri, 2 Oct 2026 01:00:00 +0200
+Subject: [PATCH] clk: sunxi-ng: a733: the DMA controllers' bus gates, MBUS clocks and resets
+
+The A733 has two DMA controllers and our CCU describes neither: their bus
+gates, MBUS clocks and resets keep the reset state, closed and asserted,
+and no consumer can claim them. This adds four clocks and two resets.
+
+Where the values come from (A733 UM V1.00, CCU chapter):
+
+  DMA0_BGR_REG 0x0704  bit 0 DMA0_GATING, bit 16 DMA0_RST
+  DMA1_BGR_REG 0x070C  bit 0 DMA1_GATING, bit 16 DMA1_RST
+  MBUS_GATE_EN 0x05E4  bit 0 DMA0_MCLK_EN, bit 3 DMA1_MCLK_EN, reset 0
+
+The UM derives the DMA0 working clock from AHB_CLK (DMA1 likewise):
+the bus gates' parent is ahb, which is also this driver's convention for
+matrix gates. The MBUS bits take ahb by that convention only; the UM
+names no parent and only the enable bit is consumed.
+
+Rejected from the A523: its bus-dma gate at 0x70C is DMA1 here (DMA0 is
+0x704), and its mbus-dma gate at 0x804 does not exist on the A733.
+Vendor: its DT names the same four bits (CLK_DMA0, CLK_MBUS_DMA0,
+RST_BUS_DMA0); it writes a key 0x40302 to the MBUS gate register, which
+the UM does not document, so it is not carried.
+
+Silicon, the 8 GiB board, our 6.18.54 kernel, 2026-10-02: DMA0_BGR = DMA1_BGR =
+0x00000000, MBUS_GATE_EN = 0x00000804 (bits 2 and 11, no DMA bit).
+
+Ids: clocks 111-114, resets 39-40, the next free ones on main.
+
+Verified: applies, builds. Silicon effect is owed to the DMA controller
+node: the controller probes only with these gates open.
+
+Assisted-by: Claude
+---
+--- a/drivers/clk/sunxi-ng/ccu-sun60iw2.c
++++ b/drivers/clk/sunxi-ng/ccu-sun60iw2.c
+@@ -2195,6 +2195,29 @@ static SUNXI_CCU_GATE_HWS(mbus_ve_dec_clk,  "mbus-ve-dec",  ahb_hws, 0x05E0, BIT
+ static SUNXI_CCU_GATE_HWS(mclk_ve_enc0_clk, "mclk-ve-enc0", ahb_hws, 0x05E4, BIT(1),  0);
+ static SUNXI_CCU_GATE_HWS(mclk_ve_dec_clk,  "mclk-ve-dec",  ahb_hws, 0x05E4, BIT(18), 0);
+ 
++/*
++ * The two DMA controllers: a bus gate and an MBUS clock each.
++ *
++ *   DMA0_BGR_REG 0x0704 -- 0 DMA0_GATING, 16 DMA0_RST
++ *   DMA1_BGR_REG 0x070C -- 0 DMA1_GATING, 16 DMA1_RST
++ *   MBUS_GATE_EN 0x05E4 -- 0 DMA0_MCLK_EN, 3 DMA1_MCLK_EN, reset 0
++ *
++ *
++ * The UM derives the DMA0 working clock from AHB_CLK (likewise for
++ * DMA1), so ahb_hws is the cited parent of the bus gates, not only this
++ * file's convention. The MBUS bits take ahb_hws by that convention (the UM
++ * names no parent for them); only the enable bit is consumed. DMAC0 sits at
++ * 0x04601000 and DMAC1 at 0x04024000 (A733 UM chapter 13).
++ *
++ * Silicon, the 8 GiB board, our 6.18.54 kernel, 2026-10-02: DMA0_BGR = DMA1_BGR =
++ * 0x00000000 and MBUS_GATE_EN = 0x00000804 (bits 2 and 11, neither a DMA bit)
++ * -- nothing in the boot chain or the kernel opens either controller today.
++ */
++static SUNXI_CCU_GATE_HWS(bus_dma0_clk,  "bus-dma0",  ahb_hws, 0x0704, BIT(0), 0);
++static SUNXI_CCU_GATE_HWS(bus_dma1_clk,  "bus-dma1",  ahb_hws, 0x070C, BIT(0), 0);
++static SUNXI_CCU_GATE_HWS(mbus_dma0_clk, "mbus-dma0", ahb_hws, 0x05E4, BIT(0), 0);
++static SUNXI_CCU_GATE_HWS(mbus_dma1_clk, "mbus-dma1", ahb_hws, 0x05E4, BIT(3), 0);
++
+ /* ccu_common-based clocks (registered and reset-mapped by the core). */
+ static struct ccu_common *sun60iw2_ccu_clks[] = {
+ 	&pll_ref_clk.common,
+@@ -2295,6 +2318,10 @@ static struct ccu_common *sun60iw2_ccu_clks[] = {
+ 	&mbus_ve_dec_clk.common,
+ 	&mclk_ve_enc0_clk.common,
+ 	&mclk_ve_dec_clk.common,
++	&bus_dma0_clk.common,
++	&bus_dma1_clk.common,
++	&mbus_dma0_clk.common,
++	&mbus_dma1_clk.common,
+ };
+ 
+ static struct clk_hw_onecell_data sun60iw2_hw_clks = {
+@@ -2410,8 +2437,12 @@ static struct clk_hw_onecell_data sun60iw2_hw_clks = {
+ 		[CLK_MBUS_VE_DEC]	= &mbus_ve_dec_clk.common.hw,
+ 		[CLK_MCLK_VE_ENC0]	= &mclk_ve_enc0_clk.common.hw,
+ 		[CLK_MCLK_VE_DEC]	= &mclk_ve_dec_clk.common.hw,
++		[CLK_BUS_DMA0]		= &bus_dma0_clk.common.hw,
++		[CLK_BUS_DMA1]		= &bus_dma1_clk.common.hw,
++		[CLK_MBUS_DMA0]		= &mbus_dma0_clk.common.hw,
++		[CLK_MBUS_DMA1]		= &mbus_dma1_clk.common.hw,
+ 	},
+-	.num	= CLK_MCLK_VE_DEC + 1,
++	.num	= CLK_MBUS_DMA1 + 1,
+ };
+ 
+ static struct ccu_reset_map sun60iw2_ccu_resets[] = {
+@@ -2460,6 +2491,8 @@ static struct ccu_reset_map sun60iw2_ccu_resets[] = {
+ 	/* VE_BGR_REG 0x0A8C: bit16 VE_ENC0_RST, bit18 VE_DEC_RST, 0 = assert. */
+ 	[RST_BUS_VE_ENC0]	= { 0x0A8C, BIT(16) },
+ 	[RST_BUS_VE_DEC]	= { 0x0A8C, BIT(18) },
++	[RST_BUS_DMA0]		= { 0x0704, BIT(16) },
++	[RST_BUS_DMA1]		= { 0x070C, BIT(16) },
+ };
+ 
+ static const struct sunxi_ccu_desc sun60iw2_ccu_desc = {
+--- a/include/dt-bindings/clock/sun60i-a733-ccu.h
++++ b/include/dt-bindings/clock/sun60i-a733-ccu.h
+@@ -202,4 +202,13 @@
+ #define CLK_MCLK_VE_ENC0	109
+ #define CLK_MCLK_VE_DEC		110
+ 
++/*
++ * The DMA controllers' bus gates (DMA0_BGR 0x0704, DMA1_BGR 0x070C, bit 0) and
++ * MBUS clocks (MBUS_GATE_EN 0x05E4, bits 0 and 3).
++ */
++#define CLK_BUS_DMA0		111
++#define CLK_BUS_DMA1		112
++#define CLK_MBUS_DMA0		113
++#define CLK_MBUS_DMA1		114
++
+ #endif /* _DT_BINDINGS_CLK_SUN60I_A733_CCU_H_ */
+--- a/include/dt-bindings/reset/sun60i-a733-ccu.h
++++ b/include/dt-bindings/reset/sun60i-a733-ccu.h
+@@ -87,4 +87,8 @@
+ #define RST_BUS_VE_ENC0		37
+ #define RST_BUS_VE_DEC		38
+ 
++/* DMA controllers -- DMA0_BGR 0x0704 and DMA1_BGR 0x070C, bit 16. */
++#define RST_BUS_DMA0		39
++#define RST_BUS_DMA1		40
++
+ #endif /* _DT_BINDINGS_RST_SUN60I_A733_CCU_H_ */

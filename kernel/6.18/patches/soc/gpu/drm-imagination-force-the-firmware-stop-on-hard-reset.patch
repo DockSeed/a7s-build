@@ -1,0 +1,368 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] drm/imagination: force the firmware stop on hard reset
+
+A hard reset is the driver's answer to a stuck GPU, and it never resets one.
+pvr_power_reset() calls pvr_fw_hard_reset() only if pvr_power_fw_disable()
+succeeded first (pvr_power.c:548-549). On a hard reset that is just
+pvr_fw_stop(), which opens by polling ROGUE_CR_SIDEKICK_IDLE with a 1 s timeout
+on cores without LAYOUT_MARS (pvr_fw_startstop.c:225-230). A stuck GPU does not
+go idle, the poll times out, and
+
+	if (err && hard_reset)
+		goto err_device_lost;
+
+(pvr_power.c:574) declares the device lost with nothing reset. This project's
+earlier Armbian-based 6.18 port of this board measured exactly that on this SoC
+and firmware: "FW stalled, trying hard reset" followed 1.008 s later by
+"GPU device lost", one poll timeout.
+
+Skipping the failed poll is not a fix. pvr_fw_stop() is also the only hardware
+quiesce the driver has: the MTS DM_ASSOC clears, the BIF/SLC drain polls, and
+the final ROGUE_CR_SOFT_RESET write. The hard reset path gates the GPU clocks
+right after it (pvr_power_device_suspend() -> power_off). That earlier port's
+first attempt ignored the error, skipped that quiesce, and was withdrawn as
+unsafe: on this SoC a clock stopped under a busy block has already frozen the
+interconnect once (`clk-sunxi-ng-a733-pll-gpu0-must-be-running-before-the-gpu-binds`).
+
+So the stop is forced, not skipped. __pvr_fw_stop(force) walks the same
+sequence; in force mode each poll gets 10 ms instead of 1 s and a timeout is
+recorded instead of returned. The core is then put into soft reset whether it
+went idle or not, while its clocks still run, SOFT_RESET2 is asserted under the
+same xe_tpu2 guard pvr_fw_start() uses, and both registers are read back to
+fence the writes before the caller unclocks the block. A timeout is logged at
+err level, "GPU did not go idle, forcing soft reset ...", so it reaches the
+console. pvr_power_fw_disable() takes the forced path only when hard_reset is
+set; the graceful stop used by runtime suspend is unchanged.
+
+In force mode the META TxVECINT_BHALT read is skipped: pvr_meta_cr_read32()
+polls its slave port with its own 1 s timeout (pvr_fw_meta.c:41-61), which the
+short leash above would not cover. Without that read the Garten poll runs, on
+the same 10 ms.
+
+The same forced stop replaces the graceful one on the boot-failure path of
+pvr_power_fw_enable(). A firmware that did not come up there has nothing to
+drain, and the graceful stop would give up after its first 1 s poll without
+writing SOFT_RESET, before pvr_power_device_resume() gates the clocks
+(err_power_off). A firmware left unstarted on a resume runs exactly that path
+(exercised by a test that skips the firmware start on resume).
+
+Differences from the earlier port's equivalent patch, which was written against
+an older driver: the LAYOUT_MARS branch (MARS_IDLE) that mainline added is
+covered too; the repeated error handling is one helper; and, deliberately, the
+graceful path gets no new writes. That port also asserted SOFT_RESET2 and fenced both
+registers on every runtime suspend. Here the graceful stop only runs after the
+core reported idle, and the reset line is asserted before the gates, so that
+change is not taken without a measurement of its own.
+That patch ran a 902 s soak on the earlier port's A733 board with one firmware
+stall: forced stop fired, "GPU device lost" did not follow, and the board kept
+rendering. That was a different kernel; it says the sequence works on this
+silicon, not that this port does.
+
+Not established: the LAYOUT_MARS value of BXM-4-64 MC1. It comes from the
+firmware header (pvr_fw.c:187) and was not decoded; the 1.008 s gap points to
+the SIDEKICK branch.
+
+The code touched here is byte-identical to mainline master (compared
+2026-09-10).
+
+Verified: applies with --fuzz=0 after `drm-imagination-run-the-device-lost-unplug-from-a-worker`; compile gate green. HW-proven on
+the test board 2026-09-10 against a faked stall -- the first idle poll forced
+to time out -- under real GL load: 3 of 3 resets take the forced stop and
+render correctly afterwards; without this patch the same stimulus ends in
+"GPU device lost". A genuinely wedged bus is not covered.
+
+Falsifier on the test board needs a real firmware stall, which an injection cannot fake:
+"FW stalled, trying hard reset", then "GPU did not go idle, forcing soft
+reset", and no "GPU device lost"; a GL acceptance run passes in the same boot.
+
+Assisted-by: Claude
+
+--- a/drivers/gpu/drm/imagination/pvr_fw_startstop.c
++++ b/drivers/gpu/drm/imagination/pvr_fw_startstop.c
+@@ -9,6 +9,7 @@
+ #include "pvr_rogue_meta.h"
+ #include "pvr_vm.h"
+ 
++#include <drm/drm_print.h>
+ #include <linux/compiler.h>
+ #include <linux/delay.h>
+ #include <linux/ktime.h>
+@@ -16,6 +17,13 @@
+ 
+ #define POLL_TIMEOUT_USEC 1000000
+ 
++/*
++ * A forced stop runs on a GPU that did not go idle. Each drain poll still gets
++ * a short chance to settle, but seven polls at POLL_TIMEOUT_USEC would hold the
++ * recovery for seven seconds to learn what the caller already knows.
++ */
++#define FORCE_POLL_TIMEOUT_USEC 10000
++
+ static void
+ rogue_axi_ace_list_init(struct pvr_device *pvr_dev)
+ {
+@@ -193,22 +201,53 @@
+ 	return err;
+ }
+ 
+-/**
+- * pvr_fw_stop() - Stop FW processor
+- * @pvr_dev: Target PowerVR device.
++/*
++ * pvr_fw_stop_poll_result() - Decide what a failed idle poll means
+  *
+- * Returns:
+- *  * 0 on success, or
+- *  * Any error returned by pvr_cr_poll_reg32().
++ * A graceful stop gives up on the first poll that times out. A forced stop
++ * records it and carries on, because the soft reset at the end is the point.
+  */
+-int
+-pvr_fw_stop(struct pvr_device *pvr_dev)
++static int
++pvr_fw_stop_poll_result(int err, bool force, bool *not_idle)
++{
++	if (err && force) {
++		*not_idle = true;
++		return 0;
++	}
++
++	return err;
++}
++
++/*
++ * pvr_fw_stop_fence_reset() - Finish a forced soft reset before the clocks go
++ *
++ * The caller gates the GPU clocks next. A reset write still in the SOCIF
++ * pipeline when its clock stops leaves a live core behind, so assert
++ * SOFT_RESET2 as pvr_fw_start() does and read both registers back.
++ */
++static void
++pvr_fw_stop_fence_reset(struct pvr_device *pvr_dev)
++{
++	bool has_reset2 = PVR_HAS_FEATURE(pvr_dev, xe_tpu2);
++
++	if (has_reset2)
++		pvr_cr_write64(pvr_dev, ROGUE_CR_SOFT_RESET2, ROGUE_CR_SOFT_RESET2_MASKFULL);
++
++	(void)pvr_cr_read64(pvr_dev, ROGUE_CR_SOFT_RESET);
++	if (has_reset2)
++		(void)pvr_cr_read64(pvr_dev, ROGUE_CR_SOFT_RESET2);
++}
++
++static int
++__pvr_fw_stop(struct pvr_device *pvr_dev, bool force)
+ {
+ 	const u32 sidekick_idle_mask = ROGUE_CR_SIDEKICK_IDLE_MASKFULL &
+ 				       ~(ROGUE_CR_SIDEKICK_IDLE_GARTEN_EN |
+ 					 ROGUE_CR_SIDEKICK_IDLE_SOCIF_EN |
+ 					 ROGUE_CR_SIDEKICK_IDLE_HOSTIF_EN);
++	const u64 poll_timeout = force ? FORCE_POLL_TIMEOUT_USEC : POLL_TIMEOUT_USEC;
+ 	bool skip_garten_idle = false;
++	bool not_idle = false;
+ 	u64 layout_mars_value = 0;
+ 	bool layout_mars = false;
+ 	bool meta_fw = pvr_dev->fw_dev.processor_type == PVR_FW_PROCESSOR_TYPE_META;
+@@ -225,13 +264,15 @@
+ 	if (!layout_mars) {
+ 		/* Wait for Sidekick/Jones to signal IDLE except for the Garten Wrapper. */
+ 		err = pvr_cr_poll_reg32(pvr_dev, ROGUE_CR_SIDEKICK_IDLE, sidekick_idle_mask,
+-					sidekick_idle_mask, POLL_TIMEOUT_USEC);
++					sidekick_idle_mask, poll_timeout);
++		err = pvr_fw_stop_poll_result(err, force, &not_idle);
+ 		if (err)
+ 			return err;
+ 
+ 		/* Wait for SLC to signal IDLE. */
+ 		err = pvr_cr_poll_reg32(pvr_dev, ROGUE_CR_SLC_IDLE, ROGUE_CR_SLC_IDLE_MASKFULL,
+-					ROGUE_CR_SLC_IDLE_MASKFULL, POLL_TIMEOUT_USEC);
++					ROGUE_CR_SLC_IDLE_MASKFULL, poll_timeout);
++		err = pvr_fw_stop_poll_result(err, force, &not_idle);
+ 		if (err)
+ 			return err;
+ 	}
+@@ -256,33 +297,38 @@
+ 	/* Extra Idle checks. */
+ 	err = pvr_cr_poll_reg32(pvr_dev, ROGUE_CR_BIF_STATUS_MMU, 0,
+ 				ROGUE_CR_BIF_STATUS_MMU_MASKFULL,
+-				POLL_TIMEOUT_USEC);
++				poll_timeout);
++	err = pvr_fw_stop_poll_result(err, force, &not_idle);
+ 	if (err)
+ 		return err;
+ 
+ 	err = pvr_cr_poll_reg32(pvr_dev, ROGUE_CR_BIFPM_STATUS_MMU, 0,
+ 				ROGUE_CR_BIFPM_STATUS_MMU_MASKFULL,
+-				POLL_TIMEOUT_USEC);
++				poll_timeout);
++	err = pvr_fw_stop_poll_result(err, force, &not_idle);
+ 	if (err)
+ 		return err;
+ 
+ 	if (!PVR_HAS_FEATURE(pvr_dev, xt_top_infrastructure)) {
+ 		err = pvr_cr_poll_reg32(pvr_dev, ROGUE_CR_BIF_READS_EXT_STATUS, 0,
+ 					ROGUE_CR_BIF_READS_EXT_STATUS_MASKFULL,
+-					POLL_TIMEOUT_USEC);
++					poll_timeout);
++		err = pvr_fw_stop_poll_result(err, force, &not_idle);
+ 		if (err)
+ 			return err;
+ 	}
+ 
+ 	err = pvr_cr_poll_reg32(pvr_dev, ROGUE_CR_BIFPM_READS_EXT_STATUS, 0,
+ 				ROGUE_CR_BIFPM_READS_EXT_STATUS_MASKFULL,
+-				POLL_TIMEOUT_USEC);
++				poll_timeout);
++	err = pvr_fw_stop_poll_result(err, force, &not_idle);
+ 	if (err)
+ 		return err;
+ 
+ 	err = pvr_cr_poll_reg64(pvr_dev, ROGUE_CR_SLC_STATUS1, 0,
+ 				ROGUE_CR_SLC_STATUS1_MASKFULL,
+-				POLL_TIMEOUT_USEC);
++				poll_timeout);
++	err = pvr_fw_stop_poll_result(err, force, &not_idle);
+ 	if (err)
+ 		return err;
+ 
+@@ -294,18 +340,25 @@
+ 		/* Wait for SLC to signal IDLE. */
+ 		err = pvr_cr_poll_reg32(pvr_dev, ROGUE_CR_SLC_IDLE,
+ 					ROGUE_CR_SLC_IDLE_MASKFULL,
+-					ROGUE_CR_SLC_IDLE_MASKFULL, POLL_TIMEOUT_USEC);
++					ROGUE_CR_SLC_IDLE_MASKFULL, poll_timeout);
++		err = pvr_fw_stop_poll_result(err, force, &not_idle);
+ 		if (err)
+ 			return err;
+ 
+ 		/* Wait for Sidekick/Jones to signal IDLE except for the Garten Wrapper. */
+ 		err = pvr_cr_poll_reg32(pvr_dev, ROGUE_CR_SIDEKICK_IDLE, sidekick_idle_mask,
+-					sidekick_idle_mask, POLL_TIMEOUT_USEC);
++					sidekick_idle_mask, poll_timeout);
++		err = pvr_fw_stop_poll_result(err, force, &not_idle);
+ 		if (err)
+ 			return err;
+ 	}
+ 
+-	if (meta_fw) {
++	/*
++	 * A forced stop skips this read: pvr_meta_cr_read32() polls the META slave
++	 * port with its own POLL_TIMEOUT_USEC, which the short leash cannot cover.
++	 * The Garten poll below then runs on that leash instead.
++	 */
++	if (meta_fw && !force) {
+ 		err = pvr_meta_cr_read32(pvr_dev, META_CR_TxVECINT_BHALT, &reg_value);
+ 		if (err)
+ 			return err;
+@@ -324,7 +377,8 @@
+ 			err = pvr_cr_poll_reg32(pvr_dev, ROGUE_CR_SIDEKICK_IDLE,
+ 						ROGUE_CR_SIDEKICK_IDLE_GARTEN_EN,
+ 						ROGUE_CR_SIDEKICK_IDLE_GARTEN_EN,
+-						POLL_TIMEOUT_USEC);
++						poll_timeout);
++			err = pvr_fw_stop_poll_result(err, force, &not_idle);
+ 			if (err)
+ 				return err;
+ 		}
+@@ -339,17 +393,56 @@
+ 					ROGUE_CR_MARS_IDLE_MH_SYSARB0_EN,
+ 					ROGUE_CR_MARS_IDLE_CPU_EN |
+ 					ROGUE_CR_MARS_IDLE_MH_SYSARB0_EN,
+-					POLL_TIMEOUT_USEC);
+-
++					poll_timeout);
++		err = pvr_fw_stop_poll_result(err, force, &not_idle);
+ 		if (err)
+ 			return err;
+ 	}
+ 
++	if (not_idle)
++		drm_err(from_pvr_device(pvr_dev),
++			"GPU did not go idle, forcing soft reset with transactions possibly in flight\n");
++
+ 	if (PVR_HAS_FEATURE(pvr_dev, pbe2_in_xe))
+ 		pvr_cr_write64(pvr_dev, ROGUE_CR_SOFT_RESET,
+ 			       ROGUE_CR_SOFT_RESET__PBE2_XE__MASKFULL);
+ 	else
+ 		pvr_cr_write64(pvr_dev, ROGUE_CR_SOFT_RESET, ROGUE_CR_SOFT_RESET_MASKFULL);
+ 
++	if (force)
++		pvr_fw_stop_fence_reset(pvr_dev);
++
+ 	return 0;
+ }
++
++/**
++ * pvr_fw_stop() - Stop FW processor
++ * @pvr_dev: Target PowerVR device.
++ *
++ * Returns:
++ *  * 0 on success, or
++ *  * Any error returned by pvr_cr_poll_reg32().
++ */
++int
++pvr_fw_stop(struct pvr_device *pvr_dev)
++{
++	return __pvr_fw_stop(pvr_dev, false);
++}
++
++/**
++ * pvr_fw_stop_force() - Stop FW processor on a GPU that will not go idle
++ * @pvr_dev: Target PowerVR device.
++ *
++ * Walks the same drain sequence as pvr_fw_stop() on a short timeout and puts
++ * the core into soft reset whether or not it went idle, while its clocks still
++ * run. For the hard reset path, where the graceful stop can only time out, and
++ * for a firmware that failed to boot.
++ *
++ * Returns:
++ *  * 0 always; a poll that times out is logged, not returned.
++ */
++int
++pvr_fw_stop_force(struct pvr_device *pvr_dev)
++{
++	return __pvr_fw_stop(pvr_dev, true);
++}
+--- a/drivers/gpu/drm/imagination/pvr_fw_startstop.h
++++ b/drivers/gpu/drm/imagination/pvr_fw_startstop.h
+@@ -9,5 +9,6 @@
+ 
+ int pvr_fw_start(struct pvr_device *pvr_dev);
+ int pvr_fw_stop(struct pvr_device *pvr_dev);
++int pvr_fw_stop_force(struct pvr_device *pvr_dev);
+ 
+ #endif /* PVR_FW_STARTSTOP_H */
+--- a/drivers/gpu/drm/imagination/pvr_power.c
++++ b/drivers/gpu/drm/imagination/pvr_power.c
+@@ -126,7 +126,16 @@
+ 		disable_irq(pvr_dev->irq);
+ 	}
+ 
+-	err = pvr_fw_stop(pvr_dev);
++	/*
++	 * A hard reset answers a GPU that is already stuck. The graceful stop
++	 * waits for idle first and can only time out there, which sends
++	 * pvr_power_reset() to "device lost" with nothing reset.
++	 */
++	if (hard_reset)
++		err = pvr_fw_stop_force(pvr_dev);
++	else
++		err = pvr_fw_stop(pvr_dev);
++
+ 	if (err && rpm_suspend)
+ 		enable_irq(pvr_dev->irq);
+ 
+@@ -148,7 +157,12 @@
+ 	err = pvr_wait_for_fw_boot(pvr_dev);
+ 	if (err) {
+ 		drm_err(from_pvr_device(pvr_dev), "Firmware failed to boot\n");
+-		pvr_fw_stop(pvr_dev);
++		/*
++		 * Nothing booted, so nothing to drain. The graceful stop would give
++		 * up at its first 1 s poll without writing SOFT_RESET, and a resume
++		 * gates the clocks right after this returns.
++		 */
++		pvr_fw_stop_force(pvr_dev);
+ 		goto out;
+ 	}
+ 

@@ -1,0 +1,149 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] clk: sunxi-ng: a733: park the core clusters on CPU_BACK_PLL, not the DCXO
+
+What. `clk-sunxi-ng-a733-add-cpu-pll-ccu` parks a cluster on the 26 MHz DCXO (mux encoding 000) for every
+CPU PLL relock. Park the two core clusters on CPU_BACK_PLL (encoding 101,
+index 2 of a733_cpu_core_mux_table) instead, when probe() finds it enabled
+and at or below 1014 MHz; otherwise keep the DCXO and say so. The DSU keeps
+the DCXO. One line at probe names the choice.
+
+Why. a cluster spends 2-5 % of wall time parked under a bursty load
+(ftrace, 2026-09-23), and `clk-sunxi-ng-a733-cpu-pll-park-timing` showed the PLL locks in 4-8 us -- the park is
+software running at 26 MHz: the clk framework around set_rate(), the
+notifiers, set_rate() itself, all on a CPU of the parked cluster (every
+change in both records). At 975 MHz the same instructions take ~1/37 of the
+time.
+
+The UM names CPU_BACK_PLL as a backup source of both core clusters: 5.1.4.1
+"PLL Distribution": the primary source of core0..core5 is
+CPU_L_PLL, the backups are the 26 MHz DCXO, CPU_BACK_PLL and a 1.2
+GHz source, the same for core6/core7 (UM V1.00 p. 243 / PDF p. 264; the same statement
+in V0.92 p. 243 / PDF p. 263). The mux is glitch-free and dynamically
+switchable (`clk-sunxi-ng-a733-add-cpu-pll-ccu`, 5.1.10.13 / 5.1.10.24). Mainline does the same elsewhere:
+mediatek-cpufreq parks on an "intermediate" clock for the same reason.
+
+Why 1014 MHz is the ceiling. A park must never run a core faster than its
+rail allows, in either direction of a change. Both CPU rails carry
+regulator-min-microvolt = 800 mV, and 1014 MHz is an operating point at
+800 mV in both clusters, in every bin the DT describes and in its
+worst-case fallback column (`arm64-dts-a733-cpu-opp-tables-and-supply`, opp-supported-hw 0x31). This driver never
+enables or reprograms CPU_BACK_PLL; a PLL that is off or set higher gets
+the DCXO park and a warning.
+
+What the board showed (the 6 GiB board, 6.18.36-t0036, 2026-09-23): the
+guard fell back -- "CPU_BACK_PLL off at 975000000 Hz", CPU_BACK_PLL_CTRL
+reads 0x40104A00 (PLL_EN 0, OUTPUT_GATE 0) under our boot chain. The vendor
+kernel enables it at run time (0xF8104A00 under the vendor kernel on the
+same chain, the 8 GiB board). So this patch does nothing until the PLL is enabled, a
+separate step (boot chain, UM 5.1.4.2 method 1). 975 MHz is the reset
+value decoded by the UM formula, and the UM gives 975 MHz as its default at a
+26 MHz DCXO (V0.92 5.1.10.1, p. 284 / PDF p. 304; V1.00 changed the note to
+900 MHz at 24 MHz, p. 284 / PDF p. 305, same N and P). The vendor driver's 1924 MHz drops the +1 on N and P0. On
+silicon (the 8 GiB board, 2026-09-23, back PLL enabled by hand with the A76 cluster at
+2002 MHz, mux 101, a one-cycle loop on cpu6 against CLOCK_MONOTONIC) it runs
+at 974.6 MHz. The cluster's EXT_DIVP divides only the own-PLL path: with it
+at /2 the parked rate is still 975 MHz, so a park from an OPP below 288 MHz
+runs the cluster at 975 MHz, not half -- under the 1014 MHz ceiling either
+way.
+
+Rejected: the 1.2 GHz input (encoding 100, PERI0PLL_DIV2). It is above the
+1014 MHz ceiling -- the A55 cluster's default bin already needs 850 mV at
+1196 MHz (`arm64-dts-a733-cpu-opp-tables-and-supply`) -- and it lives in the main CCU, which would need a DT input
+(`clk-sunxi-ng-a733-add-cpu-pll-ccu` omits it for that reason).
+
+Vendor comparison: the vendor driver never parks -- it ramps N on the live
+PLL under LFM (ccu-sun60iw2-cpupll.c). That keeps the cores at full speed
+but relocks a live PLL under them, which `clk-sunxi-ng-a733-add-cpu-pll-ccu` rejects; nothing taken.
+
+Proof wanted, on the same board against
+a kernel with `clk-sunxi-ng-a733-cpu-pll-park-timing` alone: the probe line; the parked time from `clk-sunxi-ng-a733-cpu-pll-park-timing`'s
+notifier falls several-fold on both clusters; the park share under a bursty
+load falls below 0.5 %; CPU_x_CLK_REG reads encoding 011 at rest (the park
+never sticks); no instability under a cpufreq stress. Falsifier: parked time
+not clearly below the kernel with `clk-sunxi-ng-a733-cpu-pll-park-timing` alone, or any lock-up or WARN.
+
+For a comparison run without it: A7S_SKIP_PATCHES=clk-sunxi-ng-a733-park-core-clusters-on-cpu-back-pll
+
+Assisted-by: Claude
+---
+--- a/drivers/clk/sunxi-ng/ccu-sun60i-a733-cpu.c
++++ b/drivers/clk/sunxi-ng/ccu-sun60i-a733-cpu.c
+@@ -609,8 +609,10 @@
+ 
+ /*
+  * One notifier per cluster. PRE_RATE_CHANGE on a PLL moves that cluster's mux
+- * to table entry 0 = encoding 000 = CPU_SLOW_CLK = the DCXO, POST_RATE_CHANGE
+- * moves it back to whatever it was (encoding 011 on every board seen so far).
++ * to its bypass, POST_RATE_CHANGE moves it back to whatever it was (encoding
++ * 011 on every board seen so far). The bypass is table entry 0 = encoding 000 =
++ * CPU_SLOW_CLK = the DCXO, unless probe() moves the core clusters to
++ * CPU_BACK_PLL (below).
+  * The register write bypasses the clk framework, so CLK_SET_RATE_NO_REPARENT
+  * does not block it and the framework's cached parent index stays valid because
+  * the original index is restored before the lock is dropped.
+@@ -637,6 +639,36 @@
+ A733_CPU_MUX_NB(cpu_dsu_mux_nb, cpu_dsu_clk);
+ 
+ /*
++ * Where the two core clusters park instead of the DCXO, if probe() finds it
++ * usable: CPU_BACK_PLL, index 2 of a733_cpu_core_mux_table (encoding 101).
++ * The UM names it as a backup source of both core clusters for exactly this
++ * (5.1.4.1 "PLL Distribution": backups are the 26 MHz DCXO, CPU_BACK_PLL,
++ * and 1.2 GHz; V1.00 p. 243 / PDF p. 264, the same in V0.92 p. 243 /
++ * PDF p. 263). At 26 MHz the park costs ~120 us (A76) and
++ * ~250 us (A55) per change, almost all of it software running at 26 MHz; the
++ * lock itself takes 4-8 us.
++ *
++ * The ceiling is what the rails guarantee, not what the PLL happens to run at:
++ * both CPU rails have regulator-min-microvolt 800 mV (`arm64-dts-a733-cpu-opp-tables-and-supply`), and 1014 MHz is an
++ * operating point at 800 mV in both clusters, in every bin the DT describes and
++ * in its worst-case fallback column (`arm64-dts-a733-cpu-opp-tables-and-supply`, opp-supported-hw 0x31). A park at or
++ * below it never runs a core faster than its voltage allows, in either
++ * direction of a change. This driver never enables or reprograms CPU_BACK_PLL;
++ * our boot chain leaves it off (0x40104A00 on the 6 GiB board, 2026-09-23), and then the
++ * DCXO park stays. The reset value decodes to 975 MHz, which the UM gives as
++ * the default at a 26 MHz DCXO (V0.92 5.1.10.1, p. 284 / PDF p. 304); V1.00
++ * changed the note to 900 MHz at 24 MHz (p. 284 / PDF p. 305), the same N and
++ * P. The vendor driver's 1924 MHz drops
++ * both the +1 on N and P0. Silicon: 974.6 MHz, and the cluster's EXT_DIVP does
++ * not divide it -- a park from a /2 OPP still runs at 975 MHz.
++ *
++ * The DSU keeps the DCXO: its mux has no CPU_BACK_PLL input in our table
++ * (encoding 101 is PERI0_600M there, see above); the DSU is handled separately.
++ */
++#define A733_CPU_MUX_IDX_BACK_PLL	2
++#define A733_CPU_PARK_MAX_RATE		1014000000UL
++
++/*
+  * How long a cluster really sits on the bypass: PRE_RATE_CHANGE to
+  * POST_RATE_CHANGE, i.e. set_rate() plus the clk framework's walk around it,
+  * all of it executed at 26 MHz when the CPU doing it is in that cluster.
+@@ -688,7 +720,7 @@
+ {
+ 	struct device *dev = &pdev->dev;
+ 	unsigned int n_min, n_max;
+-	unsigned long dcxo_rate;
++	unsigned long dcxo_rate, back_rate;
+ 	void __iomem *reg;
+ 	struct clk *dcxo;
+ 	unsigned int i;
+@@ -763,6 +795,19 @@
+ 	if (ret)
+ 		return ret;
+ 
++	back_rate = clk_hw_get_rate(&pll_cpu_back_clk.hw);
++	if (clk_hw_is_enabled(&pll_cpu_back_clk.hw) && back_rate &&
++	    back_rate <= A733_CPU_PARK_MAX_RATE) {
++		cpu_l_mux_nb.bypass_index = A733_CPU_MUX_IDX_BACK_PLL;
++		cpu_b_mux_nb.bypass_index = A733_CPU_MUX_IDX_BACK_PLL;
++		dev_info(dev, "core clusters park on CPU_BACK_PLL (%lu Hz) during a relock\n",
++			 back_rate);
++	} else {
++		dev_warn(dev, "CPU_BACK_PLL %s at %lu Hz (limit %lu), core clusters park on the DCXO\n",
++			 clk_hw_is_enabled(&pll_cpu_back_clk.hw) ? "on" : "off",
++			 back_rate, A733_CPU_PARK_MAX_RATE);
++	}
++
+ 	/* Mux the cores off a PLL while it is being reprogrammed. */
+ 	ccu_mux_notifier_register(pll_cpu_l_clk.common.hw.clk, &cpu_l_mux_nb);
+ 	ccu_mux_notifier_register(pll_cpu_b_clk.common.hw.clk, &cpu_b_mux_nb);

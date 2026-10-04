@@ -1,0 +1,546 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] drm: a733: dp: chain a HPD bridge on the Type-C receptacle
+
+The connector never says `connected`. Measured on the 8 GiB board,
+2026-08-22, all on one boot: Type-C alt mode entered with `pin_assignment [C]`
+and `hpd=1`, AUX up (`core 0x000a0509`), the sink answering DPCD `0x000 = 0x12`
+and a full EDID block 0 over AUX -- and `/sys/class/drm/card0-DP-1/status`
+reading `disconnected` for ever, `edid` 0 B, no modes, so `drm_client_setup()`
+gives up at "Cannot find any crtc or sizes" and there is no /dev/fb0 and no
+fbcon.
+
+THE MECHANISM, AND IT IS ONE FWNODE COMPARISON
+-----------------------------------------------
+
+typec_displayport reports every HPD change with
+drm_connector_oob_hotplug_event(dp->connector_fwnode, ...)
+(drivers/usb/typec/altmodes/displayport.c:190, :214, :399, :827). That fwnode is
+the TYPE-C PORT's:
+
+    fwnode = dev_fwnode(alt->dev.parent->parent); /* typec_port fwnode */
+    if (fwnode_property_present(fwnode, "displayport"))
+            dp->connector_fwnode = fwnode_find_reference(fwnode, "displayport", 0);
+    else
+            dp->connector_fwnode = fwnode_handle_get(fwnode); /* embedded DP */
+                                            -- displayport.c:800-804
+
+and on this board that node is the `usb-c-connector`: tcpci.c:822 takes it with
+device_get_named_child_node(dev, "connector") and hands it to TCPM as
+tcpc.fwnode, and the Type-C class puts it on the port device verbatim
+(drivers/usb/typec/class.c:2651, `port->dev.fwnode = cap->fwnode`).
+
+drm_connector_oob_hotplug_event() looks the connector up by exactly that pointer
+(drm_connector.c:3500-3514 -> drm_connector_find_by_fwnode(), :3464-3484) and
+RETURNS SILENTLY when nothing matches -- no log line, no error, no counter.
+connector->fwnode is set by drm_bridge_connector_init() from the LAST bridge in
+the chain and from nothing else:
+
+    if (drm_bridge_is_last(bridge) && bridge->of_node)
+            connector->fwnode = fwnode_handle_get(of_fwnode_handle(bridge->of_node));
+                                    -- drm_bridge_connector.c:758-759
+
+The last bridge was ours, so connector->fwnode was `displayport@5740000`. Two
+different nodes, one silent `return`. That is the whole defect: not a missing
+interrupt, not a missing register, not a missing driver.
+
+WHAT THIS ADDS
+---------------
+
+The mainline answer to precisely this, and it already has four in-tree users:
+drm_aux_hpd_bridge -- a bridge with no registers whose of_node is whatever
+device_node it was allocated against, whose type is
+DRM_MODE_CONNECTOR_DisplayPort and whose only op is DRM_BRIDGE_OP_HPD
+(drivers/gpu/drm/bridge/aux-hpd-bridge.c:171-194; the of_node comes back out of
+platform_data at :183). sun60i_dp_next_bridge_get() walks this transmitter's
+output port, and when the graph lands on a `usb-c-connector` it allocates one
+against THAT node (devm_drm_dp_hpd_bridge_alloc/_add, aux-hpd-bridge.c:50-112)
+and then resolves it back through the graph with devm_drm_of_get_bridge()
+(bridge/panel.c:497-514). .attach chains it behind this bridge with
+drm_bridge_attach(encoder, next, previous = ours, flags), so it -- not this
+driver -- is last, and connector->fwnode becomes the receptacle's.
+
+The shape is qcom_pmic_typec.c:91-115 (allocate the HPD bridge against the
+`connector` child node, register it) plus msm/dp's chaining
+(dp_display.c:1242 devm_drm_of_get_bridge on port 1 endpoint 0, attached after
+its own bridge in dp_drm.c:352-358). Both halves are here; only the side that
+performs them differs, and the next section says why.
+
+WHAT THE VENDOR DOES INSTEAD, AND WHY THERE IS NOTHING TO PORT
+---------------------------------------------------------------
+
+The vendor's hot-plug path in
+sunxi_drm_edp.c is extcon end to end and could not run on a mainline Type-C
+stack at all:
+
+| vendor | ours |
+|---|---|
+| hot-plug arrives as an extcon event: `extcon_get_edev_by_phandle(dev, 0)` in probe (sunxi_drm_edp.c:3406-3413), a notifier `edp_sink_extcon_evt()` (:401-426), `EXTCON_EDP_TYPE`/`EXTCON_DP_TYPE` both `EXTCON_DISP_DP` (:312-317) | drm_connector_oob_hotplug_event(), which drm_connector.c's own kerneldoc describes as being for "some USB Type-C setups where the hardware muxes the DisplayPort data and aux-lines but does not pass the altmode HPD status bit to the GPU's DP HPD pin" -- this board |
+| that needs an extcon PRODUCER for `EXTCON_DISP_DP`. In 6.18.36 there are exactly two, `drivers/phy/rockchip/phy-rockchip-typec.c` and `drivers/extcon/extcon-usbc-cros-ec.c`; the whole of `drivers/usb/typec/` produces none (grepped, 2026-08-22). Porting the path would mean writing the producer as well | no producer needed: the event source is `typec_displayport.ko`, which this image already ships and which already fires on this board |
+| it reaches into `"../drivers/extcon/extcon.h"` (:50-52) -- a subsystem's private header, from a DRM driver | public API only |
+| the notifier does DPCD and EDID reads inline (`typec_dp_try_communication()`, :368-398) and, on failure, re-arms `typec_hpd_monitor` every second for up to 30 rounds into a front end whose bias is off | .hpd_notify opens the channel once and calls sun60i_dp_link_probe() once; the DRM core owns retries |
+| a second, permanent `edp_running_thread` kthread runs alongside it, started and stopped by `edp_kthread_start()`/`edp_kthread_stop()` (:781-806) | no thread |
+
+So there is nothing to port. The earlier instruction to port it, in this
+driver's header block above sun60i_dp_bridge_link_budget(), is deleted rather
+than struck through.
+
+THE DECISIONS THAT ARE NOT STYLE
+---------------------------------
+
+1. THIS DRIVER PUBLISHES THE BRIDGE, NOT tcpci_rt1711h. Every in-tree caller of
+   devm_drm_dp_hpd_bridge_alloc() is on the USB side (qcom_pmic_typec.c:95,
+   drivers/soc/qcom/pmic_glink_altmode.c:464, ucsi_yoga_c630.c:265,
+   ucsi_huawei_gaokun.c:427), so tcpci_rt1711h.c is the closest precedent and it
+   is still the wrong place here. All four of those also DELIVER the event
+   themselves through drm_aux_hpd_bridge_notify(); this board's delivery path is
+   the generic alt-mode driver, which needs no Type-C-side driver at all -- only
+   the fwnode. Registering there would buy nothing and cost two things: a DRM
+   dependency in a shared USB driver on every rt1711h board in the world, none
+   of which we can test (a change we cannot exercise is
+   unproven) -- and, concretely, a probe dependency of the display pipe on the
+   I2C TCPC. devm_drm_of_get_bridge() would then return -EPROBE_DEFER until
+   tcpci_rt1711h had bound, so a PD or I2C failure would take the AUX channel,
+   every debugfs bring-up verb and the whole pipe down with it. Publishing it
+   here couples nothing: the receptacle's NODE is in the device tree whether or
+   not any driver claims it.
+
+   ⚠ The cost of that choice, named: if upstream ever gives tcpci an HPD bridge
+   of its own, one of_node carries two and of_drm_find_bridge() returns
+   whichever registered first. It is visible without hardware -- two
+   `dp_hpd_bridge` auxiliary devices for one connector under
+   /sys/bus/auxiliary/devices -- and the fix is to delete this half.
+
+2. THE `displayport` PROPERTY IS REFUSED, NOT USED. displayport.c:801 would take
+   `displayport = <&edp0>` on the receptacle and skip the whole chain. It is in
+   the code and in NO binding: usb-connector.yaml is `unevaluatedProperties:
+   false` and documents only an `altmodes/displayport` CHILD NODE, which is not
+   a property; no device tree in 6.18.36 uses it. Writing it would be inventing
+   a property, and the graph edge is the described way to say the same thing.
+
+3. THE CONNECTOR BECOMES DRM_CONNECTOR_POLL_HPD, AND THAT IS THE POINT.
+   drm_bridge_connector takes bridge_hpd from ANY bridge in the chain carrying
+   DRM_BRIDGE_OP_HPD (drm_bridge_connector.c:678-679) and then sets POLL_HPD
+   (:845-846) instead of POLL_CONNECT|POLL_DISCONNECT (:848). The chained bridge
+   carries the op (aux-hpd-bridge.c:184), so the ten-second .detect poll stops.
+   `drm-a733-dp-register-a-drm-bridge` recorded POLL_HPD as a hazard -- "waits for a drm_bridge_hpd_notify()
+   that can never come" -- and that was exactly right while nothing could
+   deliver one. What delivers it now is not drm_bridge_hpd_notify() at all:
+   .oob_hotplug_event reaches drm_bridge_connector_handle_hpd() directly
+   (drm_bridge_connector.c:170-177), which sets connector->status, calls
+   .hpd_notify on every bridge in the chain (:135-147) and then sends the
+   hotplug event (:161). This driver's own DRM_BRIDGE_OP_HPD is still NOT
+   claimed and must not be: HPD_INPUT_STATE at 0x05740128 reads zero on this
+   board through the VENDOR's live link (2026-08-19), so the pad is not routed.
+   The comment block in sun60i-dp.c that asserted the old consequence is
+   rewritten rather than annotated.
+
+WHAT THIS DOES NOT DO
+----------------------
+
+⚠ A connector that reports `connected` does not put a picture on the screen.
+The other defect measured the same day -- this hardware trains no link until the
+pixel path is programmed, so `drm-a733-dp-register-a-drm-bridge`'s .atomic_enable has train and video in the
+wrong order -- is untouched here and is fixed
+separately. Nothing in this patch may be judged by /dev/fb0 or by a picture.
+
+⚠ It also does not help a monitor that was already plugged in at boot with no
+later event: POLL_HPD means nothing re-probes on a timer. That is not a
+regression -- today's .detect returns `dpcd_valid`, which is false on such a
+boot too -- and a re-plug fixes it. Named because it is the difference a
+tester will notice.
+
+⚠ And it introduces no probe ordering of its own, but the device-tree half
+does: `remote-endpoint` is an fw_devlink supplier binding, so the new edge makes
+this transmitter a consumer of the I2C Type-C controller. It is a mutual edge
+and fw_devlink relaxes the cycle to permissive; the reasoning, the citations and
+the boot-log observable are in `arm64-dts-a733-sbu-edge-from-the-dp-transmitter-to-the-typec-receptacle`'s header, where the edge is.
+
+BEHAVIOUR WITHOUT THE DEVICE-TREE HALF
+---------------------------------------
+
+Nothing. of_graph_get_remote_node() finds no output port, next_bridge stays
+NULL, .attach chains nothing, and the chain is exactly what `drm-a733-dp-register-a-drm-bridge` built. The two
+patches are independent in that direction and only in that direction: `arm64-dts-a733-sbu-edge-from-the-dp-transmitter-to-the-typec-receptacle`
+without this one adds a graph edge nobody walks.
+
+WHAT IS VERIFIED
+-----------------
+
+✅ Applies at --fuzz=0 as part of the full series on a freshly unpacked 6.18.36.
+✅ Every API used was read in this tree, not assumed: aux-hpd-bridge.c:50-112,
+   :148-158, :171-194; drm_connector.c:3464-3514; drm_bridge_connector.c:135-181,
+   :678-679, :758-759, :845-848; drm_bridge.c:1298-1385 and drm_bridge_attach()'s
+   own unwind; bridge/panel.c:497-514; drm_of.c:240-289.
+⬜ NOT HW-PROVEN. Nothing in it has run on silicon.
+
+THE FALSIFIER
+--------------
+
+One observation, no debugfs verb involved: with the monitor plugged into J4,
+`/sys/class/drm/card0-DP-1/status` reads `connected`; unplugging makes it read
+`disconnected`; re-plugging makes it read `connected` again. Refuted by any of
+those three not changing -- and specifically refuted, not merely unproven, if
+`status` still never leaves `disconnected` while `/sys/class/typec/port0-partner/
+port0-partner.0/hpd` reads 1. A `connected` that appears only after a debugfs
+verb has been written is NOT this patch: that is `drm-a733-dp-register-a-drm-bridge`'s .detect returning
+dpcd_valid, which is a separate defect with a separate fix.
+
+Assisted-by: Claude
+
+diff --git a/drivers/gpu/drm/sun60i/Kconfig b/drivers/gpu/drm/sun60i/Kconfig
+--- a/drivers/gpu/drm/sun60i/Kconfig
++++ b/drivers/gpu/drm/sun60i/Kconfig
+@@ -13,6 +13,16 @@ config DRM_SUN60I_DP
+ 	# the same kind of accident that once held up the
+ 	# console chain. Selected explicitly so this driver stops depending on it.
+ 	select DRM_KMS_HELPER
++	# The out-of-band hot-plug path. drm_aux_hpd_bridge is what stands for
++	# the usb-c-connector node in the bridge chain, so that
++	# drm_bridge_connector_init() takes THAT node's fwnode -- the one
++	# dp_altmode_probe() looks the connector up by
++	# (drivers/usb/typec/altmodes/displayport.c:800). The symbol has no
++	# prompt (drivers/gpu/drm/bridge/Kconfig:25-31), so it can only be
++	# reached by a select; DRM_BRIDGE is def_bool y under DRM and this
++	# driver already depends on DRM && OF, so its own dependencies are met
++	# by construction and the select needs no condition.
++	select DRM_AUX_HPD_BRIDGE
+ 	select GENERIC_PHY
+ 	help
+ 	  Enable this for the DisplayPort transmitter of the Allwinner A733
+diff --git a/drivers/gpu/drm/sun60i/sun60i-dp.c b/drivers/gpu/drm/sun60i/sun60i-dp.c
+--- a/drivers/gpu/drm/sun60i/sun60i-dp.c
++++ b/drivers/gpu/drm/sun60i/sun60i-dp.c
+@@ -72,6 +72,7 @@
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+ #include <linux/of.h>
++#include <linux/of_graph.h>
+ #include <linux/phy/phy.h>
+ #include <linux/platform_device.h>
+ #include <linux/reset.h>
+@@ -80,6 +81,7 @@
+ #include <linux/uaccess.h>
+ #include <linux/unaligned.h>
+ 
++#include <drm/bridge/aux-bridge.h>
+ #include <drm/display/drm_dp.h>
+ #include <drm/display/drm_dp_helper.h>
+ #include <drm/drm_atomic.h>
+@@ -378,6 +380,12 @@ struct sun60i_dp {
+ 	 * container_of() below is the standard shape for a bridge driver.
+ 	 */
+ 	struct drm_bridge	bridge;
++	/* The bridge on our OUTPUT port, or NULL when the graph has none.
++	 * On this board it is the drm_aux_hpd_bridge that stands for the
++	 * Type-C receptacle, and it is what makes the connector's fwnode the
++	 * receptacle's node instead of ours -- see sun60i_dp_next_bridge_get().
++	 */
++	struct drm_bridge	*next_bridge;
+ 	enum sun60i_dp_ddc_owner ddc_owner;
+ };
+ 
+@@ -2263,6 +2271,20 @@ static int sun60i_dp_train(struct sun60i_dp *dp, unsigned int rate_mbps,
+  * drm_bridge_hpd_notify() that can never come -- a display that never returns
+  * after a re-plug.
+  *
++ * ...AND THE CONNECTOR IS DRM_CONNECTOR_POLL_HPD ANYWAY, which is not a
++ * contradiction but the consequence of the chain below. drm_bridge_connector
++ * takes bridge_hpd from ANY bridge in the chain that carries the op
++ * (drm_bridge_connector.c:678-679) and then sets POLL_HPD
++ * (drm_bridge_connector.c:845-846); the drm_aux_hpd_bridge chained behind us
++ * carries it (aux-hpd-bridge.c:184). The hazard the paragraph above names --
++ * POLL_HPD waiting for a notification that can never arrive -- was real only
++ * while nothing could deliver one. What delivers it is not
++ * drm_bridge_hpd_notify() at all but .oob_hotplug_event, which reaches
++ * drm_bridge_connector_handle_hpd() directly (drm_bridge_connector.c:170-177)
++ * and needs no op from anybody. The ten-second poll stopping is the point: it
++ * is what stops this driver being asked "is a sink there?" every ten seconds
++ * for ever with nothing attached.
++ *
+  * WHERE HPD ACTUALLY COMES FROM, and it is already in the tree. The alternate
+  * mode carries it: drivers/usb/typec/altmodes/displayport.c calls
+  * drm_connector_oob_hotplug_event() on every HPD change, and drm_connector.c's
+@@ -2275,23 +2297,30 @@ static int sun60i_dp_train(struct sun60i_dp *dp, unsigned int rate_mbps,
+  * -- typec_displayport.ko is shipped and DRM is pinned in A733_CONFIGS for
+  * exactly that symbol.
+  *
+- * ⬜ ONE LINK IN THAT PATH IS NOT PROVEN AND IS NOT PROVEN BY THIS PATCH.
+- * drm_connector_find_by_fwnode() matches connector->fwnode, which
+- * drm_bridge_connector sets from the LAST bridge's of_node -- our DP node --
+- * while dp_altmode_probe() takes the Type-C port's own fwnode unless the port
+- * carries a `displayport` property pointing elsewhere (displayport.c:800-804).
+- * The two are different nodes, so on this board the event would be dropped. The
+- * property exists in the code and in NO binding: usb-connector.yaml is
+- * `unevaluatedProperties: false` and documents only an `altmodes/displayport`
+- * CHILD NODE, which is not a property and does not satisfy that lookup, and no
+- * DT in the tree uses it. Falsified/closed by one observation once a connector
+- * exists: plug the monitor and watch /sys/class/drm/<card>-DP-1/status. It is
+- * NOT this patch's to fix -- the DT edit belongs with the connector.
+- *
+- * WHY .detect TOUCHES NO REGISTER. With DRM_BRIDGE_OP_DETECT and no HPD op,
+- * drm_bridge_connector sets connector->polled to POLL_CONNECT|POLL_DISCONNECT
+- * (drm_bridge_connector.c:845-848) and the probe helper calls .detect every ten
+- * seconds, for ever, with nothing attached. A .detect that talked on AUX would
++ * AND THE LINK THAT WAS MISSING IN THAT PATH IS THE FWNODE.
++ * drm_connector_find_by_fwnode() (drm_connector.c:3464-3484) matches
++ * connector->fwnode, which drm_bridge_connector sets from the LAST bridge in
++ * the chain (drm_bridge_connector.c:758-760), while dp_altmode_probe() takes
++ * the Type-C port's own fwnode -- the usb-c-connector node, because
++ * tcpci.c:822 hands that node to tcpm as tcpc.fwnode and typec class.c:2651
++ * puts it on the port device (displayport.c:800-804). With this bridge last,
++ * the two are different nodes and every out-of-band event is dropped in
++ * silence. So this bridge is NOT last any more: sun60i_dp_next_bridge_get()
++ * publishes a drm_aux_hpd_bridge whose of_node IS the receptacle's node and
++ * chains it behind us, which is the same shape qcom_pmic_typec.c:91-115 builds
++ * for the same reason. The graph edge that finds it is on the DT side.
++ *
++ * The `displayport` PROPERTY on the receptacle (displayport.c:801) would also
++ * make the lookup succeed, and it is refused rather than used: it exists in the
++ * code and in NO binding -- usb-connector.yaml is `unevaluatedProperties:
++ * false` and documents only an `altmodes/displayport` CHILD NODE, which is not
++ * a property -- and no device tree in the tree uses it.
++ *
++ * WHY .detect TOUCHES NO REGISTER. It is called on every userspace probe and
++ * once after every hot-plug event, and -- on any board or any kernel where the
++ * chain below does not form, so that connector->polled falls back to
++ * POLL_CONNECT|POLL_DISCONNECT (drm_bridge_connector.c:845-848) -- every ten
++ * seconds for ever with nothing attached. A .detect that talked on AUX would
+  * therefore reproduce the vendor's own defect -- 7 hardware retries per read
+  * into a powered-down front end, forever instead of only at bind. So .detect
+  * reports state that .hpd_notify recorded, and only .hpd_notify opens the
+@@ -2635,6 +2664,20 @@ static void sun60i_dp_bridge_atomic_disable(struct drm_bridge *bridge,
+ 	sun60i_dp_video_disable(dp);
+ }
+ 
++/*
++ * Give the AUX chardev and its ddc adapter back to this driver. Two callers --
++ * .detach, and the one failure path in .attach that has to undo itself -- which
++ * is why it is a function and not two copies.
++ */
++static void sun60i_dp_aux_unregister_locked(struct sun60i_dp *dp)
++{
++	lockdep_assert_held(&dp->lock);
++
++	drm_dp_aux_unregister(&dp->aux);
++	dp->aux.drm_dev = NULL;
++	dp->ddc_owner = SUN60I_DP_DDC_NONE;
++}
++
+ static int sun60i_dp_bridge_attach(struct drm_bridge *bridge,
+ 				   struct drm_encoder *encoder,
+ 				   enum drm_bridge_attach_flags flags)
+@@ -2646,8 +2689,8 @@ static int sun60i_dp_bridge_attach(struct drm_bridge *bridge,
+ 	 * The legacy path, where the bridge creates its own connector, is
+ 	 * refused rather than implemented -- and not on style grounds. The
+ 	 * out-of-band HPD above reaches a connector only through
+-	 * drm_bridge_connector, which is what sets connector->fwnode from
+-	 * bridge->of_node and implements .oob_hotplug_event. A hand-rolled
++	 * drm_bridge_connector, which is what sets connector->fwnode from the
++	 * LAST bridge's of_node and implements .oob_hotplug_event. A hand-rolled
+ 	 * connector here would compile, probe, and silently never see a
+ 	 * hot-plug on this board.
+ 	 */
+@@ -2657,27 +2700,52 @@ static int sun60i_dp_bridge_attach(struct drm_bridge *bridge,
+ 		return -EINVAL;
+ 	}
+ 
+-	guard(mutex)(&dp->lock);
++	scoped_guard(mutex, &dp->lock) {
++		/*
++		 * AUX may already have been opened by the user through the debugfs
++		 * verb, in which case this driver holds the ddc adapter. Hand
++		 * it over: it is the same struct i2c_adapter, and
++		 * drm_dp_aux_register() adds it again.
++		 */
++		if (dp->ddc_owner == SUN60I_DP_DDC_DRIVER) {
++			i2c_del_adapter(&dp->aux.ddc);
++			dp->ddc_owner = SUN60I_DP_DDC_NONE;
++		}
+ 
+-	/*
+-	 * A user may already have opened AUX through the debugfs verb, in
+-	 * which case this driver holds the ddc adapter. Hand it over: it is the
+-	 * same struct i2c_adapter, and drm_dp_aux_register() adds it again.
+-	 */
+-	if (dp->ddc_owner == SUN60I_DP_DDC_DRIVER) {
+-		i2c_del_adapter(&dp->aux.ddc);
+-		dp->ddc_owner = SUN60I_DP_DDC_NONE;
++		dp->aux.drm_dev = bridge->dev;
++		ret = drm_dp_aux_register(&dp->aux);
++		if (ret) {
++			dev_err(dp->dev, "DP AUX register: %d\n", ret);
++			return ret;
++		}
++
++		dp->ddc_owner = SUN60I_DP_DDC_DRM;
+ 	}
+ 
+-	dp->aux.drm_dev = bridge->dev;
+-	ret = drm_dp_aux_register(&dp->aux);
++	if (!dp->next_bridge)
++		return 0;
++
++	/*
++	 * And the whole point of the chain: this puts the receptacle's bridge
++	 * AFTER us, so drm_bridge_connector_init() reads its of_node -- the
++	 * usb-c-connector node -- into connector->fwnode instead of ours
++	 * (drm_bridge_connector.c:758-759, which tests drm_bridge_is_last()).
++	 * `previous` is this bridge, so the core does the ordering; doing it in
++	 * .attach rather than in the KMS driver keeps the KMS half unaware that
++	 * a Type-C receptacle exists at all.
++	 *
++	 * Outside the lock deliberately. The next bridge's .attach is called
++	 * from here, and holding a driver mutex across a DRM core call that
++	 * runs foreign code is a lock-ordering trap even when today's callee
++	 * (drm_aux_hpd_bridge_attach(), aux-hpd-bridge.c:160-165) does nothing.
++	 */
++	ret = drm_bridge_attach(encoder, dp->next_bridge, bridge, flags);
+ 	if (ret) {
+-		dev_err(dp->dev, "DP AUX register: %d\n", ret);
++		scoped_guard(mutex, &dp->lock)
++			sun60i_dp_aux_unregister_locked(dp);
+ 		return ret;
+ 	}
+ 
+-	dp->ddc_owner = SUN60I_DP_DDC_DRM;
+-
+ 	return 0;
+ }
+ 
+@@ -2694,9 +2762,7 @@ static void sun60i_dp_bridge_detach(struct drm_bridge *bridge)
+ 	if (dp->enabled)
+ 		sun60i_dp_aux_disable(dp);
+ 
+-	drm_dp_aux_unregister(&dp->aux);
+-	dp->aux.drm_dev = NULL;
+-	dp->ddc_owner = SUN60I_DP_DDC_NONE;
++	sun60i_dp_aux_unregister_locked(dp);
+ }
+ 
+ static const struct drm_bridge_funcs sun60i_dp_bridge_funcs = {
+@@ -2727,6 +2793,109 @@ static void sun60i_dp_teardown(void *data)
+ 			sun60i_dp_aux_disable(dp);
+ }
+ 
++/*
++ * The output edge of this transmitter in the OF graph. Port 0 is the input from
++ * TCON_TV1; port 1 is the output. The same pair the KMS driver already uses from
++ * the other side -- sun60i-kms.c asks drmm_of_get_bridge(drm, tcon_np, 1, 0) for
++ * the TCON's output -- and the numbers are a driver convention, not a binding.
++ */
++#define SUN60I_DP_OF_PORT_OUT		1
++#define SUN60I_DP_OF_ENDPOINT_OUT	0
++
++/*
++ * Resolve the bridge on the output port, and publish one for the Type-C
++ * receptacle when that is what the graph ends in.
++ *
++ * WHY A BRIDGE FOR A RECEPTACLE AT ALL. A usb-c-connector is not a display
++ * device and has no driver; the DisplayPort lanes leave the SoC and arrive at
++ * the plug with nothing in between (no SBU mux, no
++ * redriver). The bridge exists for exactly one reason -- to be the LAST bridge
++ * in the chain, so that drm_bridge_connector_init() copies ITS of_node into
++ * connector->fwnode, which is the node drm_connector_find_by_fwnode() is asked
++ * for when the alternate mode reports hot-plug. mainline has a bridge whose
++ * whole job is that: drm_aux_hpd_bridge, allocated against an arbitrary
++ * device_node and carrying no register access of any kind
++ * (drivers/gpu/drm/bridge/aux-hpd-bridge.c).
++ *
++ * WHY THIS DRIVER PUBLISHES IT AND NOT THE TYPE-C CONTROLLER. Every in-tree
++ * caller of devm_drm_dp_hpd_bridge_alloc() is on the USB side
++ * (qcom_pmic_typec.c:95, pmic_glink_altmode.c:464, ucsi_yoga_c630.c:265,
++ * ucsi_huawei_gaokun.c:427) and each of those also DELIVERS the event itself,
++ * through drm_aux_hpd_bridge_notify(). Ours does not: the delivery path here is
++ * the generic typec_displayport driver calling drm_connector_oob_hotplug_event()
++ * (displayport.c:190,214,399,827), which needs no driver on the Type-C side at
++ * all -- only the fwnode. Putting the registration in tcpci_rt1711h.c, the
++ * closest precedent, would therefore buy nothing and cost two things: a DRM
++ * dependency in a shared USB driver on every rt1711h board we cannot test, and
++ * -- the concrete one -- a probe dependency from this driver on that one. The
++ * bridge would then only exist once the TCPC had probed over I2C, and
++ * devm_drm_of_get_bridge() below would return -EPROBE_DEFER until it did, so an
++ * I2C or PD failure would take the AUX channel, the debugfs bring-up verbs and
++ * the whole display pipe down with it. Publishing it here keeps the two
++ * subsystems independent: the node is in the device tree whether or not the
++ * TCPC ever binds.
++ *
++ * ⚠ IF UPSTREAM EVER GIVES tcpci A HPD BRIDGE OF ITS OWN, this must go, or the
++ * same of_node carries two bridges and of_drm_find_bridge() returns whichever
++ * registered first. The symptom is visible without hardware: two
++ * `dp_hpd_bridge` auxiliary devices under /sys/bus/auxiliary/devices for one
++ * connector.
++ *
++ * A graph with no output port is not an error -- it is every board that reaches
++ * a panel or nothing, and it is also this driver before its device tree gained
++ * the edge. next_bridge stays NULL and the chain is what it was.
++ */
++static int sun60i_dp_next_bridge_get(struct sun60i_dp *dp)
++{
++	struct device *dev = dp->dev;
++	struct device_node *remote;
++	struct auxiliary_device *adev;
++	struct drm_bridge *bridge;
++	int ret;
++
++	remote = of_graph_get_remote_node(dev->of_node, SUN60I_DP_OF_PORT_OUT,
++					  SUN60I_DP_OF_ENDPOINT_OUT);
++	if (!remote) {
++		dev_info(dev,
++			 "no output edge in the OF graph: out-of-band hot-plug cannot reach this bridge\n");
++		return 0;
++	}
++
++	if (of_device_is_compatible(remote, "usb-c-connector")) {
++		adev = devm_drm_dp_hpd_bridge_alloc(dev, remote);
++		if (IS_ERR(adev)) {
++			ret = dev_err_probe(dev, PTR_ERR(adev),
++					    "HPD bridge for %pOF\n", remote);
++			goto out_put;
++		}
++
++		ret = devm_drm_dp_hpd_bridge_add(dev, adev);
++		if (ret) {
++			ret = dev_err_probe(dev, ret,
++					    "register HPD bridge for %pOF\n",
++					    remote);
++			goto out_put;
++		}
++	}
++
++	bridge = devm_drm_of_get_bridge(dev, dev->of_node,
++					SUN60I_DP_OF_PORT_OUT,
++					SUN60I_DP_OF_ENDPOINT_OUT);
++	if (IS_ERR(bridge)) {
++		ret = dev_err_probe(dev, PTR_ERR(bridge),
++				    "no bridge behind %pOF\n", remote);
++		goto out_put;
++	}
++
++	dp->next_bridge = bridge;
++	ret = 0;
++	dev_info(dev, "hot-plug will be matched on %pOF\n", remote);
++
++out_put:
++	of_node_put(remote);
++	return ret;
++}
++
+ static int sun60i_dp_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -2839,6 +3008,15 @@ static int sun60i_dp_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		return ret;
+ 
++	/*
++	 * Before ours goes on the list, not after: this can return
++	 * -EPROBE_DEFER, and a bridge that is briefly visible on the global
++	 * list and then withdrawn is a window an encoder can attach in.
++	 */
++	ret = sun60i_dp_next_bridge_get(dp);
++	if (ret)
++		return ret;
++
+ 	/*
+ 	 * Last in probe, and the order matters in both directions. Forwards:
+ 	 * from this call the bridge is on the global list and an encoder can

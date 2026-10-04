@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000003 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Mon, 14 Sep 2026 00:00:00 +0000
+Subject: [PATCH] sunxi: cubie-a7s: count boots in RTC GP_DATA_REG7, fall back after three
+
+A board that fails the same way on every boot is reset by the watchdog
+layers straight into the same failure again. U-Boot's boot counter gives it
+a way out: every U-Boot run increments the count, a boot that reaches
+multi-user.target clears it, and once it passes bootlimit U-Boot runs altbootcmd
+instead of bootcmd. The image's fallback entry (the image stage,
+extlinux-fallback.conf) starts the same kernel in a safe mode -- multi-user.target, the GPU and
+WLAN modules blacklisted -- so a failure in one of those drivers that resets the
+board before multi-user.target is reached ends there. The desktop is not
+ordered against the clear and can start before it; a failure after the
+clear still loops, and so does a crash in a built-in driver or in the
+kernel itself: one image carries one kernel.
+
+Where the count lives. It has to survive a warm reset. The A733 RTC keeps
+eight general purpose registers while VDD_RTC is above 0.7 V (UM v0.92, RTC
+GP_DATA_REGn, 0x0100 + N*4). REG7 = 0x0709011C, read on the board
+on 2026-09-14: a value written before a PSCI reboot and before a WDT0
+timeout reset is still there at the U-Boot prompt; after one power cycle
+with 25 s off it read 0 (measured).
+The vendor DT names REG7 as its boot counter (gpr_bootcount_pos = <7>) and
+REG6 as its reboot flag -- a hint that the slot is meant for this, not the
+reason it is used. The store follows the upstream pattern of
+BOOTCOUNT_GENERIC in a register that survives a reset: i.MX8M boards in the
+SNVS general purpose register (imx8mm-mx8menlo, imx8m_data_modul), i.MX6
+and Vybrid boards in theirs.
+
+Configuration, all U-Boot's own:
+  * BOOTCOUNT_GENERIC (the choice default) at SYS_BOOTCOUNT_ADDR, with
+    SYS_BOOTCOUNT_SINGLEWORD: magic 0xB001 in [31:16], count in [15:0]; a
+    value without the magic reads as count 0. Little-endian accessors (the
+    choice default).
+  * BOOTCOUNT_BOOTLIMIT=3, as the upstream boards above.
+  * altbootcmd scans only mmc_auto for extlinux/extlinux-fallback.conf
+    (boot_syslinux_conf), so the fallback pass does not wait on network
+    targets, then restores both variables with `env default -f` and runs
+    the normal scan if no card carries a fallback entry.
+  * CMD_BOOTCOUNT, to read and clear the counter at the prompt.
+
+On a board whose eMMC carries another system: U-Boot counts every run, an
+interrupted autoboot included. Bring-up paths that never reach the image's
+multi-user.target have to clear the counter themselves; otherwise three such
+runs put the next warm reset on the card's fallback entry.
+
+Assisted-by: Claude
+
+--- a/src/configs/radxa-cubie-a7s_defconfig
++++ b/src/configs/radxa-cubie-a7s_defconfig
+@@ -70,3 +70,9 @@ CONFIG_WDT=y
+ CONFIG_WDT_SUNXI=y
+ CONFIG_WATCHDOG=y
+ CONFIG_WATCHDOG_AUTOSTART=y
++CONFIG_BOOTCOUNT_LIMIT=y
++CONFIG_BOOTCOUNT_BOOTLIMIT=3
++CONFIG_SYS_BOOTCOUNT_ADDR=0x0709011C
++CONFIG_SYS_BOOTCOUNT_SINGLEWORD=y
++CONFIG_BOOTCOUNT_ALTBOOTCMD="setenv boot_targets mmc_auto; setenv boot_syslinux_conf extlinux/extlinux-fallback.conf; run distro_bootcmd; env default -f boot_targets boot_syslinux_conf; run distro_bootcmd"
++CONFIG_CMD_BOOTCOUNT=y

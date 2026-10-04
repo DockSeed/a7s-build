@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000005 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Tue, 15 Sep 2026 00:00:00 +0000
+Subject: [PATCH] sunxi: cubie-a7s: arm WDT_CPUS instead of WDT0
+
+sunxi-cubie-a7s-watchdog-autostart turned on WATCHDOG_AUTOSTART, and U-Boot arms every watchdog
+it probes: initr_watchdog() walks the whole WDT uclass and starts each
+device with autostart set, registering each for sysreset as well
+(drivers/watchdog/wdt-uclass.c). On this board that was WDT0
+(watchdog@2050000 in sun60i-a733.dtsi).
+
+WDT0 does not reset this board reliably. On the test board it reset a halted panic
+(panic=0) in 7 of 13 runs and a hard hang of all eight CPUs in 1 of 2.
+WDT_CPUS, the watchdog in the CPUS domain, armed from Linux with busybox
+devmem, reset 3 of 3 of those panics pinned to CPU2 and one unfed timeout;
+BL31's PSCI SYSTEM_RESET already resets through its SRST register (measured
+2026-09-15). The kernel DT moves to WDT_CPUS (kernel patch
+arm64-dts-a733-cubie-a7s-watchdog-on-wdt-cpus), the way
+upstream disables the H6's main watchdog ("Broken on some H6 boards").
+
+The change:
+
+  * A7S board DT: &wdt status = "disabled" -- U-Boot no longer binds,
+    starts or registers WDT0.
+  * A7S board DT: r_watchdog: watchdog@7021000 under /soc. A733 UM 8.3.5
+    lists WDT_CPUS at 0x07021000 with the same registers as WDT0; UM
+    Table 12-1 INTID 223 "S_WDT" gives GIC SPI 191. compatible is the WDT0
+    node's; the driver matches sun55i-a523-wdt (CTRL 0x0c, CFG 0x10, MODE
+    0x14, as UM 8.3.6). sunxi_wdt_probe() maps the register base, stops the
+    timer and takes no clock. The clocks copy radxa's WDT0 node, hosc =
+    <&osc24M> included -- the A523 value the kernel patch
+    arm64-dts-a733-feed-the-watchdog-hosc-from-the-dcxo replaces with the
+    DCXO; nothing in U-Boot reads it.
+  * CONFIG_CMD_WDT=y: `wdt dev watchdog@7021000` and `wdt stop` at the
+    prompt. The image is designed as the only system on the board, whatever
+    it boots from. A system that does not know WDT_CPUS is reset about 16 s
+    after this U-Boot boots it -- the vendor system on the eMMC of one test
+    board knows only WDT0 -- and stopping the watchdog at the prompt is how
+    such a system is reached.
+
+One difference from the UM that this patch does not change:
+sun60i-a733.dtsi gives WDT0 GIC SPI 63, the A523's value; the A733's WDT0
+is SPI 106 (UM Table 12-1). U-Boot's watchdog driver uses no interrupt and
+the node is disabled here, so it is left as radxa has it.
+
+Pairing, in both directions: with the autostart alone U-Boot hands an armed
+WDT0 to a kernel that has moved to WDT_CPUS, which neither stops nor feeds
+it; with this patch U-Boot hands an armed WDT_CPUS to a kernel that still
+uses WDT0, which does not feed it. Kernel and boot chain come from one build
+of this repository.
+
+Timeout and feeding are unchanged from the autostart (16 s, the uclass's
+cyclic reset). Linux keeps a watchdog it finds running (sunxi_wdt since
+v6.18.53).
+
+Assisted-by: Claude
+
+--- a/src/arch/arm/dts/sun60i-a733-cubie-a7s.dts
++++ b/src/arch/arm/dts/sun60i-a733-cubie-a7s.dts
+@@ -273,3 +273,27 @@
+ 	pcie1v8-supply = <&reg_bldo1>;
+ 	pcie3v3-supply = <&reg_dcdc1>;
+ };
++
++/*
++ * The watchdog U-Boot arms (WATCHDOG_AUTOSTART) and the one Linux
++ * feeds from here on is WDT_CPUS. WDT0 is disabled: on the test board it reset a halted
++ * panic 7 of 13 times and a hard hang of all CPUs 1 of 2; WDT_CPUS reset 3 of 3
++ * of those panics on CPU2 and its own unfed timeout (measured 2026-09-15). The
++ * kernel DT does the same, the way upstream disables the H6's main
++ * watchdog.
++ */
++&wdt {
++	status = "disabled";
++};
++
++&{/soc} {
++	/* UM 8.3.5 WDT_CPUS @ 0x07021000; UM Table 12-1 INTID 223 -> GIC SPI 191. */
++	r_watchdog: watchdog@7021000 {
++		compatible = "allwinner,sun60i-a733-wdt",
++			     "allwinner,sun55i-a523-wdt";
++		reg = <0x7021000 0x20>;
++		interrupts = <GIC_SPI 191 IRQ_TYPE_LEVEL_HIGH>;
++		clocks = <&osc24M>, <&rtc CLK_OSC32K>;
++		clock-names = "hosc", "losc";
++	};
++};
+--- a/src/configs/radxa-cubie-a7s_defconfig
++++ b/src/configs/radxa-cubie-a7s_defconfig
+@@ -70,6 +70,7 @@ CONFIG_WDT=y
+ CONFIG_WDT_SUNXI=y
+ CONFIG_WATCHDOG=y
+ CONFIG_WATCHDOG_AUTOSTART=y
++CONFIG_CMD_WDT=y
+ CONFIG_BOOTCOUNT_LIMIT=y
+ CONFIG_BOOTCOUNT_BOOTLIMIT=3
+ CONFIG_SYS_BOOTCOUNT_ADDR=0x0709011C

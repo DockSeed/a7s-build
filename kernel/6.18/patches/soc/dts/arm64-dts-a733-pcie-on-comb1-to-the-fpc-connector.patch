@@ -1,0 +1,173 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: a733: wire PCIe on COMB1 out to the FPC connector
+
+The last piece of the PCIe bring-up: the controller node, the COMB1 PHY node, and the one
+board fact that decides whether any of it works.
+
+THE PINS ARE THE POINT
+
+The vendor boot chain declares the PCIe control GPIOs on bank PE. This board
+routes them on bank PD -- PD20 PCIE_PWR_EN, PD21 PCIE-WAKEn, PD22 PCIE-PERSTn,
+PD23 PCIE-CLKREQn (schematic p7 L115-121, p14 L64-68). PE11-14 only offer those
+functions in their mux tables; they carry other nets here.
+
+Measured at the U-Boot prompt on the 6 GiB board, 2026-09-21: with the PE pins the link
+never leaves Detect (LTSSM 0x00, link status 0x1011, DLL down). With PD20 driven
+and PERST cycled on PD22 it trains to Gen3 x1 with the Data Link Layer active
+and the drive enumerates. Both pins are needed; PD20 alone changes nothing.
+
+PD20 is modelled as a fixed regulator rather than a bare GPIO, because that is
+what it is. This PCB has no 3.3 V slot rail and no load switch: J3 feeds an
+adapter card carrying its own regulator, and PD20 is that regulator's enable.
+As vpcie3v3-supply the ordering against PERST belongs to the framework instead
+of to driver code that has to remember it.
+
+THE WINDOWS
+
+  dbi     0x06000000  measured; the UM prints the module base one window up
+  app     0x06400000  the User Defined Space, dbi + 0x400000, where the LTSSM
+                      control and the link status live
+  config  0x20000000  an ordinary outbound region inside PCIE_SLAVE, reached
+                      through the standard DesignWare iATU
+
+PCIE_SLAVE's low range is 0x20000000..0x27FFFFFF. Config takes the first 2 MiB,
+I/O the 16 MiB at 0x21000000 and memory the remaining 96 MiB, which ends exactly
+on the window boundary -- no range reaches past what the memory map allows.
+
+WHAT IS DELIBERATELY NOT HERE
+
+ - No interrupt-map and no legacy INTx controller. NVMe is an MSI device and the
+   DWC MSI receiver is wired (SPI 153). INTx arrives through the SII interrupt
+   and can be added when something needs it; a mapping nobody exercises is a
+   mapping nobody has tested.
+ - CLKREQ# on PD23 is left alone. The controller does not use it and L1
+   substates are their own measurement.
+
+The COMB1 node maps three windows, the middle of which is shared with combophy0
+-- both protocol muxes live in that page. The PHY driver maps it without
+claiming it, for reasons its own header explains.
+
+Verified so far: the dtb builds, and every phandle resolves (compile-check
+builds it as part of the gate). The hardware proof is a booted kernel that
+enumerates the drive; this
+header does not claim it.
+
+Assisted-by: Claude
+
+diff --git a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -594,6 +594,27 @@
+ 	 * Deliberately NOT regulator-always-on: the HUSB311 owns this rail as its
+ 	 * vbus-supply, and TCPM only leaves SRC_ATTACH_WAIT with VBUS down.
+ 	 */
++	/*
++	 * PCIE_PWR_EN on PD20. This does NOT switch a rail on this PCB: the
++	 * board has no 3.3 V slot rail and no load switch. The FPC connector J3
++	 * feeds an adapter card that carries its own regulator, and this pin is
++	 * that regulator's enable (schematic p7 L115, p14 L64). Modelled as a
++	 * fixed regulator so the controller can hold it as vpcie3v3-supply and
++	 * the ordering against PERST is the framework's job, not a driver's.
++	 *
++	 * Measured: with this pin low the link never leaves Detect, because the
++	 * device on the far end is simply unpowered.
++	 */
++	reg_pcie_pwr: regulator-pcie-pwr {
++		compatible = "regulator-fixed";
++		regulator-name = "vcc3v3-pcie";
++		regulator-min-microvolt = <3300000>;
++		regulator-max-microvolt = <3300000>;
++		gpio = <&pio 3 20 GPIO_ACTIVE_HIGH>;	/* PD20 */
++		enable-active-high;
++		startup-delay-us = <20000>;
++	};
++
+ 	reg_usb3_vbus: regulator-usb3-vbus {
+ 		compatible = "regulator-fixed";
+ 		regulator-name = "usb3-vbus";
+@@ -1965,6 +1986,85 @@
+ 		 * The old note here said "IRQ 185" and mixed the two numbering
+ 		 * spaces: INTID 185 is PCIE0_MSI.
+ 		 */
++		/*
++		 * PCIe root complex. The DBI is at 0x06000000 -- measured, not
++		 * where the UM prints the module base: that address (0x06400000)
++		 * is the User Defined Space, dbi + 0x400000, which is where the
++		 * LTSSM control and link status this driver uses live. The
++		 * config window is an ordinary outbound region inside
++		 * PCIE_SLAVE, reached through the standard DesignWare iATU.
++		 */
++		pcie: pcie@6000000 {
++			compatible = "allwinner,sun60i-a733-pcie";
++			reg = <0x0 0x06000000 0x0 0x400000>,
++			      <0x0 0x06400000 0x0 0x80000>,
++			      <0x0 0x20000000 0x0 0x200000>;
++			reg-names = "dbi", "app", "config";
++			device_type = "pci";
++			#address-cells = <3>;
++			#size-cells = <2>;
++			bus-range = <0x00 0xff>;
++			num-lanes = <1>;
++			max-link-speed = <3>;
++			linux,pci-domain = <0>;
++			/*
++			 * PCIE_SLAVE low range is 0x20000000..0x27FFFFFF. Config
++			 * takes the first 2 MiB, I/O the 16 MiB at 0x21000000,
++			 * and memory the remaining 96 MiB, which ends exactly on
++			 * the window boundary.
++			 */
++			ranges = <0x81000000 0x0 0x21000000 0x0 0x21000000 0x0 0x01000000>,
++				 <0x82000000 0x0 0x22000000 0x0 0x22000000 0x0 0x06000000>;
++			interrupts = <GIC_SPI 153 IRQ_TYPE_LEVEL_HIGH>;
++			interrupt-names = "msi";
++			clocks = <&ccu CLK_PCIE_AUX>,
++				 <&ccu CLK_PCIE_AXI_SLV>,
++				 <&ccu CLK_BUS_ITS_PCIE0_ACLK>,
++				 <&serdes_ccu CLK_PCIE_SLV_ACLK>,
++				 <&serdes_ccu CLK_PCIE_MST_ACLK>,
++				 <&serdes_ccu CLK_PCIE_HCLK>;
++			clock-names = "aux", "axi-slv", "its",
++				      "slv-aclk", "mst-aclk", "hclk";
++			resets = <&ccu RST_BUS_PCIE_PWRUP>,
++				 <&ccu RST_BUS_PCIE>,
++				 <&ccu RST_BUS_ITS_PCIE0>;
++			reset-names = "pwrup", "core", "its";
++			phys = <&combophy1>;
++			phy-names = "pcie-phy";
++			/*
++			 * PERST# on PD22 (schematic p7 L119). The controller has
++			 * an internal PERST generator in SUBSYS_PCIE_BGR bit1,
++			 * but it is not wired to the connector on this board --
++			 * that bit reads 0 while a link is trained.
++			 */
++			reset-gpios = <&pio 3 22 GPIO_ACTIVE_LOW>;
++			vpcie3v3-supply = <&reg_pcie_pwr>;
++			power-domains = <&pck600 PD_PCIE>;
++			status = "okay";
++		};
++
++		/*
++		 * COMB1, the second combo PHY. It carries either PCIe or a
++		 * second USB3 SuperSpeed link; this board routes PCIe out of it
++		 * to J3, and the driver writes the protocol mux accordingly.
++		 *
++		 * The middle window is shared with combophy0 above -- both muxes
++		 * live in that page -- so the driver maps it without claiming it.
++		 */
++		combophy1: phy@6c02000 {
++			compatible = "allwinner,sun60i-a733-pcie-combophy";
++			reg = <0x0 0x06c02000 0x0 0xa00>,
++			      <0x0 0x06c06000 0x0 0x1000>,
++			      <0x0 0x06ca0000 0x0 0x20000>;
++			clocks = <&ccu CLK_SERDES_PHY_CFG>,
++				 <&serdes_ccu CLK_COMBPHY1_REFCLK>;
++			clock-names = "serdes", "refclk";
++			/* shared: combophy0 and the serdes_ccu hold it too */
++			resets = <&ccu RST_BUS_SERDES>;
++			#phy-cells = <0>;
++			status = "okay";
++		};
++
+ 		usb3: usb@6a00000 {
+ 			compatible = "allwinner,sun60i-a733-dwc3";
+ 			reg = <0x0 0x06a00000 0x0 0x10000>;

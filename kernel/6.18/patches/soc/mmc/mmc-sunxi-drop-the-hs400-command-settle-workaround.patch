@@ -1,0 +1,174 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] mmc: sunxi: drop the HS400 command-settle workaround
+
+Patch `mmc-sunxi-add-a733-emmc-hs400` added a cmd_settle_mrq path: on a response timeout of a
+command without data phase, on the can_hs400 controller and while the
+bus is in HS400 timing, the request was not completed from the hard IRQ
+but handed to the threaded handler, which polled REG_STAS for
+SDXC_CARD_DATA_BUSY up to 200 times at roughly 500 us before calling
+mmc_request_done(). The intent was to push the core's retry out of the
+card's busy window, because the first SWITCH (CMD6) after the
+HS200->HS400 change failed with -110.
+
+That symptom had two real causes, both fixed since:
+
+- The eMMC module clock ran at 400 MHz instead of 200 MHz, because the
+  SMHC clock set_rate propagated to the parent. Fixed in `clk-sunxi-ng-a733-smhc-no-set-rate-parent`
+  (no CLK_SET_RATE_PARENT on the SMHC gates) and `mmc-sunxi-read-back-the-clock-rate` (read the rate
+  back instead of trusting the requested value).
+- The HS400 data strobe delay was programmed as 0, outside the usable
+  window. `mmc-sunxi-a733-hs400-data-strobe-delay-value` replaced the fixed 0 with a working value, and `mmc-sunxi-tune-the-hs400-data-strobe-delay`
+  derives it from a delay-line sweep on the board instead of a guess.
+
+With the module clock and the strobe delay correct, the CMD6 timeout the
+workaround was written for should no longer occur, so remove it: the
+cmd_settle_mrq field, the assignment in sunxi_mmc_finalize_request(),
+the extra IRQ_WAKE_THREAD condition, and the busy-poll block in
+sunxi_mmc_handle_manual_stop(). The threaded handler goes back to the
+mainline shape, i.e. it reports "no request for manual stop" and returns
+when manual_stop_mrq is NULL, and it is only woken for the manual stop
+path.
+
+This is a hypothesis until it is confirmed on hardware. The test is a
+cold boot in which HS400 comes up on its own ("mmc1: new HS400 MMC
+card") and read, write and md5 verification pass. If initialisation
+instead aborts with -110 on CMD6, the workaround is demonstrated to be
+necessary and returns -- then with that evidence written down, rather
+than carried along as inherited code.
+
+Assisted-by: Claude
+---
+--- a/drivers/mmc/host/sunxi-mmc.c
++++ b/drivers/mmc/host/sunxi-mmc.c
+@@ -329,13 +329,12 @@
+ 	dma_addr_t	sg_dma;
+ 	void		*sg_cpu;
+ 	bool		wait_dma;
+ 
+ 	struct mmc_request *mrq;
+ 	struct mmc_request *manual_stop_mrq;
+-	struct mmc_request *cmd_settle_mrq;	/* HS400 CMD-RTO: settle busy, then retry */
+ 	int		ferror;
+ 
+ 	/* vqmmc */
+ 	bool		vqmmc_enabled;
+ 
+ 	/* timings */
+@@ -575,28 +574,12 @@
+ 			data->error = -ETIMEDOUT;
+ 			host->manual_stop_mrq = mrq;
+ 		}
+ 
+ 		if (mrq->stop)
+ 			mrq->stop->error = -ETIMEDOUT;
+-
+-		/*
+-		 * A733 HS400: the first SWITCH (CMD6) after the HS200->HS400
+-		 * mode change lands while the card is still busy and returns a
+-		 * response-timeout; the core retries back-to-back with no delay,
+-		 * so the retries stay inside the busy window and the card fails
+-		 * to init (-110). Defer this command's completion to the threaded
+-		 * handler, which waits out the DAT0 busy before letting the core
+-		 * retry. Command-only (data errors take the manual-stop path) and
+-		 * gated to HS400 on the can_hs400 controller, so SD and every
+-		 * other mode are untouched.
+-		 */
+-		if (!data && (host->int_sum & SDXC_RESP_TIMEOUT) &&
+-		    host->cfg->can_hs400 &&
+-		    host->mmc->ios.timing == MMC_TIMING_MMC_HS400)
+-			host->cmd_settle_mrq = mrq;
+ 	} else {
+ 		if (mrq->cmd->flags & MMC_RSP_136) {
+ 			mrq->cmd->resp[0] = mmc_readl(host, REG_RESP3);
+ 			mrq->cmd->resp[1] = mmc_readl(host, REG_RESP2);
+ 			mrq->cmd->resp[2] = mmc_readl(host, REG_RESP1);
+ 			mrq->cmd->resp[3] = mmc_readl(host, REG_RESP0);
+@@ -625,14 +608,13 @@
+ 	mmc_writel(host, REG_RINTR, 0xffff);
+ 
+ 	host->mrq = NULL;
+ 	host->int_sum = 0;
+ 	host->wait_dma = false;
+ 
+-	return (host->manual_stop_mrq || host->cmd_settle_mrq) ?
+-		IRQ_WAKE_THREAD : IRQ_HANDLED;
++	return host->manual_stop_mrq ? IRQ_WAKE_THREAD : IRQ_HANDLED;
+ }
+ 
+ static irqreturn_t sunxi_mmc_irq(int irq, void *dev_id)
+ {
+ 	struct sunxi_mmc_host *host = dev_id;
+ 	struct mmc_request *mrq;
+@@ -696,62 +678,35 @@
+ 	unsigned long iflags;
+ 
+ 	spin_lock_irqsave(&host->lock, iflags);
+ 	mrq = host->manual_stop_mrq;
+ 	spin_unlock_irqrestore(&host->lock, iflags);
+ 
++	if (!mrq) {
++		dev_err(mmc_dev(host->mmc), "no request for manual stop\n");
++		return IRQ_HANDLED;
++	}
++
++	dev_err(mmc_dev(host->mmc), "data error, sending stop command\n");
++
+ 	/*
+ 	 * We will never have more than one outstanding request,
+ 	 * and we do not complete the request until after
+ 	 * we've cleared host->manual_stop_mrq so we do not need to
+ 	 * spin lock this function.
+ 	 * Additionally we have wait states within this function
+ 	 * so having it in a lock is a very bad idea.
+ 	 */
+-	if (mrq) {
+-		dev_err(mmc_dev(host->mmc), "data error, sending stop command\n");
+-		sunxi_mmc_send_manual_stop(host, mrq);
+-
+-		spin_lock_irqsave(&host->lock, iflags);
+-		host->manual_stop_mrq = NULL;
+-		spin_unlock_irqrestore(&host->lock, iflags);
+-
+-		mmc_request_done(host->mmc, mrq);
+-		return IRQ_HANDLED;
+-	}
++	sunxi_mmc_send_manual_stop(host, mrq);
+ 
+-	/*
+-	 * HS400 command response-timeout: the card is still busy after the
+-	 * HS400 mode switch. Wait out the DAT0 busy (bounded) before completing
+-	 * so the core's retry of the command lands after the busy window. This
+-	 * is the deterministic replacement for the incidental delay that made
+-	 * HS400 work only with debug prints; it adjusts to the real busy time
+-	 * instead of a blind delay.
+-	 */
+ 	spin_lock_irqsave(&host->lock, iflags);
+-	mrq = host->cmd_settle_mrq;
++	host->manual_stop_mrq = NULL;
+ 	spin_unlock_irqrestore(&host->lock, iflags);
+ 
+-	if (mrq) {
+-		int i;
+-
+-		for (i = 0; i < 200; i++) {
+-			if (!(mmc_readl(host, REG_STAS) & SDXC_CARD_DATA_BUSY))
+-				break;
+-			usleep_range(400, 600);
+-		}
+-
+-		spin_lock_irqsave(&host->lock, iflags);
+-		host->cmd_settle_mrq = NULL;
+-		spin_unlock_irqrestore(&host->lock, iflags);
+-
+-		mmc_request_done(host->mmc, mrq);
+-		return IRQ_HANDLED;
+-	}
++	mmc_request_done(host->mmc, mrq);
+ 
+-	dev_err(mmc_dev(host->mmc), "no request for manual stop\n");
+ 	return IRQ_HANDLED;
+ }
+ 
+ static int sunxi_mmc_oclk_onoff(struct sunxi_mmc_host *host, u32 oclk_en)
+ {
+ 	unsigned long expire = jiffies + msecs_to_jiffies(750);

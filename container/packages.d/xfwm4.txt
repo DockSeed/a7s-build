@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# Debian packages the xfwm4 stages need in the builder itself. The cross build
+# dependencies are NOT installed here: build-xfwm4 installs them in a dedicated
+# chroot under WORK_DIR (see scripts/stages/xfwm4.sh).
+mmdebstrap
+debian-archive-keyring
+dpkg-dev
+patch
+coreutils
+mount

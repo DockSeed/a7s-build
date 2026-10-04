@@ -1,0 +1,159 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: a733: add the RTC timekeeper
+
+The RTC block has been in the tree only as a clock provider, so the kernel
+has no /dev/rtc and a board without network boots at whatever date the image
+carries. The block's counter is powered from the PMIC's RTCLDO, which
+stays up through every PMIC reset except POR, that is DCIN removed or the
+power key held > 16 s (AXP318W DS p.22-23, 6.4.5), and the board has no
+backup cell (BKUPBAT unconnected).
+So the timekeeper keeps time across reboot and poweroff while the supply
+stays connected, not across a power cycle. That is the scope of this patch.
+
+== Register set: rtc-sun6i's linear-day layout, unchanged
+
+From the A733 UM V1.00, 9.1.6 register list and 9.1.7 descriptions:
+
+  0x000 LOSC_CTRL_REG      [8] RTC_HHMMSS_ACCE, [7] RTC_DAY_ACCE: set by a
+                           write to the time registers, cleared when the
+                           write has landed; the time registers may only be
+                           written while it reads 0 (9.1.7.1)
+  0x010 RTC_DAY_REG        [15:0] day, 0-65535, a linear count (9.1.7.5)
+  0x014 RTC_HH_MM_SS_REG   hour [20:16], minute [13:8], second [5:0]
+  0x020 ALARM0_DAY_SET     [15:0] day
+  0x024 ALARM0_CUR_VLU     hour [20:16], minute [13:8], second [5:0]
+  0x028/0x02c/0x030        alarm 0 enable / irq enable / irq pending (W1C)
+  0x050 ALARM0_CONFIG_REG  [0] alarm wake-up output
+  0x100-0x11c              GP_DATA_REG0-7, kept while VDD_RTC > 0.7 V
+
+That is, field for field, what rtc-sun6i drives when its match data carries
+RTC_LINEAR_DAY: SUN6I_RTC_YMD/HMS at 0x10/0x14, the ACC bits 7/8 it polls
+before and after each write, the day-plus-HMS alarm at 0x20/0x24, enable,
+irq-enable and W1C status at 0x28-0x30, ALARM_CONFIG at 0x50, and a 0x20-byte
+nvmem over GP_DATA. The upstream binding lists allwinner,sun60i-a733-rtc with
+the fallback allwinner,sun50i-r329-rtc, and in 6.18.36 that fallback selects
+RTC_LINEAR_DAY. No driver change.
+
+  reg        0x07090000 + 0x15c: everything below the DCXO control group,
+             which `clk-sunxi-ng-a733-rtc-ccu-maps-only-the-dcxo-control-group` gives to rtc_ccu (9.1.6). A523: 0x400, rejected,
+             the two nodes would overlap.
+  interrupts GIC_SPI 196: RTC_ALARM is INTID 228, vector 0x0390 (UM 12,
+             interrupt table).
+             A523: SPI 157, rejected.
+
+== Quirks, and what the driver does about them
+
+ - No alarm 1. The UM lists nothing between 0x030 and 0x050. rtc-sun6i's
+   probe still writes 0 to 0x044/0x048 and 1 to 0x04c (the alarm-1 enable,
+   irq enable and W1C status of older SoCs), as it does on H616/R329.
+   Those are reserved offsets here. Both silicon dumps below read 0 there.
+ - The UM contradicts itself about alarm 0. 9.1.4.3 describes a counter that
+   adds 1 each second and is loaded with "n seconds", which is the older
+   sun6i countdown text, and 9.1.5.3 calls the values "count-down". The
+   register tables (9.1.7.7, 9.1.7.8) give day plus hour/minute/second
+   fields, which is what rtc-sun6i writes: the absolute alarm time. The
+   vendor's rtc-sunxi.c writes the absolute time too (type A, "rtc-v201").
+   Which one is true is open until an alarm fires on silicon.
+ - Epoch. rtc-sun6i counts day 0 = 1970-01-01. The vendor driver counts
+   day 1 = 1970-01-01 ("RTC_DAY_REG starts from 1"). A board that boots the
+   vendor system and ours in turn reads a one-day offset in each direction.
+   The 6 GB board has no vendor system. The 8 GB board does.
+ - The clock half stays off: CONFIG_SUN6I_RTC_CCU is kept off in
+   the kernel config at this point of the series. With the r329
+   fallback, rtc-sun6i's probe calls sun6i_rtc_ccu_probe(), which in 6.18.36
+   matches r329 and registers "iosc", "osc32k" and more. Our DT already has
+   fixed clocks with those names, so the registration fails and the RTC with
+   it, and ccu-sun6i-rtc would take the LOSC mux under a DT that has the
+   32k as a fixed clock. The symbol has no other user on this SoC.
+   Upstream has since given ccu-sun6i-rtc its own A733 data ("clk: sunxi-ng:
+   sun6i-rtc: add a733 support", 2026-07-24, mainline after 6.18). That is
+   the one-node shape to migrate to. It is not backported here, because it
+   replaces `clk-sunxi-ng-a733-add-minimal-rtc-ccu` and `clk-sunxi-ng-a733-rtc-ccu-add-dcxo` and moves every consumer of rtc_ccu.
+ - The counter's 32 kHz source is not touched. The driver writes LOSC_CTRL
+   only through its ACC-bit polls, which only read it. The RTC counts
+   whatever the firmware left selected. Measured on the 8 GB board, our boot
+   chain, 2026-09-17:
+   LOSC_CTRL 0x0000401c, LOSC_AUTO_SWT_STA 0. Bit 0 LOSC_SRC_SEL = 0 means
+   the 16 MHz RC oscillator as low-frequency clock (9.1.7.1), divided by 32 and by
+   INTOSC_CLK_PRESCAL + 1 = 16, so 31.25 kHz nominal, not the 32.768 kHz
+   crystal. That runs the counter about 4.6 % slow before any RC tolerance.
+   The same word reads 0x0000401d under the vendor stack, with
+   LOSC_AUTO_SWT_STA bit 0 = 1, the external crystal, because the vendor
+   kernel switches it in ccu-sun60iw2-rtc.c clock_source_init(). The error
+   is small over a reboot and large for a clock left running for a day.
+   Selecting the crystal is the clock provider's job: the LOSC mux, key
+   0x16AA, UM 9.1.5.1. Not this patch.
+ - RTC_BGR_REG (PRCM 0x20c, UM 4.2.5.22) resets to 0x0001_0001, gate pass,
+   reset de-asserted. Our R-CCU does not model it, so nothing can close it.
+   rtc-sun6i's "bus" clock is optional. A523 wires <&r_ccu CLK_BUS_R_RTC>:
+   rejected, because that gate does not exist in our R-CCU, and the rtc_ccu
+   reads that `clk-sunxi-ng-a733-add-minimal-rtc-ccu` has done since July already depend on it being open.
+ - RTC_SPI_CLK_CTRL_REG (0x310, UM 9.1.7.23) gates the bridge every RTC
+   register is reached through. Its reset value is 0x13, gated. It reads
+   0x80000013 on our chain (same measurement, 2026-09-17), so the firmware opens it. Not
+   modelled, the same as for rtc_ccu today.
+ - The r329 binding also wants hosc/ahb clocks and #clock-cells. Only
+   ccu-sun6i-rtc reads them, and it is off. A #clock-cells on a node that
+   provides no clock is a property nobody reads, so the node does not carry
+   one and does not satisfy that schema. dtbs_check has not been run on it, and
+   6.18.36's binding does not know the A733 compatible anyway.
+ - The nvmem exposes GP_DATA_REG0-7, and GP_DATA_REG7 is U-Boot's boot
+   counter (U-Boot patch `sunxi-cubie-a7s-bootcount-rtc-gpr`), which
+   a7s-boot-good.service clears by
+   devmem. The driver keeps no copy, and both sides are single MMIO words.
+
+== What the vendor does and leaves out
+
+The vendor stack has its own RTC driver (rtc-sunxi.c, "allwinner,rtc-v201")
+on rtc@7090000, reg 0x320, overlapping its rtc_ccu, and puts the LOSC switch
+into its clock driver. That switch polls LOSC_AUTO_SWT_STA with mask 0x10,
+but EXT_LOSC_STA is bit 2 and bits 31:3 are reserved (9.1.7.2). The
+"crystal is stable" check reads a reserved bit, and bit 0 is switched to the
+crystal regardless of its answer. We take neither driver. Mainline's
+rtc-sun6i covers the register set as it is.
+
+== Verification
+
+Applies at fuzz 0 on the full series. compile-check and the board dtb build
+are green. Not on silicon. What proves it:
+  /sys/class/rtc/rtc0/name       "sun6i-rtc 7090000.rtc"; dmesg "registered
+                                 as rtc0" and the hctosys line, no -EBUSY
+                                 from either node
+  /proc/iomem                    07090000-0709015b (rtc) beside
+                                 0709015c-0709016f (rtc_ccu, `clk-sunxi-ng-a733-rtc-ccu-maps-only-the-dcxo-control-group`)
+  busybox hwclock -w, reboot     RTC and system time agree after a warm
+                                 reboot, before the network sets the clock
+  echo +60 > .../wakealarm       /proc/interrupts 196 counts once, about 60 s
+                                 later. That settles absolute vs countdown.
+  0x07090044/48/4c               read 0 after probe
+  LOSC_CTRL / STA                read before and after, unchanged by probe
+Falsifier: no rtc0, a probe error, or an alarm that fires at the wrong time.
+
+Assisted-by: Claude
+---
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -3069,6 +3069,23 @@
+ 		};
+ 
+ 		/*
++		 * RTC time counter, alarm 0 and GP_DATA_REG0-7 (A733 UM 9.1.6),
++		 * the registers below the DCXO control group that rtc_ccu maps.
++		 * Linear 16-bit day counter plus hour/minute/second (9.1.7.5,
++		 * 9.1.7.6): the r329 fallback selects that layout in rtc-sun6i.
++		 * One interrupt, RTC_ALARM = INTID 228 = SPI 196 (UM 12, IRQ
++		 * table). No clocks and no #clock-cells: with SUN6I_RTC_CCU off
++		 * this node provides none, and RTC_BGR_REG (PRCM 0x20c) resets
++		 * to gate pass / reset de-asserted and is not modelled (`arm64-dts-a733-add-the-rtc-timekeeper`).
++		 */
++		rtc: rtc@7090000 {
++			compatible = "allwinner,sun60i-a733-rtc",
++				     "allwinner,sun50i-r329-rtc";
++			reg = <0x0 0x07090000 0x0 0x15c>;
++			interrupts = <GIC_SPI 196 IRQ_TYPE_LEVEL_HIGH>;
++		};
++
++		/*
+ 		 * RTC-CCU (PRCM @0x07090000, AON domain). Provides the two SERDES
+ 		 * DCXO gates (XO_CTRL1 @0x16c bit4/5); the COMB0 combo-PHY consumes
+ 		 * dcxo-serdes0. Parent = r-ahb (from the R-CCU). Driver = patch `clk-sunxi-ng-a733-add-minimal-rtc-ccu`.

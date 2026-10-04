@@ -1,0 +1,400 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] drm: a733: display: three consistency fixes on paths silicon has not walked
+
+[Recipe cut: regenerated: the hunks that touched the removed debugfs knobs
+are gone.]
+
+Items 2, 6 and 7 of a review of the four display modules, found by reading
+them against each other rather than on a board. None is a
+regression, none blocks anything, and none of the three sits on the path
+a test boot proved -- that boot trains the link from cold, follows the cable and
+puts a login prompt on /dev/fb0 with zero err or warn lines from any of the
+four modules. What the three have in common is that each is a promise the code
+makes in one file and does not keep in another.
+
+⚠ LINE NUMBERS. Every sun60i-*.c number below is the file as it stands with the
+full patches/ stack (`clk-sunxi-ng-add-A733-sun60iw2-minimal-ccu`…`arm64-dts-a733-sbu-edge-from-the-dp-transmitter-to-the-typec-receptacle`) applied to pristine 6.18.36 -- the tree this
+patch was written and compiled against. `drm-a733-dp-repair-three-error-paths` did not exist yet at that moment and
+takes sun60i-dp.c, so its numbers there will have moved; every site is named by
+function as well, for exactly that reason. Kernel-core numbers (drm_edid.c,
+drm_probe_helper.c, drm_atomic_helper.c) are 6.18.36 as shipped.
+
+FIX 1 -- THE TRANSMITTER LATCHES A DEPTH THE TCON WILL NOT PROGRAM
+-------------------------------------------------------------------
+
+WHAT IS WRONG. sun60i-dp.c:3193-3194, inside sun60i_dp_bridge_atomic_enable()
+(:3150):
+
+	if (connector->display_info.bpc)
+		dp->bpc = connector->display_info.bpc;
+
+That guard makes `bpc == 0` mean "keep whatever was there". The other half of
+the same hardware invariant, sun60i_kms_crtc_bpc() (sun60i-kms.c:504-515),
+makes it mean 8:
+
+	if (!connector || !connector->display_info.bpc)
+		return 8;
+
+And nothing ever resets dp->bpc. It is 8 at probe (sun60i-dp.c:3512) and from
+then on only ever assigned; sun60i_dp_aux_disable() does not clear it, so the
+value survives a Type-C disconnect, an AUX teardown and a physical unplug.
+
+THE SCENARIO -- two sinks, in this order:
+
+  1. Modeset on a sink whose EDID is 1.4 and carries a colour-depth field, say
+     10 bpc. Both sides read display_info.bpc, MISC0 (sun60i-dp.c:769) and
+     TV_PIXELDEPTH_MODE (sun60i-tcon-tv.c:449) agree on 10.
+  2. Unplug. dp->bpc stays 10.
+  3. Plug a sink whose EDID is 1.3. update_display_info() (drm_edid.c:6671)
+     parses the depth field only for revision >= 4 -- "Only defined for 1.4
+     with digital displays", the gate at drm_edid.c:6718-6720 -- and the EDID
+     1.3 fallback above it only fires for a DFP-1.x TMDS sink. So a plain 1.3
+     sink leaves display_info.bpc at 0. That is a NORMAL DISPLAY, not a failure.
+     TCON_TV1 is then programmed for 8 (sun60i-kms.c:568 -> sun60i-tcon-tv.c:1049
+     -> :449). The transmitter keeps 10.
+
+The two blocks now describe different pixel depths for one stream. That is the
+disagreement this driver already names: SRC0_USER_FIFO_STATUS != 0, which
+the comment ten lines above the defect itself (sun60i-dp.c:3184) calls a
+mode-programming error.
+
+⚠ AND THE COMMENT IN sun60i-kms.c WAS WRONG, which is the half that would have
+stopped the next reader from finding this. It claimed "both sides take the
+number from one place". They read the same FIELD; they do not apply the same
+rule to it, and the DP side holds a private latched copy the KMS side cannot
+see. Left standing, that comment turns a defect into documented behaviour.
+
+WHAT THIS CHANGES. One line, and the fallback rule becomes the same on both
+sides:
+
+	dp->bpc = connector->display_info.bpc ?: 8;
+
+This is the expression sun60i_dp_bridge_mode_valid() already applies to the same
+field one screen earlier (sun60i-dp.c:2981, `info->bpc ? info->bpc : 8`), so the
+file now answers `bpc == 0` one way instead of two. The sun60i-kms.c comment is
+corrected in place -- the false claim removed, the shared fallback named -- not
+left to become accidentally true.
+
+⚠ FALSIFIER, AND IT IS NOT CHEAP. This cannot be proved with one sink. It needs
+a SINK CHANGE: an EDID-1.4 display carrying a colour-depth field, then an
+EDID-1.3 display without one, on a connector that reaches .atomic_enable twice.
+Every sink measured on this tree so far has answered bpc != 0, which is exactly
+why the latch has never shown. `edid-decode < /sys/class/drm/card0-DP-1/edid`
+on BOTH sinks first, to confirm one of them really carries no depth field --
+without that step a green run proves nothing.
+
+FIX 2 -- commit->arm()'s RESULT REACHES A CALLER AGAIN
+--------------------------------------------------------
+
+WHAT IS WRONG. struct sun60i_de_commit documents its third op as "@arm: make the
+batch take effect, and report whether it did" (sun60i-de.c:366; the op at :387).
+Three of five callers honour that: sun60i_de_start() (:1295) turns a failure
+into an error and a goto, and the `background` (:1503) and `ccsc` (:1556) verbs
+hand it back to userspace. The two on the KMS path do not --
+sun60i_de_layer_disable() (:1107) and sun60i_de_layer_enable() (:1134) were void
+and dropped it, so sun60i_de_kms_scanout() (:1779), which IS the page flip,
+returned 0 unconditionally.
+
+⚠ THIS IS LATENT AND THE PATCH CLAIMS NO BENEFIT IT CANNOT SHOW.
+sun60i_de_mmio_arm() (:526) is a read-to-order and a `return 0` -- it cannot
+fail, so today nothing is lost and no log line changes. What makes it worth a
+patch now is what the indirection exists for, stated in its own kerneldoc: an
+RCQ backend behind the same three ops. Behind such a backend every page flip
+would report success whether or not the commit landed, and the one line that
+would say otherwise -- the drm_err in sun60i_kms_plane_atomic_update()
+(sun60i-kms.c:414) -- could never fire. The defect would then arrive together
+with the backend, inside a patch about something else, already invisible.
+
+WHAT THIS CHANGES. Both helpers become int and return what arm() reported.
+sun60i_de_kms_scanout() returns that instead of 0, which makes sun60i-kms.c:414
+reachable. The debugfs `layer` verb (:1593-1595) returns it too -- and that is
+what makes any of this testable from a board at all, because `echo 1 > layer` is
+this driver's own probe that a CPU store reaches a cold DE's datapath, and until
+now it could not report a failed commit either.
+
+Two callers still drop the value, deliberately, each commented at the call:
+
+  sun60i_de_stop() (:1339)          quiesce and reset have to happen whether or
+                                    not the layer-off committed; a stop that
+                                    refuses to stop leaves the block fetching
+                                    from pages about to be handed back
+  sun60i_de_kms_layer_off() (:1801) its caller is .atomic_disable, which returns
+                                    void to the atomic helpers and has nowhere
+                                    to put an error either
+
+⚠ de->layer_on IS STILL ASSIGNED UNCONDITIONALLY. What that flag should say
+after a commit that did not land is a real question, and it is one no backend in
+this tree can yet pose. Answering it here would change the behaviour of a path
+silicon has walked, on the strength of a failure mode that cannot occur yet.
+
+⚠ FALSIFIER: there is none a board can run today, and saying so is the honest
+answer. With mmio_arm() unable to fail, every path through this change returns
+what it returned before -- that is precisely why it is safe, and precisely why
+it proves nothing. It becomes testable the day a backend that can fail exists,
+and the test is then a forced failure in arm() producing a `scanout from ...`
+drm_err where before there was silence.
+
+FIX 3 -- A MODE FILTER MUST NOT LOG AT ERROR
+----------------------------------------------
+
+WHAT IS WRONG. sun60i_tcon_tv_check_mode() (sun60i-tcon-tv.c:292) refuses ten
+mode conditions silently, by bare `return -EINVAL`, and one -- interlace,
+:326-329 -- with a dev_err. It is reached from sun60i_tcon_tv_kms_check()
+(:1028), i.e. from the CRTC's .mode_valid, which the core calls once per mode
+per connector probe and again on every atomic check.
+
+sun60i-dp.c states the doctrine this contradicts at its own .detect: "no sink is
+a STATE, not an error", and that path "logs nothing on the ten-second poll"
+(sun60i-dp.c:3055-3056). sun60i_dp_bridge_mode_valid() follows it and logs
+nothing at all.
+
+⚠ THE REVIEW'S TRIGGER FOR THIS ITEM DOES NOT EXIST, AND ITEM 7 IS REFUTED HERE.
+It says a sink offering 1080i/576i produces an error line per interlaced mode on
+every probe, every ten seconds under poll. It does not, and the reason is in the
+same driver. Both mode walks ask the BRIDGE CHAIN BEFORE THE CRTC and skip the
+CRTC as soon as a bridge refuses -- drm_probe_helper.c:118-127 (`continue`) and
+drm_atomic_helper.c:529-537 (early return) -- and sun60i_dp_bridge_mode_valid()
+answers MODE_NO_INTERLACE (sun60i-dp.c:2995) first, every time. The only other
+caller, sun60i_tcon_tv_enable() (:647), reads tcon->mode, which is either the
+progressive built-in constant (:1206) or an adjusted_mode that has already been
+through that same filter; there is no debugfs setter for tcon->mode. The branch
+is unreachable in this tree. No flood is possible, and none was observed.
+
+WHY IT IS STILL WORTH THE LINE. The check stays; only the level drops, to
+DRM_UT_KMS via drm_dev_dbg(tcon->dev, ...) -- the exact expansion of
+drm_dbg_kms(), used with the struct device this module has instead of a
+drm_device it does not (precedent: drivers/gpu/drm/tiny/panel-mipi-dbi.c:144).
+This is the generic, last-line-of-defence check on a CRTC, and it goes live the
+moment a second output without an interlace filter of its own hangs off that
+CRTC -- which is the case a CRTC-level check exists for. Fixing the level while
+the branch is dead costs one line; fixing it after it is live costs somebody
+else a log flood during their bring-up.
+
+⚠ NO DIAGNOSTIC IS DELETED; the line stays. The message stays in the
+source and comes back with `drm.debug=0x04` or
+`dyndbg="func sun60i_tcon_tv_check_mode +p"`, no rebuild -- and
+sun60i_tcon_tv_enable() still prints its own dev_err naming the mode (:649-652)
+on any refusal, so the one path a user can drive keeps an ERROR line.
+
+⚠ FALSIFIER. Showing the change DID something needs both a sink that offers
+interlaced modes at all and a second, non-DP output on the same CRTC. Neither
+exists on this board. Showing it broke nothing is the cheap half and is what the
+build covers: the four objects build and no other caller of check_mode changed.
+
+WHAT DOES NOT CHANGE, AND THAT IS THE POINT
+---------------------------------------------
+
+The path the test boot proved -- cold boot, alt mode, AUX, EDID, link training,
+TCON, DE, /dev/fb0, fbcon -- is the same path after this patch, write for write:
+
+  - Fix 1 alters dp->bpc ONLY when display_info.bpc == 0. On every sink measured
+    on this tree it is non-zero, and old and new code then assign the identical
+    value. The board's own sink is one of those.
+  - Fix 2 changes no register write, no ordering and no value. It changes two
+    return types and turns `return 0` into `return ret` where ret is provably 0
+    for the only backend that exists (sun60i_de_mmio_arm(), :526).
+  - Fix 3 changes a log level on a branch nothing reaches.
+
+So this patch is expected to be a NO-OP on silicon. A test boot that shows any
+difference in the boot sequence is evidence AGAINST it, not for it. The
+acceptance criterion is sameness: same trained link, same mode list, same
+/dev/fb0, same zero err/warn lines from the four modules.
+
+BUILD
+------
+
+Pristine 6.18.36 + the full patches/ stack + this one, configured from
+configs/a733_defconfig, `make ARCH=arm64 drivers/gpu/drm/sun60i/` on the native
+aarch64 host: sun60i-dp.o, sun60i-de.o, sun60i-kms.o and sun60i-tcon-tv.o all
+compile, zero warnings. Only a measurement proves an effect, so this shows that the patch applies
+and compiles and nothing more; all three fixes are unproven on silicon.
+
+WHAT IS DELIBERATELY NOT IN HERE
+----------------------------------
+
+Items 1, 3, 4, 5 and 8 of the same review. They are five different kinds of
+change -- a use-after-free, a missing lock, two unwind paths and a register
+ownership question -- and each is worth its own bisect point. Items 1 and 8 in
+particular land in sun60i-dp.c's .attach and in sun60i_dp_video_configure(),
+which `drm-a733-dp-repair-three-error-paths` is taking; this patch therefore stays out of both functions and
+touches sun60i-dp.c in exactly one place, inside .atomic_enable.
+
+Assisted-by: Claude
+
+diff --git a/drivers/gpu/drm/sun60i/sun60i-de.c b/drivers/gpu/drm/sun60i/sun60i-de.c
+--- a/drivers/gpu/drm/sun60i/sun60i-de.c
++++ b/drivers/gpu/drm/sun60i/sun60i-de.c
+@@ -1082,14 +1082,17 @@ static void sun60i_de_layer(struct sun60i_de *de)
+ 			sun60i_de_attctl());
+ }
+ 
+-static void sun60i_de_layer_disable(struct sun60i_de *de)
++static int sun60i_de_layer_disable(struct sun60i_de *de)
+ {
+ 	u32 ovl = sun60i_de_chn(DE_VI0_SLOT) + DE_CHN_OVL;
++	int ret;
+ 
+ 	de->commit->begin(de);
+ 	sun60i_de_stage(de, ovl + OVL_LAY_ATTCTL(DE_OVL_LAYER), 0);
+-	de->commit->arm(de);
++	ret = de->commit->arm(de);
+ 	de->layer_on = false;
++
++	return ret;
+ }
+ 
+ /*
+@@ -1108,13 +1111,24 @@ static void sun60i_de_layer_disable(struct sun60i_de *de)
+  * ⚠ THE ORDER IS NOT OPTIONAL, and it is the correction to a measurement that
+  * had to be withdrawn and redone: prove the observer, THEN move a register. A
+  * screen nobody has confirmed is on cannot falsify anything.
++ *
++ * Both helpers return what @arm reported, because that is the only place in
++ * either of them that can fail; every caller that has somewhere to put an
++ * error now does. de->layer_on is still assigned unconditionally: what the
++ * flag should say after a commit that did not land is a question no backend
++ * in this tree can yet pose, and inventing an answer here would change a path
++ * silicon has walked.
+  */
+-static void sun60i_de_layer_enable(struct sun60i_de *de)
++static int sun60i_de_layer_enable(struct sun60i_de *de)
+ {
++	int ret;
++
+ 	de->commit->begin(de);
+ 	sun60i_de_layer(de);
+-	de->commit->arm(de);
++	ret = de->commit->arm(de);
+ 	de->layer_on = true;
++
++	return ret;
+ }
+ 
+ /*
+@@ -1218,6 +1232,13 @@ static int sun60i_de_start(struct sun60i_de *de)
+  */
+ static void sun60i_de_stop(struct sun60i_de *de)
+ {
++	/*
++	 * One of the two places the commit result is deliberately dropped (the
++	 * other is sun60i_de_kms_layer_off()): quiesce and reset are what has
++	 * to happen next whether or not the layer-off landed, and a stop that
++	 * refuses to stop leaves the block fetching from pages that are about
++	 * to belong to somebody else.
++	 */
+ 	sun60i_de_layer_disable(de);
+ 	sun60i_de_quiesce(de);
+ 	sun60i_de_clocks_off(de);
+@@ -1412,9 +1433,8 @@ int sun60i_de_kms_scanout(struct sun60i_de *de, dma_addr_t scanout, u32 pitch)
+ 
+ 	de->fb_dma = scanout;
+ 	de->fb_pitch = pitch;
+-	sun60i_de_layer_enable(de);
+ 
+-	return 0;
++	return sun60i_de_layer_enable(de);
+ }
+ EXPORT_SYMBOL_GPL(sun60i_de_kms_scanout);
+ 
+@@ -1425,6 +1445,11 @@ void sun60i_de_kms_layer_off(struct sun60i_de *de)
+ 	if (!de->enabled)
+ 		return;
+ 
++	/*
++	 * Dropped for the same reason as in sun60i_de_stop(), and for one more:
++	 * the caller is .atomic_disable, which returns void to the atomic
++	 * helpers and has nowhere to put an error either.
++	 */
+ 	sun60i_de_layer_disable(de);
+ }
+ EXPORT_SYMBOL_GPL(sun60i_de_kms_layer_off);
+diff --git a/drivers/gpu/drm/sun60i/sun60i-dp.c b/drivers/gpu/drm/sun60i/sun60i-dp.c
+--- a/drivers/gpu/drm/sun60i/sun60i-dp.c
++++ b/drivers/gpu/drm/sun60i/sun60i-dp.c
+@@ -2666,8 +2666,20 @@ static void sun60i_dp_bridge_atomic_enable(struct drm_bridge *bridge,
+ 	 * mismatch is the one the driver already reads and prints.
+ 	 */
+ 	drm_mode_copy(&dp->mode, &crtc_state->adjusted_mode);
+-	if (connector->display_info.bpc)
+-		dp->bpc = connector->display_info.bpc;
++
++	/*
++	 * ⚠ THE FALLBACK IS THE OTHER HALF OF THE INVARIANT ABOVE, NOT A
++	 * DEFAULT VALUE. TCON_TV1 takes its depth from sun60i_kms_crtc_bpc(),
++	 * which answers 8 for a sink that reports none, so a transmitter that
++	 * instead KEPT its previous value would describe a different pixel
++	 * depth than the raster feeding it -- the SRC0_USER_FIFO_STATUS
++	 * disagreement named above. bpc == 0 is a real sink and not an error:
++	 * EDID 1.3 has no bit-depth field at all, so it is what
++	 * drm_add_display_info() leaves behind for every pre-1.4 display.
++	 * sun60i_dp_bridge_mode_valid() already applies exactly this fallback
++	 * to the same field; this was the one place that did not.
++	 */
++	dp->bpc = connector->display_info.bpc ?: 8;
+ 
+ 	/* Auto on both: the rate ladder asks the sink and the PHY, and the lane
+ 	 * ladder is the fallback DP 1.4 section 3.5.1.2.1 requires. A modeset must not
+diff --git a/drivers/gpu/drm/sun60i/sun60i-kms.c b/drivers/gpu/drm/sun60i/sun60i-kms.c
+--- a/drivers/gpu/drm/sun60i/sun60i-kms.c
++++ b/drivers/gpu/drm/sun60i/sun60i-kms.c
+@@ -500,6 +500,12 @@ static int sun60i_kms_crtc_atomic_check(struct drm_crtc *crtc,
+  * sun60i_dp_bridge_atomic_enable() reads exactly this field for its own half,
+  * so both sides take the number from one place -- which is what retires the
+  * constant in sun60i-display.h that has held the invariant until now.
++ *
++ * ⚠ THE FALLBACK IS PART OF WHAT IS SHARED. "One place" holds only while
++ * both sides answer bpc == 0 with the SAME number, and until `drm-a733-three-consistency-fixes` they did
++ * not: the transmitter kept whatever the previous sink had reported. The two
++ * 8s -- this one and the one in sun60i_dp_bridge_atomic_enable() -- move
++ * together or not at all.
+  */
+ static u8 sun60i_kms_crtc_bpc(struct sun60i_kms *kms,
+ 			      struct drm_atomic_state *state)
+diff --git a/drivers/gpu/drm/sun60i/sun60i-tcon-tv.c b/drivers/gpu/drm/sun60i/sun60i-tcon-tv.c
+--- a/drivers/gpu/drm/sun60i/sun60i-tcon-tv.c
++++ b/drivers/gpu/drm/sun60i/sun60i-tcon-tv.c
+@@ -58,6 +58,7 @@
+ #include <linux/seq_file.h>
+ 
+ #include <drm/drm_modes.h>
++#include <drm/drm_print.h>
+ 
+ #include "sun60i-display.h"
+ #include "sun60i-kms.h"
+@@ -306,7 +307,35 @@ static int sun60i_tcon_tv_check_mode(struct sun60i_tcon_tv *tcon,
+ 		return -EINVAL;
+ 
+ 	if (mode->flags & DRM_MODE_FLAG_INTERLACE) {
+-		dev_err(tcon->dev, "interlaced modes are not implemented here\n");
++		/*
++		 * ⚠ DEBUG, NOT ERROR, BECAUSE THIS FUNCTION IS A MODE FILTER.
++		 * sun60i_tcon_tv_kms_check() runs it from the CRTC's .mode_valid,
++		 * which the core calls once per mode per connector probe -- every
++		 * ten seconds under poll -- and again on every atomic check. A
++		 * refusal there is the filter doing its job, not a fault, and it
++		 * has to stay cheap for every mode a sink offers.
++		 *
++		 * ⚠ NO PATH REACHES THIS BRANCH TODAY, so this is a level fix on a
++		 * defensive check and not a fix for an observed log flood. Both
++		 * mode walks ask the bridge chain BEFORE the CRTC and skip the CRTC
++		 * entirely once a bridge has refused (drm_probe_helper.c:118-127,
++		 * drm_atomic_helper.c:529-537), and sun60i_dp_bridge_mode_valid()
++		 * answers MODE_NO_INTERLACE first. The other caller,
++		 * sun60i_tcon_tv_enable(), only ever sees the progressive built-in
++		 * mode or an adjusted_mode that has already been through that same
++		 * filter. What makes this branch live is a second output on this
++		 * CRTC with no interlace filter of its own -- which is exactly what
++		 * a generic CRTC-level check exists for, and why it has to be right
++		 * before then rather than after.
++		 *
++		 * Demoted, not deleted: drm.debug=0x04, or a dyndbg on this
++		 * function, brings the line back with no rebuild -- and
++		 * sun60i_tcon_tv_enable() prints its own dev_err naming the mode on
++		 * any refusal, so the user-facing path keeps an ERROR line
++		 * either way.
++		 */
++		drm_dev_dbg(tcon->dev, DRM_UT_KMS,
++			    "interlaced modes are not implemented here\n");
+ 		return -EINVAL;
+ 	}
+ 

@@ -1,0 +1,562 @@
+From 20a733e4f5c6d7e8a9b0c1d2e3f4a5b6c7d8e9f0 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Wed, 22 Jul 2026 18:00:00 +0200
+Subject: [PATCH] nvmem: cpufreq: a733: read the CPU speed bin from the eFuse
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Describe the A733 Security ID (eFuse) block to the mainline sunxi_sid
+nvmem provider, expose the DVFS fuse word as an nvmem cell, and teach
+sun50i-cpufreq-nvmem to turn that word into an opp-supported-hw mask and
+a per-bin voltage column name. Patch `arm64-dts-a733-cpu-opp-tables-and-supply` supplies the OPP table this
+acts on; without `arm64-dts-a733-cpu-opp-tables-and-supply` nothing changes, because there is no OPP table to
+filter.
+
+WHAT A SPEED BIN IS. Dies cut from one wafer are not equal. Process
+variation leaves some transistors faster than others, so at the final
+test stage the part is characterised and graded, and the grade is burned
+into one-time fuses. Much later the kernel reads that grade back and uses
+it to pick, for each frequency, the voltage this particular die needs.
+
+It matters in both directions, and they fail differently:
+
+  - too little voltage for the frequency: the part still runs, and
+    mostly runs correctly. Setup timing fails only at the slowest
+    corners of temperature, load and data pattern, so what a user sees
+    is a wrong result now and then, a corrupted buffer, a crash under
+    load that never reproduces on the bench. It looks exactly like a
+    software bug, and it is not one.
+
+  - too much voltage: correct, but wasteful. Dynamic power goes with
+    V^2, so a 50 mV excess at 1 V is roughly 10 % of the CPU's dynamic
+    power thrown away as heat, which on a passively cooled board buys a
+    lower thermal trip point and therefore less sustained performance.
+    The safe direction is not the free direction.
+
+That is why we read the fuse instead of shipping one table for every
+part, and it is also why the fallback below has to be worst-case rather
+than average.
+
+--------------------------------------------------------------------
+1. THE SID: WHAT THE CONFIG HAD TO BE, AND WHERE THAT COMES FROM
+--------------------------------------------------------------------
+
+Block base 0x03006000, size 4K: A733 UM memory map, "SID
+0x03006000---0x03006FFF  4K".
+
+The mainline provider needs three things: where inside the block the
+fuse array appears (value_offset), how much of it to expose (size), and
+whether the array can be read as plain MMIO or needs the H3-style
+PRCTL/RDKEY command sequence.
+
+Answered from silicon, by dumping the whole 4K block on two dies on
+2026-07-22 (the 6 GiB board and a second 6 GiB board, raw MMIO readback, not sysfs):
+
+  0x03006000..0x030061ff  control/status. Sparse and BYTE-IDENTICAL on
+                          both dies (only 0x090 = 0x3207d078,
+                          0x09c = 0x1, 0x0a8 = 0x1, 0x0f0 = 0x00020001
+                          are non-zero).
+  0x03006200..0x0300628f  fuse content. Partly constant across dies
+                          (0x200 = 0x32c05100, 0x204 = 0x4c004900,
+                          0x208 = 0x58a3c418 on both) and partly per-die
+                          (0x20c, 0x218..0x233, 0x238, 0x244, 0x248,
+                          0x24c, 0x260, 0x264 all differ).
+  0x03006290..0x03006fff  zero on both dies.
+
+Constants where a SoC-wide identity belongs, differences where per-die
+data belongs, in a window that starts exactly at +0x200: that is the
+fuse array, and a plain readl of it returns it. So value_offset = 0x200
+and no register readout. The H3 flag exists for an H3 erratum; there is
+no sign of it here, and the values are stable (0x0300624c re-read five
+times on the 6 GiB board, identical each time).
+
+Size 0x100 covers 0x03006200..0x030062ff. Everything any of our dies has
+content in lies below 0x290, and nothing above it is non-zero on either
+die. We take the smallest window that provably contains data rather than
+the largest that might: an oversized nvmem device answers reads with
+zeroes that are indistinguishable from real fuse content, while an
+undersized one fails the cell registration loudly. Fail loud, never
+fabricate.
+
+That combination - value_offset 0x200, size 0x100, direct read - is
+already in mainline as sun50i_a64_cfg, and the binding already has the
+idiom for reusing it: sun50i-a100-sid, sun50i-h616-sid and sun55i-a523-
+sid are all documented as `<soc>-sid` plus the `allwinner,sun50i-a64-
+sid` fallback, and sunxi_sid.c matches on the fallback. So the correct
+patch is a compatible string, not a fourth copy of the same config
+struct. sunxi_sid.c is not touched at all. Note in passing that the
+A523's SID sits at the same 0x03006000 with the same size - the two SoCs
+are close relatives, which is a hint, not the evidence; the evidence is
+the dump above.
+
+No clocks and no resets on the node: the block answers at boot on both
+dies, under two different kernels, with nothing having enabled it.
+
+WHAT THE UM DOES **NOT** SETTLE. Table 7-1 gives the THS calibration a
+"Base Address: 0x14" inside the SID. Mainline's H616 DT places its
+ths_calibration cell at nvmem offset 0x14, which is consistent with the
+UM numbering being array-relative (i.e. ARM base + 0x200 + 0x14). On our
+dies ARM 0x03006214 is zero on both, while a per-die block of 16-bit
+values runs 0x03006218..0x03006233 (the 6 GiB board: 0x10a2, 0x1086, ... , 0x1048,
+0x001c; a second 6 GiB board: 0x112c, 0x115b, ... , 0x1130, 0x0028). So the THS block is
+in this array, as the UM says, but its exact layout is NOT established
+and no ths_calibration cell is added here. That job and its open question
+are left to the thermal patches; this patch only proves the array it lives in.
+
+--------------------------------------------------------------------
+2. THE FUSE WORD: WHAT SILICON SAYS
+--------------------------------------------------------------------
+
+DVFS word at ARM 0x0300624c = fuse offset 0x4c, bits [15:8] = speed bin.
+Register readback on three chips (2026-07-22):
+
+  the 8 GiB board  0x00000598  ->  bin 0x05
+  the 6 GiB board  0x00000496  ->  bin 0x04
+  a second 6 GiB board   0x00000596  ->  bin 0x05
+
+Where a vendor kernel exports /sys/class/cpufreq/dvfs_code it agrees,
+but that is a note, not the source: on a second 6 GiB board the file does not exist at
+all, which is precisely why the register is the only universal source.
+Bits [23:16], the second copy, are zero on all three.
+
+The vendor's DT mapping table ("V0.9": 0x00->0x0000, 0x01->0x0100,
+0x11->0x0101, 0x02->0x0200, 0x12->0x0201, 0x03->0x0300, 0x04->0x0400,
+0x05->0x0500, 0x06->0x0600, 0x14->0x0401, 0x15->0x0501) is a HINT and is
+treated as one. It is not encoded in this patch in any form. All it tells
+us is the value range to leave room for, and BIT(0x15) = BIT(21) fits a
+u32 mask with room to spare.
+
+--------------------------------------------------------------------
+3. THE CONTRACT WITH `arm64-dts-a733-cpu-opp-tables-and-supply` - STATE IT ONCE, HERE
+--------------------------------------------------------------------
+
+BITMASK CONVENTION: one bit per bin, and the bit position IS the raw
+fuse value.
+
+  bin 0x04  ->  opp-supported-hw bit 4  (0x00000010)
+  bin 0x05  ->  opp-supported-hw bit 5  (0x00000020)
+  bin 0x15  ->  opp-supported-hw bit 21 (0x00200000)
+
+An OPP that both of our known bins may use therefore carries
+opp-supported-hw = <0x30>. There is no translation step, so a DT mask can
+be checked against a fuse dump by eye, and adding a bin later is a DT
+change with no kernel change.
+
+VOLTAGE COLUMNS: dev_pm_opp_set_config() is called with prop_name
+"speed<N>", N the same number, so the per-bin voltage property is
+opp-microvolt-speed4 / opp-microvolt-speed5. drivers/opp/of.c
+_parse_named_prop() falls back to the unnamed opp-microvolt when the
+named one is absent, and that fallback is by design: an OPP that forgets
+a bin's column gets the worst-case voltage, never a wrong one. `arm64-dts-a733-cpu-opp-tables-and-supply`
+should therefore carry a plain opp-microvolt on every OPP.
+
+INDEX 0 IS THE WORST-CASE COLUMN. It is what an unknown die gets (see
+below), so `arm64-dts-a733-cpu-opp-tables-and-supply` must set bit 0 on every OPP that is safe on any A733,
+and give those OPPs voltages that are the per-frequency maximum over all
+bins. Bit 0 doubles as "raw fuse 0", which is exactly right: an all-zero
+fuse word cannot be told apart from an unprogrammed one.
+
+BOTH CLUSTERS MUST DECLARE THE SAME BIN SET. supported_hw and prop_name
+are set once for every CPU, so a bin present in only one cluster's table
+would leave the other cluster's policy with no OPPs at all. The driver
+side of that is handled here - sunxi_cpufreq_dt_speed_mask() ANDs the
+per-CPU masks, so a half-described bin demotes to worst case instead of
+killing a policy - but `arm64-dts-a733-cpu-opp-tables-and-supply` should simply keep the two tables in step.
+
+The nvmem cell `arm64-dts-a733-cpu-opp-tables-and-supply` must point at is labelled `cpu_speed_grade` and is
+added by this patch, so `arm64-dts-a733-cpu-opp-tables-and-supply` needs
+`nvmem-cells = <&cpu_speed_grade>;` and
+`compatible = "allwinner,sun60i-a733-operating-points";` on the OPP
+table node.
+
+--------------------------------------------------------------------
+4. WHY EXTEND sun50i-cpufreq-nvmem RATHER THAN WRITE SOMETHING NEW
+--------------------------------------------------------------------
+
+A new driver would have to do what this one already does - find the CPU
+OPP descriptor node, match its compatible, read one nvmem cell, call
+dev_pm_opp_set_config() with supported_hw and prop_name for every
+present CPU, then register cpufreq-dt - and would duplicate all of it to
+change one field extraction. The existing driver's structure (a per-SoC
+efuse_xlate behind an of_device_id) exists exactly for this. The A733
+addition is one xlate, one data struct, one OPP-table compatible and one
+machine compatible.
+
+The one shared helper added, sunxi_cpufreq_dt_speed_mask(), is new code
+that only the A733 xlate calls. dt_has_supported_hw() is deliberately
+left untouched even though the new helper could subsume it, because that
+would change probe behaviour for H6/A100/H616 - SoCs we have no hardware
+for and therefore no right to change.
+
+--------------------------------------------------------------------
+5. THE FALLBACK, AND HOW THIS DIFFERS FROM THE VENDOR
+--------------------------------------------------------------------
+
+The vendor kernel does not filter OPPs on purpose. Its per-bin tables
+carry a 0 voltage for the steps a bin does not support, and those entries
+disappear later because _opp_supported_by_regulators() rejects them. That
+is a side effect of the regulator check, and it has two consequences we
+do not want: it only works once cpu-supply is wired, and where it does
+not work, nothing complains. A second 6 GiB board demonstrates the failure mode -
+it lists the full union of the vendor table and was caught by the PLL
+register actually running 1300 MHz (N=50) at 800 mV, a point its own bin
+has no voltage entry for. We do the filtering deliberately and up front,
+with opp-supported-hw, so a mis-described bin produces an empty table
+and a failed probe rather than an undervolted core.
+
+The fallback to index 0 is taken, with a log line every time, when:
+
+  - bits [15:8] read 0. Unprogrammed and "graded 0" are the same
+    observation from outside. The vendor has a table for the zero case;
+    we refuse to guess which of the two we are looking at.
+  - the bin does not fit a u32 bit position (>= 32).
+  - no OPP in DT claims that bin, on every CPU. A die whose voltages we
+    have never measured must not inherit a table measured on a better
+    die.
+  - bits [23:16], the second copy, are programmed. The vendor prefers
+    that copy over the primary when it is non-zero. On all three chips
+    we can read it is zero, so the preference is untestable, and acting
+    on an untestable hint here means possibly selecting a FASTER table
+    than the primary fuse says. We treat such a part as unknown instead.
+    This is the one place where we are knowingly more conservative than
+    the vendor, and it is the first thing to revisit if a die ever shows
+    up with those bits set - the log line names the value.
+
+Every one of these is safe by construction only because index 0 is
+defined as the worst case. That definition is `arm64-dts-a733-cpu-opp-tables-and-supply`'s to honour.
+
+--------------------------------------------------------------------
+6. WHAT THIS BUYS, AND THE LIMIT THAT IS NOT NEGOTIABLE
+--------------------------------------------------------------------
+
+The alternative already running in this project's earlier Armbian-based
+port of this board is a single bin-neutral table whose voltage at each
+frequency is the maximum over all bins. It is correct and it is what index 0 will be. Its price,
+measured rather than assumed: on a bin-0x05 part it asks for up to 50 mV
+more than the die needs between 1612 and 2002 MHz. Reading the fuse gives
+that back on every part that is not worst case, which is at least two of
+our three boards.
+
+HARD LIMIT, ABSOLUTE: no OPP may exceed what the datasheet permits for
+VDD-CPUB/VDD-CPUL, which is 1.2 V absolute maximum. The highest voltage
+seen across all nine vendor bins is 1050 mV, and nothing in this series
+may go above it without a documented reason. This patch sets no voltage
+at all - it selects which column `arm64-dts-a733-cpu-opp-tables-and-supply`'s voltages are read from - but the
+limit is stated here because it is the constraint the whole mechanism
+exists to respect.
+
+--------------------------------------------------------------------
+7. VERIFIED / NOT VERIFIED / PENDING
+--------------------------------------------------------------------
+
+VERIFIED ON SILICON (2026-07-22, raw MMIO readback):
+  - SID block responds at 0x03006000 with no clock or reset set up.
+  - fuse array window at +0x200: layout argument above, two full 4K
+    dumps (the 6 GiB board, a second 6 GiB board).
+  - DVFS word 0x0300624c: 0x00000496 (the 6 GiB board), 0x00000596 (a second 6 GiB board),
+    0x00000598 (the 8 GiB board); bits [23:16] zero on all three; value stable
+    across repeated reads.
+
+NOT VERIFIED: applies-clean and builds are separate claims and are the
+reviewer's to make. The THS calibration layout is explicitly NOT claimed.
+
+THE ONE OBSERVABLE THAT WOULD FALSIFY THIS. With `nvmem-cpufreq-a733-speed-bin-from-efuse` + `arm64-dts-a733-cpu-opp-tables-and-supply` applied,
+boot the SAME Image and the SAME dtb on the 6 GiB board (bin 4) and the 8 GiB board (bin 5),
+drive the A76 cluster to 1898 MHz, confirm the operating point from
+CPU_B_PLL_CTRL (N=73, EXT_DIVP = /1) rather than from sysfs, then read
+VDD-CPUB from the PMIC - AXP318W at i2c 0x36, DCDC3 voltage register
+0x14, bits [6:0] = (mV - 500)/10:
+
+    the 6 GiB board must read 0x2f (970 mV)   the 8 GiB board must read 0x2c (940 mV)
+
+Two dies, one binary, two different voltages, in the direction the fuse
+words say. If both boards land on the same value, or if either boot log
+contains "using the worst-case OPP column", this patch has not done its
+job. (The two numbers themselves are `arm64-dts-a733-cpu-opp-tables-and-supply`'s measured columns; what `nvmem-cpufreq-a733-speed-bin-from-efuse`
+is on the hook for is that the boards diverge at all.)
+
+AND THE FALLBACK PATH, TESTABLE WITHOUT TOUCHING A FUSE. Build a test
+dtb with the cell moved to `cpu-speed-grade@40 { reg = <0x40 4>; }`.
+ARM 0x03006240 reads 0x00000000 on both the 6 GiB board and a second 6 GiB board (dumped
+2026-07-22), so the driver must log "no usable speed bin in fuse word
+0x00000000", select index 0, and the board must still boot and scale on
+the worst-case column. Read-only, no fuse write, exercises the whole
+unknown-die path.
+
+KCONFIG. CONFIG_NVMEM_SUNXI_SID is already =y in the arm64 defconfig and
+CONFIG_ARM_ALLWINNER_SUN50I_CPUFREQ_NVMEM is =m. Both are set built-in
+(=y) in the recipe's kernel/6.18/config, so that the OPP configuration is
+applied before userspace can command a frequency; that is a repo-side
+setting and not part of this patch file.
+
+DEPENDS. Foundation only for the DT node; the cpufreq half is inert
+until `arm64-dts-a733-cpu-opp-tables-and-supply` lands. The sid node is inserted between clock-controller@
+2002000 and interrupt-controller@3400000, chosen to sit away from the
+regions `clk-sunxi-ng-a733-rtc-ccu-add-dcxo` to `arm64-dts-a733-cpu-opp-tables-and-supply` (DCXO / oscillator model / CPU-PLL) are editing.
+
+Assisted-by: Claude
+---
+ .../bindings/nvmem/allwinner,sun4i-a10-sid.yaml     |   1 +
+ .../opp/allwinner,sun50i-h6-operating-points.yaml   |   3 +-
+ .../allwinner/sun60i-a733-cubie-a7s-minimal.dts     |  31 +++
+ drivers/cpufreq/sun50i-cpufreq-nvmem.c              | 128 ++++++++++++
+ 4 files changed, 162 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/cpufreq/cpufreq-dt-platdev.c b/drivers/cpufreq/cpufreq-dt-platdev.c
+--- a/drivers/cpufreq/cpufreq-dt-platdev.c
++++ b/drivers/cpufreq/cpufreq-dt-platdev.c
+@@ -112,6 +112,7 @@ static const struct of_device_id blocklist[] __initconst = {
+ 	{ .compatible = "allwinner,sun50i-h616", },
+ 	{ .compatible = "allwinner,sun50i-h618", },
+ 	{ .compatible = "allwinner,sun50i-h700", },
++	{ .compatible = "allwinner,sun60i-a733", },
+ 
+ 	{ .compatible = "apple,arm-platform", },
+ 
+diff --git a/Documentation/devicetree/bindings/nvmem/allwinner,sun4i-a10-sid.yaml b/Documentation/devicetree/bindings/nvmem/allwinner,sun4i-a10-sid.yaml
+--- a/Documentation/devicetree/bindings/nvmem/allwinner,sun4i-a10-sid.yaml
++++ b/Documentation/devicetree/bindings/nvmem/allwinner,sun4i-a10-sid.yaml
+@@ -28,6 +28,7 @@
+               - allwinner,sun50i-a100-sid
+               - allwinner,sun50i-h616-sid
+               - allwinner,sun55i-a523-sid
++              - allwinner,sun60i-a733-sid
+           - const: allwinner,sun50i-a64-sid
+       - const: allwinner,sun50i-h5-sid
+       - const: allwinner,sun50i-h6-sid
+diff --git a/Documentation/devicetree/bindings/opp/allwinner,sun50i-h6-operating-points.yaml b/Documentation/devicetree/bindings/opp/allwinner,sun50i-h6-operating-points.yaml
+--- a/Documentation/devicetree/bindings/opp/allwinner,sun50i-h6-operating-points.yaml
++++ b/Documentation/devicetree/bindings/opp/allwinner,sun50i-h6-operating-points.yaml
+@@ -25,6 +25,7 @@
+       - allwinner,sun50i-a100-operating-points
+       - allwinner,sun50i-h6-operating-points
+       - allwinner,sun50i-h616-operating-points
++      - allwinner,sun60i-a733-operating-points
+ 
+   nvmem-cells:
+     description: |
+@@ -56,7 +57,7 @@
+           bit per speed bin index.
+ 
+     patternProperties:
+-      "^opp-microvolt-speed[0-9]$": true
++      "^opp-microvolt-speed[0-9]+$": true
+ 
+     required:
+       - opp-hz
+diff --git a/drivers/cpufreq/sun50i-cpufreq-nvmem.c b/drivers/cpufreq/sun50i-cpufreq-nvmem.c
+--- a/drivers/cpufreq/sun50i-cpufreq-nvmem.c
++++ b/drivers/cpufreq/sun50i-cpufreq-nvmem.c
+@@ -11,7 +11,9 @@
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+ 
+ #include <linux/arm-smccc.h>
++#include <linux/bits.h>
+ #include <linux/cpu.h>
++#include <linux/limits.h>
+ #include <linux/module.h>
+ #include <linux/nvmem-consumer.h>
+ #include <linux/of.h>
+@@ -25,6 +27,21 @@
+ #define SUN50I_A100_NVMEM_MASK	0xf
+ #define SUN50I_A100_NVMEM_SHIFT	12
+ 
++/*
++ * A733 (sun60iw2). The nvmem cell is the whole 32-bit DVFS fuse word at SID
++ * fuse-array offset 0x4c (ARM 0x0300624c). Bits [15:8] hold the speed bin the
++ * wafer tester burned in; bits [23:16] hold a second copy.
++ *
++ * The bin value is used directly as the speed index, so an opp-supported-hw
++ * bit position in DT *is* the fuse value: bin 0x04 -> BIT(4). Index 0 is the
++ * worst-case column and is what an unknown die gets - see the comment on
++ * sun60i_a733_efuse_xlate().
++ */
++#define SUN60I_A733_NVMEM_MASK		0xff
++#define SUN60I_A733_NVMEM_SHIFT		8
++#define SUN60I_A733_NVMEM_BAK_SHIFT	16
++#define SUN60I_A733_SPEED_WORST_CASE	0
++
+ static struct platform_device *cpufreq_dt_pdev, *sun50i_cpufreq_pdev;
+ 
+ struct sunxi_cpufreq_data {
+@@ -124,6 +141,109 @@
+ 	return value;
+ }
+ 
++/**
++ * sunxi_cpufreq_dt_speed_mask() - speed indices every CPU OPP table describes
++ *
++ * Per CPU, ORs together every opp-supported-hw value in that CPU's OPP table;
++ * across CPUs, ANDs the results. A bit is set only if *every* CPU that has an
++ * OPP table has operating points for that speed index. Returns 0 if no CPU has
++ * an OPP table.
++ *
++ * The AND is what makes this safe on a heterogeneous SoC: supported_hw and
++ * prop_name are set once for all CPUs, so a bin described only in the A76
++ * table would leave the A55 policy with an empty OPP list. Requiring both
++ * clusters to describe the bin turns that into a deterministic demotion to the
++ * worst-case column instead of a cluster that silently loses cpufreq.
++ *
++ * Only the A733 xlate uses this. dt_has_supported_hw() below is deliberately
++ * left alone, so nothing changes for the SoCs we cannot test.
++ */
++static u32 sunxi_cpufreq_dt_speed_mask(void)
++{
++	u32 mask = U32_MAX;
++	bool found = false;
++	unsigned int cpu;
++
++	for_each_present_cpu(cpu) {
++		struct device *cpu_dev = get_cpu_device(cpu);
++		u32 cpu_mask = 0, val;
++		int count, i;
++
++		if (!cpu_dev)
++			continue;
++
++		struct device_node *np __free(device_node) =
++			dev_pm_opp_of_get_opp_desc_node(cpu_dev);
++		if (!np)
++			continue;
++
++		for_each_child_of_node_scoped(np, opp) {
++			count = of_property_count_u32_elems(opp,
++							    "opp-supported-hw");
++
++			for (i = 0; i < count; i++) {
++				if (of_property_read_u32_index(opp,
++							       "opp-supported-hw",
++							       i, &val))
++					continue;
++				cpu_mask |= val;
++			}
++		}
++
++		mask &= cpu_mask;
++		found = true;
++	}
++
++	return found ? mask : 0;
++}
++
++/*
++ * The A733 speed index is the raw fuse bin value, so DT alone decides which
++ * bins exist - no vendor mapping table is encoded here.
++ *
++ * Index 0 is the worst-case column, and it is selected deterministically
++ * whenever we do not have a bin we can act on:
++ *   - the fuse word reads 0 in bits [15:8]. An unprogrammed fuse and a part
++ *     graded "bin 0" are indistinguishable from outside, so both get the
++ *     worst case. (The vendor BSP has a separate table for a zero read; we
++ *     refuse to guess which of the two situations we are in.)
++ *   - the bin does not fit a u32 bitmask (>= 32).
++ *   - no OPP in DT claims that bin. A die we have no measured voltages for
++ *     must never inherit a table that was measured on a better die.
++ *   - the second fuse copy in bits [23:16] is programmed. The vendor BSP
++ *     prefers that copy when it is non-zero; on all three chips we can read
++ *     (the 8 GiB board, the 6 GiB board, a second 6 GiB board) it is zero, so that preference is an unverifiable
++ *     hint and we do not act on it. A part that has it set is, to us, an
++ *     unknown part.
++ */
++static u32 sun60i_a733_efuse_xlate(u32 speedbin)
++{
++	u32 bin = (speedbin >> SUN60I_A733_NVMEM_SHIFT) & SUN60I_A733_NVMEM_MASK;
++	u32 bak = (speedbin >> SUN60I_A733_NVMEM_BAK_SHIFT) & SUN60I_A733_NVMEM_MASK;
++
++	if (bak) {
++		pr_warn("A733: second speed-bin fuse copy is programmed (0x%02x, primary 0x%02x); its meaning is unverified on this SoC, using the worst-case OPP column\n",
++			bak, bin);
++		return SUN60I_A733_SPEED_WORST_CASE;
++	}
++
++	if (!bin || bin >= BITS_PER_TYPE(u32)) {
++		pr_warn("A733: no usable speed bin in fuse word 0x%08x, using the worst-case OPP column\n",
++			speedbin);
++		return SUN60I_A733_SPEED_WORST_CASE;
++	}
++
++	if (!(sunxi_cpufreq_dt_speed_mask() & BIT(bin))) {
++		pr_warn("A733: speed bin %u has no operating points in DT, using the worst-case OPP column\n",
++			bin);
++		return SUN60I_A733_SPEED_WORST_CASE;
++	}
++
++	pr_info("A733: speed bin %u (fuse word 0x%08x)\n", bin, speedbin);
++
++	return bin;
++}
++
+ static struct sunxi_cpufreq_data sun50i_h6_cpufreq_data = {
+ 	.efuse_xlate = sun50i_h6_efuse_xlate,
+ };
+@@ -136,6 +256,10 @@
+ 	.efuse_xlate = sun50i_h616_efuse_xlate,
+ };
+ 
++static struct sunxi_cpufreq_data sun60i_a733_cpufreq_data = {
++	.efuse_xlate = sun60i_a733_efuse_xlate,
++};
++
+ static const struct of_device_id cpu_opp_match_list[] = {
+ 	{ .compatible = "allwinner,sun50i-h6-operating-points",
+ 	  .data = &sun50i_h6_cpufreq_data,
+@@ -146,6 +270,9 @@
+ 	{ .compatible = "allwinner,sun50i-h616-operating-points",
+ 	  .data = &sun50i_h616_cpufreq_data,
+ 	},
++	{ .compatible = "allwinner,sun60i-a733-operating-points",
++	  .data = &sun60i_a733_cpufreq_data,
++	},
+ 	{}
+ };
+ 
+@@ -328,6 +455,7 @@
+ 	{ .compatible = "allwinner,sun50i-h616" },
+ 	{ .compatible = "allwinner,sun50i-h618" },
+ 	{ .compatible = "allwinner,sun50i-h700" },
++	{ .compatible = "allwinner,sun60i-a733" },
+ 	{}
+ };
+ MODULE_DEVICE_TABLE(of, sun50i_cpufreq_match_list);
+diff --git a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -515,6 +515,37 @@
+ 			#reset-cells = <1>;
+ 		};
+ 
++		/*
++		 * Security ID / eFuse array. Register-compatible with the A64
++		 * layout: the fuse array is mirrored into the ARM window at
++		 * base + 0x200, plain MMIO reads (no H3-style PRCTL readout).
++		 * Silicon evidence, 0x03006000..0x03006fff dumped whole on
++		 * the 6 GiB board and a second 6 GiB board (2026-07-22): 0x000..0x1ff is control/status and
++		 * byte-identical on both dies, 0x200..0x28f carries the per-die
++		 * fuse content and differs, 0x290..0xfff reads zero on both.
++		 * Hence size 0x100 for the array window - it strictly contains
++		 * every word any die of ours has content in, and an nvmem cell
++		 * placed beyond it fails loudly instead of returning invented
++		 * zeroes.
++		 */
++		sid: efuse@3006000 {
++			compatible = "allwinner,sun60i-a733-sid",
++				     "allwinner,sun50i-a64-sid";
++			reg = <0x0 0x03006000 0x0 0x1000>;
++			#address-cells = <1>;
++			#size-cells = <1>;
++
++			/*
++			 * DVFS word, fuse offset 0x4c = ARM 0x0300624c.
++			 * Bits [15:8] = speed bin, [23:16] = second copy.
++			 * Read back: the 8 GiB board 0x00000598, the 6 GiB board 0x00000496,
++			 * a second 6 GiB board 0x00000596.
++			 */
++			cpu_speed_grade: cpu-speed-grade@4c {
++				reg = <0x4c 4>;
++			};
++		};
++
+ 		gic: interrupt-controller@3400000 {
+ 			compatible = "arm,gic-v3";
+ 			#interrupt-cells = <3>;

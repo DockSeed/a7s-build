@@ -1,0 +1,179 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: allwinner: add A733 minimal boot device tree
+
+Milestone-1 minimal boot DT for the A733 (sun60iw2): one CPU + PSCI, GIC,
+arch timer, the A733 CCU and pinctrl, and UART0 (the dlan17 U-Boot debug
+console at 0x02500000, PB9/PB10). Enough to reach a serial shell; the rest
+of the SoC lands in later milestones. Bases/IRQs from the vendor BSP dtsi,
+cross-checked against the running the 8 GiB board.
+
+Assisted-by: Claude
+---
+diff --git a/arch/arm64/boot/dts/allwinner/Makefile b/arch/arm64/boot/dts/allwinner/Makefile
+index 2edfa7bf4..d73d19b2f 100644
+--- a/arch/arm64/boot/dts/allwinner/Makefile
++++ b/arch/arm64/boot/dts/allwinner/Makefile
+@@ -1,4 +1,5 @@
+ # SPDX-License-Identifier: GPL-2.0
++dtb-$(CONFIG_ARCH_SUNXI) += sun60i-a733-cubie-a7s-minimal.dtb
+ dtb-$(CONFIG_ARCH_SUNXI) += sun50i-a64-amarula-relic.dtb
+ dtb-$(CONFIG_ARCH_SUNXI) += sun50i-a64-bananapi-m64.dtb
+ dtb-$(CONFIG_ARCH_SUNXI) += sun50i-a64-nanopi-a64.dtb
+diff --git a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+new file mode 100644
+index 000000000..fc12b277f
+--- /dev/null
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -0,0 +1,152 @@
++// SPDX-License-Identifier: (GPL-2.0-only OR MIT)
++/*
++ * Minimal A733 (sun60iw2) boot device tree — milestone 1.
++ *
++ * Just enough to reach a serial shell on pristine mainline: one CPU + PSCI,
++ * GIC, arch timer, the A733 CCU and pinctrl, and UART0 (the debug console the
++ * dlan17 U-Boot uses, at 0x02500000, PB9/PB10). Everything else — the other 7
++ * cores, MMC, USB, GPU/NPU/VE/display/net — is added in later milestones.
++ *
++ * Register bases / interrupts taken from the vendor BSP sun60iw2p1.dtsi and
++ * cross-checked against the running the 8 GiB board
++ * (earlyprintk=sunxi-uart,0x2500000).
++ */
++/dts-v1/;
++
++#include <dt-bindings/interrupt-controller/arm-gic.h>
++#include <dt-bindings/clock/sun60i-a733-ccu.h>
++#include <dt-bindings/reset/sun60i-a733-ccu.h>
++
++/ {
++	model = "Radxa Cubie A7S (A733 minimal M1)";
++	compatible = "radxa,cubie-a7s", "allwinner,sun60i-a733";
++	interrupt-parent = <&gic>;
++	#address-cells = <2>;
++	#size-cells = <2>;
++
++	aliases {
++		serial0 = &uart0;
++	};
++
++	chosen {
++		stdout-path = "serial0:115200n8";
++		bootargs = "earlycon=uart8250,mmio32,0x02500000 console=ttyS0,115200 loglevel=8";
++	};
++
++	cpus {
++		#address-cells = <1>;
++		#size-cells = <0>;
++
++		cpu0: cpu@0 {
++			device_type = "cpu";
++			compatible = "arm,cortex-a55";
++			reg = <0x000>;
++			enable-method = "psci";
++		};
++	};
++
++	psci {
++		compatible = "arm,psci-1.0";
++		method = "smc";
++	};
++
++	timer {
++		compatible = "arm,armv8-timer";
++		interrupts = <GIC_PPI 13 IRQ_TYPE_LEVEL_HIGH>,
++			     <GIC_PPI 14 IRQ_TYPE_LEVEL_HIGH>,
++			     <GIC_PPI 11 IRQ_TYPE_LEVEL_HIGH>,
++			     <GIC_PPI 10 IRQ_TYPE_LEVEL_HIGH>;
++	};
++
++	osc24M: osc24M-clk {
++		#clock-cells = <0>;
++		compatible = "fixed-clock";
++		clock-frequency = <24000000>;
++		clock-output-names = "osc24M";
++	};
++
++	osc32k: osc32k-clk {
++		#clock-cells = <0>;
++		compatible = "fixed-clock";
++		clock-frequency = <32768>;
++		clock-output-names = "osc32k";
++	};
++
++	iosc: internal-osc-clk {
++		#clock-cells = <0>;
++		compatible = "fixed-clock";
++		clock-frequency = <16000000>;
++		clock-output-names = "iosc";
++	};
++
++	memory@40000000 {
++		device_type = "memory";
++		/* Fallback 1 GiB; the bootloader fixes up the real size. */
++		reg = <0x0 0x40000000 0x0 0x40000000>;
++	};
++
++	soc {
++		compatible = "simple-bus";
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++
++		pio: pinctrl@2000000 {
++			compatible = "allwinner,sun60i-a733-pinctrl";
++			reg = <0x0 0x02000000 0x0 0x800>;
++			interrupts = <GIC_SPI 69 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SPI 71 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SPI 73 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SPI 75 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SPI 77 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SPI 79 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SPI 81 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SPI 83 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SPI 85 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SPI 87 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&ccu CLK_APB1>, <&osc24M>, <&osc32k>;
++			clock-names = "apb", "hosc", "losc";
++			gpio-controller;
++			#gpio-cells = <3>;
++			interrupt-controller;
++			#interrupt-cells = <3>;
++
++			uart0_pb_pins: uart0-pb-pins {
++				pins = "PB9", "PB10";
++				allwinner,pinmux = <2>;
++				function = "uart0";
++			};
++		};
++
++		ccu: clock-controller@2002000 {
++			compatible = "allwinner,sun60i-a733-ccu";
++			reg = <0x0 0x02002000 0x0 0x2000>;
++			clocks = <&osc24M>, <&osc32k>, <&iosc>;
++			clock-names = "hosc", "losc", "iosc";
++			#clock-cells = <1>;
++			#reset-cells = <1>;
++		};
++
++		gic: interrupt-controller@3400000 {
++			compatible = "arm,gic-v3";
++			#interrupt-cells = <3>;
++			interrupt-controller;
++			reg = <0x0 0x03400000 0x0 0x10000>,	/* GIC Dist */
++			      <0x0 0x03460000 0x0 0x100000>;	/* GIC Redist */
++			interrupts = <GIC_PPI 9 IRQ_TYPE_LEVEL_HIGH>;
++		};
++
++		uart0: serial@2500000 {
++			compatible = "snps,dw-apb-uart";
++			reg = <0x0 0x02500000 0x0 0x400>;
++			interrupts = <GIC_SPI 2 IRQ_TYPE_LEVEL_HIGH>;
++			reg-shift = <2>;
++			reg-io-width = <4>;
++			clocks = <&ccu CLK_UART0>;
++			resets = <&ccu RST_BUS_UART0>;
++			pinctrl-names = "default";
++			pinctrl-0 = <&uart0_pb_pins>;
++			status = "okay";
++		};
++	};
++};

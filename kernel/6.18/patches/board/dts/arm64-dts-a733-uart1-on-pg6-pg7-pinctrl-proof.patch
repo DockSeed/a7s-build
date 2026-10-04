@@ -1,0 +1,124 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: a733: uart1 on PG6/PG7 as the distinguishing pinctrl proof
+
+`arm64-dts-allwinner-add-A733-minimal-boot-dt`'s uart0 pin node cannot be proven by a boot. U-Boot muxes PB9/PB10
+before the kernel starts, so the console riding uart0 cannot tell our
+pinctrl's write from the inherited state. This
+patch adds a pin group that U-Boot never touches, as the cheaper
+variant of the proof: uart1 on PG6/PG7, consumed by a
+dw-apb-uart node exactly like uart0 is.
+
+Values, each from the A733 documentation:
+- UART1 at 0x02501000-0x02501FFF (A733 user manual). The node maps 0x400, as uart0's node in `arm64-dts-allwinner-add-A733-minimal-boot-dt` does: the
+  UART register list (UM 18.10.8) ends at UART_FCC, 0x00F0.
+- IRQ: INTID 35 = GIC_SPI 3.
+- PG6 selector 2 = UART1-TX, PG7 selector 2 =
+  UART1-RX (A733 user manual).
+- CLK_UART1 and RST_BUS_UART1 come from `clk-sunxi-ng-add-A733-sun60iw2-minimal-ccu`: UART1_BGR_REG at 0x0E04,
+  gate bit 0, reset bit 16 (A733 user manual).
+- PG6 (ball T1) and PG7 (ball V2) (A733 datasheet V0.93, ball map) carry
+  no-connect marks in the Cubie A7S schematic V1.10, page 7. Nothing on
+  the board sees TX; RX has nothing attached. The group sets no bias, as
+  uart0's does, so PG7's input floats on an open pad: nothing reads it
+  while ttyS1 is closed, and the proof stays the mux write alone.
+
+A523 value rejected: the A523 puts uart1 at 0x02500400
+(sun55i-a523.dtsi), and so does U-Boot's own sun60i-a733.dtsi in the
+pinned u-boot-dlan17 tree, where the node stays disabled. On the A733
+0x02500400 lies inside UART0's 4 KiB window; the UM places UART1 at
+0x02501000.
+
+How Linux reads it (6.18.36):
+- Every property is read by somebody: reg-shift and reg-io-width by
+  __uart_read_properties() (serial_port.c); clocks by dw8250_probe()
+  through devm_clk_get_optional_enabled(dev, NULL); resets by
+  devm_reset_control_array_get_optional_exclusive(); pinctrl-0 by
+  pinctrl_bind_pins() (drivers/base/pinctrl.c, called from really_probe()
+  before the driver's probe); pins, function and allwinner,pinmux by
+  pinctrl-sunxi-dt.c.
+- The serial1 alias is not decoration. dw8250_probe() zeroes its port
+  and only an alias sets port->line, so without it uart1's line is 0,
+  and serial8250_find_match_or_unused() tries that slot first. Should
+  uart1 ever probe before uart0, it would become ttyS0, and
+  console=ttyS0 would land on no-connect pins. With the alias the line is
+  1 by construction.
+- VCC-PG has no traced rail yet, so no vcc-pg-supply is wired. Like PB, PH, PL and PM, the first request on PG logs "supply vcc-pg not found,
+  using dummy regulator" and "Couldn't set bank PG I/O bias: -22". The
+  dummy regulator returns before the bias register is written, and the
+  request only warns (`pinctrl-sunxi-a733-2-bit-pow-mod-sel-io-bias`), so the PG bias stays as boot left it and the
+  mux is still written.
+
+Why this is a proof with a falsifier. PG_CFG0 (0x02000380) resets to
+0xFFFFFFFF; PG6 is bits
+[27:24], PG7 bits [31:28].
+  1. At the U-Boot prompt, before booting: `md.l 0x02000380 1` must read
+     0xff in bits [31:24]. Anything else means the boot chain touched PG6
+     or PG7: record it, and the run proves nothing.
+  2. After boot: `devmem 0x02000380` must read 0x22 in bits [31:24]. Only
+     our pinctrl can have written that.
+  Bits [23:0] (PG0-PG5) are not part of the proof in either step.
+  Also read UART1_BGR (0x02002E04): its reset bit 16 is
+  deasserted only by dw8250_probe(), which runs after the pin state was
+  applied, so PG6/PG7 still io-disabled with that bit set is a FAIL: the
+  kernel believes it muxed the pins and the register says otherwise.
+
+What it proves: the consumer path uart0 relies on -- pinctrl-0 on a
+dw-apb-uart node, through pinctrl-sunxi-dt.c -- writes the A733 mux
+register at the right bank and field. For `arm64-dts-allwinner-add-A733-minimal-boot-dt`'s own PB9/PB10 node that
+is transitive (same path, another bank); a direct test of that node is still separate.
+
+Not hardware-proven: the two readbacks above are still owed.
+
+Assisted-by: Claude
+---
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -37,6 +37,7 @@ / {
+ 	aliases {
+ 		ethernet0 = &gmac0;
+ 		serial0 = &uart0;
++		serial1 = &uart1;
+ 	};
+ 
+ 	chosen {
+@@ -761,6 +762,12 @@ uart0_pb_pins: uart0-pb-pins {
+ 				function = "uart0";
+ 			};
+ 
++			uart1_pg_pins: uart1-pg-pins {
++				pins = "PG6", "PG7";
++				allwinner,pinmux = <2>;
++				function = "uart1";
++			};
++
+ 			/*
+ 			 * SD splits CLK from CMD+data because the vendor drives
+ 			 * them differently, and the difference is measurable on
+@@ -1119,6 +1126,27 @@ uart0: serial@2500000 {
+ 			status = "okay";
+ 		};
+ 
++		/*
++		 * Not a console and no user: this node is the pinctrl proof that
++		 * uart0 cannot give. U-Boot muxes PB9/PB10 before we boot, so a
++		 * boot never tells our write from U-Boot's. PG6/PG7 are no-connect
++		 * pins U-Boot leaves at their reset value, so the UART1 selector
++		 * (mux 2) on them after boot was written by our pinctrl. Procedure:
++		 * the header of patch `arm64-dts-a733-uart1-on-pg6-pg7-pinctrl-proof`.
++		 */
++		uart1: serial@2501000 {
++			compatible = "snps,dw-apb-uart";
++			reg = <0x0 0x02501000 0x0 0x400>;
++			interrupts = <GIC_SPI 3 IRQ_TYPE_LEVEL_HIGH>;
++			reg-shift = <2>;
++			reg-io-width = <4>;
++			clocks = <&ccu CLK_UART1>;
++			resets = <&ccu RST_BUS_UART1>;
++			pinctrl-names = "default";
++			pinctrl-0 = <&uart1_pg_pins>;
++			status = "okay";
++		};
++
+ 		mmc0: mmc@4020000 {
+ 			compatible = "allwinner,sun60i-a733-mmc",
+ 				     "allwinner,sun20i-d1-mmc";

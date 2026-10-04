@@ -1,0 +1,123 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] aic8800_fdrv: count received data frames in the interface statistics
+
+On a station the interface's rx counters do not follow the
+data it receives, so `ip -s link`, /sys/class/net/<if>/statistics and
+anything built on them (NetworkManager, monitoring, a check that traffic
+used the radio) see a receive path that carries nothing. Measured on the
+6 GiB board, 2026-09-23: two iperf3 -R runs
+received 95.1 MB and 137 MB over the radio, and rx_bytes went from 2530
+to 2791 (rx_packets 14 -> 17) while tx_bytes followed the sent data. The previous pin showed the same
+on 2026-08-14 ("they barely move under load", out-of-tree/aic8800/README.md).
+
+In the vendor driver: rwnx_rx_data_skb() updates
+net_stats.rx_packets and net_stats.rx_bytes inside
+`#ifdef CONFIG_BR_SUPPORT` (rwnx_rx.c:581-609 in the pinned tag, the
+counters at :586-587), the NAT2.5 bridge block. CONFIG_BR_SUPPORT is n
+(aic8800_fdrv/Makefile:81), so the two lines are not compiled and every
+frame this function hands to the stack goes up uncounted. The vendor's
+SDIO and PCIe copies of the same function in the same tag count after the
+`#endif`: src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_rx.c:682-683,
+src/PCIE/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_rx.c:589-590,
+src/PCIE/driver_fw/driver/aic8800d80x2/aic8800_fdrv/rwnx_rx.c:591-592.
+The USB copy has them inside, and so do the older USB board ports under
+src/USB/patch/ that carry the bridge block. The tx side has no such guard:
+rwnx_tx_push() and rwnx_txdatacfm() count unconditionally (rwnx_tx.c:667,
+:704, :2437), which is why only rx is flat.
+
+Which frames that is, by reading rwnx_rxdataind_aicwf() (rwnx_rx.c:2223;
+this build defines AICWF_RX_REORDER):
+- station and P2P client (:2746): QoS frames the firmware marks
+  flags_need_reord go to reord_process_unit() -> reord_single_frame_ind(),
+  which counts (:1749-1750). QoS frames without flags_need_reord (:2761)
+  and non-QoS frames (:2764) go to rwnx_rx_data_skb() and were not
+  counted.
+- AP and P2P GO (:2767): rwnx_rx_data_skb_forward() counts (:394-395), and
+  the AP reorder path ends in reord_single_frame_ind() as well. Untouched.
+- reassembled fragments, any interface type (:2683): rwnx_rx_data_skb(),
+  not counted.
+- management frames (:2703) go to cfg80211 and never reach net_stats.
+So a flat counter needs the radio to be a station, and the few frames
+unpatched driver did count took the reorder path. Which frames those were was not
+read on the board.
+
+What changes: the two lines move below the `#endif`, where the SDIO and
+PCIe copies have them, with a comment that says why they are there. Same
+counter, same value: skb->len of the 802.3 frame before eth_type_trans(),
+as reord_single_frame_ind() and rwnx_rx_data_skb_forward() in this driver
+count it. Each frame leaves through exactly one of the three functions, so
+nothing is counted twice. rwnx_get_stats() returns these fields through
+.ndo_get_stats (rwnx_main.c:1746-1751, :1794, :1817), and
+rwnx_fill_station_info() reports the same two as the station's rx
+counters (rwnx_main.c:5753, :5756).
+
+How mainline does it, read in linux-6.18.53:
+- include/uapi/linux/if_link.h:56-59: rx_bytes is "the length of Ethernet
+  Frames excluding the FCS" -- the header included, so counted before
+  eth_type_trans() pulls it.
+- mac80211, ieee80211_deliver_skb(): dev_sw_netstats_rx_add(dev,
+  skb->len) at net/mac80211/rx.c:2690, eth_type_trans() at :2761.
+- mwifiex, a cfg80211 FullMAC driver of the same shape as this one (a
+  private struct net_device_stats returned through .ndo_get_stats,
+  drivers/net/wireless/marvell/mwifiex/main.c:1279, :1302):
+  mwifiex_recv_packet() counts at util.c:534-535, eth_type_trans() at :548.
+This patch counts where mwifiex does, once per frame on the way to the
+stack.
+
+Not done here: the counters stay plain `unsigned long` increments, as at
+every other counting site in this driver. The busrx thread and
+reord_timeout_worker() (rwnx_rx.c:1901, a work item) count the same fields,
+so a rare lost increment under concurrency is possible, as it already was
+on the reorder path. Per-CPU counters (dev_sw_netstats_rx_add(), as
+mac80211) would have to replace every counting site at once -- tx
+included -- or the counters would live in two mechanisms; that is a change
+of its own. rx_dropped for frames this path frees, and the multicast
+counter, are left as the vendor has them.
+
+Origin: the same move was proposed once before and dropped unrun. This patch
+re-derives it against the pinned tag and adds the reading above.
+
+Falsifier, on the board, radio as station on a link that exists only on
+the radio (one board as station, a peer as access point and iperf3 server), read
+/sys/class/net/<if>/statistics before and after one `iperf3 -R` run with
+no omitted seconds:
+1. With this patch the rx_bytes delta is at least iperf3's receiver byte
+   count and at most ~10 % above it: a full TCP segment carries 1448 bytes
+   of payload in a 1514-byte Ethernet frame (~5 %). Without it the delta
+   stays far below the transfer (+261 B for 137 MB measured); frames that take
+   the reorder path are counted either way. rx_packets moves with it.
+2. The same with the radio as AP: the delta must match the transfer as
+   before and must not double; that path is not touched.
+3. WLAN associates and passes traffic as before.
+
+Assisted-by: Claude
+
+diff --git a/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/rwnx_rx.c b/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/rwnx_rx.c
+index 5085465..2664bb6 100644
+--- a/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/rwnx_rx.c
++++ b/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/rwnx_rx.c
+@@ -581,11 +581,6 @@ static bool rwnx_rx_data_skb(struct rwnx_hw *rwnx_hw, struct rwnx_vif *rwnx_vif,
+ #ifdef CONFIG_BR_SUPPORT
+             void *br_port = NULL;
+ 
+-
+-            /* Update statistics */
+-            rwnx_vif->net_stats.rx_packets++;
+-            rwnx_vif->net_stats.rx_bytes += rx_skb->len;
+-
+             if (1) {//(check_fwstate(pmlmepriv, WIFI_STATION_STATE | WIFI_ADHOC_STATE) == _TRUE) {
+                 /* Insert NAT2.5 RX here! */
+ #if (LINUX_VERSION_CODE <= KERNEL_VERSION(2, 6, 35))
+@@ -608,6 +603,12 @@ static bool rwnx_rx_data_skb(struct rwnx_hw *rwnx_hw, struct rwnx_vif *rwnx_vif,
+             }
+ #endif /* CONFIG_BR_SUPPORT */
+ 
++            /* Update statistics. Outside CONFIG_BR_SUPPORT, where the
++             * vendor's SDIO and PCIe copies of this function count: inside
++             * it, a build without the bridge counted none of these frames. */
++            rwnx_vif->net_stats.rx_packets++;
++            rwnx_vif->net_stats.rx_bytes += rx_skb->len;
++
+ 		rwnx_skb_align_8bytes(rx_skb);
+ 
+         rx_skb->protocol = eth_type_trans(rx_skb, rwnx_vif->ndev);

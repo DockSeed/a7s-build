@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Sun, 13 Sep 2026 17:40:00 +0200
+Subject: [PATCH] arm64: dts: a733: feed the watchdog's hosc from the DCXO
+
+The watchdog node from `watchdog-sunxi-a733-add-wdt0` names SYS_CLK24M as its high-frequency input
+("hosc"). The A733's WDT does not count from that net.
+
+WHERE EACH VALUE COMES FROM
+
+  * A733 UM 8.3.3: the WDT counts from either CLK_32K or the DCXO
+    divided by 750 (26 MHz / 750), selected by WDT_CFG_REG bit[8]
+    (0: RTC_32K, 1: DCXO/750, UM 8.3.6.5).
+  * The DCXO is exported by the RTC-CCU as CLK_RTC_DCXO (patch `clk-sunxi-ng-a733-rtc-ccu-add-dcxo`). Its
+    rate was read at the register on silicon: XO_CTRL0[15:14] = 0b10 =
+    26 MHz (2026-07-22).
+  * `watchdog-sunxi-a733-add-wdt0` could not point there because no DCXO provider existed when it
+    was written; its own comment asked for this change once one did.
+
+A523 VALUE REJECTED: sun55i-a523.dtsi gives its watchdog <&osc24M> as
+hosc. On the A733 the high-frequency source is the DCXO, not SYS_CLK24M.
+
+WHAT THIS CHANGES AND WHAT IT DOES NOT
+
+  * sunxi_wdt never calls clk_get(), so no rate is consumed and the
+    watchdog's timing cannot change through this phandle.
+  * fw_devlink turns the phandle into a supplier link: the watchdog now
+    probes only after the RTC-CCU. That is the one runtime effect, and it
+    matters: U-Boot arms WDT0 for 16 s (the U-Boot patch `sunxi-cubie-a7s-watchdog-autostart`) and only
+    sunxi_wdt's probe stops it -- measured 2026-09-13:
+    a kernel without that probe was reset by the U-Boot watchdog before
+    `reboot` ran. The RTC-CCU is built in (SUN60I_A733_RTC_CCU=y) and already
+    supplies the CPU-PLL CCU.
+
+VERIFIED HERE: applies with fuzz 0 on top of the full series; the dtb,
+built with cpp + dtc, decompiles to clocks = <rtc_ccu 2>, <osc32k>.
+
+VERIFIED ON HARDWARE (2026-09-13, test build of this patch): the live DT
+carries clocks = <0x22 2>, <0x1e> with 0x22 = clock-controller@7090000;
+sunxi-wdt probes at 1.25 s with nothing deferred and an active supplier
+link to 7090000.clock-controller (none without this patch); /dev/watchdog
+appears, the board runs past 16 s, and an opened, never-fed /dev/watchdog
+sets MODE 0xB1 and resets the board to BOOT0 about 17 s later (16 s
+interval plus reset and measurement slack, not separated).
+
+Assisted-by: Claude
+---
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -973,22 +973,21 @@
+ 		 *        the register layout, not the interrupt map.
+ 		 * clocks UM 8.3.3: the WDT's two selectable sources are RTC_32K
+ 		 *        and DCXO/750, picked by WDT_CFG_REG bit[8]. "losc" is
+-		 *        therefore exactly right, and it is the selected one on
+-		 *        silicon (WDT_CFG bit8 = 0 on both 6 GiB boards, 2026-07-22).
+-		 *        "hosc" is the closest approximation the DT can express
+-		 *        today: the real high-frequency source is the 26 MHz
+-		 *        DCXO, not the 24 MHz SYS_CLK24M this node names, and
+-		 *        no DCXO clock provider exists on this branch. The
+-		 *        driver reads neither rate (sunxi_wdt never calls
+-		 *        clk_get), so nothing computes on it -- but re-point
+-		 *        "hosc" at the RTC-CCU's DCXO once that lands.
++		 *        the RTC_32K input and the one selected on silicon
++		 *        (WDT_CFG bit8 = 0, read on two boards 2026-07-22 and
++		 *        again 2026-09-13). "hosc" is the 26 MHz DCXO, exported
++		 *        by the RTC-CCU as CLK_RTC_DCXO (patch `clk-sunxi-ng-a733-rtc-ccu-add-dcxo`) -- not the
++		 *        24 MHz SYS_CLK24M the A523 dtsi uses. The driver reads
++		 *        neither rate (sunxi_wdt never calls clk_get); what the
++		 *        phandle does change is probe order, because fw_devlink
++		 *        makes the RTC-CCU a supplier of this node (patch `arm64-dts-a733-feed-the-watchdog-hosc-from-the-dcxo`).
+ 		 */
+ 		wdt: watchdog@2050000 {
+ 			compatible = "allwinner,sun60i-a733-wdt",
+ 				     "allwinner,sun55i-a523-wdt";
+ 			reg = <0x0 0x02050000 0x0 0x20>;
+ 			interrupts = <GIC_SPI 106 IRQ_TYPE_LEVEL_HIGH>;
+-			clocks = <&osc24M>, <&osc32k>;
++			clocks = <&rtc_ccu CLK_RTC_DCXO>, <&osc32k>;
+ 			clock-names = "hosc", "losc";
+ 		};
+ 

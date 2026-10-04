@@ -1,0 +1,324 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] phy: allwinner: A733 combo-PHY -- the DP lane map and lane inverts on the real path
+
+[Recipe cut: the DP debug instrumentation this text refers to is not carried, so
+only the production path (defines, lane map/invert writes from the mux
+callback, probe defaults) is in the diff.]
+
+Two pieces of board data that only debug instrumentation (not part of this
+series) ever wrote. On a delivery image the DP lane map at
+COMB0_RAWS_TXD_MAP_CTRL stayed at its 0x0000FFFF reset and all four PMA
+lane-invert bits stayed clear, because a733_dp_lanes_enter() lives inside
+`#if IS_ENABLED(CONFIG_PHY_SUN60I_A733_COMBO_DP_BRINGUP)` -- a bool, default n,
+enabled only in test kernels.
+`phy-allwinner-a733-combophy-dp-reset-sequence`'s own code comment says so in
+as many words: "Still missing
+for actual video, named rather than implied: the DP lane map at 0x06C06C24
+(0x00003210 in the capture, 0xFFFF at reset)".
+
+The test-only guard of that debug instrumentation,
+CONFIG_PHY_SUN60I_A733_COMBO_DP_BRINGUP, was renamed CONFIG_A733_TEST_INSTRUMENTS
+on 2026-10-01; neither symbol is part of this series. Text below that names the
+old symbol records what was built and measured then.
+
+WHY IT MATTERS, MEASURED
+------------------------
+
+Without the inverts the sink escalates the voltage swing 1 -> 2 -> 3 and never
+reaches clock recovery. That is not inference, it is what was measured on the 8 GiB board
+on 2026-08-18 and it is what stood between the first attempt and CR.
+
+So every trained link this project has produced was trained by something that
+wrote these two registers outside the driver: the DP debug instrumentation of a test kernel (not carried),
+or a script through devmem. A link-training patch that does
+not move them onto the production path would train nothing on a delivery image.
+
+WHERE THE VALUES COME FROM
+--------------------------
+
+Silicon, both of them, read off a LIVE four-lane vendor link on the 8 GiB board:
+
+  lane_invert = <1 1 1 1>  -> the four per-lane PMA words 0xF000/0xF100/0xF200/
+                              0xF300 (bytes 0x06C9E000/200/400/600) each read
+                              0x0100, i.e. bit8 set
+  lane_remap  = <0 1 2 3>  -> COMB0_RAWS_TXD_MAP_CTRL reads 0x00003210, the
+                              identity. Reset is 0x0000FFFF, so this is not a
+                              value that is already there.
+
+And both were re-read with the plug turned 180 degrees on 2026-08-19: same map,
+same inverts, four lanes trained, picture confirmed by eye. ⚠ That is why there is NO
+per-orientation table here and a later patch must not add one -- the flip is
+carried by LINK_CTRL0 bit12 TYPEC_CONN_DIR alone.
+
+WHAT THE VENDOR DOES AND WHAT THIS DOES INSTEAD
+-----------------------------------------------
+
+  - The vendor writes both from its DP phy's power_on, i.e. from a path this
+    tree does not have. Ours writes them from the Type-C mux callback, which is
+    the only entry point from which a DP register write is reachable at all --
+    so a port that never enters DP alt mode never touches either register.
+  - combo0_dp_lane_remap() carries a mirrored packing for a reversed plug and
+    its orientation-aware call is commented out; the live register says the
+    identity is correct either way round. We do not carry the dead branch.
+  - The vendor never puts the USB values back. Ours snapshots them on the first
+    DP entry and restores them when the mux takes the lanes away.
+
+ONE COPY, NOT TWO
+-----------------
+
+The debug instrumentation's two debugfs knobs now point straight at the live values
+(cp->dp_lane_map, cp->dp_lane_invert) rather than at a parallel pair of its own.
+That is deliberate: a bring-up instrument that cannot try the other wiring is not
+an instrument, and an instrument that changes a copy the production path does not
+read proves nothing about the production path. What is left in the debug instrumentation is
+the one thing that is genuinely its own -- it overwrites the consumer's phy mode
+to fake an alt-mode entry, and has to put that back.
+
+ORDERING
+--------
+
+The board data goes down BEFORE `phy-allwinner-a733-combophy-dp-reset-sequence`'s reset staircase, which is exactly the
+order the debug instrumentation used on every run that produced a trained link
+(a733_dp_lanes_enter() then typec_mux_set() then phy_configure()). On the way
+out it is the other way round: teardown first, so the link is back in reset
+before the values are reverted.
+
+✅ HARDWARE-PROVEN, the 8 GiB board, 2026-08-19
+-----------------------------------------------
+
+Item 1 below is settled. With the debug instrumentation never touched -- the
+combo-PHY's own `state` file reporting that the debug instrumentation had not
+been used since boot, so nothing but the mux callback can have written them:
+
+    lane map    : 0x00003210   at 0x06C06C24   (falsifier was the 0xFFFF reset)
+    lane invert : 0xf          (bit n -> bit8 of PMA word 0xF000 + n*0x100)
+    rate table  : 0x51D951D9   at 0x06C98020   (`phy-allwinner-a733-combophy-bracket-the-dp-rate-table` still lands)
+
+That is the headline finding of this branch confirmed: the map and the inverts
+reach the PRODUCTION path from the Type-C mux callback, not from the debug instrumentation.
+
+⚠ It settles this patch and nothing else. `phy-allwinner-a733-combophy-dp-swing-and-pre-emphasis` and `drm-a733-dp-link-training` rode the same kernel and
+are NOT proven by it -- see their own headers. Items 2 and 3 below are still
+open: neither the SuperSpeed negative control nor the restore-on-unplug was
+exercised in that session.
+
+WHAT IT OWES
+------------
+
+  1. ✅ DONE -- see above. (Was: on a kernel WITHOUT
+     CONFIG_PHY_SUN60I_A733_COMBO_DP_BRINGUP, with a DP sink on J4 and alt mode
+     entered, `devmem 0x06C06C24 32` reads 0x00003210 and `devmem 0x06C9E000 32`
+     reads 0x01000100, the PMA mirroring its 16-bit words into both halves,
+     likewise 0x06C9E200 / 0x06C9E400 / 0x06C9E600. Falsified by: 0x0000FFFF or
+     0x00000000 respectively.)
+  2. The negative control, which is the half that matters: with NO sink
+     attached, the same four addresses keep their USB values and
+     `lsusb -t` still shows a SuperSpeed device at 10000M. RST_BUS_SERDES is
+     shared and this is the driver that owns COMB0.
+     Falsified by: the DP values appearing on a port that never entered DP alt
+     mode, or SuperSpeed dropping below 10000M.
+  3. Restore: after a `state=usb` (debug instrumentation) or an unplug (real), the four PMA
+     words read what they read before the DP entry.
+     Falsified by: 0x0100 persisting after the lanes go back to USB.
+
+HARDWARE-PROVEN for its own effect (item 1, the 8 GiB board, 2026-08-19); items 2 and 3
+still open. Builds clean at W=1 with the debug instrumentation both on and off; checkpatch 0/0.
+
+Assisted-by: Claude
+
+diff --git a/drivers/phy/allwinner/phy-sun60i-a733-combophy.c b/drivers/phy/allwinner/phy-sun60i-a733-combophy.c
+--- a/drivers/phy/allwinner/phy-sun60i-a733-combophy.c
++++ b/drivers/phy/allwinner/phy-sun60i-a733-combophy.c
+@@ -54,6 +54,11 @@
+  */
+ #define  DP_RAWS_TXDW_CONV_4LANE	(DP_PHY_CFG_DATA_EN | DP_PHY_CFG_LN_EN | \
+ 					 DP_PHY_CFG_LN_RSTN)
++/* COMB0_PHY_RAWS_TXD_MAP_CTRL (0x06C06C24) -- four 4-bit fields, one per DP
++ * lane, physical -> logical. Reset default 0xFFFF; this board's
++ * lane_remap = <0 1 2 3> is the identity 0x00003210.
++ */
++#define COMB0_RAWS_TXD_MAP_CTRL		0x0C24
+ #define USB3P1_PIPE_CLK_MAP_CTRL	0x0100
+ #define USB3P1_PIPE_RXD_MAP_CTRL	0x0104
+ #define  USB3P1_PIPE_MAP_MASK		GENMASK(3, 0)
+@@ -118,6 +123,34 @@
+ #define PMA_NUDGE_OFF			(0xC008 << 1)
+ #define  PMA_NUDGE_CLR			(0xF << 8)
+ 
++/*
++ * Per-lane DP config word in the PMA; bit8 inverts the lane. Vendor
++ * combo0_dp_lane_invert() walks word index 0xF000 + n * 0x100. NOTE this is
++ * a BYTE offset, like PMA_NUDGE_OFF above and unlike PMA_DP_LANE_CFG below,
++ * which is a raw word index shifted at its call site -- the file carries both
++ * conventions, so the names say which.
++ */
++#define A733_DP_LANES			4
++#define PMA_DP_LANE_INV_OFF(n)		((0xF000 + (n) * 0x100) << 1)
++#define  PMA_DP_LANE_INV_EN		BIT(8)
++
++/*
++ * The two pieces of DP board data, both read off silicon with a live
++ * four-lane vendor link on the 8 GiB board and both confirmed identical with
++ * the plug turned 180 degrees:
++ *
++ *   lane_invert = <1 1 1 1> -> bit8 set in each of the four per-lane PMA words
++ *                              0xF000/0xF100/0xF200/0xF300.
++ *   lane_remap  = <0 1 2 3> -> COMB0_RAWS_TXD_MAP_CTRL = 0x00003210, the
++ *                              identity. Reset is 0x0000FFFF, which is not it.
++ *
++ * There is NO per-orientation table here and a driver must not grow one: the
++ * flip is carried by LINK_CTRL0 bit12 TYPEC_CONN_DIR alone, and both values
++ * above are the same either way round.
++ */
++#define A733_DP_LANE_INVERT_DEFAULT	GENMASK(A733_DP_LANES - 1, 0)
++#define A733_DP_LANE_MAP_IDENTITY	0x00003210
++
+ #define SERDES_REFCLK_RATE		100000000	/* serdes-phy-cfg = 100 MHz */
+ #define PHY_LOCK_TIMEOUT_US		2000
+ #define PMA_READY_TIMEOUT_US		10000
+@@ -167,6 +200,16 @@ struct a733_combophy {
+ 	 * a board that never enters DP alt mode never executes any of them.
+ 	 */
+ 	bool			dp_active;
++	/* The DP lane map and lane inverts, and the USB values they displace.
++	 * Written when the mux hands the lanes to DisplayPort and put back when
++	 * it takes them away, so a port that never enters DP alt mode never
++	 * sees either register.
++	 */
++	u32			dp_lane_map;
++	u32			dp_lane_invert;
++	bool			dp_lanes_saved;
++	u32			saved_lane_map;
++	u16			saved_lane_cfg[A733_DP_LANES];
+ 	bool			inited;
+ };
+ 
+@@ -1459,6 +1502,79 @@ static void a733_combophy_sw_unregister(void *data)
+ 	typec_switch_unregister(data);
+ }
+ 
++/* Vendor combo0_dp_lane_invert(): read-modify-write bit8 of each lane's PMA
++ * config word. Not orientation-dependent there and not here.
++ */
++static void a733_dp_lane_invert(struct a733_combophy *cp, u32 mask)
++{
++	unsigned int i;
++
++	for (i = 0; i < A733_DP_LANES; i++) {
++		void __iomem *reg = cp->pma + PMA_DP_LANE_INV_OFF(i);
++		u16 v = readw(reg);
++
++		v &= ~PMA_DP_LANE_INV_EN;
++		if (mask & BIT(i))
++			v |= PMA_DP_LANE_INV_EN;
++		writew(v, reg);
++	}
++}
++
++/* Vendor combo0_dp_lane_remap(): nibble n carries lane n. That function has a
++ * mirrored packing for a reversed plug, but its only live caller passes
++ * TYPEC_ORIENTATION_NONE and the orientation-aware call is commented out -- and
++ * silicon agrees, the register reads the identity with the plug reversed.
++ *
++ * Not to be confused with the DisplayPort core's OWN lane remap,
++ * LANE_REMAP_CONTROL at 0x0574002C (UM 15.4.7.10): bit8 REMAP_ENABLE, [7:0] the
++ * four 2-bit mappings, [19:16] four per-lane inverts. That register is a
++ * different piece of hardware one block further down the pipe, its reset value
++ * is 0 (remap disabled, no inversion), and nothing here writes it. Two registers
++ * with the same job in the same link is exactly the pair a reader mixes up.
++ */
++static void a733_dp_lane_map(struct a733_combophy *cp, u32 map)
++{
++	writel(map, cp->top2 + COMB0_RAWS_TXD_MAP_CTRL);
++}
++
++/*
++ * Hand the lanes their DisplayPort wiring, snapshotting the USB values on the
++ * first entry so leaving DP puts back what it displaced.
++ *
++ * Both callers hold cp->lock. The order is the one that is HW-proven: the board
++ * data goes down BEFORE the DP reset staircase runs, which is how a trained
++ * four-lane link was first reached on the 8 GiB board.
++ */
++static void a733_combophy_dp_lanes_enter(struct a733_combophy *cp)
++{
++	unsigned int i;
++
++	if (!cp->dp_lanes_saved) {
++		cp->saved_lane_map = readl(cp->top2 + COMB0_RAWS_TXD_MAP_CTRL);
++		for (i = 0; i < A733_DP_LANES; i++)
++			cp->saved_lane_cfg[i] = readw(cp->pma +
++						      PMA_DP_LANE_INV_OFF(i));
++		cp->dp_lanes_saved = true;
++	}
++
++	a733_dp_lane_map(cp, cp->dp_lane_map);
++	a733_dp_lane_invert(cp, cp->dp_lane_invert);
++}
++
++static void a733_combophy_dp_lanes_leave(struct a733_combophy *cp)
++{
++	unsigned int i;
++
++	if (!cp->dp_lanes_saved)
++		return;
++
++	writel(cp->saved_lane_map, cp->top2 + COMB0_RAWS_TXD_MAP_CTRL);
++	for (i = 0; i < A733_DP_LANES; i++)
++		writew(cp->saved_lane_cfg[i], cp->pma + PMA_DP_LANE_INV_OFF(i));
++
++	cp->dp_lanes_saved = false;
++}
++
+ /* COMB0 carries either SuperSpeed or DP, never both, and the lane routing lives
+  * inside this PHY -- there is no external mux on this board. So the DisplayPort
+  * alt-mode driver reaches the lanes through here, and this callback is the only
+@@ -1474,10 +1590,13 @@ static void a733_combophy_sw_unregister(void *data)
+  * capture of that state, and guessing it against a HW-proven 10 Gbps link is the
+  * trade this tree does not make.
+  *
+- * Still missing for actual video, named rather than implied: the DP lane map at
+- * 0x06C06C24 (0x00003210 in the capture, 0xFFFF at reset), the DP AUX/HPD front
+- * end at 0x06C01E00 (0x03331131 in the capture, 0x00330000 at reset), and the PMA
+- * link-rate registers. This is the reset and link-control sequence only.
++ * The DP lane map at 0x06C06C24 and the four PMA lane inverts are written from
++ * here. Measured consequence of missing inverts: the sink escalates the
++ * voltage swing 1 -> 2 -> 3 and never reaches clock recovery.
++ *
++ * Still missing for actual video, named rather than implied: the DP AUX/HPD
++ * front end at 0x06C01E00 (0x03331131 in the capture, 0x00330000 at reset),
++ * which belongs to the separate AUX/HPD PHY, and the swing/pre-emphasis tables.
+  *
+  * Returning 0 rather than an error stays deliberate: an error aborts the
+  * alt-mode entry, and then nothing is learned about what the sink offers.
+@@ -1495,6 +1614,10 @@ static int a733_combophy_typec_mux_set(struct typec_mux_dev *mux,
+ 	if (mode == TYPEC_STATE_SAFE || mode == TYPEC_STATE_USB) {
+ 		if (cp->dp_active) {
+ 			a733_combophy_dp_teardown(cp);
++			/* After the teardown, so the link is back in reset
++			 * before the board data is reverted.
++			 */
++			a733_combophy_dp_lanes_leave(cp);
+ 			cp->dp_active = false;
+ 			dev_info(cp->dev,
+ 				 "DP alt mode left, COMB0 links back in reset; SuperSpeed does not return without a phy_exit()/phy_init() cycle\n");
+@@ -1536,6 +1659,7 @@ static int a733_combophy_typec_mux_set(struct typec_mux_dev *mux,
+ 		 "DP alt mode pin assignment %c: handing all four COMB0 lanes to DisplayPort\n",
+ 		 pin);
+ 	cp->dp_active = true;
++	a733_combophy_dp_lanes_enter(cp);
+ 	if (a733_combophy_dp_reset_seq(cp))
+ 		dev_err(cp->dev,
+ 			"DP link bring-up did not complete, see the handshake errors above\n");
+@@ -1583,6 +1707,11 @@ static int a733_combophy_probe(struct platform_device *pdev)
+ 	if (!cp)
+ 		return -ENOMEM;
+ 	cp->dev = dev;
++	/* Board data, not a policy: both values were read off a live vendor DP
++	 * link on this board and are the same in either plug orientation.
++	 */
++	cp->dp_lane_map = A733_DP_LANE_MAP_IDENTITY;
++	cp->dp_lane_invert = A733_DP_LANE_INVERT_DEFAULT;
+ 	mutex_init(&cp->lock);
+ 	cp->orientation = TYPEC_ORIENTATION_NORMAL;
+ 

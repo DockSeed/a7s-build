@@ -1,0 +1,193 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: allwinner: a733: add GMAC0 ethernet
+
+Wire the A733's single Gigabit MAC (GMAC0) on the Radxa Cubie A7S: the DWC
+Ether-QoS core, its in-block GMAC_CFG "syscon", the RGMII0 pin group on bank
+PH, and the external Maxio MAE0621A PHY on MDIO. This is DT-only on top of the
+`clk-sunxi-ng-a733-add-gmac0-clocks` CCU clocks/resets and the `net-stmmac-dwmac-sun55i-a733-syscon-offset` dwmac-sun55i sun60iw2 compatible; no new
+driver code here.
+
+Every value is anchored to primary sources (A733 UM, board schematic v1.10, the MAE0621A
+datasheet, live-silicon readback), not to the vendor DT:
+  - MAC core @0x04500000 size 0x8000 (DWC-EQoS, VERSION 0x2053); the glue
+    register block starts at 0x04508000 so the core node must not span it.
+  - syscon node @0x04508000: GMAC_CFG lives inside the GMAC block on A733, not
+    in system-control -- a separate node the glue reaches via a phandle.
+  - IRQ GIC_SPI 172 = GMAC0_TOP.
+  - rgmii0_pins = the 14 connected RGMII0 signals on PH at mux 5; PH3 and PH15
+    are omitted -- their series resistors R104/R99 are NC on this board, so
+    muxing them drives a dead net (schematic v1.10 p15).
+  - PHY at MDIO addr 1: strap PHYAD[2:0]=001 read off the schematic (PHYAD0
+    pull-up R116 fitted, PHYAD1/2 pulled down by R117/R118) and silicon-
+    confirmed (id 0x7b744412 on the 6 GiB board and the 8 GiB board).
+  - PHY reset = PH16 (SoC ball AU2 -> RA4 -> GMAC1_RSTn_L -> R132 -> PHYRSTB),
+    active low, on the *mdio bus* node -- see below.
+  - phy-mode "rgmii-id": delay added once, at the PHY (Maxio driver), matching
+    dwmac-sun55i adding no MAC delay. Derived from driver behaviour, not copied.
+
+The PHY reset sits on the mdio bus node, not on the PHY child, and that is
+load-bearing. phylib reads the PHY ID *first* (fwnode_mdio.c, get_phy_device())
+and only fetches a child's reset-gpios afterwards, in phy_device_register() ->
+mdiobus_register_gpiod(); a child reset can therefore never wake a PHY that is
+mute during the scan. Only the bus-level reset in __mdiobus_register()
+(mdio_bus_provider.c: assert -> reset-delay-us -> deassert -> reset-post-delay-us)
+runs before any child is probed. This matters on this board because PH16 idles
+LOW -- its strap divider has the pull-up R1 (47K) unfitted and the pull-down R6
+(1K) fitted -- so the PHY comes out of power-on *held in reset* and stays there
+until software drives the pin high. boot0 only samples PH16 (DDR-PARA-SEL,
+latched long before the kernel); nothing deasserts it for us.
+
+One item stays flagged until a board proves it:
+  - the RGMII delay choice (phy-mode) -- validate at a real 1000M link.
+
+The node is status = "okay"; if the Maxio PHY fails to bind it falls back to
+the generic PHY (link still comes up), so this cannot brick the boot.
+
+Assisted-by: Claude
+---
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -708,12 +708,36 @@
+ 				pins = "PC0";
+ 				allwinner,pinmux = <3>;
+ 				function = "mmc2";
+ 				drive-strength = <40>;
+ 				bias-pull-down;
+ 			};
++
++			/*
++			 * RGMII0 -> Maxio MAE0621A PHY, all on bank PH at mux 5
++			 * (A733-PINMUX: every RGMII0 signal is selector 0101).
++			 * Exactly the 14 connected RGMII signals are muxed. Two PH
++			 * pins are deliberately left out, both because the board
++			 * depopulates their series resistor (schematic v1.10 p15):
++			 * PH15 = RGMII0-EPHY-25M reaches PHY_XTALOUT only through
++			 * R99 = NC -- the PHY is clocked by its own 25 MHz crystal
++			 * Y1 (load caps C87/C126 fitted), so the SoC-generated
++			 * reference is not used on this board; PH3 = RGMII0-CLKIN
++			 * would take PHY_CLKOUT125 back in through R104 = NC.
++			 * Muxing either one drives a dead net. PH16 (the PHY reset)
++			 * is a plain GPIO, not part of this mux group.
++			 */
++			rgmii0_pins: rgmii0-pins {
++				pins = "PH0", "PH1", "PH2", "PH4",
++				       "PH5", "PH6", "PH7", "PH8",
++				       "PH9", "PH10", "PH11", "PH12",
++				       "PH13", "PH14";
++				allwinner,pinmux = <5>;
++				function = "gmac0";
++			};
++
+ 		};
+ 
+ 		ccu: clock-controller@2002000 {
+ 			compatible = "allwinner,sun60i-a733-ccu";
+ 			reg = <0x0 0x02002000 0x0 0x2000>;
+ 			clocks = <&osc24M>, <&osc32k>, <&iosc>,
+@@ -1331,6 +1355,106 @@
+ 		};
+ 
+ 		/*
++		 * GMAC0 (Ethernet) -- the A733's single Gigabit MAC, a Synopsys
++		 * DWC_ether_qos v5.30 core (MAC_VERSION 0x2053, silicon-read),
++		 * driving RJ45 J2 through an external Maxio MAE0621A RGMII PHY.
++		 * Handled by mainline dwmac-sun55i (the GMAC200 glue); the
++		 * "allwinner,sun60iw2-gmac200" compatible and its in-block syscon
++		 * offset are added by patch `net-stmmac-dwmac-sun55i-a733-syscon-offset`. The core region is 0x8000
++		 * (0x04500000..0x04507FFF); the Allwinner glue register GMAC_CFG
++		 * (RGMII mode/delay/PHY-select) is the separate syscon node below
++		 * at 0x04508000 -- on A733 that register lives in the GMAC's own
++		 * block, not in system-control, so the glue references it by a
++		 * "syscon" phandle. IRQ = GMAC0_TOP GIC_SPI 172.
++		 *
++		 * phy-mode = "rgmii-id": all RGMII clock delay is added at the PHY.
++		 * The Maxio driver's config_init programs BOTH the TX and RX MMD
++		 * delay for -id (it keys off phydev->interface), and dwmac-sun55i
++		 * adds no MAC-side delay unless tx/rx-internal-delay-ps is set (it
++		 * is not) -- so delay lives in one place, no double count. This is
++		 * derived from how the two drivers actually behave, NOT copied from
++		 * the vendor DT (which used "rgmii" + MAC glue delays TX=12/RX=10).
++		 * It MUST still be validated at a real gigabit link: if 1000M is
++		 * unstable this is the first knob to turn.
++		 *
++		 */
++		gmac0: ethernet@4500000 {
++			compatible = "allwinner,sun60iw2-gmac200",
++				     "snps,dwmac-5.30a";
++			reg = <0x0 0x04500000 0x0 0x8000>;
++			interrupts = <GIC_SPI 172 IRQ_TYPE_LEVEL_HIGH>;
++			interrupt-names = "macirq";
++			clocks = <&ccu CLK_BUS_GMAC0>, <&ccu CLK_MBUS_GMAC0>;
++			clock-names = "stmmaceth", "mbus";
++			resets = <&ccu RST_BUS_GMAC0>, <&ccu RST_BUS_GMAC0_AXI>;
++			reset-names = "stmmaceth", "ahb";
++			syscon = <&gmac0_syscon>;
++			pinctrl-names = "default";
++			pinctrl-0 = <&rgmii0_pins>;
++			phy-mode = "rgmii-id";
++			phy-handle = <&ext_rgmii_phy>;
++			phy-supply = <&reg_swout1>;
++			status = "okay";
++
++			/*
++			 * PHY reset lives on the BUS node, not on the PHY child.
++			 * phylib reads the PHY ID first (fwnode_mdio.c,
++			 * get_phy_device()) and only fetches a child's reset-gpios
++			 * later, in phy_device_register() -> mdiobus_register_gpiod()
++			 * -- so a child reset can never wake a PHY that is mute
++			 * during the scan. Only the bus reset in __mdiobus_register()
++			 * (mdio_bus_provider.c: assert -> reset-delay-us -> deassert
++			 * -> reset-post-delay-us) runs before the children probe.
++			 *
++			 * PH16 = PHYRSTB, active low, schematic v1.10: SoC ball AU2
++			 * -> RA4 (0R, fitted) -> GMAC1_RSTn_L -> R132 -> PHYRSTB.
++			 * The pin idles LOW -- the strap divider has the pull-up R1
++			 * (47K) unfitted and the pull-down R6 (1K) fitted -- so the
++			 * PHY is held in reset from power-on until software drives
++			 * PH16 high. boot0 only samples the pin (DDR-PARA-SEL strap,
++			 * latched long before the kernel), it never deasserts it, so
++			 * this reset is what brings the PHY up at all. Timing from
++			 * the MAE0621A datasheet: assert >= 10 ms, >= 72 ms settle
++			 * before register access.
++			 */
++			mdio {
++				compatible = "snps,dwmac-mdio";
++				#address-cells = <1>;
++				#size-cells = <0>;
++				reset-gpios = <&pio 7 16 GPIO_ACTIVE_LOW>;
++				reset-delay-us = <10000>;
++				reset-post-delay-us = <100000>;
++
++				/*
++				 * Maxio MAE0621A at MDIO address 0x01: strap
++				 * PHYAD[2:0]=001, read off schematic v1.10 p15
++				 * (PHYAD0 pull-up R116 4K7 fitted / R115 NC,
++				 * PHYAD1 pull-down R117, PHYAD2 pull-down R118)
++				 * and silicon-confirmed -- the PHY ACKs at :01
++				 * with id 0x7b744412 on the 6 GiB board and the 8 GiB board.
++				 */
++				ext_rgmii_phy: ethernet-phy@1 {
++					compatible = "ethernet-phy-ieee802.3-c22";
++					reg = <1>;
++				};
++			};
++		};
++
++		/*
++		 * GMAC0 glue "syscon" = the single Allwinner GMAC_CFG register
++		 * (RGMII mode / TX-RX delay / PHY-select). On A733 it is the first
++		 * register of the GMAC glue block at 0x04508000 -- a node separate
++		 * from the MAC core (which ends at 0x04507FFF), referenced by the
++		 * dwmac-sun55i glue via the "syscon" phandle. The sun60iw2 match
++		 * data (patch `net-stmmac-dwmac-sun55i-a733-syscon-offset`) makes the glue write at offset 0x00 of this
++		 * regmap (vs 0x34 on the A523, whose register is in system-control).
++		 */
++		gmac0_syscon: syscon@4508000 {
++			compatible = "allwinner,sun60iw2-gmac-syscon", "syscon";
++			reg = <0x0 0x04508000 0x0 0x1000>;
++		};
++
++		/*
+ 		 * AON / CPUS domain. The R-CCU (PRCM @0x07010000) provides the AON
+ 		 * bus clocks; the r_pio (S_GPIO @0x07025000) is the AON pin bank
+ 		 * PL/PM. Base + geometry from the pin tables of the A733 user manual (PL @0x00/14 pins, PM @0x30/

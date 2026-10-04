@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000002 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Sun, 20 Jul 2026 00:00:00 +0000
+Subject: [PATCH] sunxi: cubie-a7s: enable hardware watchdog autostart
+
+The A733 watchdog hardware + the sunxi_wdt driver + the DT node
+watchdog@2050000 are all in place, but the watchdog never starts:
+drivers/watchdog/Kconfig sets WATCHDOG_AUTOSTART default n if ARCH_SUNXI
+and the A7S defconfig enables none of the CONFIG_WDT knobs (verified
+against radxa-pkg/u-boot-dlan17 @ 7bfda4c8 + dlan17/u-boot @ 6a998fbcf809).
+
+Enable CONFIG_WDT / CONFIG_WDT_SUNXI / CONFIG_WATCHDOG /
+CONFIG_WATCHDOG_AUTOSTART so U-Boot starts the 16s watchdog
+(CONFIG_WATCHDOG_TIMEOUT_MSECS default 16000 for ARCH_SUNXI) during its
+own init - protects against U-Boot-stage hangs during autoboot + image
+load.
+
+U-Boot has no stop-before-Linux path, and none is needed: Linux keeps a
+watchdog that is running when sunxi_wdt probes. Since v6.18.53 (stable
+e1daf1ef08e7, mainline aab55360fa11, "watchdog: sunxi_wdt: preserve
+boot-enabled watchdog") sunxi_wdt_probe() tests WDT_MODE_EN, takes the
+interval programmed in WDT_MODE (U-Boot's 16s), calls sunxi_wdt_start()
+(programs that interval, selects the system-reset mode, sets WDT_MODE_EN)
+and sets WDOG_HW_RUNNING before it registers the device
+(drivers/watchdog/sunxi_wdt.c:322-331 at v6.18.54). The watchdog core
+then pings it until userspace first opens /dev/watchdog (systemd
+RuntimeWatchdogSec), for as long as watchdog.open_timeout allows. A
+watchdog that is not running at probe is left alone. Up to v6.18.52 the
+probe called sunxi_wdt_stop() unconditionally (sunxi_wdt.c:289 at
+v6.18.52), so with such a kernel the watchdog U-Boot started would be
+stopped at probe and stay off until userspace opens the device.
+
+Observed on an A733 board (Linux 6.18.54, the watchdog armed by U-Boot,
+nothing opening /dev/watchdog): WDT_MODE reads 0xB1 (interval 0b1011 =
+16s, enable set) at 14, 34 and 99 s of uptime.
+
+REQUIREMENT at the kernel layer (the kernel stage asserts it): the kernel must
+build CONFIG_SUNXI_WATCHDOG=y (built-in, not a module), so that the probe
+takes the watchdog over within the 16s that remain after U-Boot's last
+service of it, before the root mount and udev.
+
+Which of the SoC's watchdogs U-Boot arms is decided by
+sunxi-cubie-a7s-watchdog-on-wdt-cpus, which moves it from WDT0 to WDT_CPUS.
+
+Assisted-by: Claude
+
+--- a/src/configs/radxa-cubie-a7s_defconfig
++++ b/src/configs/radxa-cubie-a7s_defconfig
+@@ -64,2 +64,6 @@
+ CONFIG_UFS=y
+ CONFIG_UFS_SUNXI=y
++CONFIG_WDT=y
++CONFIG_WDT_SUNXI=y
++CONFIG_WATCHDOG=y
++CONFIG_WATCHDOG_AUTOSTART=y

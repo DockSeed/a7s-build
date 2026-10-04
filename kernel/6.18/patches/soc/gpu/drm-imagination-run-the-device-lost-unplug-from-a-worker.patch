@@ -1,0 +1,144 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] drm/imagination: run the device-lost unplug from a worker
+
+pvr_device_lost() calls drm_dev_unplug() inline, and drm_dev_unplug() ends in
+synchronize_srcu(&drm_unplug_srcu) (drivers/gpu/drm/drm_drv.c:494). Two callers
+reach it while that wait cannot end:
+
+  1. pvr_mmu_flush_exec() enters the unplug SRCU read section
+     (pvr_mmu.c:133), escalates a 1 s KCCB flush timeout to
+     pvr_power_reset(pvr_dev, true) (:169), and a failed hard reset calls
+     pvr_device_lost() (pvr_power.c:596) -- still inside that section.
+     pvr_mmu.c:176 and :183 call it there directly as well. The task waits for
+     its own reader. kernel/rcu/srcutree.c:1495: "it is illegal to call
+     synchronize_srcu() from the corresponding SRCU read-side critical section;
+     doing so will result in deadlock."
+  2. The watchdog's hard reset holds reset_sem for writing (pvr_power.c:523)
+     when it reaches pvr_device_lost(), while another task is inside
+     drm_dev_enter() and waiting for that semaphore -- pvr_mmu_flush_exec()
+     entering pvr_power_reset() (pvr_mmu.c:133, pvr_power.c:523), or an error
+     path that calls pvr_fw_structure_cleanup() from inside its own section
+     (down_read at pvr_fw.c:1112). synchronize_srcu() waits for that reader,
+     the reader waits for the semaphore. (Read in source; not observed.)
+
+Either way the thread stays in D state for good, holding reset_sem, and every
+later pvr_power_reset() blocks in down_write() before it can see ->lost.
+
+Setting ->lost stays synchronous: pvr_power_reset() and the watchdog read it
+(pvr_power.c:213, :235, :525). Only the unplug moves to lost_work on
+pvr_dev->sched_wq, which runs with no SRCU reader and no reset_sem held. Until
+the worker has run, new ioctls still pass drm_dev_enter() and meet a lost
+device (WARN_ON in pvr_ccb.c:272, KCCB timeouts) -- a window of one work item's
+start latency, and the state they already met before this patch.
+
+sched_wq exists before anything can lose the device: pvr_probe() creates it in
+pvr_queue_device_init() (pvr_drv.c:1428) and initialises the work in
+pvr_watchdog_init() (:1437), both before pvr_device_init() boots the firmware
+(:1439). pvr_watchdog_fini() cancels the work. pvr_remove() disables it before
+its own drm_dev_unplug(): drm_minor_unregister() tests device_is_registered()
+and calls device_del() without a lock (drm_drv.c:219-225), so a worker unplug
+running beside it could delete a device twice. Two unplugs one after the other
+are safe.
+
+Provenance: this project's earlier Armbian-based 6.18 port of this board hit
+case 1 as a process stuck in D state with `pvr_ioctl_vm_unmap ->
+pvr_vm_unmap_obj_locked -> pvr_mmu_op_context_destroy -> pvr_mmu_flush_exec ->
+pvr_power_reset` for more than an hour, and wrote the same deferral as a patch
+of its own, whose header says "Not yet booted". That driver is older than our
+`drm-imagination-carry-the-mainline-driver`; this is a re-port onto the
+mainline code, not a copy.
+The code touched here is byte-identical to mainline master (compared
+2026-09-10).
+
+Verified: applies with --fuzz=0 after `drm-imagination-a733-s-bxm-4-64-mc1-is-a-known-gpu`; compile gate green. HW-proven on
+the test board 2026-09-10 with injected faults (a flush timeout plus a failed
+reset): with this patch the client exits and the device unplugs; without it
+the submitting thread stays in D state in synchronize_srcu().
+
+Falsifier on the test board: after a "GPU device lost" (which needs a wedged GPU or a
+test-only injected flush timeout), no task shows __synchronize_srcu in
+/proc/<pid>/stack, the client process exits, and /dev/dri/renderD128 goes away.
+
+Assisted-by: Claude
+
+--- a/drivers/gpu/drm/imagination/pvr_device.h
++++ b/drivers/gpu/drm/imagination/pvr_device.h
+@@ -316,6 +316,14 @@
+ 	bool lost;
+ 
+ 	/**
++	 * @lost_work: Runs the drm_dev_unplug() that pvr_device_lost() requests.
++	 *
++	 * pvr_device_lost() can be reached inside a drm_dev_enter() section, and
++	 * drm_dev_unplug() waits in synchronize_srcu() for every such section to end.
++	 */
++	struct work_struct lost_work;
++
++	/**
+ 	 * @reset_sem: Reset semaphore.
+ 	 *
+ 	 * GPU reset code will lock this for writing. Any code that submits commands to the firmware
+--- a/drivers/gpu/drm/imagination/pvr_drv.c
++++ b/drivers/gpu/drm/imagination/pvr_drv.c
+@@ -1478,6 +1478,8 @@
+ 
+ 	pm_runtime_suspend(drm_dev->dev);
+ 	pvr_device_fini(pvr_dev);
++	/* A device lost during remove must not run a second unplug beside this one. */
++	disable_work_sync(&pvr_dev->lost_work);
+ 	drm_dev_unplug(drm_dev);
+ 	pvr_watchdog_fini(pvr_dev);
+ 	pvr_queue_device_fini(pvr_dev);
+--- a/drivers/gpu/drm/imagination/pvr_power.c
++++ b/drivers/gpu/drm/imagination/pvr_power.c
+@@ -29,18 +29,33 @@
+ 
+ #define WATCHDOG_TIME_MS (500)
+ 
++static void
++pvr_device_lost_work(struct work_struct *work)
++{
++	struct pvr_device *pvr_dev = container_of(work, struct pvr_device, lost_work);
++
++	drm_dev_unplug(from_pvr_device(pvr_dev));
++}
++
+ /**
+  * pvr_device_lost() - Mark GPU device as lost
+  * @pvr_dev: Target PowerVR device.
+  *
+  * This will cause the DRM device to be unplugged.
++ *
++ * The unplug runs from a worker. Callers can hold the unplug SRCU read lock
++ * (pvr_mmu_flush_exec() holds it across pvr_power_reset()) or the reset
++ * semaphore that a reader inside such a section waits for, and
++ * drm_dev_unplug() ends in synchronize_srcu(): called inline, the task waits
++ * for itself. Setting @lost stays synchronous for the reset path and the
++ * watchdog, which read it; ioctls are refused once the worker has unplugged.
+  */
+ void
+ pvr_device_lost(struct pvr_device *pvr_dev)
+ {
+ 	if (!pvr_dev->lost) {
+ 		pvr_dev->lost = true;
+-		drm_dev_unplug(from_pvr_device(pvr_dev));
++		queue_work(pvr_dev->sched_wq, &pvr_dev->lost_work);
+ 	}
+ }
+ 
+@@ -250,6 +265,7 @@
+ pvr_watchdog_init(struct pvr_device *pvr_dev)
+ {
+ 	INIT_DELAYED_WORK(&pvr_dev->watchdog.work, pvr_watchdog_worker);
++	INIT_WORK(&pvr_dev->lost_work, pvr_device_lost_work);
+ 
+ 	return 0;
+ }
+@@ -616,6 +632,7 @@
+ pvr_watchdog_fini(struct pvr_device *pvr_dev)
+ {
+ 	cancel_delayed_work_sync(&pvr_dev->watchdog.work);
++	cancel_work_sync(&pvr_dev->lost_work);
+ }
+ 
+ int pvr_power_domains_init(struct pvr_device *pvr_dev)

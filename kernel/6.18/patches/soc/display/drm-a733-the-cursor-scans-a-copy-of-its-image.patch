@@ -1,0 +1,439 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] drm/a733: de, kms: the cursor scans a copy of its image
+
+This is the second half of an earlier cursor investigation. Through the register command queue
+(drm-a733-de-commit-through-the-register-command-queue) every cursor
+register lands at frame start, and a cursor that only moves gives the
+two correct sink CRCs. One cursor update still corrupts frames: a shape
+change. Over the lightdm greeter's login box, where the pointer changes
+shape between two heights, the sink showed 7 and 6 distinct frames for a
+two-frame sequence (6 GiB board, 6.18.54-trcq2, 2026-09-30).
+
+WHY
+
+Xorg's modesetting driver keeps one cursor buffer per CRTC. On a shape
+change it rewrites the pixels with the CPU while the buffer is shown
+(HARDWARE_CURSOR_UPDATE_UNHIDDEN), then sets the same handle again with
+CURSOR2 and no MOVE, and moves the cursor to the new hotspot in a separate
+ioctl (xserver 21.1, hw/xfree86/drivers/modesetting drmmode_display.c
+drmmode_load_cursor_argb() / drmmode_set_cursor(), driver.c;
+hw/xfree86/ramdac/xf86HWCurs.c). The display engine scanned that buffer
+directly, so the new pixels were on the screen at once -- half-written,
+and at the old position -- while the registers followed at the next
+queued copy. Measured on 6.18.54-trcq3 (queue on, this patch absent), the
+image alternating between two shapes at a fixed pointer, 125 Hz asked
+(stress tool, -S mode): in-place rewrite 17 distinct sink CRCs, Xorg's
+sequence 15, the rewrite stretched over a frame 80 -- and two buffers
+switched with BO|MOVE in one ioctl 2, as correct (that run went at 60 Hz:
+with the client's buffer scanned, each buffer change waited for the copy). Upstream Xorg is not
+going to change; a compositor that
+redraws its cursor buffer in place does the same. The kernel has to stop
+scanning a buffer the client writes.
+
+WHAT THIS PATCH DOES
+
+- The display engine allocates four 64 x 64 ARGB8888 buffers of its own
+  (DE_CURSOR_BUFS, one coherent allocation at probe). A new cursor image
+  is copied into one that is none of: what the engine fetches now (read
+  back from VI1's layer address), what the last commit asked for, and the
+  address before that (in case the layer latches a frame after the
+  register reads back -- not measured, and with CPU stores it might). The
+  layer address switches to it in the same commit as size and position --
+  through the queue, one copy at frame start. Four are always enough, so a
+  shape change never waits; a switch still pending is replaced. A write
+  barrier puts the pixels in memory before any path can point the layer
+  there, including a pending request that takes the address without
+  another register write.
+- The KMS half passes the whole image with its CPU view
+  (struct sun60i_de_cursor_image). New means a different framebuffer --
+  every legacy SetCursor makes one, even for the same handle -- damage
+  clips, or any atomic (non-legacy) commit, since an atomic client may
+  redraw the same framebuffer in place without clips. Only a legacy MOVE
+  copies nothing; a source rectangle clipped at a screen edge is an offset
+  into the copy. fb damage clips are enabled on the cursor plane.
+- A buffer with no CPU mapping, or larger than 64 x 64, is scanned as
+  before, and a change of buffer or the cursor going off then still waits
+  for the engine (sun60i_de_settle()). With a copy, neither waits: the
+  client's buffer is never fetched.
+
+WHAT THE VENDOR DOES
+
+It registers no cursor plane at all (sunxi_drm_crtc.c:2513), so the
+question does not arise there; Xorg draws a software cursor into the
+primary.
+
+WHAT IS LEFT
+
+Xorg's SetCursor2 (old position) and MoveCursor (new hotspot) are two
+ioctls. Both usually coalesce into one queued copy; when a frame start
+falls between them, one frame shows the new shape at the old position,
+which is the state Xorg asked for at that moment.
+
+VERIFIED
+
+Applies at --fuzz=0 on the full series (6.18.54); compile-check with and
+without A733_TEST_KERNEL=1; sun60i-de.o and sun60i-kms.o W=1 clean.
+
+On silicon, 6 GiB board, 2026-09-30, 6.18.54-trcq4, sink
+CRC:
+- shape change at a fixed pointer, 125 Hz asked: in-place rewrite 2,
+  Xorg's sequence 2, two buffers 2 (now at 125 Hz, nothing waits), the
+  rewrite stretched over a frame 2 (before: 17, 15, 2, 80);
+- the X pointer over the greeter's login box: 4 and 4 (before 6 and 7;
+  rcq=0 50). The two extra CRCs come in a pair with equal counts, and
+  Xorg's own cursor calls were traced 168-3280 us apart (median 552 us):
+  a frame start between its SetCursor2 and MoveCursor shows the new shape
+  at the old place. The stress tool reproduces exactly that with a 600 us
+  gap between the two (-S xorggap: 2 + the same kind of pair) and shows
+  the same intermediate CRC value in both, so it is one consistent image,
+  not a torn frame. What WHAT IS LEFT above describes.
+- everything the queue patch was proven with, again: jump 125/1000 Hz 2/2,
+  flips 2 with 699/699 completed, background pointer 2, display off/on
+  with every error counter 0, no rcq line in the journal.
+
+PENDING ON HARDWARE
+
+The pointer moved fast over the desktop menu without flicker, by eye.
+
+Assisted-by: Claude
+
+diff --git a/drivers/gpu/drm/sun60i/sun60i-de.c b/drivers/gpu/drm/sun60i/sun60i-de.c
+--- a/drivers/gpu/drm/sun60i/sun60i-de.c
++++ b/drivers/gpu/drm/sun60i/sun60i-de.c
+@@ -480,7 +480,12 @@ struct sun60i_de {
+ 	bool				enabled;
+ 	bool				layer_on;
+ 	bool				cursor_on;
+-	dma_addr_t			cursor_addr;	/* what slot 1 fetches */
++	dma_addr_t			cursor_addr;	/* what slot 1 was last told to fetch */
++	dma_addr_t			cursor_prev;	/* ...and the address before that */
++	bool				cursor_client;	/* ...and it is the client's buffer */
++	void				*cursor_cpu;	/* the driver's own cursor images */
++	dma_addr_t			cursor_dma;
++	int				cursor_buf;	/* which one holds the current image */
+ 	bool				ccsc_on;
+ 	struct sun60i_de_queue		*queue;	/* the command queue backend */
+ 	/*
+@@ -1888,6 +1893,148 @@ static u32 sun60i_de_cursor_attctl(void)
+ 	       OVL_ATTCTL_EN;
+ }
+ 
++/*
++ * THE CURSOR SCANS A COPY.
++ *
++ * Xorg's modesetting driver keeps one cursor buffer per CRTC and, on a shape
++ * change, rewrites its pixels with the CPU while the display engine scans it,
++ * then sets the same buffer again and moves the cursor to the new hotspot in
++ * a separate call (xserver 21.1 hw/xfree86/drivers/modesetting,
++ * drmmode_load_cursor_argb() and drmmode_set_cursor();
++ * HARDWARE_CURSOR_UPDATE_UNHIDDEN). Scanning that buffer puts the new pixels
++ * on the screen at once, half-written and at the old position, while the
++ * registers follow at the next queued copy: over the greeter's login box,
++ * where the pointer changes shape, the sink showed 7 and 6 distinct frames
++ * for a two-frame sequence.
++ *
++ * So the engine never scans the client's cursor buffer. A new image is
++ * copied into one of DE_CURSOR_BUFS buffers of this driver's own, and the
++ * layer address switches to it in the same commit -- through the queue, the
++ * same copy as the size and position. The buffer written is none of: the one
++ * the engine fetches now (read back from the layer register), the one the
++ * last commit asked for (de->cursor_addr), and the one before that
++ * (de->cursor_prev) -- the last for the case, not measured here, that the
++ * layer latches its address a frame after the register reads it back, as
++ * with CPU stores it might. So four are always enough and nothing waits: a
++ * switch still pending is simply replaced.
++ *
++ * A buffer too large for a copy, or one with no CPU mapping, is scanned as
++ * before, and a change or an off then waits for the engine to take it
++ * (sun60i_de_kms_cursor()).
++ */
++#define DE_CURSOR_MAX			64	/* mode_config.cursor_width/height */
++#define DE_CURSOR_PITCH			(DE_CURSOR_MAX * DE_BYTES_PER_PIXEL)
++#define DE_CURSOR_BUF_SIZE		(DE_CURSOR_MAX * DE_CURSOR_PITCH)
++#define DE_CURSOR_BUFS			4
++
++static int sun60i_de_cursor_bufs_init(struct sun60i_de *de)
++{
++	de->cursor_cpu = dmam_alloc_coherent(de->dev,
++					     DE_CURSOR_BUFS * DE_CURSOR_BUF_SIZE,
++					     &de->cursor_dma, GFP_KERNEL);
++	if (!de->cursor_cpu)
++		return -ENOMEM;
++
++	de->cursor_buf = -1;
++
++	return 0;
++}
++
++/* 32-bit compares: probe() sets a 32-bit DMA mask, as for the layer register. */
++static bool sun60i_de_cursor_buf_holds(const struct sun60i_de *de,
++				       unsigned int i, u32 addr)
++{
++	u32 start = lower_32_bits(de->cursor_dma) + i * DE_CURSOR_BUF_SIZE;
++
++	return addr >= start && addr - start < DE_CURSOR_BUF_SIZE;
++}
++
++/* A buffer the engine neither fetches now nor has been told to fetch. */
++static int sun60i_de_cursor_free_buf(struct sun60i_de *de)
++{
++	u32 ovl = sun60i_de_chn(DE_CURSOR_SLOT) + DE_CHN_OVL;
++	u32 busy[] = {
++		sun60i_de_read(de, ovl + OVL_LAY_TOP_LADDR(DE_OVL_LAYER, 0)),
++		lower_32_bits(de->cursor_addr),
++		lower_32_bits(de->cursor_prev),
++	};
++	unsigned int i, j;
++
++	for (i = 0; i < DE_CURSOR_BUFS; i++) {
++		for (j = 0; j < ARRAY_SIZE(busy); j++)
++			if (sun60i_de_cursor_buf_holds(de, i, busy[j]))
++				break;
++		if (j == ARRAY_SIZE(busy))
++			return i;
++	}
++
++	return -EBUSY;
++}
++
++static bool sun60i_de_cursor_copyable(const struct sun60i_de_cursor_image *img)
++{
++	return img->vaddr && img->width <= DE_CURSOR_MAX &&
++	       img->height <= DE_CURSOR_MAX &&
++	       img->pitch >= img->width * DE_BYTES_PER_PIXEL;
++}
++
++static void sun60i_de_cursor_copy(struct sun60i_de *de, int buf,
++				  const struct sun60i_de_cursor_image *img)
++{
++	void *dst = de->cursor_cpu + buf * DE_CURSOR_BUF_SIZE;
++	unsigned int y;
++
++	for (y = 0; y < img->height; y++)
++		memcpy(dst + y * DE_CURSOR_PITCH, img->vaddr + y * img->pitch,
++		       img->width * DE_BYTES_PER_PIXEL);
++	/*
++	 * The pixels in memory before any path can point the layer here: a
++	 * queued request that is already pending takes the new address without
++	 * another register write.
++	 */
++	wmb();
++	de->cursor_buf = buf;
++}
++
++/*
++ * Where slot 1 fetches for @img: the driver's copy (made now if the image is
++ * new, the engine was restarted, or there is none), or the client's buffer
++ * when it cannot be copied. Returns the pitch through @pitch.
++ */
++static dma_addr_t sun60i_de_cursor_source(struct sun60i_de *de,
++					  const struct sun60i_de_cursor_image *img,
++					  u32 *pitch)
++{
++	int buf = de->cursor_buf;
++
++	de->cursor_client = !sun60i_de_cursor_copyable(img);
++	if (de->cursor_client) {
++		*pitch = img->pitch;
++		return img->dma;
++	}
++
++	if (img->changed || !de->cursor_on || buf < 0) {
++		int free = sun60i_de_cursor_free_buf(de);
++
++		/* Cannot happen with four; keep the old image rather than tear. */
++		if (!WARN_ON_ONCE(free < 0)) {
++			sun60i_de_cursor_copy(de, free, img);
++			buf = free;
++		}
++		if (buf < 0) {
++			de->cursor_client = true;
++			*pitch = img->pitch;
++			return img->dma;
++		}
++	}
++
++	*pitch = DE_CURSOR_PITCH;
++
++	return de->cursor_dma + buf * DE_CURSOR_BUF_SIZE +
++	       img->src_y * DE_CURSOR_PITCH +
++	       img->src_x * DE_BYTES_PER_PIXEL;
++}
++
+ static int sun60i_de_cursor_enable(struct sun60i_de *de,
+ 				   const struct drm_rect *dst,
+ 				   dma_addr_t addr, u32 pitch)
+@@ -2415,18 +2562,22 @@ EXPORT_SYMBOL_GPL(sun60i_de_kms_layer_off);
+ /*
+  * The cursor plane's two calls. A move goes out through the commit path and
+  * returns without waiting: with the queue it is copied at the next frame
+- * start, several moves in one frame coalesce, and the last one wins.
+- *
+- * What the legacy cursor path relies on is different: it skips the vblank
+- * wait and may free the previous buffer as soon as this returns. So a cursor
+- * that CHANGES buffer, or goes off, waits until the engine has taken the new
+- * state (sun60i_de_settle()) -- at most one frame, and only then. With CPU
+- * stores that wait is empty, as before.
++ * start, several moves in one frame coalesce, and the last one wins. A new
++ * image is copied into a buffer of the driver's own first (see THE CURSOR
++ * SCANS A COPY above), so the client may rewrite or free its
++ * buffer as soon as this returns -- which is what the legacy cursor path,
++ * skipping the vblank wait, relies on.
++ *
++ * Only when the client's buffer is scanned (it cannot be copied) does a
++ * change of buffer, or the cursor going off, wait until the engine has taken
++ * the new state (sun60i_de_settle()) -- at most one frame, and only then.
+  */
+ int sun60i_de_kms_cursor(struct sun60i_de *de, const struct drm_rect *dst,
+-			 dma_addr_t addr, u32 pitch)
++			 const struct sun60i_de_cursor_image *img)
+ {
+-	bool frees;
++	bool was_client;
++	dma_addr_t addr, old;
++	u32 pitch;
+ 	int ret;
+ 
+ 	guard(mutex)(&de->lock);
+@@ -2437,10 +2588,14 @@ int sun60i_de_kms_cursor(struct sun60i_de *de, const struct drm_rect *dst,
+ 	if (!sun60i_de_dst_fits(&de->mode, dst))
+ 		return -EINVAL;
+ 
+-	frees = de->cursor_on && addr != de->cursor_addr;
++	was_client = de->cursor_on && de->cursor_client;
++	old = de->cursor_addr;
++	addr = sun60i_de_cursor_source(de, img, &pitch);
+ 	ret = sun60i_de_cursor_enable(de, dst, addr, pitch);
++	if (addr != old)
++		de->cursor_prev = old;
+ 	de->cursor_addr = addr;
+-	if (frees)
++	if (was_client && addr != old)
+ 		sun60i_de_settle(de);
+ 
+ 	return ret;
+@@ -2455,7 +2610,8 @@ void sun60i_de_kms_cursor_off(struct sun60i_de *de)
+ 		return;
+ 
+ 	sun60i_de_cursor_disable(de);
+-	sun60i_de_settle(de);
++	if (de->cursor_client)
++		sun60i_de_settle(de);
+ }
+ EXPORT_SYMBOL_GPL(sun60i_de_kms_cursor_off);
+ 
+@@ -2684,6 +2840,10 @@ static int sun60i_de_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		return ret;
+ 
++	ret = sun60i_de_cursor_bufs_init(de);
++	if (ret)
++		return ret;
++
+ 	ret = sun60i_de_resources(dev, de);
+ 	if (ret)
+ 		return ret;
+diff --git a/drivers/gpu/drm/sun60i/sun60i-kms.c b/drivers/gpu/drm/sun60i/sun60i-kms.c
+--- a/drivers/gpu/drm/sun60i/sun60i-kms.c
++++ b/drivers/gpu/drm/sun60i/sun60i-kms.c
+@@ -557,13 +557,48 @@ static const u32 sun60i_kms_cursor_formats[] = {
+ 	DRM_FORMAT_ARGB8888,
+ };
+ 
++/*
++ * The image goes to the display engine whole, with a CPU view, and the engine
++ * copies it into a buffer of its own when it changed (sun60i-de.c, "THE
++ * CURSOR SCANS A COPY"). Changed means a different framebuffer --
++ * every legacy SetCursor makes one, even for the same buffer handle --
++ * damage clips, or any atomic commit: an atomic client may redraw the same
++ * framebuffer in place and send no clips, which the uAPI reads as "all
++ * damaged". Only a legacy MOVE (same framebuffer, legacy_cursor_update)
++ * copies nothing. Not drm_atomic_helper_damage_merged(): without clips it
++ * reports the whole plane as damaged on every commit, legacy moves included.
++ * The engine copies the whole buffer, so a source rectangle clipped at a
++ * screen edge needs no copy.
++ */
++static void sun60i_kms_cursor_image(const struct drm_atomic_state *state,
++				    const struct drm_plane_state *old_state,
++				    const struct drm_plane_state *new_state,
++				    struct sun60i_de_cursor_image *img)
++{
++	struct drm_framebuffer *fb = new_state->fb;
++	struct drm_gem_dma_object *gem = drm_fb_dma_get_gem_obj(fb, 0);
++
++	img->vaddr = gem && gem->vaddr ? gem->vaddr + fb->offsets[0] : NULL;
++	img->dma = sun60i_kms_plane_scanout(new_state);
++	img->width = fb->width;
++	img->height = fb->height;
++	img->pitch = fb->pitches[0];
++	img->src_x = new_state->src.x1 >> 16;
++	img->src_y = new_state->src.y1 >> 16;
++	img->changed = old_state->fb != fb ||
++		       drm_plane_get_damage_clips_count(new_state) > 0 ||
++		       !state->legacy_cursor_update;
++}
++
+ static void sun60i_kms_cursor_atomic_update(struct drm_plane *plane,
+ 					    struct drm_atomic_state *state)
+ {
++	struct drm_plane_state *old_state =
++		drm_atomic_get_old_plane_state(state, plane);
+ 	struct drm_plane_state *new_state =
+ 		drm_atomic_get_new_plane_state(state, plane);
+ 	struct sun60i_kms *kms = to_kms_plane(plane)->kms;
+-	dma_addr_t addr;
++	struct sun60i_de_cursor_image img;
+ 	int ret;
+ 
+ 	if (!new_state->visible) {
+@@ -571,12 +606,11 @@ static void sun60i_kms_cursor_atomic_update(struct drm_plane *plane,
+ 		return;
+ 	}
+ 
+-	addr = sun60i_kms_plane_scanout(new_state);
++	sun60i_kms_cursor_image(state, old_state, new_state, &img);
+ 
+-	ret = sun60i_de_kms_cursor(kms->de, &new_state->dst, addr,
+-				   new_state->fb->pitches[0]);
++	ret = sun60i_de_kms_cursor(kms->de, &new_state->dst, &img);
+ 	if (ret)
+-		drm_err(plane->dev, "cursor from %pad: %d\n", &addr, ret);
++		drm_err(plane->dev, "cursor from %pad: %d\n", &img.dma, ret);
+ }
+ 
+ static void sun60i_kms_cursor_atomic_disable(struct drm_plane *plane,
+@@ -1017,6 +1051,7 @@ static int sun60i_kms_cursor_init(struct sun60i_kms *kms,
+ 
+ 	plane->kms = kms;
+ 	drm_plane_helper_add(&plane->base, &sun60i_kms_cursor_helper_funcs);
++	drm_plane_enable_fb_damage_clips(&plane->base);
+ 	*out = &plane->base;
+ 
+ 	return 0;
+diff --git a/drivers/gpu/drm/sun60i/sun60i-kms.h b/drivers/gpu/drm/sun60i/sun60i-kms.h
+--- a/drivers/gpu/drm/sun60i/sun60i-kms.h
++++ b/drivers/gpu/drm/sun60i/sun60i-kms.h
+@@ -65,8 +65,22 @@ void sun60i_de_kms_disable(struct sun60i_de *de);
+ int sun60i_de_kms_scanout(struct sun60i_de *de, const struct drm_rect *dst,
+ 			  dma_addr_t scanout, u32 pitch);
+ void sun60i_de_kms_layer_off(struct sun60i_de *de);
++/*
++ * The cursor's image: the whole buffer (@vaddr, @width x @height, @pitch
++ * bytes per line), the first SHOWN pixel inside it (@src_x, @src_y) and its
++ * bus address (@dma), and whether it is a different image than last time
++ * (@changed). The display engine copies it into a buffer of its own; @vaddr
++ * NULL, or a buffer larger than the cursor size, makes it scan @dma instead.
++ */
++struct sun60i_de_cursor_image {
++	const void	*vaddr;
++	dma_addr_t	dma;
++	u32		width, height, pitch;
++	u32		src_x, src_y;
++	bool		changed;
++};
+ int sun60i_de_kms_cursor(struct sun60i_de *de, const struct drm_rect *dst,
+-			 dma_addr_t addr, u32 pitch);
++			 const struct sun60i_de_cursor_image *img);
+ void sun60i_de_kms_cursor_off(struct sun60i_de *de);
+ /*
+  * After the planes of a commit are staged: > 0 when they went out through the

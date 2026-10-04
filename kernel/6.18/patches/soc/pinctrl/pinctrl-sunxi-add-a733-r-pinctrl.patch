@@ -1,0 +1,155 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] pinctrl: sunxi: add an A733 r-pinctrl instead of riding the A523's
+
+The board DT already asks for `allwinner,sun60i-a733-r-pinctrl` first and
+falls back to `allwinner,sun55i-a523-r-pinctrl`, so today the A523 driver
+binds. Patch `arm64-dts-a733-aon-pinctrl-usb-host-vbus` chose that deliberately and checked what it was reusing:
+the S_GPIO register geometry is byte-for-byte the A523's (D1 NEW_REG_LAYOUT,
+0x30 bank stride, mux @0x00, data @0x10, drive @0x14, pull @0x24), verified
+against the A733 user manual.
+
+One field is not shared, and it is a register write. The A523 driver sets
+`io_bias_cfg_variant = BIAS_VOLTAGE_PIO_POW_MODE_SEL`, one bit per bank at
+position `bank`. On the A733, SGPIO_POW_MOD_SEL (0x07025340) has two bits per
+bank -- PL at 1:0 and PM at 3:2 (UM v0.92 18.14.7.20). So a
+PM bias write (bank 1, bit 1) cannot reach PM's field at all: it lands on the
+top bit of PL's. PL is the 3.3 V ALDO1 bank that carries the PMIC's own I2C,
+the Type-C interrupt and USB DRVVBUS.
+
+This has never fired, and `arm64-dts-a733-aon-pinctrl-usb-host-vbus`'s header says why: neither bank carries a
+`vcc-pX-supply`, so the dummy regulator makes `regulator_get_voltage()` return
+-EINVAL before the write. It is a landmine, not a live bug. Measured on the
+delivery image, the 8 GiB board, 2026-08-15: SGPIO_POW_MOD_SEL reads 0x000AAAAA,
+PL = 10 and PM = 10, both the reset default "3.3 V" -- nothing has written
+either field.
+
+It also makes the bank-PM mismatch fixable. `VCC-PM` is CLDO1 at 1.8 V
+(and CLDO1 reads 0x2f = 0x0d = 1800 mV enabled on
+the 8 GiB board), while PM's withstand mode is set to 3.3 V. Wiring a `vcc-pm-supply`
+is what closes that, and it must not be done on the A523 driver.
+
+Assisted-by: Claude
+---
+diff -uNr a/drivers/pinctrl/sunxi/Kconfig b/drivers/pinctrl/sunxi/Kconfig
+--- a/drivers/pinctrl/sunxi/Kconfig	2026-08-15 09:58:53.514733908 +0200
++++ b/drivers/pinctrl/sunxi/Kconfig	2026-08-15 10:00:27.294867085 +0200
+@@ -136,6 +136,11 @@
+ 	default ARM64 && ARCH_SUNXI
+ 	select PINCTRL_SUNXI
+ 
++config PINCTRL_SUN60I_A733_R
++	bool "Support for the Allwinner A733 R-PIO"
++	default ARM64 && ARCH_SUNXI
++	select PINCTRL_SUNXI
++
+ config PINCTRL_SUN55I_A523
+ 	bool "Support for the Allwinner A523 PIO"
+ 	default ARM64 && ARCH_SUNXI
+diff -uNr a/drivers/pinctrl/sunxi/Makefile b/drivers/pinctrl/sunxi/Makefile
+--- a/drivers/pinctrl/sunxi/Makefile	2026-08-15 09:58:53.506733897 +0200
++++ b/drivers/pinctrl/sunxi/Makefile	2026-08-15 10:00:27.294867085 +0200
+@@ -28,6 +28,7 @@
+ obj-$(CONFIG_PINCTRL_SUN50I_H616)	+= pinctrl-sun50i-h616.o
+ obj-$(CONFIG_PINCTRL_SUN50I_H616_R)	+= pinctrl-sun50i-h616-r.o
+ obj-$(CONFIG_PINCTRL_SUN60I_A733)	+= pinctrl-sun60iw2.o
++obj-$(CONFIG_PINCTRL_SUN60I_A733_R)	+= pinctrl-sun60iw2-r.o
+ obj-$(CONFIG_PINCTRL_SUN55I_A523)	+= pinctrl-sun55i-a523.o
+ obj-$(CONFIG_PINCTRL_SUN55I_A523_R)	+= pinctrl-sun55i-a523-r.o
+ obj-$(CONFIG_PINCTRL_SUN9I_A80)		+= pinctrl-sun9i-a80.o
+diff -uNr a/drivers/pinctrl/sunxi/pinctrl-sun60iw2-r.c b/drivers/pinctrl/sunxi/pinctrl-sun60iw2-r.c
+--- a/drivers/pinctrl/sunxi/pinctrl-sun60iw2-r.c	1970-01-01 01:00:00.000000000 +0100
++++ b/drivers/pinctrl/sunxi/pinctrl-sun60iw2-r.c	2026-08-15 10:00:18.946855230 +0200
+@@ -0,0 +1,93 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Allwinner A733 (sun60iw2) SoC r-pinctrl driver (S_GPIO, banks PL/PM).
++ *
++ * Register geometry is identical to the A523's r-pinctrl (D1 NEW_REG_LAYOUT:
++ * 0x30 bank stride, mux @0x00, data @0x10, drive @0x14, pull @0x24 -- checked
++ * against the UM), which is why the A733 rode the A523 driver
++ * on the fallback compatible until now. One field is not identical, and it is
++ * a register write: SGPIO_POW_MOD_SEL (0x0340) has a *two*-bit field per bank
++ * on the A733 (PL 1:0, PM 3:2; A733 UM v0.92 18.14.7.20),
++ * while the A523 driver's BIAS_VOLTAGE_PIO_POW_MODE_SEL writes a single bit at
++ * position `bank`. For PM (bank 1) that single bit is bit 1 -- the top bit of
++ * PL's field. So on the A523 driver a PM bias request cannot reach PM's field
++ * and can only modify PL's.
++ *
++ * That never fired, because neither bank carries a vcc-pX-supply and the dummy
++ * regulator makes regulator_get_voltage() return -EINVAL before the write. It
++ * is a landmine, not a live bug -- and this driver removes the landmine so a
++ * future PL/PM supply is safe to add.
++ *
++ * Based on drivers/pinctrl/sunxi/pinctrl-sun55i-a523-r.c, Copyright (C) 2024 Arm Ltd.
++ * Copyright (c) 2026 DockSeed A733 Debian mainline track
++ */
++
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/of.h>
++#include <linux/of_device.h>
++#include <linux/pinctrl/pinctrl.h>
++
++#include "pinctrl-sunxi.h"
++
++/*
++ * PL0..PL13 and PM0..PM5, from the UM (PL_CFG0/CFG1 defaults
++ * 0xFFFFFFFF/0x00FFFFFF = 14 pins, PM_CFG0 default 0x00FFFFFF = 6 pins) and
++ * the 159-pin mux grid in the UM. Same counts as the
++ * A523.
++ */
++static const u8 a733_r_nr_bank_pins[SUNXI_PINCTRL_MAX_BANKS] =
++/*	  PL  PM */
++	{ 14,  6 };
++
++static const unsigned int a733_r_irq_bank_map[] = { 0, 1 };
++
++static const u8 a733_r_irq_bank_muxes[SUNXI_PINCTRL_MAX_BANKS] =
++/*	  PL  PM */
++	{ 14, 14 };
++
++/*
++ * SGPIO_POW_MOD_SEL (0x0340) field positions, indexed by pin_base-relative
++ * bank. A733 UM v0.92 18.14.7.20:
++ *
++ *	31:4 -		3:2 PM_PWR_MOD_SEL	1:0 PL_PWR_MOD_SEL
++ *	00: 3.3 V	01: auto		10: 3.3 V	11: 1.8 V
++ *
++ * Both banks have a named field here, unlike the main PIO where PA/PB/PI do
++ * not.
++ */
++static const u8 a733_r_io_bias_field_shift[SUNXI_PINCTRL_MAX_BANKS] = {
++	[0] = 0,	/* PL */
++	[1] = 2,	/* PM */
++};
++
++static struct sunxi_pinctrl_desc a733_r_pinctrl_data = {
++	.irq_banks = ARRAY_SIZE(a733_r_irq_bank_map),
++	.irq_bank_map = a733_r_irq_bank_map,
++	.irq_read_needs_mux = true,
++	.io_bias_cfg_variant = BIAS_VOLTAGE_POW_MOD_SEL_2BIT,
++	.io_bias_field_shift = a733_r_io_bias_field_shift,
++	.pin_base = PL_BASE,
++};
++
++static int a733_r_pinctrl_probe(struct platform_device *pdev)
++{
++	return sunxi_pinctrl_dt_table_init(pdev, a733_r_nr_bank_pins,
++					   a733_r_irq_bank_muxes,
++					   &a733_r_pinctrl_data,
++					   SUNXI_PINCTRL_NEW_REG_LAYOUT);
++}
++
++static const struct of_device_id a733_r_pinctrl_match[] = {
++	{ .compatible = "allwinner,sun60i-a733-r-pinctrl", },
++	{}
++};
++
++static struct platform_driver a733_r_pinctrl_driver = {
++	.probe	= a733_r_pinctrl_probe,
++	.driver	= {
++		.name		= "sun60i-a733-r-pinctrl",
++		.of_match_table	= a733_r_pinctrl_match,
++	},
++};
++builtin_platform_driver(a733_r_pinctrl_driver);

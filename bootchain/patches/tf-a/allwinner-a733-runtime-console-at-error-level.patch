@@ -1,0 +1,143 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Sat, 3 Oct 2026 17:19:21 +0200
+Subject: [PATCH] fix(allwinner): A733: opt in to a runtime console, cut to
+ ERROR by log level
+
+BL31 registers the UART BOOT | CRASH (console_16550_register()).
+console_putc() prints on a console only when its flags match
+console_state (drivers/console/multi_console.c), and bl31_main() sets
+that state to RUNTIME as its last statement. So every ERROR(), WARN(),
+NOTICE() and INFO() that a PSCI or SMC handler prints after the
+hand-over to BL33 is dropped. Only panic()'s crash dump reaches the
+UART, because it goes through plat_crash_console_* and not through the
+console list. Two error paths were invisible on the A733: the PPU
+timeouts of sunxi_cpu_on() and "PSCI: System reset failed", which is
+followed by panic() and so showed the dump without its reason.
+
+The scope is narrow for a reason that stands: at runtime the UART
+belongs to the OS, and BL31 lines interleave with its output. So where a
+platform asks for it the scope goes to RUNTIME, and the runtime is kept
+quiet by level instead:
+
+- allwinner-common.mk: SUNXI_RUNTIME_CONSOLE, a boolean, default 0
+  (TF-A's behaviour), and SUNXI_RUNTIME_LOG_LEVEL, default 10
+  (LOG_LEVEL_ERROR).
+- sun60i_a733/platform.mk: SUNXI_RUNTIME_CONSOLE := 1.
+- sunxi_bl31_setup.c: the console scope BOOT | RUNTIME | CRASH when
+  SUNXI_RUNTIME_CONSOLE is set, and bl31_plat_runtime_setup() calls
+  tf_log_set_max_level(SUNXI_RUNTIME_LOG_LEVEL). bl31_main() runs that
+  hook before its console_flush() and console_switch_state(), so
+  everything BL31 prints while it boots keeps LOG_LEVEL.
+
+Why ERROR and not WARNING: the release build has LOG_LEVEL 20, which
+compiles WARN() out, and tf_log_set_max_level() only lowers the level
+(it ignores a value above LOG_LEVEL), so LOG_LEVEL_WARNING would leave
+NOTICE printing at runtime.
+
+What reaches the 16550 at runtime: console_16550_core_putc reads LSR
+until TEMT and THRE are set and writes THR; nothing writes LCR, FCR, IER
+or MCR at runtime. Two side effects remain: reading LSR clears its
+sticky error bits under the OS's driver, once per ERROR() line; and
+console_flush() before SYSTEM_OFF / SYSTEM_RESET and in panic() now
+polls the UART until it drains.
+
+Only the A733 opts in: the common default stays TF-A's, so every other
+Allwinner platform builds what it built before.
+
+Measured on the A733 (2026-10-03): no BL31 line after the hand-over
+across boot, 20 hotplug rounds and a 120 s stress; 3 of 3 reboot and
+poweroff complete; a provoked runtime ERROR() reaches the UART.
+
+Assisted-by: Claude
+---
+ plat/allwinner/common/allwinner-common.mk | 19 +++++++++++++++++++
+ plat/allwinner/common/sunxi_bl31_setup.c  | 21 +++++++++++++++++++++
+ plat/allwinner/sun60i_a733/platform.mk    |  5 +++++
+ 3 files changed, 45 insertions(+)
+
+diff --git a/plat/allwinner/common/allwinner-common.mk b/plat/allwinner/common/allwinner-common.mk
+index 1bd9591dc..576b7ae5e 100644
+--- a/plat/allwinner/common/allwinner-common.mk
++++ b/plat/allwinner/common/allwinner-common.mk
+@@ -156,6 +156,25 @@ ifneq (${SUNXI_R_PRCM_SEC_SWITCH_NS},)
+ $(eval $(call add_define,SUNXI_R_PRCM_SEC_SWITCH_NS))
+ endif
+ 
++# SUNXI_RUNTIME_CONSOLE=1 -- BL31 registers the UART for the runtime scope too
++# (sunxi_bl31_setup.c), so an ERROR() printed by a PSCI or SMC handler after
++# the hand-over to BL33 reaches it. The default, 0, is TF-A's own behaviour:
++# the console is scoped BOOT | CRASH and nothing BL31 prints at runtime shows.
++SUNXI_RUNTIME_CONSOLE	?=	0
++$(call assert_boolean,SUNXI_RUNTIME_CONSOLE)
++$(eval $(call add_define,SUNXI_RUNTIME_CONSOLE))
++
++# SUNXI_RUNTIME_LOG_LEVEL -- with SUNXI_RUNTIME_CONSOLE=1, the highest log
++# level BL31 prints once it has handed over to BL33. Boot output keeps
++# LOG_LEVEL. The default, 10 (LOG_LEVEL_ERROR), lets only ERROR() through,
++# so the OS's console is not interleaved with anything else. A level at or
++# above LOG_LEVEL changes nothing (tf_log_set_max_level() only lowers).
++SUNXI_RUNTIME_LOG_LEVEL	?=	10
++ifeq ($(filter 0 10 20 30 40 50,${SUNXI_RUNTIME_LOG_LEVEL}),)
++$(error "SUNXI_RUNTIME_LOG_LEVEL must be 0, 10, 20, 30, 40 or 50")
++endif
++$(eval $(call add_define,SUNXI_RUNTIME_LOG_LEVEL))
++
+ # The bootloader is guaranteed to only run on CPU 0 by the boot ROM.
+ COLD_BOOT_SINGLE_CPU		:=	1
+ 
+diff --git a/plat/allwinner/common/sunxi_bl31_setup.c b/plat/allwinner/common/sunxi_bl31_setup.c
+index caf0d2446..a1ca6c11d 100644
+--- a/plat/allwinner/common/sunxi_bl31_setup.c
++++ b/plat/allwinner/common/sunxi_bl31_setup.c
+@@ -111,6 +111,17 @@ void bl31_early_platform_setup2(u_register_t arg0, u_register_t arg1,
+ 	/* Initialize the debug console as soon as possible */
+ 	console_16550_register(SUNXI_UART0_BASE, SUNXI_UART0_CLK_IN_HZ,
+ 			       SUNXI_UART0_BAUDRATE, &console);
++#if SUNXI_RUNTIME_CONSOLE
++	/*
++	 * console_16550_register() scopes the console BOOT | CRASH, so nothing
++	 * BL31 prints after handing over to BL33 would reach the UART -- an
++	 * ERROR() from a PSCI or SMC handler included. At runtime this UART
++	 * belongs to the OS, so the runtime stays quiet by level, not by
++	 * scope: see bl31_plat_runtime_setup().
++	 */
++	console_set_scope(&console, CONSOLE_FLAG_BOOT | CONSOLE_FLAG_RUNTIME |
++				    CONSOLE_FLAG_CRASH);
++#endif
+ 
+ #if USE_GIC_DRIVER == 3
+ 	/* bl31_main() initialises the GIC before bl31_platform_setup(). */
+@@ -242,6 +253,16 @@ void bl31_plat_runtime_setup(void)
+ {
+ 	/* Change the DTB if the configuration requires so. */
+ 	sunxi_prepare_dtb(fdt);
++
++	/*
++	 * The last thing before bl31_main() flushes the console and switches
++	 * it to the runtime state, so the boot output above is unchanged.
++	 * From here on what BL31 prints (PSCI and SMC handlers, the other
++	 * cores' warm boot) is cut to SUNXI_RUNTIME_LOG_LEVEL.
++	 */
++#if SUNXI_RUNTIME_CONSOLE && (SUNXI_RUNTIME_LOG_LEVEL < LOG_LEVEL)
++	tf_log_set_max_level(SUNXI_RUNTIME_LOG_LEVEL);
++#endif
+ }
+ 
+ entry_point_info_t *bl31_plat_get_next_image_ep_info(uint32_t type)
+diff --git a/plat/allwinner/sun60i_a733/platform.mk b/plat/allwinner/sun60i_a733/platform.mk
+index 3900b5f84..02d859b18 100644
+--- a/plat/allwinner/sun60i_a733/platform.mk
++++ b/plat/allwinner/sun60i_a733/platform.mk
+@@ -16,6 +16,11 @@ PLATFORM_MAX_CPUS_PER_CLUSTER := 8
+ # three, set read-modify-write so the other bits stay as found (`|= 7`).
+ SUNXI_R_PRCM_SEC_SWITCH_NS := 0x7
+ 
++# Runtime console: BL31's ERROR() lines from PSCI and SMC handlers reach the
++# UART after the hand-over to BL33 (SUNXI_RUNTIME_LOG_LEVEL, default ERROR;
++# allwinner-common.mk).
++SUNXI_RUNTIME_CONSOLE := 1
++
+ # Standalone watchdogs (WDT_CPUS, WDT0); SYSTEM_RESET uses their soft reset.
+ SUNXI_STANDALONE_WATCHDOG := 1
+ 

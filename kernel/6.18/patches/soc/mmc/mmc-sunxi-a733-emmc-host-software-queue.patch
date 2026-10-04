@@ -1,0 +1,397 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] mmc: sunxi: a733: run the eMMC through the host software queue
+
+With `mmc-sunxi-a733-hardware-busy-wait` the host waits for the card's busy itself, and the block layer still
+sends one CMD13 after every write request (block.c mmc_blk_card_busy(), which
+the capability does not skip). On the eMMC the vendor stack sends none. This
+patch puts the A733 eMMC controller on mmc_hsq, the path on which the block
+layer does not poll at all, and leaves the SD slot as it is.
+
+THE MEASURED GAP
+----------------
+Board run of `mmc-sunxi-a733-hardware-busy-wait`, 2026-09-17:
+- eMMC write phases: CMD13 = CMD25 + CMD6 (402/401 random, 513/514 sequential).
+  The vendor sends 1 CMD13 and 1 CMD6 per phase and no CMD13 per write.
+- eMMC sequential writes 136-144 MiB/s against 156-160 on the vendor.
+
+DOES THE VENDOR RUN HSQ ON THE EMMC? YES, read on its running kernel
+------------------------------------------------------------------
+Vendor kernel 6.6.98, READ-ONLY:
+- /proc/config.gz: CONFIG_MMC_HSQ=y (mainline mmc_hsq.c; the BSP copy,
+  CONFIG_AW_MMC_HSQ, is not set).
+- The eMMC node sdmmc@4022000 carries cap-hsq, which its driver turns into
+  mmc_hsq_init() (radxa/allwinner-bsp cubie-aiot-v1.4.8 sunxi-mmc.c:4141-4142,
+  4373-4385).
+- /sys/kernel/debug/mmc0/caps = 0x40001343: bit 9 MMC_CAP_WAIT_WHILE_BUSY.
+- mmc0:0001/cmdq_en = 0, no cqe-on: no command queueing, so the core takes the
+  hsq branch (mmc.c:1937-1947).
+Not read: the "Host Software Queue enabled" line of its boot log. The zero
+CMD13 per write in its trace is what that path produces and the legacy path
+does not.
+
+THE CONTRACT ON THE LINUX SIDE (6.18.36)
+----------------------------------------
+- mmc_hsq_init() installs cqe_ops; the core enables the queue when it
+  attaches an eMMC without CMDQ (mmc.c:1937-1947) and, for SD, in sd.c:1587.
+  Only the eMMC cfg initializes it here, so the SD slot never gets cqe_ops.
+- Read and write requests then go mmc_blk_cqe_issue_rw_rq() ->
+  mmc_blk_hsq_issue_rw_rq() (block.c:1654-1678). They are prepared by
+  mmc_blk_rw_rq_prep() as on the legacy path, so the sbc and `mmc-sunxi-a733-emmc-hardware-auto-cmd23`'s
+  auto-CMD23 are unchanged.
+- Completion is mmc_blk_hsq_req_done() (block.c:2122): no
+  mmc_blk_card_busy(), no CMD13. An error starts mmc_blk_mq_recovery(), which
+  sends CMD13, a stop, polls busy, resets and retries.
+- Flush and discard stay synchronous (queue.c:64-70). The flush CMD6 keeps
+  the host busy wait of `mmc-sunxi-a733-hardware-busy-wait` and its one CMD13 from mmc_switch_status()
+  (mmc_ops.c:658), as on the vendor.
+- What hsq gives up with the poll: mmc_blk_card_busy() also read the card's
+  status after programming (mmc_blk_stop_err_bits() -> bytes_xfered = 0) and
+  copied R1_EXCEPTION_EVENT (block.c:2039-2075). Under hsq a programming error
+  shows up only in the next request's response, and is blamed on that
+  request. mtk-sd and sdhci-sprd make the same trade.
+- The host must complete a request through mmc_hsq_finalize_request(); the
+  queue then starts the next one from that context through ->request
+  (mmc_hsq.c mmc_hsq_pump_requests(), no ->request_atomic here).
+
+WHAT THIS PATCH DOES
+--------------------
+- Kconfig: MMC_SUNXI selects MMC_HSQ, as MMC_MTK and MMC_SDHCI_SPRD do. The
+  defconfig does not change (savedefconfig drops a selected symbol);
+  the recipe asserts MMC_HSQ=y in pins/kernel-config.assert.
+- cfg->can_hsq, set in sun60i_a733_emmc_cfg only. Probe calls mmc_hsq_init()
+  only with can_wait_busy as well: without the host busy wait nothing would
+  wait for the card after a write.
+- Every completion in the driver goes through sunxi_mmc_request_done(), which
+  hands a queue request to mmc_hsq_finalize_request() and everything else to
+  mmc_request_done(). The callers are the hard IRQ, busy_work, done_work, the
+  manual-stop thread and the error exits of sunxi_mmc_request(); none holds
+  host->lock, and sunxi_mmc_request() does not sleep (dma_map_sg, the host
+  spinlock, register writes), so the next request may start from any of them.
+- A write still busy when the host wait ends: `mmc-sunxi-a733-hardware-busy-wait` completes it without an
+  error after 1 s and leaves it to the core's CMD13 poll. With the queue there
+  is no such poll, so the wait is MMC_BLK_TIMEOUT_MS (10 s, block.c:78), the
+  bound that poll had, and the write then fails with -ETIMEDOUT and "card still
+  busy ... failed for block-layer recovery". Recovery checks the card and keeps
+  bytes_xfered if the card reports no error.
+- Runtime PM: mmc_hsq_suspend() before the clocks go off, mmc_hsq_resume()
+  after they are back, as mtk-sd and sdhci-sprd do. System sleep reaches the
+  same callbacks through pm_runtime_force_suspend/resume. Both only once the
+  core has turned the queue on (mmc->hsq_enabled): an earlier resume would make
+  the core's cqe_enable return -EBUSY at attach, and the queue would stay off
+  with no message.
+- "The queue is on" is read as mmc->cqe_enabled, not mmc->hsq_enabled: the
+  core clears the first when it removes the card (bus.c:423-425) and never
+  clears the second. mmc_hsq is this host's only cqe_ops.
+- The 10 s wait and the error apply to every data write on the eMMC host once
+  the queue is on, also those outside it (ioctl/RPMB, mmc_test). Those callers
+  get the error back instead of a 1 s wait and a CMD13 poll.
+
+COMMAND QUEUEING (CQE) -- present in the UM, not used here
+---------------------------------------------------------
+- A733 UM v0.92 11.3.1 lists eMMC 5.1 command queueing among the controller's features;
+  11.3.6.8 the CQE initialization; 11.3.7.1 the SMHC0-2
+  register list carries CQCFG 0x0408 through CQSTATUS 0x0488.
+- Mainline sunxi-mmc has no cqhci glue. The vendor has it (cqhci-core.c,
+  MMC_SUNXI_CQE_ON; compiled in, CONFIG_MMC_CQHCI=y) and does not run it on
+  this board: no cqe-on in the DT, cmdq_en = 0 (same readback).
+- This patch does not set MMC_CAP2_CQE, so the core never enables CMDQ and
+  takes the hsq branch. Whether the fitted eMMC offers CMDQ is not read.
+
+THE VENDOR, READ AS A HINT (cubie-aiot-v1.4.8)
+----------------------------------------------
+Where it differs, and what this patch does instead:
+1. It turns the queue on with a DT property of its own, cap-hsq
+   (sunxi-mmc.c:4141), which no mainline binding documents. We key it to the
+   A733 eMMC compatible's cfg.
+2. It completes a write on the busy-clear interrupt alone, bounded only by its
+   5 s transfer watchdog with a host reset (`mmc-sunxi-a733-hardware-busy-wait`, vendor points 1 and 2). On
+   the queue path nothing checks the card after that. We complete on DTC/ACD
+   and an idle DAT0, and fail a write still busy after 10 s so that the block
+   layer's recovery reads the card.
+3. It suspends and resumes the queue in its system suspend/resume only
+   (sunxi-mmc.c:4591-4594, 4791-4794). Our controller runtime-suspends 50 ms
+   after the last request, so the queue is quiesced there, where the clocks
+   actually go off.
+4. It offers ->request_atomic (sunxi-mmc.c:3087, 3530); the queue then starts
+   requests through it and retries -EBUSY from a work. We do not need it:
+   sunxi_mmc_request() has no sleeping path, as in mtk-sd.
+
+VERIFIED / NOT VERIFIED
+-----------------------
+Applies clean at --fuzz=0 on the full series. A defconfig round-trip check
+is clean with the select; without it the round-trip fails (positive control).
+Read by an independent second reviewer before the build: no blocker; its
+minor findings are folded in. NOT built locally. NOT hardware-proven.
+Not exercised by the test boot below: the recovery path under the queue (a
+write failed after 10 s, recovery_halt, cqe_recovery_finish pumping the next
+request) and system sleep.
+
+Pending, as concrete observables on the test kernel (localversion -hsq), same
+method as the `mmc-sunxi-a733-hardware-busy-wait` test boot (RAM root,
+raw-region benchmark sessions, same benchmark binary):
+ 1. Cold boot: one "mmcN: Host Software Queue enabled" line, and
+    /sys/class/mmc_host/mmcN/device resolves to 4022000.mmc (the eMMC); none
+    for the SD host.
+ 2. Trace, every eMMC write phase, both governors:
+    count(cmd_opcode=13) <= count(cmd_opcode=6), and CMD25 still carries
+    sbc_opcode=23. SD phases: CMD13 = CMD25 as with `mmc-sunxi-a733-hardware-busy-wait`. Every phase starts
+    after more than 50 ms idle, so the host has runtime-suspended; the phases
+    running at all prove the queue's suspend/resume.
+ 3. eMMC sequential write 1M/4M from 136-144 MiB/s towards 156-160. eMMC
+    random 4k write reported against `mmc-sunxi-a733-hardware-busy-wait`'s 6224-6444 (schedutil) and
+    7194-7540 IOPS (performance). The queue lets the block layer hold up to 5
+    4 KiB writes in flight (HSQ_PERFORMANCE_DEPTH), so a random-write change
+    is not the CMD13 alone.
+ 4. No regression: every read row, both media, and every SD row within the
+    spread of the two untraced 2026-09-17 runs of
+    `mmc-sunxi-a733-hardware-busy-wait`; eMMC HS400 and SD SDR104 on a cold boot;
+    verify_bad=0.
+ 5. journalctl -k of the whole session: zero "card still busy", "busy ended
+    without the busy-clear interrupt", "busy clear without DTC/ACD",
+    "error -110", "data error, sending stop command", "request already
+    pending", "could not stop mmc software queue", "recovery failed",
+    "error -108", "I/O error, dev mmcblk", "Buffer I/O error", and no
+    WARNING from mmc_hsq.
+
+Assisted-by: Claude
+---
+--- a/drivers/mmc/host/Kconfig
++++ b/drivers/mmc/host/Kconfig
+@@ -983,6 +983,7 @@
+ 	tristate "Allwinner sunxi SD/MMC Host Controller support"
+ 	depends on ARCH_SUNXI || COMPILE_TEST
+ 	depends on SUNXI_CCU
++	select MMC_HSQ
+ 	help
+ 	  This selects support for the SD/MMC Host Controller on
+ 	  Allwinner sunxi SoCs.
+--- a/drivers/mmc/host/sunxi-mmc.c
++++ b/drivers/mmc/host/sunxi-mmc.c
+@@ -41,6 +41,8 @@
+ #include <linux/spinlock.h>
+ #include <linux/workqueue.h>
+ 
++#include "mmc_hsq.h"
++
+ /* register offset definitions */
+ #define SDXC_REG_GCTRL	(0x00) /* SMC Global Control Register */
+ #define SDXC_REG_CLKCR	(0x04) /* SMC Clock Control Register */
+@@ -134,6 +136,16 @@
+  */
+ #define SDXC_WRITE_BUSY_TIMEOUT_MS	1000
+ /*
++ * The same wait on a host running the software queue (cfg->can_hsq). There
++ * the block layer sends no CMD13 after a write (block.c
++ * mmc_blk_hsq_req_done() has no mmc_blk_card_busy()), so nothing behind the
++ * host would notice a card that is still busy. The host therefore holds the
++ * write for as long as the core's own poll would have waited,
++ * MMC_BLK_TIMEOUT_MS (10 s, block.c:78), and then fails it, which starts
++ * the block layer's recovery.
++ */
++#define SDXC_HSQ_WRITE_BUSY_TIMEOUT_MS	10000
++/*
+  * A write whose busy clear came in without DTC/ACD. The UM does not say that
+  * both arrive; without a bound such a request would never complete.
+  */
+@@ -371,6 +383,14 @@
+ 	 * SMHC_THLD BCIG busy-clear interrupt and SMHC_STATUS CARD_BUSY.
+ 	 */
+ 	bool can_wait_busy;
++
++	/*
++	 * The block layer issues requests through mmc_hsq, the host software
++	 * queue: no CMD13 after a write, and the next request is started from
++	 * the completion of the one before. Only with can_wait_busy, because
++	 * the host is then the only thing that waits for the card's busy.
++	 */
++	bool can_hsq;
+ };
+ 
+ struct sunxi_mmc_host {
+@@ -440,6 +460,24 @@
+ 	struct delayed_work done_work;
+ };
+ 
++/*
++ * Complete a request. With the software queue (cfg->can_hsq) a request the
++ * queue issued goes back to the queue, which completes it and starts the next
++ * one from here -- the hard IRQ, busy_work/done_work or the manual-stop thread.
++ * sunxi_mmc_request() does not sleep (dma_map_sg, the host spinlock, register
++ * writes), and no caller holds host->lock. Requests the core sends outside the
++ * queue (card init, CMD6, the cache flush, tuning, recovery) are not the
++ * queue's; mmc_hsq_finalize_request() says so and they take the usual path.
++ */
++static void sunxi_mmc_request_done(struct sunxi_mmc_host *host,
++				   struct mmc_request *mrq)
++{
++	if (host->cfg->can_hsq && mmc_hsq_finalize_request(host->mmc, mrq))
++		return;
++
++	mmc_request_done(host->mmc, mrq);
++}
++
+ static int sunxi_mmc_reset_host(struct sunxi_mmc_host *host)
+ {
+ 	unsigned long expire = jiffies + msecs_to_jiffies(250);
+@@ -895,7 +933,9 @@
+ 	unsigned long delay = 0;
+ 
+ 	if (mrq->data)
+-		timeout_ms = SDXC_WRITE_BUSY_TIMEOUT_MS;
++		timeout_ms = host->mmc->cqe_enabled ?
++			     SDXC_HSQ_WRITE_BUSY_TIMEOUT_MS :
++			     SDXC_WRITE_BUSY_TIMEOUT_MS;
+ 	else if (mrq->cmd->busy_timeout)
+ 		timeout_ms = mrq->cmd->busy_timeout;
+ 
+@@ -940,7 +980,11 @@
+ 			mrq->cmd->opcode, rint);
+ 
+ 	if (still_busy) {
+-		if (mrq->data)
++		if (mrq->data && host->mmc->cqe_enabled)
++			dev_err(mmc_dev(host->mmc),
++				"write: card still busy after %lld us, failed for block-layer recovery\n",
++				us);
++		else if (mrq->data)
+ 			dev_warn(mmc_dev(host->mmc),
+ 				 "write: card still busy after %lld us, left to the core's status poll\n",
+ 				 us);
+@@ -959,6 +1003,8 @@
+ 
+ 	if (still_busy && !mrq->data)
+ 		mrq->cmd->error = -ETIMEDOUT;
++	else if (still_busy && host->mmc->cqe_enabled)
++		mrq->data->error = -ETIMEDOUT;
+ 
+ 	return mrq;
+ }
+@@ -973,7 +1019,7 @@
+ 	if (ret == IRQ_WAKE_THREAD)
+ 		sunxi_mmc_handle_manual_stop(host->irq, host);
+ 	else
+-		mmc_request_done(host->mmc, mrq);
++		sunxi_mmc_request_done(host, mrq);
+ }
+ 
+ /*
+@@ -1054,7 +1100,7 @@
+ 	mrq = sunxi_mmc_end_busy_wait(host, busy, "DAT0 poll");
+ 	spin_unlock_irqrestore(&host->lock, iflags);
+ 
+-	mmc_request_done(host->mmc, mrq);
++	sunxi_mmc_request_done(host, mrq);
+ }
+ 
+ /*
+@@ -1171,10 +1217,10 @@
+ 	spin_unlock(&host->lock);
+ 
+ 	if (finalize && ret == IRQ_HANDLED)
+-		mmc_request_done(host->mmc, mrq);
++		sunxi_mmc_request_done(host, mrq);
+ 
+ 	if (busy_mrq)
+-		mmc_request_done(host->mmc, busy_mrq);
++		sunxi_mmc_request_done(host, busy_mrq);
+ 
+ 	if (sdio_int)
+ 		mmc_signal_sdio_irq(host->mmc);
+@@ -1213,7 +1259,7 @@
+ 	host->manual_stop_mrq = NULL;
+ 	spin_unlock_irqrestore(&host->lock, iflags);
+ 
+-	mmc_request_done(host->mmc, mrq);
++	sunxi_mmc_request_done(host, mrq);
+ 
+ 	return IRQ_HANDLED;
+ }
+@@ -1818,7 +1864,7 @@
+ 	/* Check for set_ios errors (should never happen) */
+ 	if (host->ferror) {
+ 		mrq->cmd->error = host->ferror;
+-		mmc_request_done(mmc, mrq);
++		sunxi_mmc_request_done(host, mrq);
+ 		return;
+ 	}
+ 
+@@ -1828,7 +1874,7 @@
+ 			dev_err(mmc_dev(mmc), "map DMA failed\n");
+ 			cmd->error = ret;
+ 			data->error = ret;
+-			mmc_request_done(mmc, mrq);
++			sunxi_mmc_request_done(host, mrq);
+ 			return;
+ 		}
+ 	}
+@@ -1890,7 +1936,7 @@
+ 
+ 		dev_err(mmc_dev(mmc), "request already pending\n");
+ 		mrq->cmd->error = -EBUSY;
+-		mmc_request_done(mmc, mrq);
++		sunxi_mmc_request_done(host, mrq);
+ 		return;
+ 	}
+ 
+@@ -2196,6 +2242,7 @@
+ 	.can_hs400 = true,
+ 	.can_auto_cmd23 = true,
+ 	.can_wait_busy = true,
++	.can_hsq = true,
+ 	/* UM 11.3.8.17 recommends BSIZE_OF_TRANS = 3 (MSize 16), TX_TL = 240
+ 	 * and RX_TL = 15, and 11.3.6.2 writes 0x300F00F0 verbatim.
+ 	 * Vendor silicon on the 8 GiB board reads exactly this while writing this eMMC
+@@ -2535,6 +2582,25 @@
+ 		mmc->max_busy_timeout = SDXC_MAX_BUSY_TIMEOUT_MS;
+ 	}
+ 
++	/*
++	 * The core turns the queue on when it attaches an eMMC without
++	 * command queueing (mmc.c, "Host Software Queue enabled"); it needs
++	 * the host's busy wait above, see cfg->can_hsq.
++	 */
++	if (host->cfg->can_hsq && host->cfg->can_wait_busy) {
++		struct mmc_hsq *hsq;
++
++		hsq = devm_kzalloc(&pdev->dev, sizeof(*hsq), GFP_KERNEL);
++		if (!hsq) {
++			ret = -ENOMEM;
++			goto error_free_dma;
++		}
++
++		ret = mmc_hsq_init(hsq, mmc);
++		if (ret)
++			goto error_free_dma;
++	}
++
+ 	ret = mmc_of_parse(mmc);
+ 	if (ret)
+ 		goto error_free_dma;
+@@ -2618,6 +2684,17 @@
+ 	sunxi_mmc_set_clk(host, &mmc->ios);
+ 	enable_irq(host->irq);
+ 
++	/*
++	 * Only while the core has the queue on: resuming it earlier would
++	 * make the core's own cqe_enable fail with -EBUSY at attach, and the
++	 * queue would stay unused without a word. cqe_enabled, not
++	 * hsq_enabled: the core clears the first when it removes the card
++	 * (bus.c mmc_remove_card) and never clears the second. On this host
++	 * mmc_hsq is the only cqe_ops, so both mean the queue.
++	 */
++	if (host->cfg->can_hsq && mmc->cqe_enabled)
++		mmc_hsq_resume(mmc);
++
+ 	return 0;
+ }
+ 
+@@ -2626,6 +2703,9 @@
+ 	struct mmc_host	*mmc = dev_get_drvdata(dev);
+ 	struct sunxi_mmc_host *host = mmc_priv(mmc);
+ 
++	if (host->cfg->can_hsq && mmc->cqe_enabled)
++		mmc_hsq_suspend(mmc);
++
+ 	/*
+ 	 * When clocks are off, it's possible receiving
+ 	 * fake interrupts, which will stall the system.

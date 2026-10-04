@@ -1,0 +1,285 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] clk: sunxi-ng: a733: expose the DCXO in the RTC-CCU
+
+The three CPU PLLs (CPU_L / CPU_B / CPU_DSU at 0x08870000) are clocked
+*directly* by the DCXO, not by REFPLL. The CPU-PLL controller therefore needs a
+real DCXO clock to name as its parent, and today's minimal RTC-CCU exposes only
+the two SERDES DCXO gates. Add the DCXO itself as CLK_RTC_DCXO (= 2, allocated
+against main; 0 and 1 stay with the SERDES gates and are untouched).
+
+== The chain this patch models, end to end
+
+X1 on the board -- 26.000 MHz, 16 pF, 10 ppm, schematic p.8 -- is the crystal
+wired to the SoC's DCXO pads; the DCXO cell turns it into the reference edge
+every high-speed block eventually counts. The cell does *not* know which crystal
+is fitted. Which rate the silicon believes it has is selected at reset by two
+external strap pads, DCXO_ST0 and DCXO_ST1. Both are weak pull-up by default, so
+a floating or pulled-up pad reads 1 and a grounded pad reads 0 (UM 9.1.5.4).
+That two-bit strap is mirrored, read-only, into XO_CTRL0[15:14] at RTC-CCU base
+0x07090000 + 0x160:
+
+    00 = 24 MHz   01 = 19.2 MHz   10 = 26 MHz   11 = 24 MHz
+
+and UM 4.1.4.1 makes reading it the prescribed method rather than an option:
+the DCXO frequency is to be derived from XO_CTRL0_REG bits 15:14, while the
+REFPLL frequency is stated to be a fixed 24 MHz.
+
+That second point is the reason this clock cannot be folded into the existing
+"hosc": REFPLL is fixed at 24 MHz whatever the crystal, so the PLLs that source
+REFPLL keep 24 MHz while the PLLs that source DCXO follow the strap. Getting it
+wrong is not cosmetic for the CPU PLLs: their N field is programmed raw
+(f = InputFreq * N / P / (M0*M1), N = PLL_N with no +1), so the whole frequency
+axis scales linearly with this number. At 24 MHz instead of 26, every CPU OPP
+would be described ~7.7 % low, and an OPP table keyed on those frequencies would
+hand each step the voltage of a lower one.
+
+== Where the values come from
+
+Encoding {24, 19.2, 26, 24} MHz: A733 UM 9.1.5.4 (prose) and the 0x0160
+XO_CTRL0_REG table in 9.1.7.16, which lists DCXO_ST as bits[15:14], access "R",
+with exactly those four meanings. The vendor BSP ccu-sun60iw2-rtc.c models the
+same four-way order as a mux; that was the hint that made us look, the encoding
+above is the UM's own.
+
+26 MHz on this board, two witnesses that do not share a source:
+
+ 1. Schematic / board reference: X1 = 26.000 MHz (16 pF, 10 ppm), and the
+    CK-SEL strap nets read SEL1 = 1 / SEL0 = 0, labelled "SOC=26M"
+    (schematic p.8).
+ 2. Silicon: XO_CTRL0 @0x07090160 = 0x983FB0F7, byte-identical on the 6 GiB board and
+    the 8 GiB board -> bits[15:14] = 0b10 = 26 MHz. Re-read on the 6 GiB board on 2026-07-22, five
+    consecutive reads, all 0x983fb0f7. Note the register's own reset default is
+    0x983F_10F7 (DCXO_ST = 00): the 0b10 in bits[15:14] is the pads talking, not
+    a default.
+
+The UM agrees where it names the crystal: 7.1.4 gives the DCXO as 26 MHz,
+and Table 4-2's 26 MHz reference column for the CPU PLLs (UM V1.00 PDF
+p. 362 and 41). Its CPU_BACK_PLL default note is no witness: V0.92 gave
+975 MHz for a 26 MHz DCXO, V1.00 gives 900 MHz for a 24 MHz DCXO
+(PDF p. 305), for the same reset fields (N = 75, P0 = 2), so the note
+fits whichever crystal it names.
+
+== Why a read-only clock and not a mux
+
+DCXO_ST is an "R" field: it reports pad state, it does not select anything.
+XO_CTRL0 as a whole additionally sits behind the XO_CTRL_WP_REG (0x15c) 0x16AA
+key. And the physical crystal is soldered. So there is no rate for Linux to
+choose here, at any layer -- software, register, or board. Modelling it as a
+four-way mux (as the BSP does) would advertise a .set_parent the silicon does not
+implement, and would need four otherwise-pointless fixed-rate DT parents just so
+three of them can never be selected. This uses a ccu_common with a single
+.recalc_rate that decodes the strap, in the shape ccu-sun6i-rtc.c already uses
+for "iosc": no .set_rate, no .determine_rate, no .set_parent, so clk_set_rate()
+on it cannot reach the register. The rate cannot change after reset, so
+CLK_GET_RATE_NOCACHE is deliberately not set -- sunxi_ccu_probe() assigns
+common->base before it registers the hws, so the single read at registration
+happens with a valid mapping and is the whole truth.
+
+One thing the BSP does not do is follow the UM's own read rule: 9.1.5.4 says
+to sample the field three times and only trust it when all reads agree, to
+rule out external interference. The pads are asynchronous inputs into
+the always-on RTC domain and a single glitched read would silently mis-scale the
+entire CPU frequency axis, so the decode resamples until three consecutive reads
+agree, and warns loudly instead of guessing quietly if they never do. On the 6 GiB board
+the field was stable across five reads; the loop costs nothing and removes the
+one failure mode that would be invisible afterwards.
+
+Not changed here: the two SERDES gates keep index 0/1 and their r-ahb parent.
+UM 9.1.5.5 describes those gates as sitting on the DCXO's PHY reference-clock
+outputs, which suggests their modelled parent is wrong, but that is a USB3/PCIe
+question with its own consumer and its own board test -- not this patch.
+
+== Verified / not verified
+
+Verified: the register value and its decode, on silicon, twice (the 6 GiB board re-read
+2026-07-22; a register dump of the 6 GiB board and the 8 GiB board), against the UM field table, and
+cross-checked against the UM's stated CPU_BACK_PLL default. Not verified here:
+the built object, the boot, and the clock the framework reports -- this patch has
+not been built or run.
+
+Pending, as one falsifiable observation on hardware: on the 6 GiB board, with `clk-sunxi-ng-a733-rtc-ccu-add-dcxo` applied
+and CONFIG_SUN60I_A733_RTC_CCU=y, /sys/kernel/debug/clk/dcxo/clk_rate must read
+exactly 26000000 in the same session in which devmem 0x07090160 shows
+bits[15:14] = 0b10. Any other rate falsifies the field position or the encoding
+table.
+
+Assisted-by: Claude
+
+diff --git a/drivers/clk/sunxi-ng/ccu-sun60i-a733-rtc.c b/drivers/clk/sunxi-ng/ccu-sun60i-a733-rtc.c
+index 2904a8ac4..e5684db1a 100644
+--- a/drivers/clk/sunxi-ng/ccu-sun60i-a733-rtc.c
++++ b/drivers/clk/sunxi-ng/ccu-sun60i-a733-rtc.c
+@@ -2,20 +2,22 @@
+ /*
+  * Allwinner A733 (sun60iw2) RTC clock control unit — minimal.
+  *
+- * Models only the two SERDES DCXO gates the COMB0 combo-PHY consumes
+- * (dcxo-serdes0/1). Both are plain gates on XO_CTRL1 (offset 0x16c) whose parent
+- * is the R-CCU r-ahb clock. Verified on silicon (the 8 GiB board, vendor 6.6, USB 3.2 Gen2
+- * device linked at 10 Gbps): both read 200 MHz (= r-ahb) with gate bits 4/5 in
+- * 0x16c. The full RTC clock tree (iosc/losc/rtc-1k, some key-field protected) is
+- * intentionally out of scope; it is not needed for USB3/SERDES and can be added
+- * later.
++ * Models the DCXO root clock and the two SERDES DCXO gates the COMB0 combo-PHY
++ * consumes (dcxo-serdes0/1). The gates are plain gates on XO_CTRL1 (offset
++ * 0x16c) whose parent is the R-CCU r-ahb clock. Verified on silicon (the 8 GiB board,
++ * vendor 6.6, USB 3.2 Gen2 device linked at 10 Gbps): both read 200 MHz
++ * (= r-ahb) with gate bits 4/5 in 0x16c. The full RTC clock tree
++ * (iosc/losc/rtc-1k, some key-field protected) is intentionally out of scope;
++ * it is not needed for USB3/SERDES/CPU-PLL and can be added later.
+  *
+  * Register offsets + gate bits from BSP ccu-sun60iw2-rtc.c (the radxa/allwinner-bsp tree)
+  * as a reference for values only; this uses solely mainline ccu-sunxi-ng
+- * primitives (no vendor key-field machinery — the dcxo-serdes gates need none).
++ * primitives (no vendor key-field machinery — the clocks here need none).
+  */
+ 
++#include <linux/bitfield.h>
+ #include <linux/clk-provider.h>
++#include <linux/io.h>
+ #include <linux/module.h>
+ #include <linux/platform_device.h>
+ 
+@@ -24,8 +26,94 @@
+ 
+ #include <dt-bindings/clock/sun60i-a733-rtc-ccu.h>
+ 
++#define SUN60I_A733_RTC_XO_CTRL0_REG	0x160
++#define SUN60I_A733_RTC_DCXO_ST		GENMASK(15, 14)
+ #define SUN60I_A733_RTC_XO_CTRL1_REG	0x16c
+ 
++/*
++ * The DCXO is the SoC's high-frequency reference oscillator. Which crystal the
++ * silicon believes it has is picked at reset by the two external strap pads
++ * DCXO_ST0/DCXO_ST1, and their state is mirrored read-only into
++ * XO_CTRL0[15:14] (A733 UM 9.1.5.4 and the 0x0160 register table, 9.1.7.16):
++ *
++ *   00: 24 MHz   01: 19.2 MHz   10: 26 MHz   11: 24 MHz
++ *
++ * UM 4.1.4.1 states it as a rule: the DCXO frequency is derived from the
++ * XO_CTRL0_REG field [15:14]. Note that this is *not* REFPLL, which
++ * the same paragraph fixes at 24 MHz and which the DT models as "hosc" — the
++ * PLLs that source REFPLL keep their 24 MHz reference, the ones sourcing DCXO
++ * (the CPU PLLs) do not.
++ */
++static const unsigned long sun60i_a733_dcxo_rates[] = {
++	24000000, 19200000, 26000000, 24000000,
++};
++
++/*
++ * UM 9.1.5.4 also prescribes how to read the field: sample it three times and
++ * only trust it when all reads agree, to rule out external interference. The pads
++ * are asynchronous inputs into the always-on
++ * RTC domain, so this is a real requirement, not boilerplate — and a wrong
++ * answer here silently mis-scales every CPU PLL by 24/26. Resample until three
++ * consecutive reads agree; if they never do, keep the last value and say so
++ * loudly rather than pretend.
++ */
++#define SUN60I_A733_DCXO_ST_SAMPLES	3
++#define SUN60I_A733_DCXO_ST_ATTEMPTS	5
++
++static u32 sun60i_a733_dcxo_read_st(struct ccu_common *cm)
++{
++	u32 st, val;
++	int attempt, i;
++
++	st = FIELD_GET(SUN60I_A733_RTC_DCXO_ST, readl(cm->base + cm->reg));
++
++	for (attempt = 0; attempt < SUN60I_A733_DCXO_ST_ATTEMPTS; attempt++) {
++		bool stable = true;
++
++		for (i = 1; i < SUN60I_A733_DCXO_ST_SAMPLES; i++) {
++			val = FIELD_GET(SUN60I_A733_RTC_DCXO_ST,
++					readl(cm->base + cm->reg));
++			if (val != st) {
++				st = val;
++				stable = false;
++			}
++		}
++
++		if (stable)
++			return st;
++	}
++
++	pr_warn("sun60i-a733-rtc-ccu: DCXO_ST unstable, assuming %lu Hz\n",
++		sun60i_a733_dcxo_rates[st]);
++
++	return st;
++}
++
++static unsigned long ccu_dcxo_recalc_rate(struct clk_hw *hw,
++					  unsigned long parent_rate)
++{
++	struct ccu_common *cm = hw_to_ccu_common(hw);
++
++	return sun60i_a733_dcxo_rates[sun60i_a733_dcxo_read_st(cm)];
++}
++
++/*
++ * Deliberately read-only: DCXO_ST is an "R" field reflecting pad straps, and
++ * XO_CTRL0 as a whole is behind the XO_CTRL_WP_REG (0x15c) 0x16AA key. There is
++ * no writable mux here, so this clock offers no .set_rate and no .set_parent —
++ * modelling it as a mux (as the BSP does) would advertise a knob the silicon
++ * does not have. The rate cannot change after reset, so no CLK_GET_RATE_NOCACHE
++ * either: one read at registration is the whole truth.
++ */
++static const struct clk_ops ccu_dcxo_ops = {
++	.recalc_rate	= ccu_dcxo_recalc_rate,
++};
++
++static struct ccu_common dcxo_clk = {
++	.reg		= SUN60I_A733_RTC_XO_CTRL0_REG,
++	.hw.init	= CLK_HW_INIT_NO_PARENT("dcxo", &ccu_dcxo_ops, 0),
++};
++
+ static const struct clk_parent_data r_ahb_parent[] = {
+ 	{ .fw_name = "r-ahb" },
+ };
+@@ -36,6 +124,7 @@
+ 			   SUN60I_A733_RTC_XO_CTRL1_REG, BIT(4), 0);
+ 
+ static struct ccu_common *sun60i_a733_rtc_ccu_clks[] = {
++	&dcxo_clk,
+ 	&dcxo_serdes1_clk.common,
+ 	&dcxo_serdes0_clk.common,
+ };
+@@ -44,8 +133,9 @@
+ 	.hws	= {
+ 		[CLK_RTC_DCXO_SERDES1]	= &dcxo_serdes1_clk.common.hw,
+ 		[CLK_RTC_DCXO_SERDES0]	= &dcxo_serdes0_clk.common.hw,
++		[CLK_RTC_DCXO]		= &dcxo_clk.hw,
+ 	},
+-	.num	= 2,
++	.num	= 3,
+ };
+ 
+ static const struct sunxi_ccu_desc sun60i_a733_rtc_ccu_desc = {
+@@ -80,5 +170,5 @@
+ };
+ module_platform_driver(sun60i_a733_rtc_ccu_driver);
+ 
+-MODULE_DESCRIPTION("Allwinner A733 RTC CCU (minimal, SERDES DCXO gates)");
++MODULE_DESCRIPTION("Allwinner A733 RTC CCU (minimal: DCXO + SERDES DCXO gates)");
+ MODULE_LICENSE("GPL");
+diff --git a/include/dt-bindings/clock/sun60i-a733-rtc-ccu.h b/include/dt-bindings/clock/sun60i-a733-rtc-ccu.h
+index 0017c0743..a08161f82 100644
+--- a/include/dt-bindings/clock/sun60i-a733-rtc-ccu.h
++++ b/include/dt-bindings/clock/sun60i-a733-rtc-ccu.h
+@@ -1,13 +1,15 @@
+ /* SPDX-License-Identifier: GPL-2.0-only OR MIT */
+ /*
+  * A733 (sun60iw2) RTC-CCU clock indices — minimal set.
+- * Only the SERDES DCXO gates are modelled (needed by the COMB0 combo-PHY); the
+- * full vendor RTC clock tree (iosc/osc32k/rtc-1k/...) is not required here.
++ * Only the SERDES DCXO gates and the DCXO root itself are modelled (the gates
++ * are needed by the COMB0 combo-PHY, the DCXO by the CPU PLLs); the full vendor
++ * RTC clock tree (iosc/osc32k/rtc-1k/...) is not required here.
+  */
+ #ifndef _DT_BINDINGS_CLK_SUN60I_A733_RTC_CCU_H_
+ #define _DT_BINDINGS_CLK_SUN60I_A733_RTC_CCU_H_
+ 
+ #define CLK_RTC_DCXO_SERDES1	0
+ #define CLK_RTC_DCXO_SERDES0	1
++#define CLK_RTC_DCXO		2
+ 
+ #endif

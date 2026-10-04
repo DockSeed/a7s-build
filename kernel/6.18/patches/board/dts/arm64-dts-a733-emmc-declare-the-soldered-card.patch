@@ -1,0 +1,259 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: a733: say in the DT that SMHC2 is a soldered eMMC
+
+`mmc@4022000` has carried `non-removable` since `arm64-dts-allwinner-a733-add-sd-emmc`, and nothing else. So the
+node describes a controller that merely happens to keep its card, and the core
+treats it as one: every `mmc_rescan_try_freq()` still opens with an SDIO reset
+and a full SD attach before it ever reaches `mmc_attach_mmc()`. Read the
+guards in drivers/mmc/core/core.c (6.18.36):
+
+    2119   if (!(host->caps2 & MMC_CAP2_NO_SDIO))
+    2120           sdio_reset(host);
+    2122   mmc_go_idle(host);
+    2124   if (!(host->caps2 & MMC_CAP2_NO_SD)) {
+    2125           if (mmc_send_if_cond_pcie(host, host->ocr_avail))
+    2127           if (mmc_card_sd_express(host))
+    2132   if (!(host->caps2 & MMC_CAP2_NO_SDIO))
+    2133           if (!mmc_attach_sdio(host))
+    2136   if (!(host->caps2 & MMC_CAP2_NO_SD))
+    2137           if (!mmc_attach_sd(host))
+    2140   if (!(host->caps2 & MMC_CAP2_NO_MMC))
+    2141           if (!mmc_attach_mmc(host))
+
+Four call sites, all gated by the two bits this patch sets. There is no card
+slot on SMHC2 to find anything in: the device is soldered -- U8A, a Samsung
+KLM8G1GETF-B041, schematic V1.10 p9 -- and it has no SDIO function. So the DT
+gets `no-sd` and `no-sdio`, read by drivers/mmc/core/host.c:401-404.
+
+`mmc-ddr-1_8v` is the second half of the same point. DDR52 works on this board
+today, but only as a side effect: sunxi-mmc.c hands MMC_CAP_1_8V_DDR (and
+MMC_CAP_3_3V_DDR) to *every* new-timings host, before mmc_of_parse() runs. That
+is a statement about the controller family. What the board says is the card:
+EXT_CSD[196] DEVICE_TYPE reads 0x57 on the fitted part, i.e. bits 0/1/2/4/6 =
+HS26, HS52, DDR52-1.8V, HS200-1.8V, HS400-1.8V. Reader:
+drivers/mmc/core/host.c:387-388.
+
+And the same statement on the host side, drivers/mmc/host/sunxi-mmc.c:
+`MMC_CAP2_NO_SD | MMC_CAP2_NO_SDIO` in sunxi_mmc_probe().
+
+    ! This bit must NOT be set unconditionally. One and the same driver
+    ! serves SMHC0, the SD slot that carries root on the 8 GiB board and the 6 GiB board, and
+    ! mmc_of_parse() never clears these two bits. An ungated
+    ! mmc->caps2 |= MMC_CAP2_NO_SD would make mmc_attach_sd() unreachable
+    ! on SMHC0 and the SD card would never enumerate again.
+
+It is therefore gated on a new per-cfg flag, `emmc_only`, set on
+`sun60i_a733_emmc_cfg` alone -- the same shape as `can_hs400`, `can_auto_cmd23`
+and `can_hsq` already in that struct. The other SoCs' `-emmc` cfgs are left
+untouched: no board here can measure them.
+
+`cap-mmc-hw-reset` is KEPT, with the card-side state written into the node.
+The board side is real, and both citations were re-read for this patch rather
+than taken over:
+
+  - schematic V1.10 p7, ball 1AB23: net EMMC_RST on
+    `PC1/NAND-ALE/SDC2-RST/SDC3-RST/PC-EINT1`;
+  - schematic V1.10 p9, U8A pin RST: the same net at the package;
+  - and `mmc2_clk_pins` in this DTS already muxes PC1 to function "mmc2".
+
+The host can drive it: sunxi_mmc_hw_reset() toggles SMHC_HWRST and is hooked as
+`.card_hw_reset`. The card ignores it: EXT_CSD[162] RST_N_FUNCTION reads 0x00
+= "RST_n temporarily disabled", so mmc_card_can_reset()
+(drivers/mmc/core/mmc.c:2300-2306) is false and _mmc_hw_reset() falls to its
+power-cycle branch (mmc.c:2319-2328).
+
+    ! That branch resets nothing on this board either. vmmc is SWOUT2 and
+    ! vqmmc is CLDO5; both are `regulator-always-on` and both are shared
+    ! with an I/O bank supply (vcc-ph / vcc-pc in the pinctrl node), so
+    ! mmc_power_cycle() cannot drop the card's rails. Today this eMMC has
+    ! no working reset of any kind. That is a finding, not something this
+    ! patch fixes.
+
+Dropping the property would not improve that; it would only delete the true
+statement that the host can drive RST_N, and it would remove the precondition
+for the one reset that could work here. Note also that
+mmc_hw_reset_for_init() (core.c:2048-2055) checks MMC_CAP_HW_RESET and
+`ops->card_hw_reset` but NOT mmc_card_can_reset() -- so with the property the
+pin is already asserted before each init; it is the card's RST_N_FUNCTION, not
+Linux, that makes it a no-op. Turning the card side on means programming
+RST_N_FUNCTION = 0x1, which is permanent and irreversible. That is a separate
+decision with its own evidence, not part of a wiring baseline.
+
+`fixed-emmc-driver-type` is deliberately NOT set. The card offers five driver
+types (EXT_CSD[197] DRIVER_STRENGTH = 0x1f) and we run type B because nothing
+selects one: EXT_CSD[185] HS_TIMING reads 0x03 and its driver-type nibble
+[7:4] is 0. Any value here would be a guess about pad and trace impedance. The
+node carries a comment naming the experiment that would earn one; the reader,
+if it is ever set, is drivers/mmc/core/host.c:412-414 ->
+mmc_select_driver_type() (mmc.c:1356).
+
+Card-side values: `mmc extcsd`-style raw dump taken on the 8 GiB board, 2026-09-19, from
+the eMMC this image runs on. Bytes 162 / 185 / 196 / 197 = 0x00 / 0x03 / 0x57 /
+0x1f.
+
+Verified -- three separate claims:
+
+  - applies: `patch -p1 --fuzz=0` over a freshly unpacked pristine 6.18.36
+    with the full numbered series, 184 of 184, no fuzz, no reject (2026-09-19).
+  - builds, DT half only: `cpp` + `dtc -I dts -O dtb` on the applied tree,
+    0 warnings, and checked in the *output* rather than the source -- the
+    decompiled dtb's `mmc@4022000` carries `mmc-ddr-1_8v`, `no-sd`, `no-sdio`
+    and `cap-mmc-hw-reset`, and carries no `fixed-emmc-driver-type`. All four
+    properties are in `mmc-controller-common.yaml`, so the node still passes
+    the sunxi binding's `unevaluatedProperties: false`.
+  - builds, C half: ✅ compiled by the automated build (compile-gate + full kernel).
+    Not built by the author; the pipeline result is the witness.
+  - silicon: NOT verified. Nothing in this patch has been on a board.
+
+Pending, as one observable on hardware: on a boot of a kernel carrying this
+patch, an MMC command trace of `4022000.mmc` over a rescan contains no CMD52
+and no CMD8/ACMD41 SD sequence -- only CMD0/CMD1/CMD2/CMD3 -- while
+`4020000.mmc` still enumerates the SD card normally. That single boot
+falsifies both halves at once: the eMMC skipping the SD/SDIO attach, and the
+gate not having leaked onto the SD controller.
+
+Assisted-by: Claude
+---
+
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -887,9 +887,92 @@
+ 			max-frequency = <200000000>;
+ 			non-removable;
+ 			cap-mmc-highspeed;
++
++			/*
++			 * The card answers DDR52 at 1.8 V: EXT_CSD[196]
++			 * DEVICE_TYPE reads 0x57 on the fitted part
++			 * (the 8 GiB board, 2026-09-19), i.e. bits 0/1/2/4/6 =
++			 * HS26, HS52, DDR52-1.8V, HS200-1.8V, HS400-1.8V.
++			 * Say so here. Today the bit already arrives from the
++			 * driver, which hands MMC_CAP_1_8V_DDR to every
++			 * new-timings host (sunxi-mmc.c, the
++			 * clk_delays||use_new_timings block before
++			 * mmc_of_parse()); that is a controller default, not a
++			 * statement about this board's card.
++			 * Reader: drivers/mmc/core/host.c:387-388.
++			 */
++			mmc-ddr-1_8v;
+ 			mmc-hs200-1_8v;
+ 			mmc-hs400-1_8v;
++
++			/*
++			 * Soldered eMMC at footprint U8A. ⚠ The schematic
++			 * symbol carries KLM8G1GETF-B041 (V1.10 p9); the part
++			 * actually fitted on the 8 GiB board is a SanDisk iNAND
++			 * SDINBDV4-32G -- package photo, and sysfs reads
++			 * manfid 0x45, name DV4032, 29.1 GiB (2026-09-19).
++			 * Either way it is soldered: no removable card and no SDIO
++			 * function can ever appear on SMHC2, so every rescan
++			 * may skip the SD and SDIO halves of the probe:
++			 * sdio_reset()'s CMD52, mmc_send_if_cond_pcie(),
++			 * mmc_attach_sdio() and mmc_attach_sd()
++			 * (drivers/mmc/core/core.c:2119-2138 -- each of those
++			 * four call sites is guarded by exactly these two
++			 * caps2 bits).
++			 * Readers: drivers/mmc/core/host.c:401-404.
++			 */
++			no-sd;
++			no-sdio;
++
++			/*
++			 * RST_N is wired on the board: net EMMC_RST runs from
++			 * PC1 (PC1/NAND-ALE/SDC2-RST/SDC3-RST/PC-EINT1,
++			 * schematic V1.10 p7 ball 1AB23) to the card's RST pin
++			 * (p9, U8A pin RST), and mmc2_clk_pins above muxes PC1
++			 * to the mmc2 function. The host drives it from
++			 * SMHC_HWRST (sunxi-mmc.c sunxi_mmc_hw_reset(), hooked
++			 * as .card_hw_reset), and this property is what arms
++			 * that path (drivers/mmc/core/host.c:372-373 ->
++			 * MMC_CAP_HW_RESET).
++			 *
++			 * The card currently ignores the signal:
++			 * EXT_CSD[162] RST_N_FUNCTION reads 0x00 on the fitted
++			 * part (the 8 GiB board, 2026-09-19) = "RST_n temporarily
++			 * disabled". So mmc_card_can_reset() is false
++			 * (drivers/mmc/core/mmc.c:2300-2306) and _mmc_hw_reset()
++			 * takes its power-cycle branch
++			 * (drivers/mmc/core/mmc.c:2319-2328) -- which on this
++			 * board resets nothing either, because vmmc (SWOUT2)
++			 * and vqmmc (CLDO5) are regulator-always-on and are
++			 * shared with the PH and PC I/O banks.
++			 *
++			 * The property stays because it describes the board and
++			 * the host, which is this node's job, and because it is
++			 * the precondition for the only reset that could ever
++			 * work here. Enabling it at the card is a one-time
++			 * programming of RST_N_FUNCTION = 0x1 (permanent, not
++			 * reversible) and is therefore a separate decision with
++			 * its own evidence, not part of the wiring.
++			 */
+ 			cap-mmc-hw-reset;
++
++			/*
++			 * fixed-emmc-driver-type is deliberately absent.
++			 * The card offers five types: EXT_CSD[197]
++			 * DRIVER_STRENGTH = 0x1f (the 8 GiB board, 2026-09-19), and we run
++			 * type B today because nothing selects one --
++			 * EXT_CSD[185] HS_TIMING reads 0x03, whose driver-type
++			 * nibble [7:4] is 0. Picking a value without measuring
++			 * it would be a guess about pad/trace impedance.
++			 * The experiment that would settle it: sweep
++			 * fixed-emmc-driver-type 0..4 on the 8 GiB board and record, per
++			 * value, HS400 re-tune count and the CRC/end-bit error
++			 * histogram from sunxi_mmc_dump_errinfo() over a fixed
++			 * write soak. Until that exists, no value here.
++			 * Reader, when it is set: drivers/mmc/core/host.c:412-414
++			 * -> host->fixed_drv_type, consumed by
++			 * mmc_select_driver_type() (drivers/mmc/core/mmc.c:1356).
++			 */
+ 			#address-cells = <1>;
+ 			#size-cells = <0>;
+ 			status = "okay";
+--- a/drivers/mmc/host/sunxi-mmc.c
++++ b/drivers/mmc/host/sunxi-mmc.c
+@@ -391,6 +391,16 @@
+ 	 * the host is then the only thing that waits for the card's busy.
+ 	 */
+ 	bool can_hsq;
++
++	/*
++	 * The compatible this cfg is reached by names a controller instance
++	 * that is wired to a soldered eMMC device: no removable card, no SDIO
++	 * function. Lets the core skip the SD and SDIO halves of every probe.
++	 * Must stay per-cfg: one and the same driver serves the SD slot on this
++	 * SoC, and an unconditional MMC_CAP2_NO_SD there would stop the card
++	 * that carries root from ever attaching.
++	 */
++	bool emmc_only;
+ };
+ 
+ struct sunxi_mmc_host {
+@@ -2243,6 +2253,7 @@
+ 	.can_auto_cmd23 = true,
+ 	.can_wait_busy = true,
+ 	.can_hsq = true,
++	.emmc_only = true,
+ 	/* UM 11.3.8.17 recommends BSIZE_OF_TRANS = 3 (MSize 16), TX_TL = 240
+ 	 * and RX_TL = 15, and 11.3.6.2 writes 0x300F00F0 verbatim.
+ 	 * Vendor silicon on the 8 GiB board reads exactly this while writing this eMMC
+@@ -2601,6 +2612,19 @@
+ 			goto error_free_dma;
+ 	}
+ 
++	/*
++	 * A controller wired to a soldered eMMC has no SD card and no SDIO
++	 * function to find, so mmc_rescan_try_freq() may go straight to
++	 * mmc_attach_mmc(): these two bits are what gate sdio_reset()'s CMD52,
++	 * mmc_send_if_cond_pcie(), mmc_attach_sdio() and mmc_attach_sd()
++	 * (mmc/core/core.c). The board says the same thing through no-sd /
++	 * no-sdio in the DT and the two agree: mmc_of_parse() below only ORs
++	 * these two bits in (core/host.c:401-404), and its single caps2 clear
++	 * is "no-mmc-hs400", which touches the HS400 bits alone.
++	 */
++	if (host->cfg->emmc_only)
++		mmc->caps2 |= MMC_CAP2_NO_SD | MMC_CAP2_NO_SDIO;
++
+ 	ret = mmc_of_parse(mmc);
+ 	if (ret)
+ 		goto error_free_dma;

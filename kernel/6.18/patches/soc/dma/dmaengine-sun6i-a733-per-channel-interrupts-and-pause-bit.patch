@@ -1,0 +1,256 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Fri, 2 Oct 2026 04:00:00 +0200
+Subject: [PATCH] dmaengine: sun6i: add the A733, per-channel interrupts and pause at bit 0
+
+The A733 DMA controller is the A100's in its channel registers, the
+descriptor and the configuration word, but not in two places the driver
+writes:
+
+1. Interrupts. There is no global DMA_IRQ_EN/DMA_IRQ_STAT block at
+   0x00/0x10. Each channel has its own enable at 0x100 + 0x34 + N*0x40 and
+   its own W1C pending register at +0x38, with the same four bits (half,
+   package, queue, timeout). UM V1.00 ch13: the register list begins at
+   0x20, DMA_IRQ_EN_REG and DMA_IRQ_PEND_REG are
+   per channel.
+2. Pause. DMA_PAU_REG has its pause bit at bit 0; the
+   driver writes bit 1.
+
+Both read back on silicon, the 8 GiB board, 2026-10-02, bus gate and reset of
+DMAC0 opened by hand: 0x7 written to 0x00 and to 0x10 reads back 0; 0xf
+written to channel 0's IRQ_EN (0x134) reads 0xf, 0x2 to channel 1's
+(0x174) reads 0x2; 0x2 written to DMA_PAU reads 0, 0x1 reads 1.
+
+So the A733 gets its own config, has_per_chan_irq and pause_bit:
+start_desc writes the channel's IRQ_EN directly, the interrupt handler
+walks the channels' pending registers, kill_tasklet clears every channel's
+enable, and the common-register dump prints only what exists.
+
+Left as the A100 has it: the h3 auto-gating write (0x28 = 0x4, "when
+initializing, bit-2 should be set"), h6 DRQ and mode
+fields, h3 burst field, DMA_STAT at 0x30.
+
+Not taken: has_high_addr. The A733's high address bits are three per
+side at PARA[13:11] and [17:15] (35-bit), not two at
+[17:16]/[19:18] where SRC_HIGH_ADDR/DST_HIGH_ADDR put them, so the flag
+would corrupt the parameter word. Descriptors and buffers stay 32-bit.
+Bus widths 1, 2 and 4 bytes only: the UM claims 64-bit, the vendor driver
+does not offer it, and nothing here needs it.
+
+Vendor: allwinner,dma-v106 in the BSP is a fork of this driver with the
+same per-channel accessors (sunxi_dma_v106, *_v102 callbacks); this is a
+re-derivation from the UM, not a copy. The vendor additionally writes
+IRQ_CPU_EN = 0xFF and IRQ_CPUS_EN = 0xFF00 to split the channels between
+the CPU and a coprocessor; with no coprocessor using DMAC0 here, the
+reset value 0xFFFF in both is left alone.
+
+A523: mainline is gaining "allwinner,sun55i-a523-dma" with the A100 as
+fallback; the A523 has the A100's global interrupt registers, so neither
+that compatible nor its fallback fits the A733.
+
+Verified: applies, builds. Silicon effect owed: dmatest memcpy on DMAC0.
+
+Assisted-by: Claude
+---
+--- a/drivers/dma/sun6i-dma.c
++++ b/drivers/dma/sun6i-dma.c
+@@ -61,6 +61,7 @@
+ 
+ #define DMA_CHAN_PAUSE		0x04
+ #define DMA_CHAN_PAUSE_PAUSE		BIT(1)
++#define DMA_CHAN_PAUSE_PAUSE_A733	BIT(0)
+ #define DMA_CHAN_PAUSE_RESUME		0
+ 
+ #define DMA_CHAN_LLI_ADDR	0x08
+@@ -92,6 +93,16 @@
+ 
+ #define DMA_CHAN_CUR_PARA	0x1c
+ 
++/*
++ * Per-channel interrupt registers (A733). This controller has no global
++ * DMA_IRQ_EN/DMA_IRQ_STAT block at 0x00/0x10: each channel carries its own
++ * enable and W1C pending register, with the same four bits (half, package,
++ * queue, timeout) the global registers pack per channel.
++ */
++#define DMA_CHAN_IRQ_EN		0x34
++#define DMA_CHAN_IRQ_PEND	0x38
++#define DMA_CHAN_IRQ_ALL	(DMA_IRQ_HALF | DMA_IRQ_PKG | DMA_IRQ_QUEUE | BIT(3))
++
+ /*
+  * LLI address mangling
+  *
+@@ -144,6 +155,14 @@ struct sun6i_dma_config {
+ 	u32 dst_addr_widths;
+ 	bool has_high_addr;
+ 	bool has_mbus_clk;
++	/*
++	 * The interrupt enable and pending bits live in each channel's register
++	 * block (DMA_CHAN_IRQ_EN/DMA_CHAN_IRQ_PEND) instead of in the global
++	 * DMA_IRQ_EN/DMA_IRQ_STAT registers.
++	 */
++	bool has_per_chan_irq;
++	/* Pause bit in DMA_CHAN_PAUSE; 0 means DMA_CHAN_PAUSE_PAUSE. */
++	u32 pause_bit;
+ };
+ 
+ /*
+@@ -236,6 +255,13 @@ to_sun6i_desc(struct dma_async_tx_descriptor *tx)
+ 
+ static inline void sun6i_dma_dump_com_regs(struct sun6i_dma_dev *sdev)
+ {
++	if (sdev->cfg->has_per_chan_irq) {
++		dev_dbg(sdev->slave.dev, "Common register:\n"
++			"\tstats(%04x): 0x%08x\n",
++			DMA_STAT, readl(sdev->base + DMA_STAT));
++		return;
++	}
++
+ 	dev_dbg(sdev->slave.dev, "Common register:\n"
+ 		"\tmask0(%04x): 0x%08x\n"
+ 		"\tmask1(%04x): 0x%08x\n"
+@@ -462,12 +488,18 @@ static int sun6i_dma_start_desc(struct sun6i_vchan *vchan)
+ 
+ 	vchan->irq_type = vchan->cyclic ? DMA_IRQ_PKG : DMA_IRQ_QUEUE;
+ 
++	if (sdev->cfg->has_per_chan_irq) {
++		writel(vchan->irq_type, pchan->base + DMA_CHAN_IRQ_EN);
++		goto start;
++	}
++
+ 	irq_val = readl(sdev->base + DMA_IRQ_EN(irq_reg));
+ 	irq_val &= ~((DMA_IRQ_HALF | DMA_IRQ_PKG | DMA_IRQ_QUEUE) <<
+ 			(irq_offset * DMA_IRQ_CHAN_WIDTH));
+ 	irq_val |= vchan->irq_type << (irq_offset * DMA_IRQ_CHAN_WIDTH);
+ 	writel(irq_val, sdev->base + DMA_IRQ_EN(irq_reg));
+ 
++start:
+ 	writel(pchan->desc->p_lli, pchan->base + DMA_CHAN_LLI_ADDR);
+ 	writel(DMA_CHAN_ENABLE_START, pchan->base + DMA_CHAN_ENABLE);
+ 
+@@ -542,6 +574,49 @@ static void sun6i_dma_tasklet(struct tasklet_struct *t)
+ 	}
+ }
+ 
++static void sun6i_dma_chan_irq(struct sun6i_pchan *pchan, u32 status)
++{
++	struct sun6i_vchan *vchan = pchan->vchan;
++
++	if (!vchan || !(status & vchan->irq_type))
++		return;
++
++	if (vchan->cyclic) {
++		vchan_cyclic_callback(&pchan->desc->vd);
++	} else {
++		spin_lock(&vchan->vc.lock);
++		vchan_cookie_complete(&pchan->desc->vd);
++		pchan->done = pchan->desc;
++		spin_unlock(&vchan->vc.lock);
++	}
++}
++
++static irqreturn_t sun6i_dma_interrupt_per_chan(struct sun6i_dma_dev *sdev)
++{
++	struct sun6i_pchan *pchan;
++	int i, ret = IRQ_NONE;
++	u32 status;
++
++	for (i = 0; i < sdev->num_pchans; i++) {
++		pchan = sdev->pchans + i;
++		status = readl(pchan->base + DMA_CHAN_IRQ_PEND) & DMA_CHAN_IRQ_ALL;
++		if (!status)
++			continue;
++
++		dev_dbg(sdev->slave.dev, "DMA irq status chan %d: 0x%x\n",
++			i, status);
++
++		writel(status, pchan->base + DMA_CHAN_IRQ_PEND);
++		sun6i_dma_chan_irq(pchan, status);
++		ret = IRQ_HANDLED;
++	}
++
++	if (ret == IRQ_HANDLED && !atomic_read(&sdev->tasklet_shutdown))
++		tasklet_schedule(&sdev->task);
++
++	return ret;
++}
++
+ static irqreturn_t sun6i_dma_interrupt(int irq, void *dev_id)
+ {
+ 	struct sun6i_dma_dev *sdev = dev_id;
+@@ -550,6 +625,9 @@ static irqreturn_t sun6i_dma_interrupt(int irq, void *dev_id)
+ 	int i, j, ret = IRQ_NONE;
+ 	u32 status;
+ 
++	if (sdev->cfg->has_per_chan_irq)
++		return sun6i_dma_interrupt_per_chan(sdev);
++
+ 	for (i = 0; i < sdev->num_pchans / DMA_IRQ_CHAN_NR; i++) {
+ 		status = readl(sdev->base + DMA_IRQ_STAT(i));
+ 		if (!status)
+@@ -887,7 +965,7 @@ static int sun6i_dma_pause(struct dma_chan *chan)
+ 	dev_dbg(chan2dev(chan), "vchan %p: pause\n", &vchan->vc);
+ 
+ 	if (pchan) {
+-		writel(DMA_CHAN_PAUSE_PAUSE,
++		writel(sdev->cfg->pause_bit ?: DMA_CHAN_PAUSE_PAUSE,
+ 		       pchan->base + DMA_CHAN_PAUSE);
+ 	} else {
+ 		spin_lock(&sdev->lock);
+@@ -1064,8 +1142,15 @@ static struct dma_chan *sun6i_dma_of_xlate(struct of_phandle_args *dma_spec,
+ static inline void sun6i_kill_tasklet(struct sun6i_dma_dev *sdev)
+ {
+ 	/* Disable all interrupts from DMA */
+-	writel(0, sdev->base + DMA_IRQ_EN(0));
+-	writel(0, sdev->base + DMA_IRQ_EN(1));
++	if (sdev->cfg->has_per_chan_irq) {
++		int i;
++
++		for (i = 0; i < sdev->num_pchans; i++)
++			writel(0, sdev->pchans[i].base + DMA_CHAN_IRQ_EN);
++	} else {
++		writel(0, sdev->base + DMA_IRQ_EN(0));
++		writel(0, sdev->base + DMA_IRQ_EN(1));
++	}
+ 
+ 	/* Prevent spurious interrupts from scheduling the tasklet */
+ 	atomic_inc(&sdev->tasklet_shutdown);
+@@ -1261,6 +1346,31 @@ static struct sun6i_dma_config sun50i_h6_dma_cfg = {
+  * and a total of 24 usable source and destination endpoints.
+  */
+ 
++/*
++ * The A733 controller: the A100's channel layout, burst, DRQ and mode fields,
++ * but per-channel interrupt registers, the pause bit at bit 0, and 35-bit high
++ * address fields that do not sit where SRC_HIGH_ADDR/DST_HIGH_ADDR put them,
++ * so has_high_addr stays false and descriptors and buffers stay 32-bit.
++ * The number of channels comes from the device tree.
++ */
++static struct sun6i_dma_config sun60i_a733_dma_cfg = {
++	.clock_autogate_enable = sun6i_enable_clock_autogate_h3,
++	.set_burst_length = sun6i_set_burst_length_h3,
++	.set_drq          = sun6i_set_drq_h6,
++	.set_mode         = sun6i_set_mode_h6,
++	.src_burst_lengths = BIT(1) | BIT(4) | BIT(8) | BIT(16),
++	.dst_burst_lengths = BIT(1) | BIT(4) | BIT(8) | BIT(16),
++	.src_addr_widths   = BIT(DMA_SLAVE_BUSWIDTH_1_BYTE) |
++			     BIT(DMA_SLAVE_BUSWIDTH_2_BYTES) |
++			     BIT(DMA_SLAVE_BUSWIDTH_4_BYTES),
++	.dst_addr_widths   = BIT(DMA_SLAVE_BUSWIDTH_1_BYTE) |
++			     BIT(DMA_SLAVE_BUSWIDTH_2_BYTES) |
++			     BIT(DMA_SLAVE_BUSWIDTH_4_BYTES),
++	.has_mbus_clk = true,
++	.has_per_chan_irq = true,
++	.pause_bit = DMA_CHAN_PAUSE_PAUSE_A733,
++};
++
+ static struct sun6i_dma_config sun8i_v3s_dma_cfg = {
+ 	.nr_max_channels = 8,
+ 	.nr_max_requests = 23,
+@@ -1289,6 +1399,7 @@ static const struct of_device_id sun6i_dma_match[] = {
+ 	{ .compatible = "allwinner,sun50i-a64-dma", .data = &sun50i_a64_dma_cfg },
+ 	{ .compatible = "allwinner,sun50i-a100-dma", .data = &sun50i_a100_dma_cfg },
+ 	{ .compatible = "allwinner,sun50i-h6-dma", .data = &sun50i_h6_dma_cfg },
++	{ .compatible = "allwinner,sun60i-a733-dma", .data = &sun60i_a733_dma_cfg },
+ 	{ /* sentinel */ }
+ };
+ MODULE_DEVICE_TABLE(of, sun6i_dma_match);

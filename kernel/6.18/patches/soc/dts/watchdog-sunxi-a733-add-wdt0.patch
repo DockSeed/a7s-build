@@ -1,0 +1,225 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Wed, 22 Jul 2026 14:10:00 +0200
+Subject: [PATCH] watchdog: sunxi: A733: add WDT0 to the DT
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add the A733's WDT0 to the board DT via a fallback compatible on the
+A523 watchdog, and extend the binding to accept that compatible. The
+block is real hardware and belongs in the DT on its own merits: it gives
+the board a working /dev/watchdog.
+
+THE CARRY THIS PATCH USED TO CARRY, AND WHY IT IS GONE (2026-08-08)
+
+Until now this patch also added an optional `priority` DT property to
+`sunxi_wdt`, set it to 192 in the node, and existed mainly for that: the
+prebuilt vendor BL31 blob (`awbin/a733/bl31.bin`,
+`v2.5(debug):177ce84c2-dirty`) had a PSCI SYSTEM_RESET that never
+completed, PSCI's restart handler registers at 129 against the
+watchdog's 128, and `kernel/reboot.c` walks the chain in descending
+priority -- so `reboot` reached PSCI, hung there, and never reached the
+watchdog. Raising the watchdog above 129 was the workaround.
+
+Its own drop condition, quoted from the version of this header that
+shipped: "a boot of a chain whose BL31 was built from source, in which
+`reboot` resets the board with the `priority = <192>;` line deleted from
+the watchdog node. At that point delete the line (and, if nothing else
+has grown a use for it, the driver hunk and the binding's `priority`
+property with it). Keep the node."
+
+That observation exists. On 2026-07-20, on the source-BL31 branch, `reboot -f` reached
+`BOOT0 is starting!` on a tree that carried **no version of this patch at all** --
+not the line deleted, the whole patch absent -- and with U-Boot's
+watchdog not started either (`WDT: Not starting watchdog@2050000`). The
+condition is met more strongly than it was written. The source chain has
+since landed and is what ships (HW-proven 2026-08-03).
+
+The mechanism, so nobody reads this as "PSCI suddenly works": TF-A v2.12
+builds `plat/allwinner/sun60i_a733` with `STANDALONE_WATCHDOG := 1`, and
+`sunxi_native_pm.c` therefore implements SYSTEM_RESET as a single
+`mmio_write_32(SUNXI_R_WDOG_BASE + 0x0008, 0x16aa0001)` -- a watchdog
+soft reset **inside BL31**. The reset never leaves firmware. The v2.5
+blob did not do this, which is the whole difference.
+(This describes the TF-A v2.12 tree of 2026-08. The recipe now builds TF-A
+master with the TF-A patch `allwinner-system-reset-through-a-standalone-watchdog`,
+which also keeps SYSTEM_RESET inside BL31.)
+
+So all three carry pieces are removed here: the `priority = <192>;` line,
+the driver hunk in `sunxi_wdt.c`, and the binding's `priority` property
+plus its `$ref` to `restart-handler.yaml#`. Nothing else in this tree
+reads `priority` (checked: it appears in no other patch). What stays is
+the node and its compatible.
+
+WHERE EACH VALUE COMES FROM
+
+Spec: A733 UM 8.3.5 places WDT0_CPUX at 0x02050000; the documented defaults are the last row below.
+
+Silicon -- register readback, `/sys/class/sunxi_dump`, 2026-07-22, read
+on both boards, 0x02050000..0x02050020:
+
+              +0x00  +0x04  +0x08  +0x0c  +0x10  +0x14  +0x18
+  first 6 GiB   0      0      0      0      1      0xb1   0x1f
+  second 6 GiB  0      0      0      0      1      0      0x1f
+  UM def        0      0      0      0      1      0      0x1f
+
+Two different claims follow, and they are worth keeping apart:
+
+  1. The offsets are right and the block is the documented one. Every
+     register with a non-zero documented default reads exactly that
+     default on a board that has not touched it (the second 6 GiB board): WDT_CFG 0x1,
+     WDT_OCFG 0x1F. A wrong base would not reproduce two distinct
+     documented defaults at two distinct offsets.
+  2. The block is live, not a hole. The one register that differs
+     between the boards is WDT_MODE: the first 6 GiB board reads 0xb1 = bit0 (enable) +
+     bits[7:4] = 0xb (512k cycles = 16 s), i.e. what a watchdog
+     userspace on the first 6 GiB board's BSP kernel would arm. Reads only -- nothing was
+     written to this block on any board.
+
+Corollary for the clocks: WDT_CFG bit[8] = 0 on both boards, so the
+selected source is RTC_32K, the "losc" input.
+
+RESET SCOPE -- still relevant, now only for /dev/watchdog
+
+`sun55i_wdt_reg` sets `wdt_reset_mask = 0x03, wdt_reset_val = 0x01`, so
+`sunxi_wdt_restart()` writes WDT_CFG = 0x16AA0001, byte-for-byte the
+value the UM's own example in 8.3.4.3 writes to WDT_CFG_REG for a whole-system
+reset. 8.3.1 describes the watchdog as the block that issues a
+system-wide reset after a fault.
+
+That this actually resets this SoC is **observed**, not merely read:
+2026-07-27 on the 8 GiB board, on the blob chain and with the then-still-present
+priority carry, `reboot -f` printed `reboot: Restarting system` and
+`[74]HELLO! BOOT0 is starting!` followed immediately, through to a full
+boot. So the kernel-side watchdog
+restart path works on this silicon. It is simply no longer the path
+`reboot` takes, because BL31 now services SYSTEM_RESET itself.
+
+What the UM still does not settle, unchanged and unclosed: what "whole
+system" excludes (AON/PRCM, RTC, E902, the WDT block itself are all
+plausible and none is named), and whether eMMC RST_n is driven -- which
+the eMMC-boot work inherits.
+
+THE CLOCK REFERENCE
+
+The node uses `clocks = <&osc24M>, <&osc32k>`. Since the CPU-DVFS series
+landed, `arm64-dts-a733-model-the-26mhz-dcxo` renames that node to `sys24M-clk` and keeps **both**
+labels on it (`sys24M: osc24M: sys24M-clk`), so `&osc24M` and `&sys24M`
+resolve to the same clock and the choice is cosmetic today. The
+substantive point is the one the DTS comment makes: neither label is the
+physically correct source. UM 8.3.3 lists CLK_32K and the DCXO divided by
+750 (26 MHz / 750) as the WDT sources, so the high-frequency
+input is the **26 MHz DCXO**, not the 24 MHz SYS_CLK24M either label
+names. `sunxi_wdt` never calls `clk_get()`, so no rate is consumed and
+nothing computes on the wrong number, and the source actually selected
+on silicon is the losc one, which the node describes correctly. The
+follow-up stands: re-point "hosc" at the RTC-CCU's DCXO.
+
+BINDING
+
+`allwinner,sun4i-a10-wdt.yaml` has `unevaluatedProperties: false` and
+lists `allwinner,sun55i-a523-wdt` only as a bare `const`, so the
+two-item `allwinner,sun60i-a733-wdt` -> `allwinner,sun55i-a523-wdt`
+compatible has to be added or `dtbs_check` rejects the node. The
+existing `if:` clause matches with `contains:`, so the A733 keeps the
+sun55i clock schema (hosc/losc + required `clock-names`) automatically.
+
+`SUNXI_WATCHDOG` is pinned =y in the recipe's kernel config, which
+is what makes the driver present at all on a bring-up initramfs; the
+arm64 defconfig ships it `=m`.
+
+VERIFIED / NOT VERIFIED
+
+Verified:
+
+  * The node's effect on silicon: see RESET SCOPE above, the 8 GiB board,
+    2026-07-27.
+  * The two silicon dumps quoted above were taken on the first and the
+    second 6 GiB board, on 2026-07-22, read-only.
+  * This revision was produced mechanically, not by hand-editing hunks:
+    the series was applied to a freshly unpacked 6.18.36 up to the CPU OPP patch, the
+    carry was removed in the resulting tree, and the diff regenerated
+    against that base.
+
+Not verified by this revision:
+
+  * The tree has not been booted since the carry was removed. What that
+    would show is *nothing new about the watchdog* -- `reboot` no longer
+    goes through it either way -- so the observable that matters is the
+    narrow one: with this patch the board must still `reboot` (BL31's
+    own path) and `/dev/watchdog` must still appear. Both are cheap to
+    read off the next board session that happens for another reason.
+  * `dtbs_check` has not been run against the amended binding (no
+    dt-schema in this environment).
+
+Assisted-by: Claude
+---
+--- a/Documentation/devicetree/bindings/watchdog/allwinner,sun4i-a10-wdt.yaml
++++ b/Documentation/devicetree/bindings/watchdog/allwinner,sun4i-a10-wdt.yaml
+@@ -30,12 +30,15 @@
+           - const: allwinner,sun6i-a31-wdt
+       - const: allwinner,sun20i-d1-wdt
+       - items:
+           - const: allwinner,sun20i-d1-wdt-reset
+           - const: allwinner,sun20i-d1-wdt
+       - const: allwinner,sun55i-a523-wdt
++      - items:
++          - const: allwinner,sun60i-a733-wdt
++          - const: allwinner,sun55i-a523-wdt
+ 
+   reg:
+     maxItems: 1
+ 
+   clocks:
+     minItems: 1
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -543,12 +543,47 @@
+ 			 */
+ 			cpu_speed_grade: cpu-speed-grade@4c {
+ 				reg = <0x4c 4>;
+ 			};
+ 		};
+ 
++		/*
++		 * WDT0_CPUX. Real hardware, described unconditionally. The
++		 * `priority` carry that used to sit in this node is gone: BL31
++		 * is built from source now and resets over its own
++		 * watchdog, so nothing has to outrank PSCI any more.
++		 *
++		 * reg    A733 UM 8.3.5 register list: WDT0_CPUX @ 0x02050000
++		 *        (4 KiB block in the memory map). 0x20
++		 *        spans the whole documented register set (the last one
++		 *        is WDT_OCFG_REG at +0x18), same as sun55i-a523.dtsi.
++		 * irq    A733 UM Table 12-1, INTID 138 "WDT0" -> GIC SPI
++		 *        138 - 32 = 106.
++		 *        Deliberately NOT the A523's SPI 63: the two SoCs share
++		 *        the register layout, not the interrupt map.
++		 * clocks UM 8.3.3: the WDT's two selectable sources are RTC_32K
++		 *        and DCXO/750, picked by WDT_CFG_REG bit[8]. "losc" is
++		 *        therefore exactly right, and it is the selected one on
++		 *        silicon (WDT_CFG bit8 = 0 on both 6 GiB boards, 2026-07-22).
++		 *        "hosc" is the closest approximation the DT can express
++		 *        today: the real high-frequency source is the 26 MHz
++		 *        DCXO, not the 24 MHz SYS_CLK24M this node names, and
++		 *        no DCXO clock provider exists on this branch. The
++		 *        driver reads neither rate (sunxi_wdt never calls
++		 *        clk_get), so nothing computes on it -- but re-point
++		 *        "hosc" at the RTC-CCU's DCXO once that lands.
++		 */
++		wdt: watchdog@2050000 {
++			compatible = "allwinner,sun60i-a733-wdt",
++				     "allwinner,sun55i-a523-wdt";
++			reg = <0x0 0x02050000 0x0 0x20>;
++			interrupts = <GIC_SPI 106 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&osc24M>, <&osc32k>;
++			clock-names = "hosc", "losc";
++		};
++
+ 		gic: interrupt-controller@3400000 {
+ 			compatible = "arm,gic-v3";
+ 			#interrupt-cells = <3>;
+ 			interrupt-controller;
+ 			reg = <0x0 0x03400000 0x0 0x10000>,	/* GIC Dist */
+ 			      <0x0 0x03460000 0x0 0x100000>;	/* GIC Redist */

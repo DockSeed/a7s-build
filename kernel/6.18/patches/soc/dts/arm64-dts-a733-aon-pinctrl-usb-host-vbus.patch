@@ -1,0 +1,121 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: allwinner: A733 minimal — AON pinctrl + USB host VBUS (PM5)
+
+Adds the AON/CPUS controllers and switches on the USB-A (J8) VBUS so a device
+enumerates on the USB2.0 host path (`clk-sunxi-ng-a733-add-usb2-clocks` and `arm64-dts-a733-add-usb2-ehci-ohci-phy`):
+
+ - r_ccu @0x07010000 — the PRCM CCU (patch `clk-sunxi-ng-a733-add-minimal-r-ccu`), providing the AON bus clocks.
+ - r_pio @0x07025000 — the S_GPIO pin bank PL/PM. Base + geometry from the pin tables of the A733 user manual
+   (PL @0x00 / 14 pins, PM @0x30 / 6 pins) match sun55i-a523-r exactly, so it is
+   reused via the "allwinner,sun55i-a523-r-pinctrl" fallback — no new pinctrl
+   code. It takes only its apb clock and is a plain GPIO controller (no
+   interrupts): the sunxi pinctrl clock-count gate is debounce-only, so one
+   clock + no interrupt-controller is a valid GPIO-output-only instance.
+ - reg_usb_host_vbus — a fixed 5V regulator gated by PM5 = USB_HOST_EN
+   (schematic p7:172 / p13:92; SGM2576 U10 switching VCC5V0_USB20). Held on so
+   the CH334F hub powers J8 and the on-board WiFi/BT. This is the port-power that a
+   `clk-sunxi-ng-a733-add-usb2-clocks` and `arm64-dts-a733-add-usb2-ehci-ohci-phy` cross-check flagged as missing.
+
+Only PM5/J8 is driven: J8 (behind the hub off USB1) is the USB2 host proof port.
+J4 (USB0-DRVVBUS/PL2) belongs to the deferred USB3 combo, J16 (USB0/OTG) has no
+enable GPIO wired.
+
+defconfig (build.sh): SUN60I_A733_R_CCU + PINCTRL_SUN55I_A523_R.
+
+HW proof (stick enumerates + reads on J8) pending — compile/dtc-gated only.
+
+Assisted-by: Claude
+---
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -15,6 +15,7 @@
+ 
+ #include <dt-bindings/interrupt-controller/arm-gic.h>
+ #include <dt-bindings/clock/sun60i-a733-ccu.h>
++#include <dt-bindings/clock/sun60i-a733-r-ccu.h>
+ #include <dt-bindings/gpio/gpio.h>
+ #include <dt-bindings/reset/sun60i-a733-ccu.h>
+ 
+@@ -497,6 +498,22 @@
+ 		regulator-always-on;
+ 	};
+ 
++	/*
++	 * VCC5V0_USB20 -> the CH334F hub (USB-A J8 + on-board WiFi/BT), switched by
++	 * SGM2576 U10 whose enable is USB_HOST_EN = PM5 (schematic p7:172 / p13:92).
++	 * Held on: the hub must be powered for J8 and the WiFi/BT module to work.
++	 * PM5 lives on the AON S_GPIO bank (r_pio), bank index 1 (PL=0, PM=1).
++	 */
++	reg_usb_host_vbus: regulator-usb-host-vbus {
++		compatible = "regulator-fixed";
++		regulator-name = "usb-host-vbus";
++		regulator-min-microvolt = <5000000>;
++		regulator-max-microvolt = <5000000>;
++		gpio = <&r_pio 1 5 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		regulator-always-on;
++	};
++
+ 	memory@40000000 {
+ 		device_type = "memory";
+ 		/* Fallback 1 GiB; the bootloader fixes up the real size. */
+@@ -1110,5 +1127,59 @@
+ 			phy-names = "usb";
+ 			status = "okay";
+ 		};
++
++		/*
++		 * AON / CPUS domain. The R-CCU (PRCM @0x07010000) provides the AON
++		 * bus clocks; the r_pio (S_GPIO @0x07025000) is the AON pin bank
++		 * PL/PM. Base + geometry from the pin tables of the A733 user manual (PL @0x00/14 pins, PM @0x30/
++		 * 6 pins) which matches the sun55i-a523-r pinctrl exactly -- same
++		 * register geometry too (both the D1 NEW_REG_LAYOUT: 0x30 bank stride,
++		 * mux @0x00, data @0x10, drive @0x14, pull @0x24), NOT the main pio's
++		 * 0x80 that forced patch `pinctrl-sunxi-add-A733-sun60iw2-minimal-pio` -- so reused via the fallback compatible,
++		 * no new pinctrl code. The a523-r driver is an interrupt-controller and
++		 * requires the per-bank EINT lines or it fails probe with -ENXIO (which
++		 * took the VBUS regulator down with it in the first HW boot). The A733
++		 * S_GPIO EINT GIC lines are SPI 198 (PL) + 200 (PM), verified against the
++		 * UM interrupt table (anchor = vector/4, since the OCR'd text shifts the
++		 * INTID column by one row): GPIOL_NS = vector 0x0398 = INTID 230 = SPI
++		 * 198, GPIOM_NS = vector 0x03A0 = INTID 232 = SPI 200. These are the
++		 * *non-secure* lines Linux receives; the _S secure lines (SPI 197/199)
++		 * belong to the secure world, not us. Not a blindly-copied vendor value
++		 * -- an earlier A523-copied IRQ bug taught us to anchor on the UM. Routed to the main GIC
++		 * (root interrupt-parent). We use only PM5 as a GPIO output (VBUS
++		 * enable); the EINT domain is set up but unused.
++		 *
++		 * Caveat: the a523-r driver sets io_bias_cfg_variant =
++		 * BIAS_VOLTAGE_PIO_POW_MODE_SEL, the 1-bit write that was proven
++		 * wrong for the A733's 2-bit POW_MOD_SEL. It stays dormant here because
++		 * no bank has a vcc-pX-supply: the dummy regulator has no ops and no
++		 * fixed_uV, so regulator_get_voltage() returns -EINVAL and set_io_bias
++		 * leaves at its uV < 0 branch. A PL/PM supply needs an A733 r-pinctrl
++		 * carrying the correct 2-bit variant -- that is `pinctrl-sunxi-add-a733-r-pinctrl`.
++		 */
++		r_ccu: clock-controller@7010000 {
++			compatible = "allwinner,sun60i-a733-r-ccu";
++			reg = <0x0 0x07010000 0x0 0x250>;
++			clocks = <&osc24M>, <&osc32k>, <&iosc>,
++				 <&ccu CLK_PLL_PERI0_200M>,
++				 <&ccu CLK_PLL_PERI0_300M>;
++			clock-names = "hosc", "losc", "iosc",
++				      "pll-periph-200m", "pll-periph-300m";
++			#clock-cells = <1>;
++		};
++
++		r_pio: pinctrl@7025000 {
++			compatible = "allwinner,sun60i-a733-r-pinctrl",
++				     "allwinner,sun55i-a523-r-pinctrl";
++			reg = <0x0 0x07025000 0x0 0x800>;
++			interrupts = <GIC_SPI 198 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SPI 200 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&r_ccu CLK_R_APB0>, <&osc24M>, <&osc32k>;
++			clock-names = "apb", "hosc", "losc";
++			gpio-controller;
++			#gpio-cells = <3>;
++			interrupt-controller;
++			#interrupt-cells = <3>;
++		};
+ 	};
+ };

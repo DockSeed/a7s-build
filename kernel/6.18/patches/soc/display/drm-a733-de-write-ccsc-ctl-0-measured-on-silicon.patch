@@ -1,0 +1,127 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] drm/a733 de: write CCSC_CTL = 0, measured on silicon
+
+``drm-a733-display-engine-dram-into-tcon-tv1`` enabled the channel colour-space converter and wrote the unity matrix,
+and left the question open: is `ctl = 1` with a unity matrix right (what the
+vendor does), or `ctl = 0` (the block disabled entirely, which a linear-RGB
+layer needs no coefficients for)? Both were made reachable from the debugfs
+`ccsc` verb so one board session could settle it. That session ran on the 8 GiB board on
+2026-09-19 and the answer is 0, on two independent silicon readings.
+
+1. The reset value is 0, not 1. `state` captures `cold_ccsc` before this driver
+   writes anything; on a cold DE it reads `0x00000000`. The argument in the
+   header -- eight instances reading 1 on the vendor's live link make 1 the
+   reset default -- is false. The 1 is the vendor's own configuration, which it
+   writes together with 24 coefficient words.
+
+2. Both settings put the same pixels on the wire. The sink's own frame CRC is
+   the only observer downstream of this block, and it is identical for `ctl = 1`
+   and `ctl = 0` across five flat fields -- the three primaries, white and
+   mid-grey -- with two captures each:
+
+       pattern      ccsc   crc R/G/B
+       0x00ff0000   1      0x132f/0x0000/0x0000
+       0x00ff0000   0      0x132f/0x0000/0x0000
+       0x0000ff00   1      0x0000/0x132f/0x0000
+       0x0000ff00   0      0x0000/0x132f/0x0000
+       0x000000ff   1      0x0000/0x0000/0x132f
+       0x000000ff   0      0x0000/0x0000/0x132f
+       0x00ffffff   1      0x132f/0x132f/0x132f
+       0x00ffffff   0      0x132f/0x132f/0x132f
+       0x00808080   1      0xa11a/0xa11a/0xa11a
+       0x00808080   0      0xa11a/0xa11a/0xa11a
+
+   `0x00020000` is unity, now confirmed on the wire rather than inferred from a
+   diagonal. The same table proves there is no channel swap in this path: red
+   moves only the R CRC, green only G, blue only B.
+
+So the block is transparent either way, and the choice is not a hardware fact.
+It is decided on cost: `ctl = 0` needs no coefficient words, and 24 words whose
+encoding this part's UM does not document anywhere are 24 chances to be wrong.
+That the A523/T527 series also writes 0 is a coincidence of outcome and not a
+reason -- another part is a hint, never a verification target, and it settled
+nothing here.
+
+Both values stay reachable from `ccsc`, because the measurement above is only
+repeatable while they are.
+
+Measured with a script on the board.
+This closes a previously open question about CTL.
+
+Assisted-by: Claude
+
+diff --git a/drivers/gpu/drm/sun60i/sun60i-de.c b/drivers/gpu/drm/sun60i/sun60i-de.c
+--- a/drivers/gpu/drm/sun60i/sun60i-de.c
++++ b/drivers/gpu/drm/sun60i/sun60i-de.c
+@@ -293,17 +293,27 @@
+  * framebuffer really does contain red; and no clock change can help, because
+  * the pixels are being multiplied by zero.
+  *
+- * ⚠ AND IT MEANS THE ARGUMENT FOR WRITING 1 WAS WRONG. This driver reasoned
+- * that eight instances reading 1 on the vendor's link made 1 the reset default.
+- * The vendor also writes 24 coefficient words, so it CONFIGURES this block
+- * rather than leaving it alone -- which is evidence that 1 is the vendor's
+- * value, not the reset. The A523/T527 series writes ctl = 0 for a linear-RGB
+- * layer, and that reading is now the more likely of the two.
+- *
+- * SO BOTH ARE REACHABLE FROM debugfs `ccsc`, and the board settles it in one
+- * session instead of two: 1 (default) writes the vendor's configuration --
+- * enabled with a unity matrix -- and 0 disables the block the way the prior art
+- * does. HYPOTHESIS, not proof: nothing here has been on a board.
++ * MEASURED ON the 8 GiB board, 2026-09-19, AND THE ANSWER IS 0. Two independent readings,
++ * both from silicon:
++ *
++ *   1. The reset value is 0, not 1. `state` captures cold_ccsc before this
++ *      driver writes anything, and on a cold DE it reads 0x00000000. The old
++ *      argument here -- eight instances reading 1 on the vendor's link make 1
++ *      the reset default -- is therefore false: 1 is the vendor's own
++ *      configuration, which it writes together with 24 coefficient words.
++ *
++ *   2. Both settings put the SAME pixels on the wire. The sink's own frame CRC,
++ *      the only observer downstream of this block, is identical for ctl = 1 and
++ *      ctl = 0 across five flat fields -- the three primaries, white and
++ *      mid-grey (five patterns x two
++ *      settings x two captures). 0x00020000 is unity, confirmed.
++ *
++ * So the block is transparent either way and the choice is not a hardware fact.
++ * It is decided on what the two configurations cost: ctl = 0 needs no
++ * coefficient words at all, and 24 words whose encoding this part's UM does not
++ * document are 24 chances to be wrong. That the A523/T527 series also writes 0
++ * is a coincidence of outcome, not a reason -- another part is a hint, never a
++ * verification target, and it was not what settled this.
+  */
+ #define  CCSC_COEFF_ROW0		0x0010
+ #define  CCSC_COEFF_ROW_STRIDE		0x0010
+@@ -876,15 +886,14 @@ static void sun60i_de_ccsc_one(struct sun60i_de *de, u32 base)
+  * written, and printed by `state`.
+  *
+  * CCSC (channel colour-space conversion), slot + 0x800, eight instances at a
+- * 0x100 stride. Live: every one of the eight reads 0x00000001, on a board where
+- * exactly ONE layer of ONE channel was fetching -- which is the argument that 1
+- * is this block's reset default rather than something the vendor configured.
+- * The A523 series writes 0 here for a linear-RGB layer; that is code, on a
+- * different part, and our own silicon says 1 while producing correct colour on
+- * this part. Silicon beats code, so this driver writes 1.
+- *   FALSIFIED BY: wrong colour -- channels swapped, or washed out -- which
+- *   would mean the block is on the path with non-unity coefficients and the
+- *   answer is 0. One line, and cold_ccsc in `state` says which way to go.
++ * 0x100 stride. Live on the VENDOR's link every one of the eight reads
++ * 0x00000001, and that was once read as the reset default. cold_ccsc settled it
++ * the other way: on a cold DE the same register reads 0x00000000, so the 1 is
++ * the vendor's configuration. This driver writes 0, and the sink's frame CRC
++ * says the wire cannot tell the difference (2026-09-19, the header above).
++ *   FALSIFIED BY: a picture that is black, or wrong in colour, with ctl = 0 --
++ *   which would mean the block is not a bypass when disabled. One write of the
++ *   `ccsc` verb tries the other reading without a rebuild.
+  *
+  * VSU (the per-channel scaler), slot + 0x4000. Live: VSU_CTL and
+  * ATTR_OUT_SIZE both read zero and there is a picture, so a 1:1 unscaled path
+@@ -1631,7 +1640,7 @@ static int sun60i_de_probe(struct platform_device *pdev)
+ 	de->dev = dev;
+ 	de->mode = sun60i_display_mode_1920x1200;
+ 	de->background = BLD_COLOR_BLACK;
+-	de->ccsc_on = true;
++	de->ccsc_on = false;
+ 	de->commit = &sun60i_de_commit_mmio;
+ 	platform_set_drvdata(pdev, de);
+ 

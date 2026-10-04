@@ -1,0 +1,63 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: allwinner: a733: describe GMAC0's per-channel TX and RX interrupts
+
+GMAC0 had one interrupt in the DT, GMAC0_TOP (SPI 172, "macirq"). The A733
+User Manual lists two more for it (Table 12-1;
+gic_spi = INTID - 32):
+
+  GMAC0_PERCH_TX_0   INTID 205 -> GIC SPI 173
+  GMAC0_PERCH_RX_0   INTID 206 -> GIC SPI 174
+
+This patch adds them as "tx-queue-0" and "rx-queue-0". snps,dwmac.yaml
+defines those names, stmmac_get_platform_resources() reads them (backport
+net-stmmac-platform-read-channels-irq), and the gmac200 binding allows them
+for the A733 (dt-bindings-net-sun8i-emac-add-a733-gmac200-per-channel-irqs).
+The UM names per-channel lines for channel 0 only, so there is no
+channel 1 to describe. How many DMA channels the core has is its own
+question: MAC_HW_FEATURE2 at 0x04500124 (dwmac4.h: GMAC_HW_FEATURE2 = 0x124)
+has TXCHCNT and RXCHCNT, and it is still to be read back on the board. Nothing in this patch depends on
+the count.
+
+Trigger type: IRQ_TYPE_LEVEL_HIGH, the same as GMAC0_TOP. The UM interrupt table
+gives no trigger types. The vendor 6.6 kernel shows "Level" for both lines,
+and dwmac-s32's DT uses level with the same INTM = 1. Both are hints, so
+this is still to be checked on the board.
+
+Left out:
+- SPI 178, GMAC0_PWS_CLK_CTRL. The vendor kernel requests it as "lpi";
+  6.18.53's platform code reads no such line, and the UM does not
+  say what it signals.
+- SPI 175-177, which have no name in the UM.
+
+Pending on silicon: end0:tx-0 and end0:rx-0 in /proc/interrupts count under
+one-directional traffic, end0:mac stays near zero, and RX and TX throughput
+match the single-IRQ mode.
+
+Assisted-by: Claude
+---
+diff --git a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+index 3207420ad..a52ea2d52 100644
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -1383,8 +1383,19 @@ gmac0: ethernet@4500000 {
+ 			compatible = "allwinner,sun60iw2-gmac200",
+ 				     "snps,dwmac-5.30a";
+ 			reg = <0x0 0x04500000 0x0 0x8000>;
+-			interrupts = <GIC_SPI 172 IRQ_TYPE_LEVEL_HIGH>;
+-			interrupt-names = "macirq";
++			/*
++			 * Three lines, A733 UM Table 12-1 (the interrupt
++			 * list of the A733 user manual): GMAC0_TOP (INTID 204), and the
++			 * per-channel completion lines of DMA channel 0,
++			 * GMAC0_PERCH_TX_0 (INTID 205) and GMAC0_PERCH_RX_0
++			 * (INTID 206). The UM names per-channel lines for
++			 * channel 0 only. With both named, dwmac-sun55i runs
++			 * stmmac in multi-IRQ mode.
++			 */
++			interrupts = <GIC_SPI 172 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SPI 173 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SPI 174 IRQ_TYPE_LEVEL_HIGH>;
++			interrupt-names = "macirq", "tx-queue-0", "rx-queue-0";
+ 			clocks = <&ccu CLK_BUS_GMAC0>, <&ccu CLK_MBUS_GMAC0>;
+ 			clock-names = "stmmaceth", "mbus";
+ 			resets = <&ccu RST_BUS_GMAC0>, <&ccu RST_BUS_GMAC0_AXI>;

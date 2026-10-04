@@ -1,0 +1,159 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] mmc: sunxi: A733 HS400 timing selection - 2x mode, CCLK_DIV 0, module = card
+
+Selects the HS400 timing on the A733 eMMC. All four fields are one choice, not
+four knobs, so they land together:
+
+    NTSR MODE_SEL         stays 1     2x timing, as every other mode here
+    NTSR HS400_NEW_SAM_EN cleared     the 1x-mode sample variant is not ours
+    NTSR DAT_SAM_TIM_PHS  cleared     ditto (the vendor also runs both at 0)
+    CLKDIV CCLK_DIV       0           UM: must be 0 while HS400_MD_EN is set
+    module clock          = card      no DDR52-style doubling for HS400
+
+The last two need saying, because the code did the opposite. CCLK_DIV ended up 1
+because a single `div` variable carried two jobs: the doubled module clock (right
+for DDR52) and the internal divider (a UM violation under HS400_MD_EN). Split
+into `clkdiv` for the register and `div` for the rate bookkeeping. And HS400 is
+taken out of the DDR52 doubling entirely: under the new timing mode the module
+clock already equals the card clock and the controller derives the DDR edges
+itself.
+
+How this was established -- an A/B on one binary, not a vendor transplant:
+the same Image and
+dtb were booted twice, HS200 produced by deleting a single DT property in U-Boot
+(fdt rm /soc/mmc@4022000 mmc-hs400-1_8v). HS200 read 8 MiB twice with an
+identical md5 and no errors at 200 MHz; HS400 returned zero bytes. Eight of the
+eleven controller registers were byte-identical between the two. CSDC = 6 and
+HS400_MD_EN = 1 are forced by the mode, and HALF_START_BIT was cleared at runtime
+in the same boot and changed nothing. What was left was NTSR MODE_SEL plus the
+module/card ratio -- the pair this patch fixes.
+
+An earlier version of this patch cleared MODE_SEL and doubled the module clock,
+copying the vendor's 1x configuration. That is not wrong for the vendor: it is a
+different driver with a different clock model. This driver sets use_new_timings
+for this controller and puts NTSR into 2x at probe, so half a vendor
+configuration grafted on produced a state neither stack has ever run. The
+measurement above is what settled it.
+
+Hardware: this is one of the five changes that together make HS400 work on the 8 GiB board
+(read + write error-free, ~120 MB/s). None of the five is
+sufficient alone.
+
+Assisted-by: Claude
+---
+--- a/drivers/mmc/host/sunxi-mmc.c
++++ b/drivers/mmc/host/sunxi-mmc.c
+@@ -77,12 +77,13 @@
+ #define SDXC_REG_EMMC_DSBD	0x10C /* eMMC DDR Start Bit Detect Control */
+ 
+ /* HS400 data-strobe fields (A733 UM 11.3, V5P3X controller) */
+ #define SDXC_HS400_MD_EN		BIT(31)	  /* EMMC_DSBD: HS400 mode enable */
+ #define SDXC_HALF_START_BIT		BIT(0)	  /* EMMC_DSBD: half start-bit (eMMC>=4.5) */
+ #define SDXC_HS400_NEW_SAM_EN		BIT(0)	  /* SD_NTSR: HS400 new sample */
++#define SDXC_NTSR_MODE_SEL		BIT(31)	  /* SD_NTSR: new sample/output timing */
+ #define SDXC_NTSR_DAT_SAM_PH_MASK	(0x3 << 8)
+ #define SDXC_NTSR_DAT_SAM_PH_HS400	(0x3 << 8) /* SD2 HS400: 0 degree */
+ #define SDXC_CSDC_CRC_DET_MASK		0xf
+ #define SDXC_CSDC_HS400			0x6	  /* CSDC: HS400 speed mode */
+ #define SDXC_CSDC_OTHER			0x3	  /* CSDC: non-HS400 speed mode */
+ #define SDXC_DS_DL_SW_MASK		0x3f	  /* DS_DL: 6-bit SW delay */
+@@ -864,17 +865,25 @@
+ 	/* CRC-status detect = HS400 speed mode (UM SMHC_CSDC[3:0] = 0b110) */
+ 	rval = mmc_readl(host, REG_CSDC);
+ 	rval &= ~SDXC_CSDC_CRC_DET_MASK;
+ 	rval |= SDXC_CSDC_HS400;
+ 	mmc_writel(host, REG_CSDC, rval);
+ 
+-	/* HS400 new sample method + 0-degree data sample phase (UM SMHC_NTSR) */
++	/*
++	 * HS400 timing selection (UM SMHC_NTSR + Table 11-9). Keep MODE_SEL set,
++	 * clear HS400_NEW_SAM_EN and the data sample phase: with NEW_SAM_EN set the
++	 * UM halves the *data drive* phase from 90 to 45 degrees
++	 * (SMHC_DRV_DL DAT_DRV_PH_SEL in HS400: 90 degrees with 0x5C[0] = 0,
++	 * 45 degrees with 0x5C[0] = 1), and the data drive phase is the
++	 * write path. The three fields plus CCLK_DIV are one timing choice,
++	 * not four knobs. The vendor stack, which writes this eMMC without
++	 * error, also runs the two cleared fields at 0.
++	 */
+ 	rval = mmc_readl(host, REG_SD_NTSR);
+-	rval &= ~SDXC_NTSR_DAT_SAM_PH_MASK;
+-	rval |= SDXC_NTSR_DAT_SAM_PH_HS400;
+-	rval |= SDXC_HS400_NEW_SAM_EN;
++	rval &= ~(SDXC_NTSR_DAT_SAM_PH_MASK | SDXC_HS400_NEW_SAM_EN);
++	rval |= SDXC_NTSR_MODE_SEL;
+ 	mmc_writel(host, REG_SD_NTSR, rval);
+ 
+ 	/*
+ 	 * Data-strobe delay: enable the software delay line, load
+ 	 * host->ds_dl. Stays 0: at 150 MHz every delay reads back, the
+ 	 * sweep was dropped, and the UM prescribes no value.
+@@ -899,13 +908,13 @@
+ 
+ static int sunxi_mmc_clk_set_rate(struct sunxi_mmc_host *host,
+ 				  struct mmc_ios *ios)
+ {
+ 	struct mmc_host *mmc = host->mmc;
+ 	long rate;
+-	u32 rval, clock = ios->clock, div = 1;
++	u32 rval, clock = ios->clock, div = 1, clkdiv = 1;
+ 	int ret;
+ 
+ 	ret = sunxi_mmc_oclk_onoff(host, 0);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -921,20 +930,37 @@
+ 	 * mode, all DDR modes require a doubled module clock. HS400 is
+ 	 * 8-bit DDR and uses the same 2x module clock: silicon shows a
+ 	 * 200 MHz HS400 card (module 400 MHz, CCLK_DIV=0) sustains reads,
+ 	 * whereas a 4x module (800 MHz) is too fast and no data-strobe
+ 	 * delay locks. So HS400 shares the DDR52 divider here.
+ 	 */
+-	if ((ios->timing == MMC_TIMING_MMC_DDR52 ||
+-	     ios->timing == MMC_TIMING_MMC_HS400) &&
++	if (ios->timing == MMC_TIMING_MMC_DDR52 &&
+ 	    (host->use_new_timings ||
+ 	     ios->bus_width == MMC_BUS_WIDTH_8)) {
+ 		div = 2;
+ 		clock <<= 1;
+ 	}
+ 
++	/*
++	 * HS400 does NOT take the DDR52 doubling. Under the new timing mode
++	 * the module clock already equals the card clock and the controller
++	 * derives the DDR edges itself -- which is exactly how HS200 runs on
++	 * this board: 200 MHz module, 200 MHz card, NTSR MODE_SEL set, and
++	 * not a single data error. The A/B that established this is
++	 * the following: one
++	 * kernel, one card, HS200 versus HS400 with only the DT property
++	 * removed, eight of eleven controller registers byte-identical, and
++	 * the whole difference in the timing mode plus the module/card ratio.
++	 *
++	 * CCLK_DIV stays 0 regardless (it must be 0 while HS400_MD_EN is set,
++	 * UM SMHC_CLKDIV), which is what clkdiv = 1 encodes
++	 * here -- the register takes clkdiv - 1.
++	 */
++	if (ios->timing == MMC_TIMING_MMC_HS400)
++		clkdiv = 1;
++
+ 	if (host->use_new_timings && host->cfg->ccu_has_timings_switch) {
+ 		ret = sunxi_ccu_set_mmc_timing_mode(host->clk_mmc, true);
+ 		if (ret) {
+ 			dev_err(mmc_dev(mmc),
+ 				"error setting new timing mode\n");
+ 			return ret;
+@@ -958,13 +984,13 @@
+ 		return ret;
+ 	}
+ 
+ 	/* set internal divider */
+ 	rval = mmc_readl(host, REG_CLKCR);
+ 	rval &= ~0xff;
+-	rval |= div - 1;
++	rval |= clkdiv - 1;
+ 	mmc_writel(host, REG_CLKCR, rval);
+ 
+ 	/* update card clock rate to account for internal divider */
+ 	rate /= div;
+ 
+ 	/*

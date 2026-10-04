@@ -1,0 +1,136 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] net: stmmac: dwmac-sun55i: program the A733 syscon after the MAC reset
+
+On the A733 (sun60iw2) the "syscon" register this glue programs is GMAC_CFG,
+the first register of the GMAC's own glue block at 0x04508000 -- not a slot in
+the shared system-control block as on the A523. That difference is not just an
+offset, which is all the driver models today: it puts the register inside the
+MAC's reset domain.
+
+sun55i_gmac200_probe() writes the register and only then calls
+devm_stmmac_pltfr_probe(), and stmmac_dvr_probe() begins with
+
+	reset_control_assert(priv->plat->stmmac_rst);
+	reset_control_deassert(priv->plat->stmmac_rst);
+
+so on the A733 every value this driver writes is wiped before the MAC is used.
+The register returns to its reset default 0x00008000, whose bit 15 PHY_SELECT
+selects the *internal* PHY (A733 UM). The MDIO scan
+later in that same probe then talks to a PHY that does not exist on this SoC,
+and the external bus stays silent:
+
+	dwmac-sun55i 4500000.ethernet: User ID: 0x20, Synopsys ID: 0x53
+	mdio_bus stmmac-7: MDIO device at address 1 is missing.
+	eth0: cannot attach to PHY (error: -ENODEV)
+
+Measured on a Radxa Cubie A7S (8 GiB), mainline 6.18.36, 2026-07-21. The MAC
+itself is healthy (MAC_VERSION 0x2053), the PHY rail is on (AXP318W reg 0x11 =
+0x1f, SWOUT1 set), its 25 MHz reference runs (GMAC0_PHY_CLK_REG 0x80000005),
+the block is out of reset (GMAC0_BGR_REG 0x00030001), the RGMII pins are muxed
+(PH_CFG0/CFG1 0x55555555) and the MDIO line idles high -- yet a hand-driven
+clause-22 read over MAC_MDIO_Address/Data returns 0xFFFF on all 32 addresses.
+Writing GMAC_CFG = 0x00011146 by hand and repeating that scan returns 0x7B74 at
+address 1 immediately, and the driver reaches a 1 Gbps/Full link with a DHCP
+lease and bidirectional ping. Unbinding and re-binding the driver reproduces
+the failure exactly: 0x00000000 while unbound, 0x00008000 after bind.
+
+Fix it where the asymmetry is, in the per-variant match data: pulse the reset
+in the glue, program the register afterwards, and take the reset away from
+stmmac so it cannot undo the write. The A523 keeps its current behaviour --
+its register is outside the reset domain and needs none of this.
+
+The Allwinner BSP glue (dwmac-sunxi.c) orders it the same way: its
+sunxi_dwmac_clk_init() deasserts the resets and only then does
+sunxi_dwmac_hw_init() call set_syscon().
+
+Note this driver writes no MAC-side delays of its own, so with nothing in the DT
+the programmed value is 0x00000006 (EPIT | ETCS_INT_GMII) rather than the
+vendor's 0x00011146 (which carries TX 12 / RX 10).
+
+[Corrected 2026-07-21, after this patch was merged: the sentence that stood here
+claimed the delay is added by the Maxio PHY instead. It is not. Measured on the
+board, a link with no MAC-side delay trains at 1 Gbps and then loses 100 % of
+its frames; `arm64-dts-a733-gmac0-measured-rgmii-delays` adds tx-internal-delay-ps = 700 / rx-internal-delay-ps = 1000
+from a sweep. The PHY does contribute its RX 2 ns, but from the RXDLY strap, not
+from driver programming -- `net-phy-maxio-drop-phy-side-rgmii-delay` removed that programming after the datasheet
+showed the register it wrote does not exist.] Suspend/resume is not addressed here: with the reset no longer held by
+stmmac, a resume path that powers the block down would need the register
+reprogrammed.
+
+Assisted-by: Claude
+---
+--- a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun55i.c
++++ b/drivers/net/ethernet/stmicro/stmmac/dwmac-sun55i.c
+@@ -19,6 +19,7 @@
+ #include <linux/property.h>
+ #include <linux/regmap.h>
+ #include <linux/regulator/consumer.h>
++#include <linux/reset.h>
+ #include <linux/stmmac.h>
+ 
+ #include "stmmac.h"
+@@ -36,6 +37,11 @@
+  */
+ struct sun55i_gmac_variant {
+ 	u32 syscon_offset;
++	/*
++	 * True when that register sits inside the GMAC block itself and is
++	 * therefore cleared by the MAC reset. See sun55i_gmac200_probe().
++	 */
++	bool syscon_in_reset_domain;
+ };
+ 
+ static const struct sun55i_gmac_variant sun55i_a523_gmac200 = {
+@@ -44,6 +50,7 @@
+ 
+ static const struct sun55i_gmac_variant sun60iw2_gmac200 = {
+ 	.syscon_offset = 0x00,
++	.syscon_in_reset_domain = true,
+ };
+ 
+ /* RMII specific bits */
+@@ -126,12 +133,17 @@
+ 
+ static int sun55i_gmac200_probe(struct platform_device *pdev)
+ {
++	const struct sun55i_gmac_variant *variant;
+ 	struct plat_stmmacenet_data *plat_dat;
+ 	struct stmmac_resources stmmac_res;
+ 	struct device *dev = &pdev->dev;
+ 	struct clk *clk;
+ 	int ret;
+ 
++	variant = device_get_match_data(dev);
++	if (!variant)
++		return -EINVAL;
++
+ 	ret = stmmac_get_platform_resources(pdev, &stmmac_res);
+ 	if (ret)
+ 		return ret;
+@@ -144,6 +156,26 @@
+ 	plat_dat->flags |= STMMAC_FLAG_SPH_DISABLE;
+ 	plat_dat->host_dma_width = 32;
+ 
++	/*
++	 * On the A733 the syscon register is GMAC_CFG, the first register of
++	 * the GMAC's own glue block, so it shares the MAC's reset domain: the
++	 * assert/deassert that stmmac_dvr_probe() performs would clear it back
++	 * to its reset default, and that default selects the *internal* PHY
++	 * (PHY_SELECT). The MDIO scan that follows inside the same probe would
++	 * then find nothing on the external bus. Pulse the reset here, program
++	 * the register afterwards, and take the reset away from stmmac so it
++	 * cannot undo the write. On the A523 the register lives in the shared
++	 * system-control block, outside that reset domain, and needs none of
++	 * this.
++	 */
++	if (variant->syscon_in_reset_domain && plat_dat->stmmac_rst) {
++		ret = reset_control_assert(plat_dat->stmmac_rst);
++		reset_control_deassert(plat_dat->stmmac_rst);
++		if (ret == -ENOTSUPP)
++			reset_control_reset(plat_dat->stmmac_rst);
++		plat_dat->stmmac_rst = NULL;
++	}
++
+ 	ret = sun55i_gmac200_set_syscon(dev, plat_dat);
+ 	if (ret)
+ 		return ret;

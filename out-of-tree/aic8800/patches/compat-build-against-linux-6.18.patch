@@ -1,0 +1,96 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] Build the aic8800 USB driver against Linux 6.18
+
+Applies to radxa-pkg/aic8800 tag 5.0+git20260123.5f7be68d-8. On the previous
+pin, 4.0+git20250410.b99ca8b6-5, the vendor source failed on 6.18.36 with 13
+errors across five kernel API changes: MODULE_IMPORT_NS now takes a string
+literal, the wakeup_source create/add/remove/destroy quartet is gone in favour
+of register/unregister, del_timer[_sync] became timer_delete[_sync], from_timer
+became timer_container_of, and several cfg80211 ops and helpers gained link_id
+or radio_idx parameters.
+
+The 5.0 tag guards every one of those call sites itself, with
+LINUX_VERSION_CODE branches for 6.12 / 6.13 / 6.15 / 6.16 / 6.17 in
+aicwf_tcp_ack.c, rwnx_main.c, rwnx_radar.c, rwnx_rx.c, rwnx_wakelock.c,
+aic_priv_cmd.c and aic_bluetooth_main.c, so those hunks are gone. What is left:
+
+- rwnx_cfg80211_get_tx_power() is new in 5.0 (the previous pin had the op
+  commented out) and is wired into rwnx_cfg80211_ops with the pre-6.14
+  prototype. 6.18.36 expects (wiphy, wdev, int radio_idx, unsigned int link_id,
+  int *dbm), include/net/cfg80211.h:4991. Both parameters are accepted and
+  ignored. Radxa's packaging fixes the same site with
+  debian/patches/fix-linux-6.14-build.patch and fix-linux-6.17-build.patch,
+  which our build does not apply.
+- Four call sites our build never compiles but that still name removed timer
+  APIs: three in aicwf_sdio.c (CONFIG_SDIO_SUPPORT = n,
+  aic8800_fdrv/Makefile:60) and one del_timer_sync() inside #if 0 in
+  rwnx_cfg80211_del_iface(). Carried unchanged from the previous revision of
+  this patch, so the subtree names no removed timer API.
+
+Replacements read out of the 6.18.36 tree: timer_delete / timer_delete_sync at
+include/linux/timer.h:167,166, timer_container_of at :132, get_tx_power at
+include/net/cfg80211.h:4991. The in_irq() that fix-linux-6.19-build.patch
+replaces still exists in 6.18.36 (include/linux/preempt.h:141) and is left
+alone.
+
+Not fixed here, noted because the previous revision of this patch edited the
+line: on kernels >= 6.12, rwnx_radar_cancel_cac() in 5.0 reports
+NL80211_RADAR_CAC_FINISHED on a cancelled CAC (rwnx_radar.c:1621), where its
+own < 6.12 branch and the previous pin report NL80211_RADAR_CAC_ABORTED.
+
+SPDX-License-Identifier: GPL-2.0-only
+
+Assisted-by: Claude
+
+diff --git a/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/aicwf_sdio.c b/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/aicwf_sdio.c
+index f8e79cc..d154a5c 100644
+--- a/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/aicwf_sdio.c
++++ b/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/aicwf_sdio.c
+@@ -527,7 +527,7 @@ static void aicwf_sdio_bus_stop(struct device *dev)
+ 
+     aicwf_sdio_pwrctl_timer(sdiodev, 0);
+     if(timer_pending(&sdiodev->rwnx_hw->p2p_alive_timer)){
+-        ret = del_timer(&sdiodev->rwnx_hw->p2p_alive_timer);}
++        ret = timer_delete(&sdiodev->rwnx_hw->p2p_alive_timer);}
+     sdio_dbg("%s\n",__func__);
+     if (sdiodev->pwrctl_tsk) {
+         complete(&sdiodev->pwrctrl_trgg);
+@@ -997,7 +997,7 @@ static void aicwf_sdio_bus_pwrctl(struct timer_list *t)
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(4,14,0)
+     struct aic_sdio_dev *sdiodev = (struct aic_sdio_dev *) data;
+ #else
+-    struct aic_sdio_dev *sdiodev = from_timer(sdiodev, t, timer);
++    struct aic_sdio_dev *sdiodev = timer_container_of(sdiodev, t, timer);
+ #endif
+ 
+     if (sdiodev->bus_if->state == BUS_DOWN_ST) {
+@@ -1080,7 +1080,7 @@ void aicwf_sdio_pwrctl_timer(struct aic_sdio_dev *sdiodev, uint duration)
+     spin_lock_bh(&sdiodev->pwrctl_lock);
+     if (!duration) {
+         if (timer_pending(&sdiodev->timer))
+-            del_timer_sync(&sdiodev->timer);
++            timer_delete_sync(&sdiodev->timer);
+     } else {
+         sdiodev->active_duration = duration;
+         timeout = msecs_to_jiffies(sdiodev->active_duration);
+diff --git a/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/rwnx_main.c b/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/rwnx_main.c
+index 3245ecf..221961b 100644
+--- a/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/rwnx_main.c
++++ b/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/rwnx_main.c
+@@ -2587,7 +2587,7 @@ static int rwnx_cfg80211_del_iface(struct wiphy *wiphy, struct wireless_dev *wde
+ #if 0
+ 	if (rwnx_vif == rwnx_hw->p2p_dev_vif) {
+ 		if (timer_pending(&rwnx_hw->p2p_alive_timer)) {
+-			del_timer_sync(&rwnx_hw->p2p_alive_timer);
++			timer_delete_sync(&rwnx_hw->p2p_alive_timer);
+ 		}
+ 	}
+ #endif
+@@ -4514,6 +4514,7 @@ static int rwnx_cfg80211_get_tx_power(struct wiphy *wiphy,
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 8, 0)
+  struct wireless_dev *wdev,
+ #endif
++ int radio_idx, unsigned int link_id,
+ 	int *mbm)
+ {
+     #if LINUX_VERSION_CODE < KERNEL_VERSION(3, 8, 0)

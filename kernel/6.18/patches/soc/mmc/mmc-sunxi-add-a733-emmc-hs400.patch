@@ -1,0 +1,362 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] mmc: sunxi: add HS400 support for the A733 eMMC (sun60iw2)
+
+The A733 eMMC (SMHC2; SanDisk iNAND SDINBDV4-32G, eMMC 5.1) is HS400-1.8V
+capable -- EXT_CSD DEVICE_TYPE bit6, read on silicon -- but the mainline driver
+masks MMC_CAP2_HS400 out unconditionally. Add HS400 for controllers that carry
+the data-strobe delay path.
+
+- New sun60i-a733-emmc cfg + compatible with a can_hs400 flag; only that
+  instance gets HS400, so the shared SD controller (SMHC0) is untouched. The
+  HS400 mask becomes conditional on can_hs400; enhanced strobe is never offered.
+- HS400 timing recipe from the A733 UM ch. 11.3, in the clock-setup path (clock
+  gated): CSDC[3:0]=0b110 (p.452), NTSR HS400_NEW_SAM_EN + 0-degree data sample
+  phase (p.453), the data-strobe software delay line at a fixed 0, and
+  EMMC_DDR_SBIT_DET[31]=HS400_MD_EN + [0]=HALF_START last (p.460). CTRL
+  DDR_MOD_SEL stays 0 (the UM requires it to be 0
+  in HS400 mode). CCLK_DIV does NOT: the code takes div = 2 and writes
+  div - 1, so CCLK_DIV ends up 1, while the UM says it must be 0 whenever
+  HS400_MD_EN is set. **This is a known defect, not a description
+  of correct behaviour** -- the vendor runs CCLK_DIV = 0 with a 2x module clock
+  (400 MHz module / 200 MHz card, read back on silicon). Tracked as a write-side
+  suspect; an earlier version of this header claimed CCLK_DIV stayed 0, which was
+  never true of the code.
+- No DS_DL sweep: the strobe eye is full at 150 MHz (every delay reads back), so
+  a fixed DS_DL is used. (The earlier rationale here -- "matching how the vendor
+  BSP leaves DS_DL untuned" -- was wrong and is withdrawn: vendor silicon reads
+  DS_DL = 0x282, i.e. SW_EN set with delay 2, arrived at by a runtime retry loop,
+  not left at the 0x2000 reset. The UM still prescribes no value, so a fixed 0
+  remains a board finding at 150 MHz, not a vendor-derived constant.) An earlier
+  ext_csd sweep that gated/re-latched the clock 128
+  times left the card response-timing-out on the next SWITCH (CMD6) after HS400
+  selection ("smc 1 err, cmd 6, RTO" -> -110); dropping the sweep removes that.
+
+Register recipe from the UM + silicon readback (the 8 GiB board and the 6 GiB board), not the vendor BSP.
+
+Assisted-by: Claude
+---
+--- a/drivers/mmc/host/sunxi-mmc.c
++++ b/drivers/mmc/host/sunxi-mmc.c
+@@ -73,6 +73,19 @@
+ #define SDXC_REG_DRV_DL		0x140 /* Drive Delay Control Register */
+ #define SDXC_REG_SAMP_DL_REG	0x144 /* SMC sample delay control */
+ #define SDXC_REG_DS_DL_REG	0x148 /* SMC data strobe delay control */
++#define SDXC_REG_CSDC		0x054 /* CRC Status Detect Control (HS400) */
++#define SDXC_REG_EMMC_DSBD	0x10C /* eMMC DDR Start Bit Detect Control */
++
++/* HS400 data-strobe fields (A733 UM 11.3, V5P3X controller) */
++#define SDXC_HS400_MD_EN		BIT(31)	  /* EMMC_DSBD: HS400 mode enable */
++#define SDXC_HALF_START_BIT		BIT(0)	  /* EMMC_DSBD: half start-bit (eMMC>=4.5) */
++#define SDXC_HS400_NEW_SAM_EN		BIT(0)	  /* SD_NTSR: HS400 new sample */
++#define SDXC_NTSR_DAT_SAM_PH_MASK	(0x3 << 8)
++#define SDXC_NTSR_DAT_SAM_PH_HS400	(0x3 << 8) /* SD2 HS400: 0 degree */
++#define SDXC_CSDC_CRC_DET_MASK		0xf
++#define SDXC_CSDC_HS400			0x6	  /* CSDC: HS400 speed mode */
++#define SDXC_CSDC_OTHER			0x3	  /* CSDC: non-HS400 speed mode */
++#define SDXC_DS_DL_SW_MASK		0x3f	  /* DS_DL: 6-bit SW delay */
+ 
+ #define mmc_readl(host, reg) \
+ 	readl((host)->reg_base + SDXC_##reg)
+@@ -264,6 +277,9 @@
+ 
+ 	/* clock hardware can switch between old and new timing modes */
+ 	bool ccu_has_timings_switch;
++
++	/* controller carries the HS400 data-strobe delay path */
++	bool can_hs400;
+ };
+ 
+ struct sunxi_mmc_host {
+@@ -294,6 +310,7 @@
+ 
+ 	struct mmc_request *mrq;
+ 	struct mmc_request *manual_stop_mrq;
++	struct mmc_request *cmd_settle_mrq;	/* HS400 CMD-RTO: settle busy, then retry */
+ 	int		ferror;
+ 
+ 	/* vqmmc */
+@@ -301,6 +318,9 @@
+ 
+ 	/* timings */
+ 	bool		use_new_timings;
++
++	/* HS400 data-strobe delay value (0..63); tuned on the board */
++	u32		ds_dl;
+ };
+ 
+ static int sunxi_mmc_reset_host(struct sunxi_mmc_host *host)
+@@ -528,6 +548,22 @@
+ 
+ 		if (mrq->stop)
+ 			mrq->stop->error = -ETIMEDOUT;
++
++		/*
++		 * A733 HS400: the first SWITCH (CMD6) after the HS200->HS400
++		 * mode change lands while the card is still busy and returns a
++		 * response-timeout; the core retries back-to-back with no delay,
++		 * so the retries stay inside the busy window and the card fails
++		 * to init (-110). Defer this command's completion to the threaded
++		 * handler, which waits out the DAT0 busy before letting the core
++		 * retry. Command-only (data errors take the manual-stop path) and
++		 * gated to HS400 on the can_hs400 controller, so SD and every
++		 * other mode are untouched.
++		 */
++		if (!data && (host->int_sum & SDXC_RESP_TIMEOUT) &&
++		    host->cfg->can_hs400 &&
++		    host->mmc->ios.timing == MMC_TIMING_MMC_HS400)
++			host->cmd_settle_mrq = mrq;
+ 	} else {
+ 		if (mrq->cmd->flags & MMC_RSP_136) {
+ 			mrq->cmd->resp[0] = mmc_readl(host, REG_RESP3);
+@@ -562,7 +598,8 @@
+ 	host->int_sum = 0;
+ 	host->wait_dma = false;
+ 
+-	return host->manual_stop_mrq ? IRQ_WAKE_THREAD : IRQ_HANDLED;
++	return (host->manual_stop_mrq || host->cmd_settle_mrq) ?
++		IRQ_WAKE_THREAD : IRQ_HANDLED;
+ }
+ 
+ static irqreturn_t sunxi_mmc_irq(int irq, void *dev_id)
+@@ -632,13 +669,6 @@
+ 	mrq = host->manual_stop_mrq;
+ 	spin_unlock_irqrestore(&host->lock, iflags);
+ 
+-	if (!mrq) {
+-		dev_err(mmc_dev(host->mmc), "no request for manual stop\n");
+-		return IRQ_HANDLED;
+-	}
+-
+-	dev_err(mmc_dev(host->mmc), "data error, sending stop command\n");
+-
+ 	/*
+ 	 * We will never have more than one outstanding request,
+ 	 * and we do not complete the request until after
+@@ -647,14 +677,48 @@
+ 	 * Additionally we have wait states within this function
+ 	 * so having it in a lock is a very bad idea.
+ 	 */
+-	sunxi_mmc_send_manual_stop(host, mrq);
++	if (mrq) {
++		dev_err(mmc_dev(host->mmc), "data error, sending stop command\n");
++		sunxi_mmc_send_manual_stop(host, mrq);
++
++		spin_lock_irqsave(&host->lock, iflags);
++		host->manual_stop_mrq = NULL;
++		spin_unlock_irqrestore(&host->lock, iflags);
+ 
++		mmc_request_done(host->mmc, mrq);
++		return IRQ_HANDLED;
++	}
++
++	/*
++	 * HS400 command response-timeout: the card is still busy after the
++	 * HS400 mode switch. Wait out the DAT0 busy (bounded) before completing
++	 * so the core's retry of the command lands after the busy window. This
++	 * is the deterministic replacement for the incidental delay that made
++	 * HS400 work only with debug prints; it adjusts to the real busy time
++	 * instead of a blind delay.
++	 */
+ 	spin_lock_irqsave(&host->lock, iflags);
+-	host->manual_stop_mrq = NULL;
++	mrq = host->cmd_settle_mrq;
+ 	spin_unlock_irqrestore(&host->lock, iflags);
+ 
+-	mmc_request_done(host->mmc, mrq);
++	if (mrq) {
++		int i;
++
++		for (i = 0; i < 200; i++) {
++			if (!(mmc_readl(host, REG_STAS) & SDXC_CARD_DATA_BUSY))
++				break;
++			usleep_range(400, 600);
++		}
++
++		spin_lock_irqsave(&host->lock, iflags);
++		host->cmd_settle_mrq = NULL;
++		spin_unlock_irqrestore(&host->lock, iflags);
+ 
++		mmc_request_done(host->mmc, mrq);
++		return IRQ_HANDLED;
++	}
++
++	dev_err(mmc_dev(host->mmc), "no request for manual stop\n");
+ 	return IRQ_HANDLED;
+ }
+ 
+@@ -711,8 +775,8 @@
+ 	 * yet. The best rate have been obtained by simply setting the
+ 	 * delay to 0, as Allwinner does in its BSP.
+ 	 *
+-	 * The only mode that doesn't have such a delay is HS400, that
+-	 * is in itself a TODO.
++	 * HS400 needs a non-zero data-strobe delay; that is programmed
++	 * separately in sunxi_mmc_hs400_enable(), not here.
+ 	 */
+ 	writel(SDXC_CAL_DL_SW_EN, host->reg_base + reg_off);
+ 
+@@ -757,6 +821,82 @@
+ 	return 0;
+ }
+ 
++/*
++ * Program the HS400-specific timing bits. Called from the clock-setup path
++ * with the card clock gated, only on controllers that carry the data-strobe
++ * delay (cfg->can_hs400). Everything is gated on the HS400 timing, so the SD
++ * controller (which never selects HS400) is untouched. Register recipe from
++ * the A733 UM ch. 11.3.
++ */
++static void sunxi_mmc_hs400_enable(struct sunxi_mmc_host *host,
++				   struct mmc_ios *ios)
++{
++	u32 rval;
++
++	if (ios->timing != MMC_TIMING_MMC_HS400) {
++		/*
++		 * Leaving HS400: undo the whole HS400 timing setup, not just
++		 * the mode-enable bit, so a later re-init (e.g. after a card
++		 * hw-reset or an error path that re-runs the 400 kHz init) does
++		 * not run with HS400 CRC-detect, the forced sample phase, or the
++		 * strobe delay still programmed. These timing regs survive the
++		 * FIFO/DMA/soft reset. Mirrors the vendor teardown.
++		 */
++		rval = mmc_readl(host, REG_EMMC_DSBD);
++		rval &= ~(SDXC_HS400_MD_EN | SDXC_HALF_START_BIT);
++		mmc_writel(host, REG_EMMC_DSBD, rval);
++
++		rval = mmc_readl(host, REG_CSDC);
++		rval &= ~SDXC_CSDC_CRC_DET_MASK;
++		rval |= SDXC_CSDC_OTHER;
++		mmc_writel(host, REG_CSDC, rval);
++
++		rval = mmc_readl(host, REG_SD_NTSR);
++		rval &= ~(SDXC_NTSR_DAT_SAM_PH_MASK | SDXC_HS400_NEW_SAM_EN);
++		mmc_writel(host, REG_SD_NTSR, rval);
++
++		rval = mmc_readl(host, REG_DS_DL_REG);
++		rval &= ~(SDXC_DS_DL_SW_MASK | SDXC_CAL_DL_SW_EN);
++		mmc_writel(host, REG_DS_DL_REG, rval);
++		return;
++	}
++
++	/* CRC-status detect = HS400 speed mode (UM SMHC_CSDC[3:0] = 0b110) */
++	rval = mmc_readl(host, REG_CSDC);
++	rval &= ~SDXC_CSDC_CRC_DET_MASK;
++	rval |= SDXC_CSDC_HS400;
++	mmc_writel(host, REG_CSDC, rval);
++
++	/* HS400 new sample method + 0-degree data sample phase (UM SMHC_NTSR) */
++	rval = mmc_readl(host, REG_SD_NTSR);
++	rval &= ~SDXC_NTSR_DAT_SAM_PH_MASK;
++	rval |= SDXC_NTSR_DAT_SAM_PH_HS400;
++	rval |= SDXC_HS400_NEW_SAM_EN;
++	mmc_writel(host, REG_SD_NTSR, rval);
++
++	/*
++	 * Data-strobe delay: enable the software delay line, load
++	 * host->ds_dl. Stays 0: at 150 MHz every delay reads back, the
++	 * sweep was dropped, and the UM prescribes no value.
++	 */
++	rval = mmc_readl(host, REG_DS_DL_REG);
++	rval &= ~SDXC_DS_DL_SW_MASK;
++	rval |= host->ds_dl & SDXC_DS_DL_SW_MASK;
++	rval |= SDXC_CAL_DL_SW_EN;
++	mmc_writel(host, REG_DS_DL_REG, rval);
++
++	/*
++	 * HS400 mode enable + half start-bit detection, required before the
++	 * first HS400 data command (UM EMMC_DSBD[31] + [0]). The board chip is
++	 * eMMC 5.1 and HALF_START_BIT's reset default reads 0 on silicon
++	 * (the 8 GiB board and the 6 GiB board), so it must be set explicitly, not left to the default.
++	 * The clock is still gated here; the caller turns it back on.
++	 */
++	rval = mmc_readl(host, REG_EMMC_DSBD);
++	rval |= SDXC_HS400_MD_EN | SDXC_HALF_START_BIT;
++	mmc_writel(host, REG_EMMC_DSBD, rval);
++}
++
+ static int sunxi_mmc_clk_set_rate(struct sunxi_mmc_host *host,
+ 				  struct mmc_ios *ios)
+ {
+@@ -778,13 +918,14 @@
+ 	/*
+ 	 * Under the old timing mode, 8 bit DDR requires the module
+ 	 * clock to be double the card clock. Under the new timing
+-	 * mode, all DDR modes require a doubled module clock.
+-	 *
+-	 * We currently only support the standard MMC DDR52 mode.
+-	 * This block should be updated once support for other DDR
+-	 * modes is added.
++	 * mode, all DDR modes require a doubled module clock. HS400 is
++	 * 8-bit DDR and uses the same 2x module clock: silicon shows a
++	 * 200 MHz HS400 card (module 400 MHz, CCLK_DIV=0) sustains reads,
++	 * whereas a 4x module (800 MHz) is too fast and no data-strobe
++	 * delay locks. So HS400 shares the DDR52 divider here.
+ 	 */
+-	if (ios->timing == MMC_TIMING_MMC_DDR52 &&
++	if ((ios->timing == MMC_TIMING_MMC_DDR52 ||
++	     ios->timing == MMC_TIMING_MMC_HS400) &&
+ 	    (host->use_new_timings ||
+ 	     ios->bus_width == MMC_BUS_WIDTH_8)) {
+ 		div = 2;
+@@ -849,12 +990,13 @@
+ 		return ret;
+ 
+ 	/*
+-	 * FIXME:
+-	 *
+-	 * In HS400 we'll also need to calibrate the data strobe
+-	 * signal. This should only happen on the MMC2 controller (at
+-	 * least on the A64).
++	 * HS400 timing bits (incl. the data-strobe delay) are programmed
++	 * here with the clock still gated, only where the controller
++	 * supports it. Gated on the HS400 timing inside, so other modes and
++	 * the SD controller are unaffected.
+ 	 */
++	if (host->cfg->can_hs400)
++		sunxi_mmc_hs400_enable(host, ios);
+ 
+ 	ret = sunxi_mmc_oclk_onoff(host, 1);
+ 	if (ret)
+@@ -1207,6 +1349,15 @@
+ 	.needs_new_timings = true,
+ };
+ 
++static const struct sunxi_mmc_cfg sun60i_a733_emmc_cfg = {
++	.idma_des_size_bits = 13,
++	.idma_des_shift = 2,
++	.can_calibrate = true,
++	.mask_data0 = true,
++	.needs_new_timings = true,
++	.can_hs400 = true,
++};
++
+ static const struct of_device_id sunxi_mmc_of_match[] = {
+ 	{ .compatible = "allwinner,sun4i-a10-mmc", .data = &sun4i_a10_cfg },
+ 	{ .compatible = "allwinner,sun5i-a13-mmc", .data = &sun5i_a13_cfg },
+@@ -1219,6 +1370,7 @@
+ 	{ .compatible = "allwinner,sun50i-a100-mmc", .data = &sun20i_d1_cfg },
+ 	{ .compatible = "allwinner,sun50i-a100-emmc", .data = &sun50i_a100_emmc_cfg },
+ 	{ .compatible = "allwinner,sun50i-h616-mmc", .data = &sun50i_h616_cfg },
++	{ .compatible = "allwinner,sun60i-a733-emmc", .data = &sun60i_a733_emmc_cfg },
+ 	{ /* sentinel */ }
+ };
+ MODULE_DEVICE_TABLE(of, sunxi_mmc_of_match);
+@@ -1454,8 +1606,15 @@
+ 		mmc->caps2 &= ~MMC_CAP2_HS200;
+ 	}
+ 
+-	/* TODO: This driver doesn't support HS400 mode yet */
+-	mmc->caps2 &= ~MMC_CAP2_HS400;
++	/*
++	 * HS400 is only wired up on controllers that carry the data-strobe
++	 * delay path (cfg->can_hs400). Elsewhere, mask it out so a stray
++	 * mmc-hs400-1_8v in the DT is ignored. Enhanced strobe has no
++	 * hardware support on this controller and is never offered.
++	 */
++	if (!host->cfg->can_hs400)
++		mmc->caps2 &= ~MMC_CAP2_HS400;
++	mmc->caps2 &= ~MMC_CAP2_HS400_ES;
+ 
+ 	ret = sunxi_mmc_init_host(host);
+ 	if (ret)

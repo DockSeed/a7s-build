@@ -1,0 +1,205 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] usb: dwc3: set LLUCTL bit30 on the A733, or Gen2 devices may link at Gen1
+
+A USB-C NVMe enclosure with an RTL9210 bridge (0bda:9210) links at 5000 on
+this kernel and at 10000 on the vendor 6.6 stack: same board (the 8 GiB board), same
+plug, same orientation, same day. Sequential O_DIRECT reads of 4 GiB give
+315-319 MB/s at 1 MiB and 391-405 MB/s at 4 MiB here, which is Gen1's
+ceiling. The vendor stack gives 716-767 and 922-945 MB/s. The Kingston DataTraveler
+Max this port was proven with links at 10000 on this kernel (2026-07-21,
+2026-08-07), so the gap stayed hidden.
+
+Where the value comes from
+--------------------------
+
+The dwc3 link-layer registers are not in the A733 user manual. UM 18.4.4.2
+defers to the Synopsys programming guide, which we do not hold, so the
+evidence is silicon. A script read the same windows on both
+stacks, and the two captures were diffed:
+
+  - Identical: the SERDES wrapper LINK_CTRL0..3 and LINK_STUS0 (UM 18.2),
+    the CCU USB3 clocks 0x1340..0x1364, and the dwc3 GCTL, GUCTL, GUCTL1 and
+    GUSB3PIPECTL registers.
+  - The dwc3 link-layer window differs in three words:
+      - LLUCTL(0) 0x06A0D024: vendor 0x408b8080, ours 0x008b8080.
+      - 0x06A0D050: vendor 0x40008082, ours 0x40008042.
+      - 0x06A0D054: vendor 0x00080000, ours 0.
+    The last two are unidentified. Neither script wrote them.
+    The 6 GiB board, on a 6.18.36 kernel built from the allwinner-bsp tree,
+    reads LLUCTL(0) 0x408b8080 too, with no device attached.
+  - Also different, and left untouched by everything below: about 40 words
+    of the Cadence PMA body, most of them per-lane RX adaptation state, and
+    the SERDES status/AUX words 0x06C01904/1908/1E00/1E04.
+
+Causality, with a script: write only that bit, retrain
+through an xHCI unbind/bind (the dwc3 core and LLUCTL are not reset; the
+script reads the bit back afterwards), and read the speed and PORTSC. There were 9 retrains,
+and the speed matched the bit in all 9:
+
+  - 5 actually changed the bit. On this kernel: 0->1, 1->0, 0->1. On the
+    vendor stack: 1->0, 0->1.
+  - 4 rewrote the value already there.
+
+With the bit set by hand, this kernel reads the enclosure at 602-656 MB/s
+(1 MiB) and 863-869 MB/s (4 MiB).
+
+The bit has no name in mainline. drivers/usb/dwc3/core.h names only bit10
+FORCE_GEN1, in 6.18.36 and in torvalds/master as of 2026-09-17. Allwinner's
+BSP (alexcaoys/allwinner-bsp, branch linux-6.18.y @656a550c8267 -- the tree read, not the
+6.6.98 kernel measured above;
+drivers/usb/dwc3/dwc3-sunxi.h:24-25) calls it DWC3_LLUCTL_INV_SYNC_HDR,
+"link uses data block sync header for Gen2 polarity detection". That name
+is a hint, not a source. Only the effect is measured.
+
+What the vendor does, and what this does instead
+------------------------------------------------
+
+  - The vendor glue (dwc3-sunxi-plat.c) writes the bit from its own probe
+    (dwc3_sunxi_init, :648), behind aw,inv-sync-hdr-quirk (:691). On
+    resume it schedules a work item (:900). The work item polls, 50000 times
+    usleep_range(1, 2), which its own timeout message calls 50 ms, until
+    GUID reads LINUX_VERSION_CODE and LLUCTL(0) is non-zero,
+    then writes the bit again (:140-162). It infers that the core has
+    reinitialised by watching registers that dwc3_core_init() happens to
+    write. Here the bit is set inside dwc3_core_init() itself, next to
+    FORCE_GEN1. That covers probe, a dwc3 rebind, and the
+    dwc3_core_init_for_resume() path a host takes on system resume, with
+    nothing to poll for and nothing to time out.
+  - Not covered, as for mainline's FORCE_GEN1: core soft resets outside
+    dwc3_core_init(), which happen on DRD role switches and on gadget soft
+    connect. Neither applies to this dr_mode = "host" node.
+  - The vendor sets only LLUCTL(0). This sets it for every SuperSpeed port
+    the core reports (num_usb3_ports). The A733 has one.
+  - The vendor's property carries its own vendor prefix on a Synopsys
+    register. This one is snps,inv-sync-hdr-quirk, placed with the other
+    dwc3 quirks in snps,dwc3-common.yaml. It is opt-in, so it is a no-op on
+    every other SoC, and gated to DWC_usb31 because that is the only core
+    it has been measured on (GSNPSID 0x33313130).
+
+Gen2 writes to this device additionally need `usb-dwc3-a733-program-lcsr-tx-deemph-for-gen2` (LCSR_TX_DEEMPH): with
+`usb-dwc3-a733-set-lluctl-bit30-for-gen2` alone they fail with USB transaction errors, on the vendor stack as
+well. Merge the two together.
+
+Verified: the bit's effect on silicon (the 8 GiB board, both stacks, 2026-09-17). This
+patch: applies with --fuzz=0 on a fresh 6.18.36 tree carrying the whole
+series. Not built, not run.
+
+Pending on hardware, with a kernel carrying this patch:
+  - LLUCTL(0) reads bit30 set after a cold boot and after a dwc3
+    unbind/bind, and the RTL9210 links at 10000 in both cases.
+  - The Kingston stick still links at 10000 (no-regression control).
+  - The resume path is reasoned from the source, not measured.
+
+Regenerated against 6.18.53 (3-way rebase): stable 6.18.40
+(e534790c4c27, "usb: dwc3: Support USB3340x ULPI PHY high-speed
+negotiation.") adds enable_usb2_transceiver_delay at the same place in
+struct dwc3 and in its kernel-doc. Both fields are kept, upstream's first.
+
+Assisted-by: Claude
+
+diff --git a/Documentation/devicetree/bindings/usb/snps,dwc3-common.yaml b/Documentation/devicetree/bindings/usb/snps,dwc3-common.yaml
+index 6c0b8b6..35f2d09 100644
+--- a/Documentation/devicetree/bindings/usb/snps,dwc3-common.yaml
++++ b/Documentation/devicetree/bindings/usb/snps,dwc3-common.yaml
+@@ -207,6 +207,13 @@ properties:
+       avoid -EPROTO errors with usbhid on some devices (Hikey 970).
+     type: boolean
+ 
++  snps,inv-sync-hdr-quirk:
++    description:
++      When set, the link layer detects Gen2 receiver polarity from the data
++      block sync header (DWC_usb31 LLUCTL bit 30). Without it some Gen2
++      devices link at Gen1 on Allwinner A733.
++    type: boolean
++
+   snps,gfladj-refclk-lpm-sel-quirk:
+     description:
+       When set, run the SOF/ITP counter based on ref_clk.
+diff --git a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+index c502285..bfeeb8f 100644
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -1214,6 +1214,14 @@ usb3: usb@6a00000 {
+ 			snps,dis-u2-entry-quirk;
+ 			snps,dis_u3_susphy_quirk;
+ 			snps,dis_u2_susphy_quirk;
++			/*
++			 * LLUCTL(0) bit30. Measured 2026-09-17: an RTL9210
++			 * Gen2 bridge links at 5000 with the bit clear and
++			 * at 10000 with it set, retrained by an xHCI rebind,
++			 * flipped both ways on this kernel and on the vendor
++			 * stack, which sets it (0x06A0D024 = 0x408b8080).
++			 */
++			snps,inv-sync-hdr-quirk;
+ 
+ 			/* Target for the connector's mandatory port@0 (HS). Inert:
+ 			 * dwc3 only builds a role switch when usb-role-switch is
+diff --git a/drivers/usb/dwc3/core.c b/drivers/usb/dwc3/core.c
+index f0a9bb5..2e6a1bb 100644
+--- a/drivers/usb/dwc3/core.c
++++ b/drivers/usb/dwc3/core.c
+@@ -1520,6 +1520,21 @@ static int dwc3_core_init(struct dwc3 *dwc)
+ 		}
+ 	}
+ 
++	/*
++	 * dwc3_core_init() runs on probe and again before the host restarts
++	 * after a system resume, so set the bit here. Only measured on
++	 * DWC_usb31.
++	 */
++	if (dwc->inv_sync_hdr_quirk && DWC3_IP_IS(DWC31)) {
++		int i;
++
++		for (i = 0; i < dwc->num_usb3_ports; i++) {
++			reg = dwc3_readl(dwc, DWC3_LLUCTL(i));
++			reg |= DWC3_LLUCTL_INV_SYNC_HDR;
++			dwc3_writel(dwc, DWC3_LLUCTL(i), reg);
++		}
++	}
++
+ 	/*
+ 	 * STAR 9001346572: This issue affects DWC_usb31 versions 1.80a and
+ 	 * prior. When an active endpoint not currently cached in the host
+@@ -1869,6 +1884,9 @@ static void dwc3_get_properties(struct dwc3 *dwc)
+ 	dwc->dis_split_quirk = device_property_read_bool(dev,
+ 				"snps,dis-split-quirk");
+ 
++	dwc->inv_sync_hdr_quirk = device_property_read_bool(dev,
++				"snps,inv-sync-hdr-quirk");
++
+ 	dwc->lpm_nyet_threshold = lpm_nyet_threshold;
+ 	dwc->tx_de_emphasis = tx_de_emphasis;
+ 
+diff --git a/drivers/usb/dwc3/core.h b/drivers/usb/dwc3/core.h
+index a39bf28..e416b92 100644
+--- a/drivers/usb/dwc3/core.h
++++ b/drivers/usb/dwc3/core.h
+@@ -676,6 +676,12 @@
+ 
+ /* Force Gen1 speed on Gen2 link */
+ #define DWC3_LLUCTL_FORCE_GEN1		BIT(10)
++/*
++ * Use the data block sync header for Gen2 Rx polarity detection. Not in the
++ * public documentation of the core; the name is the one Allwinner's BSP gives
++ * this bit. Without it an A733 links some Gen2 devices at Gen1.
++ */
++#define DWC3_LLUCTL_INV_SYNC_HDR	BIT(30)
+ 
+ /* Structures */
+ 
+@@ -1164,6 +1170,7 @@ struct dwc3_glue_ops {
+  * @dis_split_quirk: set to disable split boundary.
+  * @enable_usb2_transceiver_delay: Set to insert a delay before the
+  *			assertion of the TxValid signal during a HS Chirp.
++ * @inv_sync_hdr_quirk: set to detect Gen2 Rx polarity from the sync header.
+  * @sys_wakeup: set if the device may do system wakeup.
+  * @wakeup_configured: set if the device is configured for remote wakeup.
+  * @suspended: set to track suspend event due to U3/L2.
+@@ -1407,6 +1414,7 @@ struct dwc3 {
+ 
+ 	unsigned		dis_split_quirk:1;
+ 	unsigned		enable_usb2_transceiver_delay:1;
++	unsigned		inv_sync_hdr_quirk:1;
+ 	unsigned		async_callbacks:1;
+ 	unsigned		sys_wakeup:1;
+ 	unsigned		wakeup_configured:1;

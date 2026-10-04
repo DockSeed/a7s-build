@@ -1,0 +1,808 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] phy: allwinner: A733 DisplayPort AUX/HPD PHY
+
+Without an AUX channel there is no DPCD, no EDID and no link training, so of
+everything the DP-alt path still needs (PD, a Type-C mux, a Trilinear DP
+transmitter, TCON_TV, a KMS driver) this is the smallest piece with the
+largest downstream effect -- and, unusually for this subsystem, the one whose
+registers are fully documented.
+
+The block is AUX_HPD_PHY_PINS_CTRL0/1/2 at 0x06C01E00, three registers inside
+the SERDES subsystem aperture. It is not part of the combo PHY: the UM block
+diagram (Figure 18-3) draws AUX_HPD PHY beside
+COMB0_PHY_SERDES, each with its own interface into the DP1.4/eDP controller,
+and the UM gives it its own chapters 18.2.6.12-18.2.6.14.
+
+An earlier register map listed this block as an open gap. It is not.
+---------------------------------------------------------------
+
+That map listed the block as
+
+    | 0x1e00 | AUX_HPD_PHY_PINS_CTRL0 | DP AUX/HPD analog front-end
+      (def 0x00330000) |
+
+i.e. one register, no fields, marked open. The A733 UM V0.92 in fact documents
+all three registers field by field, with encodings and per-field defaults
+(sections 18.2.6.12 = 0x1e00, .13 = 0x1e04, .14 = 0x1e08; the next section,
+18.2.6.15, is already COMB1). So every value below is cited to a UM field row
+rather than to the vendor.
+
+Silicon, and what it is a witness of
+------------------------------------
+
+A register capture was taken on 2026-08-17 on
+the 8 GiB board under the vendor 6.6 stack with a real DP-alt link up: a 1920x1200
+monitor on Type-C J4, alt mode entered (SVID ff01, pin assignment C), HPD
+asserted, plug orientation REVERSE. In it:
+
+    0x06c01e00  0x03331131      (reset 0x00330000)
+    0x06c01e04  0x00010e0d      (reset 0x0000000d)
+    0x06c01e08  absent          (the dump lists non-zero words only, so = 0)
+
+The same three registers were read at their reset values on this board twice
+before: on our own 6.18.36 kernel and on the 2026-07-18 vendor capture, both
+with nothing plugged into J4. So this block is
+configured at alt-mode entry, not at boot, and that capture is the first
+time anyone here has seen it in its working state. That is what makes it usable
+as a target: it is not "a register that happens to read X", it is "the value a
+board with a live AUX channel runs".
+
+⚠ It is still a witness argument, not a mechanism proof. It says what a working
+AUX front end looks like; it does not say which of these writes is the one that
+matters, and a write whose value equals the reset default is invisible to this
+method by construction -- five of the fourteen below are exactly that.
+
+Why a new driver and not a second phy inside `phy-allwinner-a733-add-serdes-combophy`
+-------------------------------------------------
+
+Both were considered against how `phy-allwinner-a733-add-serdes-combophy` and `arm64-dts-a733-add-usb3-dwc3-combophy` are actually built, and the split
+wins on four counts:
+
+1. `arm64-dts-a733-add-usb3-dwc3-combophy` gives combophy0 `#phy-cells = <0>` with `of_phy_simple_xlate`, and dwc3
+   references it as `phys = <&u2phy>, <&combophy0>`. A second phy on that
+   provider needs `#phy-cells = <1>`, i.e. a cell-count change on the one node
+   in this tree that is HW-proven at 10 Gbps in both plug orientations. Nothing
+   about a DP front end justifies re-opening that; a bring-up patch that has
+   never seen a board should not be the reason a working link is re-tested.
+
+2. `phy-allwinner-a733-add-serdes-combophy`'s header records the 2026-07-29 change that moved the SERDES subsystem
+   gates and the companion PHY's reset-n *out* of that driver -- "they are a
+   clock and a reset and they belong to the provider added in `clk-sunxi-ng-a733-add-serdes-subsystem-clocks` and to the
+   companion PHY driver `phy-allwinner-a733-add-usb2-companion-phy`". Putting a second, unrelated register block back
+   into the same driver would undo that lesson rather than extend it. AUX/HPD
+   is a different register block, a different UM chapter and a different PHY
+   instance in the UM's own block diagram.
+
+3. The consumers and their lifetimes differ. combophy0's phy_ops.init has to run
+   from dwc3, four lines before its core soft reset; this one runs from the DP
+   transmitter on alt-mode entry, seconds later and possibly never. `arm64-dts-a733-add-usb3-dwc3-combophy`'s
+   header already records what came of coupling this device's probe order to
+   another's: a devlink ring that fw_devlink stopped honouring once the Type-C
+   connector's graph closed.
+
+4. The vendor models it the same way -- its own DT node, its own reg, its own
+   phy_ops (aux_hpd_phy_ops) -- which is a hint, not evidence, and is listed
+   last for that reason.
+
+What argues for one driver is the shared SERDES clock and the shared SERDES
+reset. That is already solved in this tree and needs no new mechanism: `phy-allwinner-a733-add-serdes-combophy`
+takes RST_BUS_SERDES with devm_reset_control_get_shared() and `clk-sunxi-ng-a733-add-serdes-subsystem-clocks`'s provider
+holds it deasserted, so a third shared consumer is the established pattern.
+This driver takes it shared for the same reason and never sets the clock's rate
+-- `phy-allwinner-a733-add-serdes-combophy` owns the 100 MHz serdes-phy-cfg rate and both PHYs hang off that net.
+
+Every write, and where it comes from
+------------------------------------
+
+Fourteen register writes: eleven that program fields, then three enable bits.
+Order is the vendor's and is kept. "delta" = does the write change the register
+when it starts from its documented reset value.
+
+  #   reg      field                     val   delta  source
+  --  -------  ------------------------  ----  -----  --------------------------
+   1  CTRL0    [27:24] RX_HYST_LVL       0x3   yes    UM: 011 = 15 mV, marked
+                                                      "(default)" in the encoding
+                                                      table; register reset is 0
+                                                      = no hysteresis
+   2  CTRL0    [21:20] RX_DEGLITCH_FLT   0x3   no     UM: highest glitch-duration
+                                                      rejection, = reset value
+   3  CTRL0    [17:16] TX_SLEW           0x3   no     UM: 81 ps rise/fall,
+                                                      = reset value
+   4  CTRL0    [13:12] BG_START_ADJ      0x1   yes    UM: 01 = 558.5 mV bandgap
+                                                      start-up sense, marked
+                                                      "(default)"; reset is 0 =
+                                                      543.0 mV
+   5  CTRL0    [8] CFG_AUX_EN            1     yes    UM: enable AUX TX_EN/RX_EN
+                                                      per CFG_AUX_TX_DIRECTION
+   6  CTRL1    [28] RX_OFFSET_DISABLE    0     no     UM: loopback-only offset;
+                                                      = reset value
+   7  CTRL1    [24] TERM_HIGHZ_EN        0     no     UM: drive low in
+                                                      mission mode, high only for
+                                                      IDDQ testing
+   8  CTRL1    [23:16] ATBSEL_ONEHOT     0x01  yes    ⚠ see below
+   9  CTRL1    [12:8] TX_CUR_CTRL        0x0e  yes    UM: 0xE = 367/169 mVpp (DP
+                                                      default); 0x13 = 428/230
+                                                      mVpp (eDP default) would be wrong
+                                                      here -- this board has no
+                                                      eDP connector at all
+  10  CTRL1    [4:0] TERM_SEG_EN         0x0d  no     UM: 94 ohm, marked
+                                                      "(default)", field goal is
+                                                      100 ohm differential;
+                                                      = reset value
+  11  CTRL2    whole register            0     no     UM: no AUX polarity
+                                                      inversion either way,
+                                                      HPD_GP_ANA 0, HPD_TX_OEN 0
+                                                      (HPD pad stays an input),
+                                                      TX_REDUCED_SWING 0 = DP
+                                                      swing -- which has to agree
+                                                      with #9, and does
+  12  CTRL0    [4] DECAP_EN              1     yes    UM: with decap_en_del,
+                                                      limits the inrush current
+                                                      into the avdd decoupling
+                                                      capacitor
+  13  CTRL0    [5] DECAP_EN_DEL          1     yes    UM: delayed decap enable;
+                                                      both decap bits have to be
+                                                      high for the HPD circuitry
+                                                      to work
+  14  CTRL0    [0] BG_EN                 1     yes    UM: bandgap enable;
+                                                      powers the AUX RX/TX bias
+
+Accumulate them from the reset values and the arithmetic closes on the capture:
+
+  CTRL0  0x00330000 -> #1 0x03330000 -> #4 0x03331000 -> #5 0x03331100
+                    -> #12 0x03331110 -> #13 0x03331130 -> #14 0x03331131  ✓
+  CTRL1  0x0000000d -> #8 0x0001000d -> #9 0x00010e0d                      ✓
+  CTRL2  0x00000000 -> #11 0x00000000                                                ✓
+
+Writes #2, #3, #6, #7, #10 are no-ops against a fresh block and are kept anyway:
+nothing resets this block short of RST_BUS_SERDES, which USB3 holds deasserted
+for the life of the system, so a second DP attach inherits whatever the first
+one left.
+
+The one write that is documented but not justified
+--------------------------------------------------
+
+#8. The honest form: the vendor writes 1 to bit 16 of 0x06C01E04; the UM does
+document that field -- [23:16] `i_auxhpd_atbsel_onehot`, a one-hot ATB select,
+where 0x1 picks the source voltage of the AUX receiver's differential pair -- but
+that is an analog test bus tap, and no reason is given anywhere why a mission-mode driver
+should enable one. Silicon with a live DP-alt link reads it set. It is
+reproduced because the only known-good witness has it on, and dropping it would
+both diverge from that witness and make the read-back check below meaningless.
+If it is later shown inert, removing it is one line.
+
+(The vendor sets bit 16 with a one-bit RMW; this driver writes the whole one-hot
+field as 0x01. Same end state on silicon -- bits 23:17 read 0 there -- and
+deterministic if some earlier owner left another code selected.)
+
+Two more things sourced only to the vendor, stated as such:
+
+ - the two `msleep(10)` calls, one at the top of .init and one at the top of
+   .power_on. The UM documents no settling time for this block and names no rail
+   this would wait on. Kept because a superfluous 10 ms costs 10 ms per DP
+   attach and a missing one costs a board cycle.
+ - the split itself -- clock and reset in .init, register programming in
+   .power_on -- follows the vendor's aux_hpd_init/aux_hpd_power_on. It is also
+   the right layering independently, and it is what the generic PHY API asks
+   for, so it is not carried on the vendor's authority alone.
+
+Board wiring, and what it settles
+---------------------------------
+
+DP-AUXP/AUXN go straight to Type-C J4 SBU1/SBU2 through 100 nF DC blocking caps
+(C105/C107, sch p12 L38-44; SoC-side nets sch p6 L124-125). There is no external SBU mux and no redriver on
+this board -- HUSB311 is a CC/PD controller only, not a lane crossbar.
+DP-REXT = R68 3.01K (sch p6 L144-145).
+
+So a reversed plug swaps AUX+ and AUX-, and something has to un-swap it. It is
+not the two AUX polarity bits in CTRL2: the 8 GiB board's capture was taken with the plug
+REVERSE -- COMB0 LINK_CTRL0 reads 0x00001131 in the same dump, bit12
+TYPEC_CONN_DIR set -- and CTRL2 was still 0 while the link ran. Orientation is
+therefore handled upstream of this block, and programming those bits per
+orientation would break the one case that has been observed working.
+Who does swap AUX on a reversed plug stays an open question; this
+capture does not answer it, but it does rule this register out.
+
+The DP-HPD pad (sch p6 L127) occurs on no other schematic page, while AUXP/AUXN
+occur on both p6 and p12. Read as: HPD is not routed to the connector, and in DP
+alt mode it arrives over CC as a DisplayPort Attention message. That changes
+none of the writes -- the vendor enables the HPD circuitry regardless and
+silicon agrees -- but nobody should expect a hotplug interrupt out of this PHY.
+
+The AUX/HPD rail is `AVDD-HPD-AUX`, 3.3 V (sch p6 L130). We
+have not traced it to a PMIC output, so no `*-supply` is wired here. A `regulator-fixed`
+stand-in would satisfy the binding and prove nothing -- this tree has paid for
+that once already -- so the rail is left unmodelled and named as open.
+
+Register window overlap -- a real one, worked around on purpose
+---------------------------------------------------------------
+
+`arm64-dts-a733-add-usb3-dwc3-combophy` gives combophy0 a first window of 0x06C01000 + 0x1000, which swallows this
+block whole (0x06C01E00 + 0x200 ends at 0x06C01FFF), and
+devm_platform_ioremap_resource() requests its region exclusively
+(lib/devres.c:154), so this driver would probe with -EBUSY against a working
+USB3 PHY.
+
+This driver therefore maps with platform_get_resource() + devm_ioremap(), the
+same non-exclusive pattern `phy-allwinner-a733-add-usb2-companion-phy` uses for the shared SYSCFG res_base. The clean
+fix is on the other side -- combophy0's highest offset is LINK_STUS0 at 0x900,
+its window only needs 0xa00, and the vendor DT uses exactly 0xa00 -- but
+shrinking it edits the HW-proven USB3 node, so it belongs to a patch that
+re-proves SuperSpeed rather than to this one. Recorded here so the next reader
+finds the reason instead of the symptom.
+
+The vendor's AUX behaviour, and why none of it is here
+------------------------------------------------------
+
+The vendor's DP stack talks on AUX at bind, blind, and retries for four and a
+half seconds. Measured on the 8 GiB board booted from the vendor eMMC system with nothing
+plugged into J4:
+
+    eDP binds at 1.646 s and immediately issues DPCD reads
+    34 x "edp wait aux reply timeout!" between 1.69 s and 6.21 s, in 5 rounds
+    trilinear_aux_read retry 7 ... AUX_TIMEOUT
+      -> edp_aux_read fail addr:0x0 len:0x10
+      -> "fail to read edp dpcd from extcon sink"
+      -> "typec aux communication failed after retry N"
+    throughout: the vendor's own mux sits in STATE_SAFE and every extcon reads
+    DP=0
+
+The mechanism is in the vendor source, not guessed: edp_sink_extcon_evt() reacts
+to an extcon event and on failure schedules drm_edp_typec_hpd_monitor() once a
+second for up to 30 rounds (sunxi_drm_edp.c, ~359-412 and ~4429). Blind probe at
+bind, plus a long blind retry loop.
+
+This is behaviour to reject, and it is worth naming the likely reason it can
+never have worked: with nothing attached, this block reads its reset value
+0x00330000 -- observed under the vendor stack on 2026-07-18 and again on our own
+kernel on 2026-08-17. Reset value means BG_EN = 0 and
+CFG_AUX_EN = 0, i.e. the AUX transmitter and receiver bias were never enabled.
+The vendor's aux_hpd power_on only runs on alt-mode entry, so those 34
+transactions were issued into a front end that was still powered down. Two
+separate observations, one inference; stated as an inference.
+
+What this driver does about it: nothing, by construction, and the constraint is
+recorded here so the future DP consumer inherits it.
+
+ 1. No AUX transaction at bind -- this driver issues none, ever. It programs
+    analog trims and enables; the transactions belong to the DP transmitter.
+ 2. The .init/.power_on split is the hook that makes gating possible, and that
+    is the reason to keep it. .init is clock and reset only and is safe at bind;
+    .power_on is what turns on the bandgap, the AUX enable and the termination,
+    and it is what the consumer must defer until DP alt mode has actually been
+    entered and the mux is in a DP state. A consumer that calls phy_power_on()
+    at bind gets the vendor's ordering back.
+ 3. No sink is a state, not an error. There is no error-level logging on any
+    path here that "no sink" can reach: .init logs dev_err only if the clock or
+    the reset genuinely fails, and .power_on's single line is dev_info and
+    prints once per power-on, never in a loop.
+ 4. No retry loop, no poll, no timeout -- and none is possible: the whole block
+    is three R/W configuration registers (0x1e00/04/08, then COMB1 at 0x2000).
+    There is no status or ready bit in it to wait on, so the entire class of
+    failure the vendor logs cannot originate in this driver. If a bounded retry
+    is ever needed on the DP side, its bound and its reason belong in that
+    patch's header.
+
+What this patch does not do
+---------------------------
+
+No DT binding document (`phy-allwinner-a733-add-serdes-combophy` and `phy-allwinner-a733-add-usb2-companion-phy` have none either; owed for all three).
+No consumer: the DP transmitter does not exist in this tree, so the phy provider
+registers and nothing calls it. probe() deliberately touches no register at all
+-- it maps, gets the clock and the reset, creates the phy and returns -- so an
+unconsumed node costs exactly one platform device.
+
+HW-pending, single observable
+-----------------------------
+
+With a DP sink on J4 and a consumer calling phy_init()/phy_power_on(), the
+driver's own dev_info line must print
+
+    CTRL0=0x03331131 CTRL1=0x00010e0d CTRL2=0x00000000
+
+which is the vendor's live-link state read back off our own writes. Read
+independently with `busybox devmem 0x06c01e00` / `0x06c01e04` / `0x06c01e08`;
+matching all three is the proof, and a mismatch names the failing field
+directly. That line is dev_info and not dev_dbg until it has been recorded;
+demote it afterwards, do not delete it.
+
+Negatively, and it has to be checked in the same session: USB3 must still
+enumerate at SuperSpeed. This driver writes no register outside
+0x06C01E00..0x06C01FFF and takes the SERDES reset shared, so it should not be
+able to disturb it -- "should not" is the claim under test.
+
+Assisted-by: Claude
+
+diff --git a/drivers/phy/allwinner/Kconfig b/drivers/phy/allwinner/Kconfig
+--- a/drivers/phy/allwinner/Kconfig
++++ b/drivers/phy/allwinner/Kconfig
+@@ -81,3 +81,16 @@
+ 	help
+ 	  Enable this for the USB2.0 UTMI companion PHY of the A733 (sun60iw2)
+ 	  USB3.1 DRD controller. Required for the dwc3 core to leave reset.
++
++config PHY_SUN60I_A733_AUX_HPD
++	tristate "Allwinner A733 DisplayPort AUX/HPD PHY"
++	depends on ARCH_SUNXI || COMPILE_TEST
++	depends on HAS_IOMEM && OF
++	depends on RESET_CONTROLLER
++	select GENERIC_PHY
++	help
++	  Enable this for the DisplayPort AUX/HPD analog front end inside the
++	  A733 (sun60iw2) SERDES subsystem. It drives the AUX differential pair
++	  and the HPD pin, so without it a sink cannot be reached over AUX and
++	  there is no DPCD, no EDID and no link training. Separate from the
++	  COMB0 combo-PHY, which carries the DP main-link lanes.
+diff --git a/drivers/phy/allwinner/Makefile b/drivers/phy/allwinner/Makefile
+--- a/drivers/phy/allwinner/Makefile
++++ b/drivers/phy/allwinner/Makefile
+@@ -5,3 +5,4 @@
+ obj-$(CONFIG_PHY_SUN50I_USB3)		+= phy-sun50i-usb3.o
+ obj-$(CONFIG_PHY_SUN60I_A733_COMBO)	+= phy-sun60i-a733-combophy.o
+ obj-$(CONFIG_PHY_SUN60I_A733_USB2)	+= phy-sun60i-a733-usb2.o
++obj-$(CONFIG_PHY_SUN60I_A733_AUX_HPD)	+= phy-sun60i-a733-aux-hpd.o
+diff --git a/drivers/phy/allwinner/phy-sun60i-a733-aux-hpd.c b/drivers/phy/allwinner/phy-sun60i-a733-aux-hpd.c
+new file mode 100644
+--- a/drivers/phy/allwinner/phy-sun60i-a733-aux-hpd.c
++++ b/drivers/phy/allwinner/phy-sun60i-a733-aux-hpd.c
+@@ -0,0 +1,460 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Allwinner A733 (sun60iw2) DisplayPort AUX/HPD PHY.
++ *
++ * The A733 SERDES subsystem contains four PHY instances, and the UM block
++ * diagram (Figure 18-3) draws them as peers: the AUX_HPD
++ * PHY sits beside COMB0_PHY_SERDES with its own interface into the DP1.4/eDP
++ * controller. It is not part of the combo PHY -- it is the low-speed analog
++ * front end for the DP AUX differential pair and the HPD pin, and it has its own
++ * three-register block at 0x06C01E00 (SERDES_SUBSYS_APP + 0x1e00..0x1e08,
++ * UM 18.2.6.12-18.2.6.14).
++ *
++ * Without it there is no AUX channel: no DPCD read, no EDID, no link training.
++ * It is therefore the smallest piece of the DP-alt path, and the first one that
++ * can be written against a fully documented register set -- every field
++ * programmed here comes from the UM field tables, not from a decoded silicon
++ * dump (the Cadence PMA body next door is the opposite case).
++ *
++ * Register-block ownership, the lesson `phy-allwinner-a733-add-serdes-combophy` already paid for: this driver
++ * touches 0x06C01E00..0x06C01FFF and nothing else. It does not write the COMB0
++ * link registers, it does not write the SERDES subsystem gates, and it does not
++ * touch a single register on the USB3 path.
++ *
++ * The SERDES config clock and the SERDES block reset are shared with the COMB0
++ * combo PHY (`phy-allwinner-a733-add-serdes-combophy`) and the serdes-ccu (`clk-sunxi-ng-a733-add-serdes-subsystem-clocks`). The reset is taken *shared* for
++ * the same reason `phy-allwinner-a733-add-serdes-combophy` takes it shared: those two hold it deasserted, and
++ * asserting it from here would take their registers away mid-flight. The clock
++ * is enabled but its rate is never set -- `phy-allwinner-a733-add-serdes-combophy` owns the 100 MHz serdes-phy-cfg
++ * rate, and both personalities run off that one net.
++ *
++ * phy_ops split follows the block: .init is plumbing (clock + reset), .power_on
++ * is the analog bring-up. The phy core serialises both under phy->mutex, so this
++ * driver carries no lock of its own.
++ *
++ * ---------------------------------------------------------------------------
++ * A constraint for whoever writes the DP consumer, because the vendor gets it
++ * wrong and the failure is expensive to diagnose from the other end.
++ *
++ * The vendor's DP stack issues DPCD reads at bind and retries blind: measured on
++ * the 8 GiB board with nothing plugged into Type-C J4, eDP binds at 1.646 s and logs
++ * 34 x "edp wait aux reply timeout!" between 1.69 s and 6.21 s, in five rounds,
++ * while its own mux sits in STATE_SAFE and every extcon reads DP=0. The retry is
++ * edp_sink_extcon_evt() rescheduling drm_edp_typec_hpd_monitor() once a second
++ * for up to 30 rounds. Four and a half seconds of every boot, talking to a sink
++ * that is not there.
++ *
++ * So:
++ *  - Nothing here talks on AUX. This driver only programs the analog front end;
++ *    the transactions are the DP transmitter's.
++ *  - phy_power_on() is the gate, and that is why the ops are split. .init
++ *    (clock + reset) is safe at bind. .power_on turns on the bandgap, the AUX
++ *    enable and the termination, and must be deferred until DP alt mode has
++ *    actually been entered and the mux is in a DP state. Calling it at bind
++ *    reproduces the vendor's ordering.
++ *  - "No sink" is a state, not an error: no path reachable without a sink logs
++ *    at error level, and there is no retry loop here at all. Nor could there be
++ *    one -- the block is three R/W config registers with no status or ready bit
++ *    to poll, so no AUX timeout can originate in this driver.
++ * ---------------------------------------------------------------------------
++ */
++
++#include <linux/bitfield.h>
++#include <linux/bits.h>
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/phy/phy.h>
++#include <linux/platform_device.h>
++#include <linux/reset.h>
++
++/*
++ * AUX_HPD_PHY_PINS_CTRL0, offset 0x00, reset 0x0033_0000 (UM 18.2.6.12).
++ * The UM's reserved rows print as 23:21 / 19:17 / 11:10 / 7:6 / 3:1, i.e. they
++ * overlap the field row below them by one bit. That is an extraction artefact of
++ * the PDF, not two readings of the silicon: the reset value 0x00330000 has
++ * exactly bits 21,20,17,16 set, which is only self-consistent if TX_SLEW is
++ * [17:16] and RX_DEGLITCH_FILTER is [21:20] as their own rows say. The field
++ * rows are used; the reserved rows are not.
++ */
++#define AUX_HPD_CTRL0			0x00
++#define  CTRL0_RX_HYST_LVL		GENMASK(27, 24)
++#define  CTRL0_RX_DEGLITCH_FILTER	GENMASK(21, 20)
++#define  CTRL0_TX_SLEW			GENMASK(17, 16)
++#define  CTRL0_BG_START_ADJ		GENMASK(13, 12)
++#define  CTRL0_CFG_AUX_TX_DIRECTION	BIT(9)
++#define  CTRL0_CFG_AUX_EN		BIT(8)
++#define  CTRL0_DECAP_EN_DEL		BIT(5)
++#define  CTRL0_DECAP_EN			BIT(4)
++#define  CTRL0_BG_EN			BIT(0)
++
++/* AUX_HPD_PHY_PINS_CTRL1, offset 0x04, reset 0x0000_000D (UM 18.2.6.13). */
++#define AUX_HPD_CTRL1			0x04
++#define  CTRL1_RX_OFFSET_DISABLE	BIT(28)
++#define  CTRL1_TERM_HIGHZ_EN		BIT(24)
++#define  CTRL1_ATBSEL_ONEHOT		GENMASK(23, 16)
++#define  CTRL1_TX_CUR_CTRL		GENMASK(12, 8)
++#define  CTRL1_TERM_SEG_EN		GENMASK(4, 0)
++
++/*
++ * AUX_HPD_PHY_PINS_CTRL2, offset 0x08, reset 0x0000_0000 (UM 18.2.6.14):
++ * bit29 AUX_DATA_OUT_POLAR_SEL, bit28 AUX_DATA_IN_POLAR_SEL, [11:8] HPD_GP_ANA,
++ * bit4 HPD_TX_OEN, bit0 TX_REDUCED_SWING. All zero = AUX polarity not inverted,
++ * HPD pad output disabled (HPD is an input, driven by the sink), and normal DP
++ * transmitter swing rather than the reduced eDP swing.
++ */
++#define AUX_HPD_CTRL2			0x08
++
++/* Field values, all from the UM encodings cited per write in _power_on(). */
++#define RX_HYST_LVL_15MV		0x3	/* code 011 */
++#define RX_DEGLITCH_HIGHEST		0x3
++#define TX_SLEW_81PS			0x3
++#define BG_START_ADJ_558MV		0x1
++#define ATBSEL_RX_DIFF_PAIR_SRC		0x01
++#define TX_CUR_CTRL_DP			0x0e	/* 367/169 mVpp, "DP default" */
++#define TERM_SEG_EN_94R			0x0d	/* 94 ohm, targets 100 ohm diff */
++
++/*
++ * Vendor sleeps 10 ms at the top of both its aux_hpd init and its power_on. The
++ * UM documents no settling time for this block and names no rail this would be
++ * waiting on, so the number has no source beyond the vendor. It is kept because
++ * a superfluous 10 ms costs ten milliseconds per DP attach and a missing one
++ * costs a board cycle; when the DP path has its own silicon witness, removing it
++ * is a measurable experiment rather than a guess.
++ */
++#define AUX_HPD_SETTLE_MS		10
++
++struct a733_aux_hpd {
++	struct device		*dev;
++	void __iomem		*base;
++	struct clk		*clk;
++	struct reset_control	*reset;
++};
++
++static void aux_hpd_rmw(struct a733_aux_hpd *p, u32 off, u32 mask, u32 val)
++{
++	u32 v = readl(p->base + off);
++
++	v &= ~mask;
++	v |= val & mask;
++	writel(v, p->base + off);
++}
++
++/*
++ * The analog bring-up. Every write below is one UM field row; the comment says
++ * where the value comes from and whether it changes the register.
++ *
++ * The order is load-bearing and is the vendor's: eleven field writes first, then
++ * the three enable bits, DECAP_EN before DECAP_EN_DEL before BG_EN. The UM says
++ * why -- decap_en and decap_en_del together limit the inrush into the avdd
++ * decoupling capacitor while it charges, and the UM wants both high for the
++ * HPD circuitry. Asserting them before the trims are in place,
++ * or in one write, defeats the staging.
++ *
++ * End state on silicon, from a vendor 6.6 stack with a live DP-alt link on
++ * the 8 GiB board (1920x1200 monitor on Type-C J4, HPD asserted, read back
++ * on 2026-08-17):
++ *
++ *	0x06c01e00 = 0x03331131   (reset 0x00330000)
++ *	0x06c01e04 = 0x00010e0d   (reset 0x0000000d)
++ *	0x06c01e08 = 0x00000000   (reset 0x00000000, absent from the non-zero dump)
++ *
++ * The writes below accumulate to exactly those three values from those three
++ * reset values. That is the read-back this driver owes.
++ */
++static int a733_aux_hpd_power_on(struct phy *phy)
++{
++	struct a733_aux_hpd *p = phy_get_drvdata(phy);
++
++	msleep(AUX_HPD_SETTLE_MS);
++
++	/*
++	 * CTRL0 trims. RX_HYST_LVL / RX_DEGLITCH_FILTER / TX_SLEW /
++	 * BG_START_ADJ are each set to the value the UM's own encoding table
++	 * marks "(default)", which for two of them is not the register's reset
++	 * value:
++	 *
++	 *  [27:24] RX_HYST_LVL   = 3 -> 15 mV AUX receiver hysteresis. Reset is
++	 *                          0 = no hysteresis; 011 is the UM's marked
++	 *                          default. Changes the register.
++	 *  [21:20] RX_DEGLITCH   = 3 -> highest glitch-duration rejection. UM
++	 *                          default AND reset value: a no-op write, kept
++	 *                          so the state is programmed, not inherited.
++	 *  [17:16] TX_SLEW       = 3 -> 81 ps AUX TX rise/fall. UM default AND
++	 *                          reset value; same reason.
++	 *  [13:12] BG_START_ADJ  = 1 -> 558.5 mV bandgap start-up sense voltage.
++	 *                          Reset is 0 = 543.0 mV; 01 is the UM's marked
++	 *                          default. Changes the register.
++	 *
++	 * The two no-ops matter because nothing resets this block short of
++	 * RST_BUS_SERDES, which USB3 holds deasserted for the life of the
++	 * system: a second DP attach finds whatever the first one left behind.
++	 */
++	aux_hpd_rmw(p, AUX_HPD_CTRL0, CTRL0_RX_HYST_LVL,
++		    FIELD_PREP(CTRL0_RX_HYST_LVL, RX_HYST_LVL_15MV));
++	aux_hpd_rmw(p, AUX_HPD_CTRL0, CTRL0_RX_DEGLITCH_FILTER,
++		    FIELD_PREP(CTRL0_RX_DEGLITCH_FILTER, RX_DEGLITCH_HIGHEST));
++	aux_hpd_rmw(p, AUX_HPD_CTRL0, CTRL0_TX_SLEW,
++		    FIELD_PREP(CTRL0_TX_SLEW, TX_SLEW_81PS));
++	aux_hpd_rmw(p, AUX_HPD_CTRL0, CTRL0_BG_START_ADJ,
++		    FIELD_PREP(CTRL0_BG_START_ADJ, BG_START_ADJ_558MV));
++
++	/*
++	 * bit8 CFG_AUX_EN = 1: turns on AUX TX_EN and RX_EN, gated by
++	 * CFG_AUX_TX_DIRECTION; bit9 CFG_AUX_TX_DIRECTION is deliberately left
++	 * at its reset 0 = RX enabled, TX disabled -- AUX is half-duplex and the
++	 * direction is flipped per transaction by whoever drives the channel.
++	 * The vendor PHY driver never writes bit9 either; whichever block turns
++	 * the pair around, it is not this one.
++	 */
++	aux_hpd_rmw(p, AUX_HPD_CTRL0, CTRL0_CFG_AUX_EN, CTRL0_CFG_AUX_EN);
++
++	/*
++	 * CTRL1.
++	 *
++	 *  bit28 RX_OFFSET_DISABLE = 0 -> the loopback-only common-mode offset
++	 *        stays at its reset value. Written explicitly because loopback
++	 *        is a test mode and mission mode wants it off.
++	 *  bit24 TERM_HIGHZ_EN     = 0 -> on-chip termination driven, not
++	 *        high-z. The UM is unusually direct here: low for mission
++	 *        mode, high only for IDDQ testing.
++	 */
++	aux_hpd_rmw(p, AUX_HPD_CTRL1, CTRL1_RX_OFFSET_DISABLE, 0);
++	aux_hpd_rmw(p, AUX_HPD_CTRL1, CTRL1_TERM_HIGHZ_EN, 0);
++
++	/*
++	 * [23:16] ATBSEL_ONEHOT = 0x01. This is the one write here that is
++	 * documented but not justified. The UM calls the field
++	 * i_auxhpd_atbsel_onehot, a one-hot ATB select, with
++	 * 0x1 picking the source voltage of the AUX receiver pair -- an analog test bus
++	 * tap, which a mission-mode driver has no reason to turn on. It is
++	 * reproduced anyway because the only silicon we have with a working AUX
++	 * channel has it set (0x06c01e04 bit16 = 1 with a live link), and
++	 * deviating from the sole known-good witness on a hunch is how a PHY
++	 * stops training. Reset value is 0, so this does change the register.
++	 *
++	 * The vendor sets bit16 with a one-bit read-modify-write; the whole
++	 * one-hot field is written here instead. Same end state on silicon --
++	 * bits 23:17 read 0 there -- and deterministic if some earlier owner
++	 * left a different code selected.
++	 */
++	aux_hpd_rmw(p, AUX_HPD_CTRL1, CTRL1_ATBSEL_ONEHOT,
++		    FIELD_PREP(CTRL1_ATBSEL_ONEHOT, ATBSEL_RX_DIFF_PAIR_SRC));
++
++	/*
++	 * [12:8] TX_CUR_CTRL = 0x0E. The UM's encoding table annotates exactly
++	 * two of the 32 codes: 0xE = 367/169 mVpp (the DP default) and 0x13 =
++	 * 428/230 mVpp (the eDP default). This board's only display path is DP over
++	 * Type-C J4 -- the schematic has no eDP connector on any page
++	 * -- so
++	 * 0xE is the sourced value and 0x13 would be the wrong one. It has to
++	 * agree with CTRL2 bit0 TX_REDUCED_SWING = 0
++	 * (0 = normal DP swing) below, and it does.
++	 *
++	 * [4:0] TERM_SEG_EN = 0x0D -> 94 ohm, the UM's marked default, out of a
++	 * field that aims at a 100 ohm differential
++	 * termination. Equals the reset value: a no-op on a fresh block, a
++	 * repair on a re-attach.
++	 */
++	aux_hpd_rmw(p, AUX_HPD_CTRL1, CTRL1_TX_CUR_CTRL,
++		    FIELD_PREP(CTRL1_TX_CUR_CTRL, TX_CUR_CTRL_DP));
++	aux_hpd_rmw(p, AUX_HPD_CTRL1, CTRL1_TERM_SEG_EN,
++		    FIELD_PREP(CTRL1_TERM_SEG_EN, TERM_SEG_EN_94R));
++
++	/*
++	 * CTRL2 = 0 as a whole register, which is what the vendor writes and
++	 * what silicon reads on a live link. Field by field: no AUX data
++	 * polarity inversion in either direction, HPD_GP_ANA 0, HPD_TX_OEN 0
++	 * (the HPD pad stays an input) and TX_REDUCED_SWING 0 = DP swing.
++	 *
++	 * Worth stating because it looks like an omission: the AUX pair is wired
++	 * straight to Type-C SBU1/SBU2 through 100 nF DC blocking caps with no
++	 * external mux (schematic p12 L38-44, C105/C107 100NF 10V; the SoC-side
++	 * nets DP-AUXP/AUXN are p6 L124-125), so a reversed plug swaps AUX+ and
++	 * AUX- and something has to un-swap it. It is not these two polarity
++	 * bits: the 8 GiB board's capture was taken with the plug REVERSE -- COMB0
++	 * LINK_CTRL0 reads 0x00001131, bit12 TYPEC_CONN_DIR set -- and CTRL2 was
++	 * still 0 while the link ran. So orientation is handled upstream of this
++	 * block, and writing these bits per orientation would break the one case
++	 * that has actually been observed working.
++	 */
++	writel(0, p->base + AUX_HPD_CTRL2);
++
++	/*
++	 * The three enables, last and in this order. bit4 DECAP_EN then bit5
++	 * DECAP_EN_DEL is the inrush staging the UM describes (a delayed decap
++	 * enable that limits the inrush current into the avdd decoupling
++	 * capacitor); reversing them, or merging them into one write,
++	 * charges the decoupling cap in a single step. bit0 BG_EN goes last and
++	 * powers up the AUX RX/TX bias -- it
++	 * is the switch that makes everything programmed above take effect.
++	 */
++	aux_hpd_rmw(p, AUX_HPD_CTRL0, CTRL0_DECAP_EN, CTRL0_DECAP_EN);
++	aux_hpd_rmw(p, AUX_HPD_CTRL0, CTRL0_DECAP_EN_DEL, CTRL0_DECAP_EN_DEL);
++	aux_hpd_rmw(p, AUX_HPD_CTRL0, CTRL0_BG_EN, CTRL0_BG_EN);
++
++	/*
++	 * This patch has exactly one observable and this line is it, so it is
++	 * dev_info and not dev_dbg until the comparison has been made on a
++	 * board: CTRL0 must read 0x03331131, CTRL1 0x00010e0d, CTRL2 0x00000000.
++	 * Demote it once that is recorded -- do not delete it.
++	 */
++	dev_info(p->dev,
++		 "AUX/HPD on: CTRL0=0x%08x CTRL1=0x%08x CTRL2=0x%08x (want 0x03331131 0x00010e0d 0x00000000)\n",
++		 readl(p->base + AUX_HPD_CTRL0),
++		 readl(p->base + AUX_HPD_CTRL1),
++		 readl(p->base + AUX_HPD_CTRL2));
++
++	return 0;
++}
++
++/*
++ * Deliberately a no-op, and deliberately not "symmetric".
++ *
++ * The obvious power_off -- drop BG_EN, DECAP_EN_DEL, DECAP_EN and CFG_AUX_EN --
++ * would save the AUX bias current between DP sessions and is what a reviewer
++ * expects to see. It is not written because it has no witness of any kind: the
++ * vendor's power_off is empty, so the only unplug/replug behaviour ever observed
++ * on this block is "the analog front end stays enabled and power_on runs again".
++ * power_on above is idempotent -- every write is an absolute field write, no
++ * toggles -- so re-running it over a still-enabled block is exactly the case the
++ * vendor stack exercises.
++ *
++ * Turning the bias off here is four lines and one board test away; guessing at
++ * it now would put an unproven power-down in front of an unproven bring-up.
++ */
++static int a733_aux_hpd_power_off(struct phy *phy)
++{
++	return 0;
++}
++
++static int a733_aux_hpd_init(struct phy *phy)
++{
++	struct a733_aux_hpd *p = phy_get_drvdata(phy);
++	int ret;
++
++	msleep(AUX_HPD_SETTLE_MS);
++
++	/*
++	 * Enable only -- the rate belongs to the COMB0 combo PHY, which sets
++	 * serdes-phy-cfg to 100 MHz (`phy-allwinner-a733-add-serdes-combophy`). Both PHYs hang off that one clock,
++	 * so a clk_set_rate() from here would be two drivers fighting over one
++	 * net.
++	 */
++	ret = clk_prepare_enable(p->clk);
++	if (ret) {
++		dev_err(p->dev, "serdes clk enable failed: %d\n", ret);
++		return ret;
++	}
++
++	/*
++	 * Shared, and that is the point: combophy0 and the serdes-ccu each hold
++	 * a deassert on this line, so this one is a refcount bump and the
++	 * matching assert in .exit can never pull the SERDES block -- and with
++	 * it the running USB3 controller -- out from under them.
++	 */
++	ret = reset_control_deassert(p->reset);
++	if (ret) {
++		dev_err(p->dev, "serdes reset deassert failed: %d\n", ret);
++		clk_disable_unprepare(p->clk);
++		return ret;
++	}
++
++	return 0;
++}
++
++static int a733_aux_hpd_exit(struct phy *phy)
++{
++	struct a733_aux_hpd *p = phy_get_drvdata(phy);
++
++	reset_control_assert(p->reset);
++	clk_disable_unprepare(p->clk);
++
++	return 0;
++}
++
++static const struct phy_ops a733_aux_hpd_ops = {
++	.init		= a733_aux_hpd_init,
++	.exit		= a733_aux_hpd_exit,
++	.power_on	= a733_aux_hpd_power_on,
++	.power_off	= a733_aux_hpd_power_off,
++	.owner		= THIS_MODULE,
++};
++
++static int a733_aux_hpd_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct a733_aux_hpd *p;
++	struct phy_provider *provider;
++	struct resource *res;
++	struct phy *phy;
++
++	p = devm_kzalloc(dev, sizeof(*p), GFP_KERNEL);
++	if (!p)
++		return -ENOMEM;
++	p->dev = dev;
++
++	/*
++	 * devm_ioremap(), not devm_platform_ioremap_resource(), and the reason
++	 * is a real overlap rather than tidiness: `arm64-dts-a733-add-usb3-dwc3-combophy` gives combophy0 a first
++	 * window of 0x06C01000 + 0x1000, which swallows this block whole
++	 * (0x06C01E00 + 0x200 ends at 0x06C01FFF). devm_ioremap_resource()
++	 * requests its region exclusively and would fail here with -EBUSY
++	 * against a driver that is HW-proven at 10 Gbps.
++	 *
++	 * The clean fix is on the other side -- combophy0's window only needs
++	 * 0xa00, its highest offset being LINK_STUS0 at 0x900, and the vendor DT
++	 * uses exactly 0xa00 -- but shrinking it edits the proven USB3 node, so
++	 * it belongs in a patch that re-proves SuperSpeed, not in this one. Same
++	 * non-exclusive mapping pattern `phy-allwinner-a733-add-usb2-companion-phy` uses for the shared SYSCFG
++	 * res_base.
++	 */
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!res)
++		return -ENODEV;
++	p->base = devm_ioremap(dev, res->start, resource_size(res));
++	if (!p->base)
++		return -ENOMEM;
++
++	p->clk = devm_clk_get(dev, "serdes");
++	if (IS_ERR(p->clk))
++		return dev_err_probe(dev, PTR_ERR(p->clk), "serdes clk\n");
++
++	p->reset = devm_reset_control_get_shared(dev, NULL);
++	if (IS_ERR(p->reset))
++		return dev_err_probe(dev, PTR_ERR(p->reset), "serdes reset\n");
++
++	phy = devm_phy_create(dev, NULL, &a733_aux_hpd_ops);
++	if (IS_ERR(phy))
++		return PTR_ERR(phy);
++	phy_set_drvdata(phy, p);
++
++	/*
++	 * Nothing above this line touched a register, and that is intentional:
++	 * with no DP consumer in the tree yet this driver probes, registers a
++	 * provider and stops. The first write happens when a consumer calls
++	 * phy_init() / phy_power_on().
++	 */
++	provider = devm_of_phy_provider_register(dev, of_phy_simple_xlate);
++	return PTR_ERR_OR_ZERO(provider);
++}
++
++static const struct of_device_id a733_aux_hpd_of_match[] = {
++	{ .compatible = "allwinner,sun60i-a733-aux-hpd-phy" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, a733_aux_hpd_of_match);
++
++static struct platform_driver a733_aux_hpd_driver = {
++	.probe	= a733_aux_hpd_probe,
++	.driver	= {
++		.name		= "sun60i-a733-aux-hpd-phy",
++		.of_match_table	= a733_aux_hpd_of_match,
++	},
++};
++module_platform_driver(a733_aux_hpd_driver);
++
++MODULE_DESCRIPTION("Allwinner A733 DisplayPort AUX/HPD PHY");
++MODULE_LICENSE("GPL");

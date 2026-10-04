@@ -1,0 +1,108 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] clk: sunxi-ng: a733: add the THS bus gate, its reset, and the GPADC 24 MHz clock
+
+The thermal sensor controller needs three things from the CCU and the tree
+modelled none of them: a bus gate, a reset, and a separate 24 MHz clock for the
+conversion itself.
+
+  THS0_BGR_REG        0x0FE4  bit0  gate, bit16 reset
+  GPADC0_24M_CLK_REG  0x0FC0  bit31 gate
+
+Both from the A733 user manual (THS and GPADC clock and bus gating registers),
+and both confirmed on a live board: after
+boot 0x02002FE4 reads 0x00010001 (gate pass, reset de-asserted) and 0x02002FC0
+reads 0x80000000 (clock on, source SYS_CLK24M, M=0).
+
+The 24 MHz matters and the 26 MHz would be wrong. sun8i_thermal computes its
+acquisition and sample-period constants as 2 us and 20 us against this clock and
+calls clk_set_rate(24000000), failing probe on a mismatch. It is therefore
+parented to the SYS_CLK24M net (osc24M), not to the DCXO -- the distinction this
+SoC has already produced three separate defects over.
+
+The bus gate's parent is an inference and is marked as one: the UM names the
+register but not which bus feeds THS0. It follows what this tree already does
+for every peripheral BGR gate (bus-smhc0, bus-gmac0) and is inert for
+correctness, because the driver only enables that clock and never reads its
+rate.
+
+Assisted-by: Claude
+---
+--- a/include/dt-bindings/clock/sun60i-a733-ccu.h
++++ b/include/dt-bindings/clock/sun60i-a733-ccu.h
+@@ -73,4 +73,8 @@
+ #define CLK_BUS_GMAC0		46
+ #define CLK_MBUS_GMAC0		47
+ 
++/* Thermal sensor controller (THS0) and its 24 MHz conversion clock. */
++#define CLK_BUS_THS		55
++#define CLK_GPADC0_24M		56
++
+ #endif /* _DT_BINDINGS_CLK_SUN60I_A733_CCU_H_ */
+--- a/include/dt-bindings/reset/sun60i-a733-ccu.h
++++ b/include/dt-bindings/reset/sun60i-a733-ccu.h
+@@ -32,4 +32,6 @@
+ #define RST_BUS_GMAC0		17
+ #define RST_BUS_GMAC0_AXI	18
+ 
++#define RST_BUS_THS		21
++
+ #endif /* _DT_BINDINGS_RST_SUN60I_A733_CCU_H_ */
+--- a/drivers/clk/sunxi-ng/ccu-sun60iw2.c
++++ b/drivers/clk/sunxi-ng/ccu-sun60iw2.c
+@@ -426,6 +426,27 @@
+  * crystal, so the SoC PHY clock is unused.
+  */
+ static SUNXI_CCU_GATE_HWS(bus_gmac0_clk,  "bus-gmac0",  ahb_hws, 0x141C, BIT(0),  0);
++
++/*
++ * Thermal sensor controller. Two clocks, and only the second one's rate
++ * matters to the driver.
++ *
++ * THS0_BGR_REG 0x0FE4 bit0 is the bus gate, bit16 its reset (A733 UM,
++ * user manual). ⚠ The UM does not name which
++ * bus feeds THS0, so the parent here follows what this tree already does for
++ * every peripheral BGR gate (bus-smhc0, bus-gmac0): ahb. That choice is inert
++ * for correctness -- sun8i_thermal only enables this clock and never reads its
++ * rate -- but it is an inference and not a measured parent.
++ *
++ * GPADC0_24M_CLK_REG 0x0FC0 bit31 gates the 24 MHz conversion clock
++ * (A733 user manual). This one's rate IS load
++ * bearing: the driver's acquisition and sample-period constants are 2 us and
++ * 20 us at 24 MHz, and it calls clk_set_rate(24000000) and fails probe on a
++ * mismatch. It hangs off the 24 MHz SYS_CLK24M net, never the 26 MHz DCXO --
++ * the distinction this SoC has already produced three separate defects over.
++ */
++static SUNXI_CCU_GATE_HWS(bus_ths_clk,    "bus-ths",    ahb_hws, 0x0FE4, BIT(0),  0);
++static SUNXI_CCU_GATE_DATA(gpadc0_24m_clk, "gpadc0-24m", osc24M, 0x0FC0, BIT(31), 0);
+ static SUNXI_CCU_GATE_HWS(mbus_gmac0_clk, "mbus-gmac0", ahb_hws, 0x05E4, BIT(11), 0);
+ 
+ /* ccu_common-based clocks (registered and reset-mapped by the core). */
+@@ -471,6 +492,8 @@
+ 	&bus_serdes_clk.common,
+ 	&mbus_serdes_clk.common,
+ 	&bus_gmac0_clk.common,
++	&bus_ths_clk.common,
++	&gpadc0_24m_clk.common,
+ 	&mbus_gmac0_clk.common,
+ };
+ 
+@@ -531,8 +554,10 @@
+ 		[CLK_MBUS_SERDES]	= &mbus_serdes_clk.common.hw,
+ 		[CLK_BUS_GMAC0]		= &bus_gmac0_clk.common.hw,
+ 		[CLK_MBUS_GMAC0]	= &mbus_gmac0_clk.common.hw,
++		[CLK_BUS_THS]		= &bus_ths_clk.common.hw,
++		[CLK_GPADC0_24M]	= &gpadc0_24m_clk.common.hw,
+ 	},
+-	.num	= CLK_MBUS_SERDES + 1,
++	.num	= CLK_GPADC0_24M + 1,
+ };
+ 
+ static struct ccu_reset_map sun60iw2_ccu_resets[] = {
+@@ -557,6 +582,7 @@
+ 	[RST_USB_2]		= { 0x135C, BIT(16) },
+ 	[RST_BUS_GMAC0]		= { 0x141C, BIT(16) },
+ 	[RST_BUS_GMAC0_AXI]	= { 0x141C, BIT(17) },
++	[RST_BUS_THS]		= { 0x0FE4, BIT(16) },
+ };
+ 
+ static const struct sunxi_ccu_desc sun60iw2_ccu_desc = {

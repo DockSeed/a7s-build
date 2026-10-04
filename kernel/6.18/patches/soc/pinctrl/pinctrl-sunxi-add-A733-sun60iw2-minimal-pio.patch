@@ -1,0 +1,321 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] pinctrl: sunxi: add Allwinner A733 (sun60iw2) minimal PIO
+
+Minimal A733 pinctrl using the modern DT-table sunxi model (like the
+in-tree A523 driver): bank geometry + IRQ layout only; pin mux comes from
+the device tree via allwinner,pinmux. Bank pin counts are ground-truth
+from the running vendor board. Based on pinctrl-sun55i-a523.c (Copyright
+(C) 2023 Arm Ltd).
+
+The A733 PIO does not use the A523 register layout. With the PIO at
+0x02000000, each bank occupies a 0x80 block starting one bank slot in:
+
+    bank_base(n) = 0x80 + n * 0x80        (A=0, B=1, ... K=10)
+
+      +0x00 mux    +0x10 data   +0x14 data_set  +0x18 data_clr
+      +0x20 dlevel +0x30 pull
+      +0x40 irq_cfg +0x50 irq_ctrl +0x54 irq_status +0x58 irq_debounce
+
+Bank A is not bonded; its slot holds the power-mode registers (0x40/0x48).
+Two consequences for the shared code:
+
+  - Every bank is regular here, bank K included. The PK_BASE/0x500 special
+    case must not apply: on A733 offset 0x500 is bank J, so keeping it
+    would redirect bank K accesses onto bank J.
+  - The per-bank IRQ registers are interleaved into the bank blocks instead
+    of forming one global block, so an IRQ bank maps to its PIO bank index
+    (PB = 1, giving bank F's irq_cfg at 0xc0 + 5 * 0x80 = 0x340).
+
+Add the plumbing this needs to the shared sunxi core: an initial bank
+offset, a per-variant dlevel register offset, and overridable IRQ register
+bases/stride in sunxi_pinctrl_desc. All default to the previous values, so
+other SoCs are unaffected.
+
+Assisted-by: Claude
+---
+diff --git a/drivers/pinctrl/sunxi/Kconfig b/drivers/pinctrl/sunxi/Kconfig
+index dc62eba96..471513eb7 100644
+--- a/drivers/pinctrl/sunxi/Kconfig
++++ b/drivers/pinctrl/sunxi/Kconfig
+@@ -131,6 +131,11 @@ config PINCTRL_SUN50I_H616_R
+ 	default ARM64 && ARCH_SUNXI
+ 	select PINCTRL_SUNXI
+ 
++config PINCTRL_SUN60I_A733
++	bool "Support for the Allwinner A733 PIO"
++	default ARM64 && ARCH_SUNXI
++	select PINCTRL_SUNXI
++
+ config PINCTRL_SUN55I_A523
+ 	bool "Support for the Allwinner A523 PIO"
+ 	default ARM64 && ARCH_SUNXI
+diff --git a/drivers/pinctrl/sunxi/Makefile b/drivers/pinctrl/sunxi/Makefile
+index 951b3f1e4..bab447334 100644
+--- a/drivers/pinctrl/sunxi/Makefile
++++ b/drivers/pinctrl/sunxi/Makefile
+@@ -27,6 +27,7 @@ obj-$(CONFIG_PINCTRL_SUN50I_H6)		+= pinctrl-sun50i-h6.o
+ obj-$(CONFIG_PINCTRL_SUN50I_H6_R)	+= pinctrl-sun50i-h6-r.o
+ obj-$(CONFIG_PINCTRL_SUN50I_H616)	+= pinctrl-sun50i-h616.o
+ obj-$(CONFIG_PINCTRL_SUN50I_H616_R)	+= pinctrl-sun50i-h616-r.o
++obj-$(CONFIG_PINCTRL_SUN60I_A733)	+= pinctrl-sun60iw2.o
+ obj-$(CONFIG_PINCTRL_SUN55I_A523)	+= pinctrl-sun55i-a523.o
+ obj-$(CONFIG_PINCTRL_SUN55I_A523_R)	+= pinctrl-sun55i-a523-r.o
+ obj-$(CONFIG_PINCTRL_SUN9I_A80)		+= pinctrl-sun9i-a80.o
+diff --git a/drivers/pinctrl/sunxi/pinctrl-sun60iw2.c b/drivers/pinctrl/sunxi/pinctrl-sun60iw2.c
+new file mode 100644
+index 000000000..f30df24cd
+--- /dev/null
++++ b/drivers/pinctrl/sunxi/pinctrl-sun60iw2.c
+@@ -0,0 +1,77 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Allwinner A733 (sun60iw2) SoC pinctrl driver.
++ *
++ * Uses the modern DT-table sunxi pinctrl model (like the in-tree A523 driver):
++ * the driver only describes the bank geometry and IRQ layout; the actual pin
++ * mux is supplied by the device tree via `pins` + `allwinner,pinmux`, so no
++ * hardcoded per-pin function table is needed. Bank pin counts are ground-truth
++ * from the running vendor board (all banks contiguous, count == max offset + 1).
++ *
++ * Based on drivers/pinctrl/sunxi/pinctrl-sun55i-a523.c, Copyright (C) 2023 Arm Ltd.
++ * Copyright (c) 2026 DockSeed A733 Debian mainline track
++ */
++
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/of.h>
++#include <linux/of_device.h>
++#include <linux/pinctrl/pinctrl.h>
++
++#include "pinctrl-sunxi.h"
++
++/*
++ * Pins per bank, ground-truth from the running the 8 GiB board
++ * (/sys/kernel/debug/pinctrl/2000000.pinctrl/pins — all banks contiguous,
++ * count == max offset + 1). A733 has no bank PA.
++ */
++static const u8 a733_nr_bank_pins[SUNXI_PINCTRL_MAX_BANKS] =
++/*	  PA  PB  PC  PD  PE  PF  PG  PH  PI  PJ  PK */
++	{  0, 11, 17, 24, 16,  7, 15, 20, 17, 28, 26 };
++
++/*
++ * The IRQ registers sit inside each bank's own block, so an IRQ bank maps to
++ * its PIO bank index. Mind the two numberings: an IRQ bank is an index into
++ * the DT "interrupts" list (0 == PB, the first bank that has pins), while the
++ * hardware bank it names counts from PA (PB == 1). Together with
++ * A733_IRQ_CFG_REG that puts PB's IRQ config at 0xc0 + 1 * 0x80 = 0x140 and
++ * bank F's at 0xc0 + 5 * 0x80 = 0x340.
++ */
++static const unsigned int a733_irq_bank_map[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
++
++static const u8 a733_irq_bank_muxes[SUNXI_PINCTRL_MAX_BANKS] =
++/*	  PA  PB  PC  PD  PE  PF  PG  PH  PI  PJ  PK */
++	{  0, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14 };
++
++static struct sunxi_pinctrl_desc a733_pinctrl_data = {
++	.irq_banks = ARRAY_SIZE(a733_irq_bank_map),
++	.irq_bank_map = a733_irq_bank_map,
++	.irq_read_needs_mux = true,
++	.irq_cfg_reg = A733_IRQ_CFG_REG,
++	.irq_ctrl_reg = A733_IRQ_CTRL_REG,
++	.irq_status_reg = A733_IRQ_STATUS_REG,
++	.irq_debounce_reg = A733_IRQ_DEBOUNCE_REG,
++	.irq_mem_size = A733_IRQ_MEM_SIZE,
++};
++
++static int a733_pinctrl_probe(struct platform_device *pdev)
++{
++	return sunxi_pinctrl_dt_table_init(pdev, a733_nr_bank_pins,
++					   a733_irq_bank_muxes,
++					   &a733_pinctrl_data,
++					   SUNXI_PINCTRL_A733_REG_LAYOUT);
++}
++
++static const struct of_device_id a733_pinctrl_match[] = {
++	{ .compatible = "allwinner,sun60i-a733-pinctrl", },
++	{}
++};
++
++static struct platform_driver a733_pinctrl_driver = {
++	.probe	= a733_pinctrl_probe,
++	.driver	= {
++		.name		= "sun60i-a733-pinctrl",
++		.of_match_table	= a733_pinctrl_match,
++	},
++};
++builtin_platform_driver(a733_pinctrl_driver);
+diff --git a/drivers/pinctrl/sunxi/pinctrl-sunxi.c b/drivers/pinctrl/sunxi/pinctrl-sunxi.c
+index 0fb057a07..4a0f52232 100644
+--- a/drivers/pinctrl/sunxi/pinctrl-sunxi.c
++++ b/drivers/pinctrl/sunxi/pinctrl-sunxi.c
+@@ -62,11 +62,18 @@ static struct irq_chip sunxi_pinctrl_level_irq_chip;
+ /*
+  * When using the extended register layout, Bank K does not fit into the
+  * space used for the other banks. Instead it lives at offset 0x500.
++ *
++ * SoCs that set an initial bank offset lay every bank out contiguously from
++ * there, bank K included, so that special case does not apply to them.
+  */
+ static u32 sunxi_bank_offset(const struct sunxi_pinctrl *pctl, u32 pin)
+ {
+ 	u32 offset = 0;
+ 
++	if (pctl->initial_bank_offset)
++		return pctl->initial_bank_offset +
++		       (pin / PINS_PER_BANK) * pctl->bank_mem_size;
++
+ 	if (pin >= PK_BASE) {
+ 		pin -= PK_BASE;
+ 		offset = PIO_BANK_K_OFFSET;
+@@ -102,7 +109,7 @@ static void sunxi_dlevel_reg(const struct sunxi_pinctrl *pctl,
+ {
+ 	u32 offset = pin % PINS_PER_BANK * pctl->dlevel_field_width;
+ 
+-	*reg   = sunxi_bank_offset(pctl, pin) + DLEVEL_REGS_OFFSET +
++	*reg   = sunxi_bank_offset(pctl, pin) + pctl->dlevel_regs_offset +
+ 		 offset / BITS_PER_TYPE(u32) * sizeof(u32);
+ 	*shift = offset % BITS_PER_TYPE(u32);
+ 	*mask  = (BIT(pctl->dlevel_field_width) - 1) << *shift;
+@@ -1521,16 +1528,26 @@ int sunxi_pinctrl_init_with_flags(struct platform_device *pdev,
+ 	pctl->dev = &pdev->dev;
+ 	pctl->desc = desc;
+ 	pctl->variant = flags & SUNXI_PINCTRL_VARIANT_MASK;
+-	if (flags & SUNXI_PINCTRL_NEW_REG_LAYOUT) {
++	if (flags & SUNXI_PINCTRL_A733_REG_LAYOUT) {
++		pctl->initial_bank_offset = A733_INITIAL_BANK_OFFSET;
++		pctl->bank_mem_size = A733_BANK_MEM_SIZE;
++		pctl->dlevel_regs_offset = A733_DLEVEL_REGS_OFFSET;
++		pctl->pull_regs_offset = A733_PULL_REGS_OFFSET;
++		pctl->dlevel_field_width = D1_DLEVEL_FIELD_WIDTH;
++	} else if (flags & SUNXI_PINCTRL_NEW_REG_LAYOUT) {
+ 		pctl->bank_mem_size = D1_BANK_MEM_SIZE;
++		pctl->dlevel_regs_offset = DLEVEL_REGS_OFFSET;
+ 		pctl->pull_regs_offset = D1_PULL_REGS_OFFSET;
+ 		pctl->dlevel_field_width = D1_DLEVEL_FIELD_WIDTH;
+ 	} else {
+ 		pctl->bank_mem_size = BANK_MEM_SIZE;
++		pctl->dlevel_regs_offset = DLEVEL_REGS_OFFSET;
+ 		pctl->pull_regs_offset = PULL_REGS_OFFSET;
+ 		pctl->dlevel_field_width = DLEVEL_FIELD_WIDTH;
+ 	}
+-	if (flags & SUNXI_PINCTRL_ELEVEN_BANKS)
++	if (flags & SUNXI_PINCTRL_A733_REG_LAYOUT)
++		pctl->pow_mod_sel_offset = A733_POW_MOD_SEL_REG;
++	else if (flags & SUNXI_PINCTRL_ELEVEN_BANKS)
+ 		pctl->pow_mod_sel_offset = PIO_11B_POW_MOD_SEL_REG;
+ 	else
+ 		pctl->pow_mod_sel_offset = PIO_POW_MOD_SEL_REG;
+diff --git a/drivers/pinctrl/sunxi/pinctrl-sunxi.h b/drivers/pinctrl/sunxi/pinctrl-sunxi.h
+index ad26e4de1..2b8e5eff1 100644
+--- a/drivers/pinctrl/sunxi/pinctrl-sunxi.h
++++ b/drivers/pinctrl/sunxi/pinctrl-sunxi.h
+@@ -53,6 +53,23 @@
+ #define D1_DLEVEL_FIELD_WIDTH	4
+ #define D1_PULL_REGS_OFFSET	0x24
+ 
++/*
++ * A733 layout: banks are 0x80 apart and start one bank slot into the register
++ * space -- the unbonded bank A slot holds the power-mode registers instead.
++ * Every bank is regular here, bank K included, and each bank block carries its
++ * own IRQ registers at +0x40 rather than a separate global IRQ block.
++ */
++#define A733_INITIAL_BANK_OFFSET	0x80
++#define A733_BANK_MEM_SIZE		0x80
++#define A733_DLEVEL_REGS_OFFSET		0x20
++#define A733_PULL_REGS_OFFSET		0x30
++#define A733_IRQ_CFG_REG		0xc0
++#define A733_IRQ_CTRL_REG		0xd0
++#define A733_IRQ_STATUS_REG		0xd4
++#define A733_IRQ_DEBOUNCE_REG		0xd8
++#define A733_IRQ_MEM_SIZE		0x80
++#define A733_POW_MOD_SEL_REG		0x40
++
+ #define PINS_PER_BANK		32
+ 
+ #define IRQ_PER_BANK		32
+@@ -91,6 +108,7 @@
+ #define SUNXI_PINCTRL_NEW_REG_LAYOUT	BIT(8)
+ #define SUNXI_PINCTRL_PORTF_SWITCH	BIT(9)
+ #define SUNXI_PINCTRL_ELEVEN_BANKS	BIT(10)
++#define SUNXI_PINCTRL_A733_REG_LAYOUT	BIT(11)
+ 
+ #define PIO_POW_MOD_SEL_REG		0x340
+ #define PIO_11B_POW_MOD_SEL_REG		0x380
+@@ -141,6 +159,16 @@ struct sunxi_pinctrl_desc {
+ 	bool				irq_read_needs_mux;
+ 	bool				disable_strict_mode;
+ 	enum sunxi_desc_bias_voltage	io_bias_cfg_variant;
++	/*
++	 * IRQ register block. Zero keeps the classic layout (IRQ_CFG_REG and
++	 * friends, IRQ_MEM_SIZE stride). SoCs that interleave the per-bank IRQ
++	 * registers into the bank blocks instead override these.
++	 */
++	u32				irq_cfg_reg;
++	u32				irq_ctrl_reg;
++	u32				irq_status_reg;
++	u32				irq_debounce_reg;
++	u32				irq_mem_size;
+ };
+ 
+ struct sunxi_pinctrl_function {
+@@ -175,7 +203,9 @@ struct sunxi_pinctrl {
+ 	raw_spinlock_t			lock;
+ 	struct pinctrl_dev		*pctl_dev;
+ 	unsigned long			variant;
++	u32				initial_bank_offset;
+ 	u32				bank_mem_size;
++	u32				dlevel_regs_offset;
+ 	u32				pull_regs_offset;
+ 	u32				dlevel_field_width;
+ 	u32				pow_mod_sel_offset;
+@@ -232,14 +262,19 @@ static inline u32 sunxi_irq_hw_bank_num(const struct sunxi_pinctrl_desc *desc, u
+ 		return desc->irq_bank_map[bank];
+ }
+ 
++static inline u32 sunxi_irq_mem_size(const struct sunxi_pinctrl_desc *desc)
++{
++	return desc->irq_mem_size ?: IRQ_MEM_SIZE;
++}
++
+ static inline u32 sunxi_irq_cfg_reg(const struct sunxi_pinctrl_desc *desc,
+ 				    u16 irq)
+ {
+ 	u8 bank = irq / IRQ_PER_BANK;
+ 	u8 reg = (irq % IRQ_PER_BANK) / IRQ_CFG_IRQ_PER_REG * 0x04;
+ 
+-	return IRQ_CFG_REG +
+-	       sunxi_irq_hw_bank_num(desc, bank) * IRQ_MEM_SIZE + reg;
++	return (desc->irq_cfg_reg ?: IRQ_CFG_REG) +
++	       sunxi_irq_hw_bank_num(desc, bank) * sunxi_irq_mem_size(desc) + reg;
+ }
+ 
+ static inline u32 sunxi_irq_cfg_offset(u16 irq)
+@@ -250,7 +285,8 @@ static inline u32 sunxi_irq_cfg_offset(u16 irq)
+ 
+ static inline u32 sunxi_irq_ctrl_reg_from_bank(const struct sunxi_pinctrl_desc *desc, u8 bank)
+ {
+-	return IRQ_CTRL_REG + sunxi_irq_hw_bank_num(desc, bank) * IRQ_MEM_SIZE;
++	return (desc->irq_ctrl_reg ?: IRQ_CTRL_REG) +
++	       sunxi_irq_hw_bank_num(desc, bank) * sunxi_irq_mem_size(desc);
+ }
+ 
+ static inline u32 sunxi_irq_ctrl_reg(const struct sunxi_pinctrl_desc *desc,
+@@ -269,14 +305,14 @@ static inline u32 sunxi_irq_ctrl_offset(u16 irq)
+ 
+ static inline u32 sunxi_irq_debounce_reg_from_bank(const struct sunxi_pinctrl_desc *desc, u8 bank)
+ {
+-	return IRQ_DEBOUNCE_REG +
+-	       sunxi_irq_hw_bank_num(desc, bank) * IRQ_MEM_SIZE;
++	return (desc->irq_debounce_reg ?: IRQ_DEBOUNCE_REG) +
++	       sunxi_irq_hw_bank_num(desc, bank) * sunxi_irq_mem_size(desc);
+ }
+ 
+ static inline u32 sunxi_irq_status_reg_from_bank(const struct sunxi_pinctrl_desc *desc, u8 bank)
+ {
+-	return IRQ_STATUS_REG +
+-	       sunxi_irq_hw_bank_num(desc, bank) * IRQ_MEM_SIZE;
++	return (desc->irq_status_reg ?: IRQ_STATUS_REG) +
++	       sunxi_irq_hw_bank_num(desc, bank) * sunxi_irq_mem_size(desc);
+ }
+ 
+ static inline u32 sunxi_irq_status_reg(const struct sunxi_pinctrl_desc *desc,

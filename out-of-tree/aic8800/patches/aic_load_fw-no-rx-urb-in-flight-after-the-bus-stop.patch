@@ -1,0 +1,226 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] aic_load_fw: no rx URB in flight after the bus stop
+
+From code reading (pinned tag plus the earlier patches of this series; kernel 6.18.53).
+
+aicwf_usb_bus_stop() (as changed by aic_load_fw-no-rx-refill-after-the-bus-has-stopped) cancels a pending refill, sets USB_DOWN_ST
+and kills the anchored rx URBs (aicwf_usb.c:767-770 after aic8800-init-the-rx-refill-work-before-the-first-error-path). A
+completion that lands between the cancel and the state change still sees
+USB_UP_ST and queues a refill (:231-237, :280). That refill can pass both
+state checks (:336, :296) before the state change, sleep in
+__dev_alloc_skb(GFP_KERNEL) (:302) while the stop kills the anchor, and
+anchor and submit afterwards (:317, :319). On the disconnect path no URB
+completes there (see the header of that patch). On the probe's error path (a failed
+configuration or upload, :1892, :1896) the part is still on the bus,
+out_free frees usb_dev with that URB in flight (:1913), and its completion
+runs on freed memory.
+
+In the vendor driver: the stop kills the rx URBs once and assumes no
+one submits afterwards, but the refill work checks the state and submits
+without anything that orders the two against the stop.
+
+What changes: after the kill, the stop cancels the work once more, which
+waits for a refill that is still running, and kills the anchor once more.
+After the state change nothing queues a refill (every completion sees
+USB_DOWN_ST), and usb_kill_anchored_urbs() returns only when no
+completion of an anchored URB is running: the core counts
+suspend_wakeups around ->complete() (drivers/usb/core/hcd.c:1648-1664) and
+the kill waits for that count (drivers/usb/core/urb.c:813-836). So after
+the second kill no rx URB is in flight and no refill is pending. The
+refill that straddles the change still prints "usb state is not up!" and
+"usb rx refill fail" for its next buffer; that is the state it finds.
+
+Not taken:
+- The second cancel alone: the refill it waits for may already have
+  submitted.
+- The state change before the first cancel, which would make the second
+  pass unnecessary for a refill that has not started: the earlier patch put the cancel
+  first so that a pending refill does not run and print; that reason
+  stands.
+- A lock over check and submit: the submit path sleeps (GFP_KERNEL, and
+  msleep(100) after a failed submit, :326).
+
+Test stimulus and counters under /sys/module/aic_load_fw/parameters:
+rx_loader_inject_stop_race (0644): the next N probes take the error path of
+a failed configuration right after the bus start, with the part on the bus
+and its rx URBs live. Their stop kills one rx URB while the bus is up, so
+that its completion queues the refill, holds that refill after both state
+checks, lets it go once the stop has killed the anchor, and then counts
+rx_loader_urb_after_stop (0444) if an rx URB is still in flight -- and kills
+it, so the stimulus itself never frees usb_dev under a live URB.
+rx_loader_stop_race_missed (0444) counts runs whose refill never reached the
+hold point.
+
+Falsifier, on the board, with the part at its loaded id:
+  modprobe -r aic8800_fdrv aic_load_fw
+  modprobe aic_load_fw rx_loader_inject_stop_race=1
+Without the fix: rx_loader_urb_after_stop 1 per run; with it: 0, and
+rx_loader_stop_race_missed 0. One count with the fix refutes it.
+
+HW-proven, 8 GiB board, 2026-09-24 (6.18.53): three runs each; the stimulus
+alone left an rx URB in flight after the stop every time, with this patch
+none, and the refill held on every run of both.
+
+Assisted-by: Claude
+
+diff --git a/src/USB/driver_fw/drivers/aic8800/aic_load_fw/aicwf_usb.c b/src/USB/driver_fw/drivers/aic8800/aic_load_fw/aicwf_usb.c
+index ca98bb3..3899334 100644
+--- a/src/USB/driver_fw/drivers/aic8800/aic_load_fw/aicwf_usb.c
++++ b/src/USB/driver_fw/drivers/aic8800/aic_load_fw/aicwf_usb.c
+@@ -220,6 +220,35 @@ MODULE_PARM_DESC(rx_loader_refill_skipped, "rx completions on a stopped bus that
+ static int rx_loader_inject_pending_refill;
+ module_param(rx_loader_inject_pending_refill, int, 0644);
+ MODULE_PARM_DESC(rx_loader_inject_pending_refill, "Test stimulus: the next N disconnects queue the rx refill before they stop the bus");
++static int rx_loader_inject_stop_race;
++module_param(rx_loader_inject_stop_race, int, 0644);
++MODULE_PARM_DESC(rx_loader_inject_stop_race, "Test stimulus: the next N probes take the error path after the bus start, and their bus stop holds one rx refill between its state checks and its submit until the rx URBs are killed");
++static uint rx_loader_urb_after_stop;
++module_param(rx_loader_urb_after_stop, uint, 0444);
++MODULE_PARM_DESC(rx_loader_urb_after_stop, "stimulus runs that found an rx URB in flight after the bus stop (the stimulus kills it then)");
++static uint rx_loader_stop_race_missed;
++module_param(rx_loader_stop_race_missed, uint, 0444);
++MODULE_PARM_DESC(rx_loader_stop_race_missed, "stimulus runs whose refill never reached the hold point");
++
++/* rx_loader_inject_stop_race: one refill that has found the bus up is held
++ * before it submits and let go once the stop has killed the rx URBs -- the
++ * window a refill opens that sleeps in its skb allocation while the bus
++ * stops. One device at a time; a test stimulus, not a mechanism.
++ */
++static bool stop_race_pending;
++static bool stop_race_armed;
++static bool stop_race_holding;
++static DECLARE_COMPLETION(stop_race_held);
++static DECLARE_COMPLETION(stop_race_go);
++static DECLARE_COMPLETION(stop_race_done);
++
++static void aicwf_usb_stop_race_submitted(void)
++{
++    if (unlikely(READ_ONCE(stop_race_holding))) {
++        WRITE_ONCE(stop_race_holding, false);
++        complete(&stop_race_done);
++    }
++}
+ 
+ /* No refill work may run once the bus is down: it would only find
+  * USB_DOWN_ST in aicwf_usb_rx_submit_all_urb() and report it as an error.
+@@ -299,6 +328,13 @@ static int aicwf_usb_submit_rx_urb(struct aic_usb_dev *usb_dev,
+         return -1;
+     }
+ 
++    if (unlikely(READ_ONCE(stop_race_armed))) {
++        WRITE_ONCE(stop_race_armed, false);
++        WRITE_ONCE(stop_race_holding, true);
++        complete(&stop_race_held);
++        wait_for_completion_timeout(&stop_race_go, msecs_to_jiffies(2000));
++    }
++
+     skb = __dev_alloc_skb(AICWF_USB_MAX_PKT_SIZE, GFP_KERNEL);
+     if (!skb) {
+         aicwf_usb_rx_buf_put(usb_dev, usb_buf);
+@@ -343,7 +379,10 @@ static void aicwf_usb_rx_submit_all_urb(struct aic_usb_dev *usb_dev)
+ }
+ 
+     while((usb_buf = aicwf_usb_rx_buf_get(usb_dev)) != NULL) {
+-        if (aicwf_usb_submit_rx_urb(usb_dev, usb_buf)) {
++        int err = aicwf_usb_submit_rx_urb(usb_dev, usb_buf);
++
++        aicwf_usb_stop_race_submitted();
++        if (err) {
+             usb_err("usb rx refill fail\n");
+             if (usb_dev->state != USB_UP_ST){
+                 return;
+@@ -752,10 +791,56 @@ static void aicwf_usb_cancel_all_urbs(struct aic_usb_dev *usb_dev)
+     usb_kill_anchored_urbs(&usb_dev->rx_submitted);
+ }
+ 
++/* Stimulus, before USB_DOWN_ST: kill one rx URB on the live bus, so that its
++ * completion queues the refill, and wait until that refill holds.
++ */
++static bool aicwf_usb_stop_race_hold(struct aic_usb_dev *usb_dev)
++{
++    struct urb *urb;
++
++    if (likely(!stop_race_pending) || usb_dev->state != USB_UP_ST)
++        return false;
++    stop_race_pending = false;
++    reinit_completion(&stop_race_held);
++    reinit_completion(&stop_race_go);
++    reinit_completion(&stop_race_done);
++    WRITE_ONCE(stop_race_armed, true);
++    urb = usb_get_from_anchor(&usb_dev->rx_submitted);
++    if (urb) {
++        usb_kill_urb(urb);
++        usb_put_urb(urb);
++    }
++    if (!urb || !wait_for_completion_timeout(&stop_race_held, msecs_to_jiffies(2000))) {
++        WRITE_ONCE(stop_race_armed, false);
++        rx_loader_stop_race_missed++;
++        pr_warn("aic_load_fw: stop race stimulus: no refill reached the hold point\n");
++        return false;
++    }
++    pr_info("aic_load_fw: stop race stimulus: refill held past its state checks\n");
++    return true;
++}
++
++/* Stimulus, at the end of the stop: count an rx URB that is still in flight,
++ * then kill it, so the run does not free usb_dev under it.
++ */
++static void aicwf_usb_stop_race_check(struct aic_usb_dev *usb_dev)
++{
++    if (!wait_for_completion_timeout(&stop_race_done, msecs_to_jiffies(2000)))
++        pr_warn("aic_load_fw: stop race stimulus: the held refill did not submit\n");
++    if (!usb_anchor_empty(&usb_dev->rx_submitted)) {
++        rx_loader_urb_after_stop++;
++        pr_warn("aic_load_fw: stop race stimulus: rx URB in flight after the bus stop, killed now\n");
++        usb_kill_anchored_urbs(&usb_dev->rx_submitted);
++    } else {
++        pr_info("aic_load_fw: stop race stimulus: no rx URB in flight after the bus stop\n");
++    }
++}
++
+ static void aicwf_usb_bus_stop(struct device *dev)
+ {
+     struct aicwf_bus *bus_if = dev_get_drvdata(dev);
+     struct aic_usb_dev *usb_dev = bus_if->bus_priv.usb;
++    bool race;
+ 
+     if (usb_dev == NULL)
+         return;
+@@ -766,8 +851,20 @@ static void aicwf_usb_bus_stop(struct device *dev)
+     /* Before USB_DOWN_ST, see aicwf_usb_rx_refill(). */
+     if (cancel_work_sync(&usb_dev->rx_urb_work))
+         rx_loader_refill_cancelled++;
++    race = aicwf_usb_stop_race_hold(usb_dev);
+     aicwf_usb_state_change(usb_dev, USB_DOWN_ST);
+     aicwf_usb_cancel_all_urbs(usb_dev);
++    if (race)
++        complete(&stop_race_go);
++    /* A refill that found the bus up before the state change can still
++     * submit after the kill above: wait for it, then kill what it
++     * sent. Nothing queues a refill any more -- every completion now sees
++     * USB_DOWN_ST -- so after this no rx URB is in flight.
++     */
++    cancel_work_sync(&usb_dev->rx_urb_work);
++    usb_kill_anchored_urbs(&usb_dev->rx_submitted);
++    if (race)
++        aicwf_usb_stop_race_check(usb_dev);
+ }
+ 
+ static void aicwf_usb_deinit(struct aic_usb_dev *usbdev)
+@@ -1874,6 +1971,16 @@ static int aicwf_usb_probe(struct usb_interface *intf, const struct usb_device_i
+ 
+     aic_bt_platform_init(usb_dev);
+ 
++    /* Stimulus: the error path of a failed configuration (system_config()
++     * below), taken with the part still on the bus and its rx URBs live.
++     */
++    if (unlikely(rx_loader_inject_stop_race > 0)) {
++        rx_loader_inject_stop_race--;
++        stop_race_pending = true;
++        usb_err("stop race stimulus: error path after the bus start\n");
++        goto out_free_bus;
++    }
++
+     if ((usb->speed != USB_SPEED_HIGH) && (usb->speed != USB_SPEED_SUPER)) {
+         printk("Aic USB device detected speed = %d\n", usb->speed);
+         system_reboot(usb_dev);

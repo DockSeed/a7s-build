@@ -1,0 +1,200 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] clk: sunxi-ng: a733: add the eDP/DP bus gate and reset
+
+The eDP/DP transmitter (eDP0 @0x05740000) is the block a DisplayPort-alt-mode
+driver has to reach, and this tree cannot reach it: our CCU models no display
+clock and no display reset at all, so EDP_BGR_REG keeps its reset value and the
+whole eDP0 register window reads back zero. Measured on the 8 GiB board on our own
+6.18.36: 0x0200364C = 0x00000000, against
+0x00010001 under the vendor 6.6 stack on the same board while it drove a live
+four-lane DP-alt link. This patch models exactly that one register,
+so a future DP transmitter driver can claim it. It changes nothing by itself --
+nothing in the tree references the new ids yet.
+
+Where the values come from
+--------------------------
+  CCU base            0x02002000        A733 user manual, CCU register list
+  EDP_BGR_REG         offset 0x164C     A733 UM V0.92 4.1.6.228 (offset 5708),
+  absolute            0x0200364C        CCU base + offset
+  bit 0  EDP_GATING   0=Mask 1=Pass     EDP_BGR_REG field table
+  bit 16 EDP_RST      0=Assert          (same table)
+                      1=De-assert
+  reset value         0x00000000        same table, and read back as such on the 8 GiB board
+
+Silicon, three reads, none of them from code:
+  - the 6 GiB board, vendor stack, 2026-07-18: 0x0200364c = 0x00010001, the only released
+    display gate on that board
+  - the 8 GiB board, vendor 6.6, 2026-08-17, live 4-lane DP link: the same 0x00010001
+  - the 8 GiB board, our 6.18.36, 2026-08-18: 0x00000000
+
+Both bits, not one -- measured
+------------------------------
+The gate alone does nothing observable. Written by hand on the 8 GiB board on 2026-08-18
+and restored afterwards:
+
+  0x0200364C = 0x00000001   gate only            -> 0x057400FC reads 0x00000000
+  0x0200364C = 0x00010001   gate + reset released -> 0x057400FC reads 0x000A0509
+
+0x000A0509 is the DP core id the UM documents, and the same value the vendor
+shows on a live link. That is why the clock and the reset are one patch and why
+the pending observable below is the core id rather than a CCU read-back: the CCU
+echoing what was just written to it proves only that the write landed.
+
+And the block does more than answer once it is up. On the same board and day,
+with these two bits released by hand and the AUX front end powered by `phy-allwinner-a733-aux-hpd-phy` and `phy-allwinner-a733-aux-hpd-bringup-knob`,
+a hand-driven AUX transaction read DPCD 0x00000 = 12 0A 84 ... (DPCD rev 1.2,
+MAX_LINK_RATE 2.7 Gbps, 4 lanes) and a full checksum-valid EDID over
+I2C-over-AUX. That is the
+whole point of modelling this register -- the sink is reachable the moment the
+gate and the reset are.
+
+What the A523 says, and why none of it was taken
+------------------------------------------------
+ccu-sun55i-a523.c is the nearest mainline part and it models this block, which is
+exactly what makes it dangerous here -- every number in it is plausible and every
+number in it is wrong for the A733:
+
+  A523 (ccu-sun55i-a523.c:1032,1618)   A733 (UM 4.1.6.228)
+  bus_edp     0xbbc BIT(0)             EDP_BGR_REG 0x164C bit0
+  RST_BUS_EDP 0xbbc BIT(16)            EDP_BGR_REG 0x164C bit16
+
+Neither 0x0BB0 nor 0x0BBC is a documented A733 CCU register: both are absent from
+the register list of the A733 user manual, whose nearest neighbours are
+0x0B24 (GPU0_GATING_REG) and 0x0C00 (DRAM0_CLK_REG). Carried over unchanged, the
+gate would write into an undocumented hole and the eDP block would stay dark
+while the write looked like it had succeeded, which is this tree's most expensive
+failure mode.
+
+What is deliberately left out: the EDP_TV module clock
+------------------------------------------------------
+EDP_TV_CLK_REG (0x1640) is NOT modelled, and the omission is a
+decision, not an oversight:
+
+  - It is not needed for register access. During the measurement above it stayed
+    0x00000000 the whole time while the eDP0 window answered. Its job is pixel
+    transport, not reachability -- so it belongs to the patch that drives pixels,
+    not to this one.
+  - Its mux cannot be expressed by this tree yet. CLK_SRC_SEL [26:24] selects
+    000 VIDEO0PLL4X, 001 VIDEO1PLL4X, 010 VIDEO2PLL4X, 011 PERI0PLL2X, and this
+    CCU models none of the three video PLLs. The one parent silicon shows in use
+    is VIDEO1PLL4X (EDP_TV_CLK = 0x81000000 on the 6 GiB board)
+    -- precisely the one we cannot name. Modelling a four-way mux with three
+    parents missing would be a guess, and guesses do not ship here.
+
+For the patch that does model it later, the field widths are read and recorded so
+nobody re-derives them: bit 31 gating, [26:24] the four-way mux above, [12:8]
+FACTOR_N with N = FACTOR_N + 1, [4:0] FACTOR_M with M = FACTOR_M + 1, both 5 bits
+wide, EDP_TV_CLK = source / M / N. The A523's edp clock at
+0xbb0 is a 4-bit M with no N and five parents -- it must not be copied either.
+
+Also left out, and named so they are not mistaken for gaps in this patch:
+TCONTV1_BGR_REG (0x160C) and DPSS_TOP1_BGR_REG (0x16CC) are separate gates with
+separate resets, and they belong to the TCON_TV and DPSS patches.
+
+The new ids do not collide: allocated against main, next free clock id
+59 and next free reset id 24, and scripts/check-binding-ids.sh is green over all
+eight A733 headers (60 clock ids, 25 reset ids, no duplicates in any namespace).
+
+Verified: applies at fuzz 0 as part of the full series, ccu-sun60iw2.o builds
+warning-free at W=1, and checkpatch --strict reports 0 checks and the same three
+findings the other CCU patches in this series produce -- the 75-char description
+note, this tree's fixed Signed-off-by line, and "DT includes should be a separate
+patch" -- and no new ones.
+
+NOT hardware-proven. What would prove it, stated as one observable: with a
+consumer node claiming clocks = <&ccu CLK_BUS_EDP> and resets = <&ccu
+RST_BUS_EDP> and both taken, 0x057400FC reads 0x000A0509 on the 8 GiB board AND a native
+AUX read of DPCD 0 returns the sink's capability bytes -- both of which the
+hand-driven session above has already produced, so what is unproven is only that
+our driver reaches the same state, not that the state exists. 0x0200364C reading
+0x00010001 is the necessary intermediate step, not the proof.
+
+Assisted-by: Claude
+---
+--- a/include/dt-bindings/clock/sun60i-a733-ccu.h
++++ b/include/dt-bindings/clock/sun60i-a733-ccu.h
+@@ -81,4 +81,7 @@
+ #define CLK_BUS_PWM0		57
+ #define CLK_BUS_PWM1		58
+ 
++/* eDP/DP transmitter bus gate -- EDP_BGR_REG 0x164C bit0. */
++#define CLK_BUS_EDP		59
++
+ #endif /* _DT_BINDINGS_CLK_SUN60I_A733_CCU_H_ */
+--- a/include/dt-bindings/reset/sun60i-a733-ccu.h
++++ b/include/dt-bindings/reset/sun60i-a733-ccu.h
+@@ -37,4 +37,7 @@
+ #define RST_BUS_PWM0		22
+ #define RST_BUS_PWM1		23
+ 
++/* eDP/DP transmitter reset -- EDP_BGR_REG 0x164C bit16. */
++#define RST_BUS_EDP		24
++
+ #endif /* _DT_BINDINGS_RST_SUN60I_A733_CCU_H_ */
+--- a/drivers/clk/sunxi-ng/ccu-sun60iw2.c
++++ b/drivers/clk/sunxi-ng/ccu-sun60iw2.c
+@@ -473,6 +473,37 @@
+ static SUNXI_CCU_GATE_HWS(bus_pwm1_clk,   "bus-pwm1",   ahb_hws, 0x078C, BIT(0),  0);
+ static SUNXI_CCU_GATE_HWS(mbus_gmac0_clk, "mbus-gmac0", ahb_hws, 0x05E4, BIT(11), 0);
+ 
++/*
++ * eDP/DP transmitter (eDP0 @0x05740000, the DP-alt sink of the COMB0 combo PHY).
++ *
++ *   EDP_BGR_REG  0x164C  bit0 EDP_GATING (0=Mask 1=Pass)
++ *                        bit16 EDP_RST   (0=Assert 1=De-assert), reset 0
++ *
++ * A733 UM V0.92 4.1.6.228: offset 0x164C (5708) in the CCU register list,
++ * field layout from that register's table in the A733 user manual; absolute
++ * address 0x0200364C over the CCU base 0x02002000.
++ *
++ * Both bits are needed and that is measured, not reasoned: on the 8 GiB board on 2026-08-18
++ * writing 0x00000001 (gate only) left the entire 0x05740000 window reading zero,
++ * and 0x00010001 (gate + reset de-asserted) made 0x057400FC return 0x000A0509,
++ * the core id the UM documents.
++ * So a consumer has to take the clock AND the reset; either alone proves nothing.
++ * With both released, a hand-driven AUX read on the same board returned the
++ * sink's DPCD and a checksum-valid EDID
++ *.
++ *
++ * The module clock EDP_TV_CLK_REG (0x1640) is deliberately NOT modelled here;
++ * the patch header says why, and the same measurement shows it is not needed for
++ * register access (it stayed 0x00000000 throughout).
++ *
++ * The bus parent is an inference and is marked as one: the UM names the register
++ * but not which bus feeds the eDP block. ahb follows what this tree already does
++ * for every peripheral BGR gate (bus-smhc0, bus-serdes, bus-gmac0, bus-ths). It
++ * is inert for correctness -- nothing derives a rate from a BGR gate; the eDP
++ * pixel rate comes from EDP_TV_CLK, which is not modelled.
++ */
++static SUNXI_CCU_GATE_HWS(bus_edp_clk,    "bus-edp",    ahb_hws, 0x164C, BIT(0),  0);
++
+ /* ccu_common-based clocks (registered and reset-mapped by the core). */
+ static struct ccu_common *sun60iw2_ccu_clks[] = {
+ 	&pll_ref_clk.common,
+@@ -520,6 +551,7 @@
+ 	&gpadc0_24m_clk.common,
+ 	&bus_pwm0_clk.common,
+ 	&bus_pwm1_clk.common,
++	&bus_edp_clk.common,
+ 	&mbus_gmac0_clk.common,
+ };
+ 
+@@ -584,8 +616,9 @@
+ 		[CLK_GPADC0_24M]	= &gpadc0_24m_clk.common.hw,
+ 		[CLK_BUS_PWM0]		= &bus_pwm0_clk.common.hw,
+ 		[CLK_BUS_PWM1]		= &bus_pwm1_clk.common.hw,
++		[CLK_BUS_EDP]		= &bus_edp_clk.common.hw,
+ 	},
+-	.num	= CLK_BUS_PWM1 + 1,
++	.num	= CLK_BUS_EDP + 1,
+ };
+ 
+ static struct ccu_reset_map sun60iw2_ccu_resets[] = {
+@@ -613,6 +646,7 @@
+ 	[RST_BUS_THS]		= { 0x0FE4, BIT(16) },
+ 	[RST_BUS_PWM0]		= { 0x0784, BIT(16) },
+ 	[RST_BUS_PWM1]		= { 0x078C, BIT(16) },
++	[RST_BUS_EDP]		= { 0x164C, BIT(16) },
+ };
+ 
+ static const struct sunxi_ccu_desc sun60iw2_ccu_desc = {

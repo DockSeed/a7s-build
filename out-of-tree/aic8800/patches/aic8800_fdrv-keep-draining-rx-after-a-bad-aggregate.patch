@@ -1,0 +1,194 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] aic8800_fdrv: keep draining the rx queue after a bad aggregate header
+
+This board runs the aggregated prealloc rx path: the module enumerates as
+0xa69c:0x8d81, which is USB_PRODUCT_ID_AIC8800D81, and aicwf_usb_chipmatch()
+sets aicwf_usb_rx_aggr = true for it. In that path, aicwf_process_rxframes()
+returns -EBADE when a header claims more than the buffer holds. It frees that
+one buffer and leaves every buffer queued behind it in rxq.
+
+The consumer then stops for good. usb_busrx_thread() sleeps on busrx_trgg, and
+aicwf_usb_rx_complete() calls complete() only when rx_cnt goes from 0 to 1.
+With k buffers left in the queue, rx_cnt stays at k or higher, so every later
+enqueue misses that edge. Unless a wake-up is already pending, nothing runs the
+queue again. Completing URBs keep taking buffers from the prealloc pool and
+parking them in rxq until the pool is empty. Then aicwf_usb_submit_rx_urb()
+fails for all 20 URBs ("failed to alloc rxbuff", "sub rx fail"). Only the
+consumer re-arms them (rx_urb_sched, then rx_urb_work), and it is asleep.
+
+Both logged runs that carry the parser line end that way (2026-09-11 and 2026-09-12):
+- 2026-09-11 soak, run 1 (4.0 pin, same parser): `pkt_len:27704
+  buffer->len:974` at 523 s, pool empty and 20 x `sub rx fail` at 706 s, rx
+  0.22 Mbit/s over 724 s.
+- 2026-09-12 USB-path run 1 `pkt_len:42382 buffer->len:5780` at
+  418 s, traffic stopped at 440 s, pool 980 -> 435 -> 257 -> 205 while EHCI
+  kept completing transfers.
+The 900 s run of 2026-09-12 that did not fail has no parser line. This is a
+code reading plus two logs, not a silicon proof.
+
+What changes, in the aggregated prealloc branch only:
+- A too-long header drops the rest of that aggregate, and the loop goes on with
+  the next queued buffer. The normal end-of-buffer path frees the buffer,
+  honours rx_urb_sched and decrements rx_cnt.
+- The two allocation failures in the same loop do the same. The skb one
+  returned like the length check. The kmalloc one also returned without
+  atomic_dec(), which left rx_cnt one high for good, so the 0 -> 1 edge could
+  never fire again.
+
+Diagnostics under /sys/module/aic8800_fdrv/parameters (read-only unless noted):
+- rx_bad_len_drops: aggregates dropped by the length check.
+- rx_bad_len_backlog_max: the most buffers queued behind a dropped aggregate
+  (rx_cnt at the drop, minus the dropped buffer). At 1 or more, the vendor
+  return would have left those buffers behind a consumer that is not woken.
+- rx_inject_bad_len (0644): test stimulus. The next N aggregate headers count
+  as too long. 0 by default.
+- rx_urb_errors, rx_urb_last_status: bulk-IN URBs that completed with a status
+  below 0. Such a URB goes back to the free list, and the next good completion
+  of another URB re-arms it through aicwf_usb_rx_submit_all_urb(). If every URB
+  in flight fails, nothing re-arms them; rx_urbs_in_flight 0 with rx_urb_errors
+  above 0 shows that case. Counted because the second failure image
+  (`Txmsg wait timed out` with no parser line) is unexplained.
+- rx_urbs_in_flight: rx_urb_cnt, URBs submitted and not yet completed.
+- rx_queued_at_enqueue: rx_cnt right after the last enqueue.
+
+Left as the vendor has it:
+- The non-aggregated prealloc branch and the skb branches. This board does not
+  take or build them, so nothing here can prove a change to them. The
+  non-aggregated prealloc branch has the same missing atomic_dec() on a kmalloc
+  failure.
+- The 0 -> 1 wake-up edge itself. It is correct while rx_cnt counts every
+  queued buffer, and the paths above now keep that true.
+- down(&aicwf_deinit_sem) in URB completion context on a status below 0: a
+  sleeping call in atomic context, a separate defect.
+- rx_urb_sched is a plain bool: set by a failed submit after the consumer's
+  last check, it re-arms nothing until the consumer frees the next buffer.
+- The length check does not cover the copies after it (pkt_len + 60 bytes for
+  data, aggr_len + 4 for config), so both can read a few bytes past the buffer.
+- aic_load_fw's own parser (skb_pull return ignored): a separate change.
+
+Falsifier, on the board under WLAN rx load: write N to rx_inject_bad_len.
+Expected: rx_bad_len_drops rises by N, rx traffic continues, and aic_load_fw's
+rx_buff_list_ava returns to its idle value. A stall, a draining pool or
+`sub rx fail` refutes the change.
+
+Assisted-by: Claude
+
+--- a/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/aicwf_txrxif.c
++++ b/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/aicwf_txrxif.c
+@@ -463,6 +463,9 @@
+ #endif
+ 
+ extern bool rx_urb_sched;
++extern uint rx_bad_len_drops;
++extern int rx_inject_bad_len;
++extern int rx_bad_len_backlog_max;
+ int aicwf_process_rxframes(struct aicwf_rx_priv *rx_priv)
+ {
+ #ifdef AICWF_SDIO_SUPPORT
+@@ -585,11 +588,18 @@
+                 pkt_len = (*data | (*(data + 1) << 8));
+                 //printk("%s cnt:%d pkt_len:%d \r\n", __func__, cnt, pkt_len);
+ #ifndef CONFIG_USB_RX_REASSEMBLE
++                if (unlikely(rx_inject_bad_len > 0)) {
++                    rx_inject_bad_len--;
++                    pkt_len = buffer->len + 1;
++                }
+                 if (pkt_len > buffer->len) {
+                     AICWFDBG(LOGERROR, "%s pkt_len:%d buffer->len:%d\r\n", __func__, pkt_len, buffer->len);
+-                    aicwf_prealloc_rxbuff_free(buffer, &rx_priv->rxbuff_lock);
+-                    atomic_dec(&rx_priv->rx_cnt);
+-                    return -EBADE;
++                    /* Drop the rest of this aggregate, keep draining the queue. */
++                    rx_bad_len_drops++;
++                    /* rx_cnt still counts this buffer: the rest were queued behind it */
++                    if (atomic_read(&rx_priv->rx_cnt) - 1 > rx_bad_len_backlog_max)
++                        rx_bad_len_backlog_max = atomic_read(&rx_priv->rx_cnt) - 1;
++                    break;
+                 }
+ #endif
+ 
+@@ -599,9 +609,7 @@
+                     skb_inblock = __dev_alloc_skb(aggr_len + CCMP_OR_WEP_INFO, GFP_KERNEL);
+                     if (skb_inblock == NULL) {
+                         txrx_err("no more space! skip\n");
+-                        aicwf_prealloc_rxbuff_free(buffer, &rx_priv->rxbuff_lock);
+-                        atomic_dec(&rx_priv->rx_cnt);
+-                        return -EBADE;
++                        break;
+                     }
+ 
+                     skb_put(skb_inblock, aggr_len);
+@@ -620,8 +628,7 @@
+                     msg = kmalloc(aggr_len+4, GFP_KERNEL);
+                     if(msg == NULL){
+                         txrx_err("no more space for msg!\n");
+-                        aicwf_prealloc_rxbuff_free(buffer, &rx_priv->rxbuff_lock);
+-                        return -EBADE;
++                        break;
+                     }
+                     memcpy(msg, data, aggr_len + 4);
+ 
+--- a/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/aicwf_usb.c
++++ b/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/aicwf_usb.c
+@@ -56,6 +56,44 @@
+ #endif
+ atomic_t rx_urb_cnt;
+ bool rx_urb_sched = false;
++
++/* rx diagnostics, read under /sys/module/aic8800_fdrv/parameters */
++static uint rx_urb_errors;
++module_param(rx_urb_errors, uint, 0444);
++MODULE_PARM_DESC(rx_urb_errors, "Bulk-IN rx URBs that completed with an error");
++static int rx_urb_last_status;
++module_param(rx_urb_last_status, int, 0444);
++MODULE_PARM_DESC(rx_urb_last_status, "urb->status of the last failed bulk-IN rx URB");
++uint rx_bad_len_drops;
++module_param(rx_bad_len_drops, uint, 0444);
++MODULE_PARM_DESC(rx_bad_len_drops, "rx aggregates dropped because a header claimed more than the buffer holds");
++int rx_inject_bad_len;
++module_param(rx_inject_bad_len, int, 0644);
++MODULE_PARM_DESC(rx_inject_bad_len, "Test stimulus: treat the next N rx aggregate headers as too long");
++int rx_bad_len_backlog_max;
++module_param(rx_bad_len_backlog_max, int, 0444);
++MODULE_PARM_DESC(rx_bad_len_backlog_max, "Most buffers queued behind a dropped aggregate (the vendor code left them unprocessed)");
++static int rx_queued_at_enqueue;
++module_param(rx_queued_at_enqueue, int, 0444);
++MODULE_PARM_DESC(rx_queued_at_enqueue, "rx_cnt right after the last enqueue: buffers waiting for the busrx thread");
++
++static int rx_urbs_in_flight_get(char *buf, const struct kernel_param *kp)
++{
++    return sysfs_emit(buf, "%d\n", atomic_read(&rx_urb_cnt));
++}
++
++/* parse_one() calls ->set unchecked for a modprobe argument */
++static int rx_urbs_in_flight_set(const char *val, const struct kernel_param *kp)
++{
++    return -EPERM;
++}
++
++static const struct kernel_param_ops rx_urbs_in_flight_ops = {
++    .set = rx_urbs_in_flight_set,
++    .get = rx_urbs_in_flight_get,
++};
++module_param_cb(rx_urbs_in_flight, &rx_urbs_in_flight_ops, NULL, 0444);
++MODULE_PARM_DESC(rx_urbs_in_flight, "Bulk-IN rx URBs submitted and not yet completed");
+ u32 aicwf_usb_max_pkt_size = AICWF_USB_MAX_PKT_SIZE;
+ 
+ void aicwf_usb_tx_flowctrl(struct rwnx_hw *rwnx_hw, bool state)
+@@ -297,6 +335,8 @@
+         aicwf_usb_rx_buf_put(usb_dev, usb_buf);
+         if(urb->status < 0){
+             AICWFDBG(LOGDEBUG, "%s urb->status:%d \r\n", __func__, urb->status);
++            rx_urb_errors++;
++            rx_urb_last_status = urb->status;
+ 
+             if(g_rwnx_plat->wait_disconnect_cb == false){
+                 g_rwnx_plat->wait_disconnect_cb = true;
+@@ -334,6 +374,7 @@
+         }
+         spin_unlock_irqrestore(&rx_priv->rxqlock, flags);
+         atomic_inc(&rx_priv->rx_cnt);
++        rx_queued_at_enqueue = atomic_read(&rx_priv->rx_cnt);
+ 
+         if(atomic_read(&rx_priv->rx_cnt) == 1){
+             complete(&rx_priv->usbdev->bus_if->busrx_trgg);

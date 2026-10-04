@@ -1,0 +1,217 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: a733: run LOSC from the 32.768 kHz crystal
+
+The board has a 32.768 kHz crystal and LOSC does not use it (the
+measurement and the register decode are in `clk-sunxi-ng-sun6i-rtc-a733-losc-half-on-a-split-rtc-block`). This is the DT half: the
+crystal becomes an input of the RTC node, the RTC node becomes the provider of
+the 32k and RC clocks, and assigned-clock-rates selects the crystal.
+
+== The crystal
+
+Y2, 32.768 kHz, 12.5 pF, 20 ppm, on X32KIN/X32KOUT (schematic v1.10 p.8,
+"OSC-32K"). Modelled as upstream's sun55i boards do it:
+ext_osc32k: ext-osc32k-clk, fixed-clock, 32768, output name "ext_osc32k",
+passed to the RTC node as "ext-osc32k". ccu-sun6i-rtc reads it by that name
+(devm_clk_get_optional, because the node has clock-names) and hangs it under
+ext-osc32k-gate, the EXT_LOSC_EN gate.
+
+== The switch
+
+  assigned-clocks = <&rtc CLK_OSC32K>;
+  assigned-clock-rates = <32768>;
+
+the line the avaota-a1 and orangepi-4a DTs carry. of_clk_add_hw_provider()
+applies it while rtc-sun6i probes. The osc32k mux has two parents: iosc-32k
+at 16 MHz / 32 / 16 = 31250 Hz (INTOSC_CLK_PRESCAL 0xf, UM 9.1.7.3) and the
+crystal at 32768, so the exact match is the crystal and the mux is reparented
+(`clk-sunxi-ng-sun6i-rtc-a733-losc-half-on-a-split-rtc-block` keeps IOSC calibration off so the RC side can never report 32768 too).
+Register writes: LOSC_CTRL 0x0000401c (EXT_LOSC_EN, already set), then
+0x16aa401d (key + LOSC_SRC_SEL).
+
+== Consumers move to the RTC node
+
+The two fixed clocks "osc32k" (32768) and "iosc" (16 MHz) are removed. They
+described outputs of this block, and ccu-sun6i-rtc registers clocks of the
+same names, which __clk_register() would reject with -EEXIST and fail the RTC
+probe (the reason `arm64-dts-a733-add-the-rtc-timekeeper` kept SUN6I_RTC_CCU off). Every user now names the
+real output, as sun55i-a523.dtsi does:
+
+  losc  <&rtc CLK_OSC32K>  pio, ccu, wdt, r_ccu, r_watchdog, r_pio
+  iosc  <&rtc CLK_IOSC>    ccu, r_ccu
+
+"osc32k" had described the crystal's rate for a clock that ran at 31250 Hz;
+it now reads what the mux really selects. Rates the consumers see after the
+switch are the ones they saw before (32768, 16 MHz), so no divider changes.
+
+== Probe order -- this changes it
+
+fw_devlink turns each phandle above into a supplier link, so pio, ccu, r_ccu,
+r_pio and the two watchdogs now wait for the RTC device to bind. The RTC's
+only supplier is ext_osc32k, a CLK_OF_DECLARE fixed clock that is ready
+before any device, and nothing it needs depends back on those consumers: no
+cycle. rtc-sun6i is builtin_platform_driver (device_initcall), linked after
+drivers/clk and drivers/pinctrl, so those providers are deferred once and
+reprobed when the RTC binds. Mainline's sun55i DTs have the same edges. The
+RTC probing late is not addressed here; this makes the RTC a supplier
+of the main CCU, so whatever is fixed there now also gates the CCU.
+
+== Effects to expect
+
+Everything on the system 32k runs 4.6 % faster than before, i.e. at its
+nominal rate: the RTC counter, WDT0 and WDT_CPUS (WDT_CFG bit 8 = 0 selects
+RTC_32K, UM 8.3.3), the PIO debounce when set to 32k. Until the RTC probes,
+LOSC is still the RC, so U-Boot's 16 s WDT_CPUS window runs 16 * 32768 /
+31250 = 16.8 s up to that point, and exactly 16 s afterwards; the kernel's
+watchdog timeouts become exact. The DCXO, REF_PLL and the SERDES gates are
+not touched: they sit in XO_CTRL0/XO_CTRL1, rtc_ccu's window.
+
+== What the vendor does and leaves out
+
+The vendor carries the crystal as a fixed clock "ext-32k" in the SoC dtsi
+(sun60iw2p1.dtsi), not in a board DT, and its rtc_ccu finds it by global name;
+the driver switches to it unconditionally at probe (`clk-sunxi-ng-sun6i-rtc-a733-losc-half-on-a-split-rtc-block`). So every A733
+board is declared to have the crystal, and one without it would be switched
+to a dead input and left to the auto switch. Here the crystal is a board fact
+passed by phandle; without the node the mux stays on the RC.
+
+== Number
+
+A misc number for apply order: the RTC node is added by `arm64-dts-a733-add-the-rtc-timekeeper`.
+
+== Verification
+
+Applies at fuzz 0 on the full series; the board dtb builds. Not on silicon.
+What proves it, on the 6 GiB board with `clk-sunxi-ng-sun6i-rtc-a733-losc-half-on-a-split-rtc-block` + `arm64-dts-a733-run-losc-from-the-32k-crystal`:
+  dmesg         "LOSC from the external 32768 Hz crystal (LOSC_CTRL 0x0000401d,
+                STA 0x00000001)"; no -EEXIST, rtc0 registered
+  devmem        0x07090000 = 0x0000401d, 0x07090004 bit 0 = 1
+  clk_summary   ext_osc32k -> ext-osc32k-gate -> osc32k 32768; iosc 16000000
+  RTC vs NTP    ~0 drift over ~10 min (was -3 s in 48 s)
+  watchdogs     WDT_CPUS fires on time (U-Boot 16 s arm, kernel timeout)
+  DCXO/SERDES   dcxo 26000000, USB3 on COMB0 links as before
+Falsifier: the RC line or the warning, STA bit 0 = 0, a drift that stays at
+-4.6 %, or a provider that no longer probes.
+
+Assisted-by: Claude
+---
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -20,6 +20,7 @@
+ #include <dt-bindings/clock/sun60i-a733-r-ccu.h>
+ #include <dt-bindings/clock/sun60i-a733-rtc-ccu.h>
+ #include <dt-bindings/clock/sun60i-a733-serdes-ccu.h>
++#include <dt-bindings/clock/sun6i-rtc.h>
+ #include <dt-bindings/gpio/gpio.h>
+ #include <dt-bindings/thermal/thermal.h>
+ #include <dt-bindings/reset/sun60i-a733-ccu.h>
+@@ -473,18 +474,17 @@
+ 		clock-output-names = "sys24M";
+ 	};
+ 
+-	osc32k: osc32k-clk {
++	/*
++	 * Y2, the 32.768 kHz crystal (12.5 pF, 20 ppm) on X32KIN/X32KOUT,
++	 * schematic p.8 ("OSC-32K"). An input of the RTC block, which selects
++	 * it as LOSC through assigned-clock-rates on &rtc CLK_OSC32K (`arm64-dts-a733-run-losc-from-the-32k-crystal`).
++	 * The name and shape follow the sun55i boards upstream.
++	 */
++	ext_osc32k: ext-osc32k-clk {
+ 		#clock-cells = <0>;
+ 		compatible = "fixed-clock";
+ 		clock-frequency = <32768>;
+-		clock-output-names = "osc32k";
+-	};
+-
+-	iosc: internal-osc-clk {
+-		#clock-cells = <0>;
+-		compatible = "fixed-clock";
+-		clock-frequency = <16000000>;
+-		clock-output-names = "iosc";
++		clock-output-names = "ext_osc32k";
+ 	};
+ 
+ 	/*
+@@ -728,7 +728,7 @@
+ 				     <GIC_SPI 83 IRQ_TYPE_LEVEL_HIGH>,
+ 				     <GIC_SPI 85 IRQ_TYPE_LEVEL_HIGH>,
+ 				     <GIC_SPI 87 IRQ_TYPE_LEVEL_HIGH>;
+-			clocks = <&ccu CLK_APB1>, <&osc24M>, <&osc32k>;
++			clocks = <&ccu CLK_APB1>, <&osc24M>, <&rtc CLK_OSC32K>;
+ 			clock-names = "apb", "hosc", "losc";
+ 			gpio-controller;
+ 			#gpio-cells = <3>;
+@@ -970,7 +970,7 @@
+ 		ccu: clock-controller@2002000 {
+ 			compatible = "allwinner,sun60i-a733-ccu";
+ 			reg = <0x0 0x02002000 0x0 0x2000>;
+-			clocks = <&osc24M>, <&osc32k>, <&iosc>,
++			clocks = <&osc24M>, <&rtc CLK_OSC32K>, <&rtc CLK_IOSC>,
+ 				 <&dcxo26M>;
+ 			clock-names = "hosc", "losc", "iosc", "dcxo";
+ 			#clock-cells = <1>;
+@@ -1088,7 +1088,7 @@
+ 				     "allwinner,sun55i-a523-wdt";
+ 			reg = <0x0 0x02050000 0x0 0x20>;
+ 			interrupts = <GIC_SPI 106 IRQ_TYPE_LEVEL_HIGH>;
+-			clocks = <&rtc_ccu CLK_RTC_DCXO>, <&osc32k>;
++			clocks = <&rtc_ccu CLK_RTC_DCXO>, <&rtc CLK_OSC32K>;
+ 			clock-names = "hosc", "losc";
+ 			status = "disabled";
+ 		};
+@@ -2568,7 +2568,7 @@
+ 		r_ccu: clock-controller@7010000 {
+ 			compatible = "allwinner,sun60i-a733-r-ccu";
+ 			reg = <0x0 0x07010000 0x0 0x250>;
+-			clocks = <&osc24M>, <&osc32k>, <&iosc>,
++			clocks = <&osc24M>, <&rtc CLK_OSC32K>, <&rtc CLK_IOSC>,
+ 				 <&ccu CLK_PLL_PERI0_200M>,
+ 				 <&ccu CLK_PLL_PERI0_300M>,
+ 				 <&dcxo26M>;
+@@ -2624,7 +2624,7 @@
+ 				     "allwinner,sun55i-a523-wdt";
+ 			reg = <0x0 0x07021000 0x0 0x20>;
+ 			interrupts = <GIC_SPI 191 IRQ_TYPE_LEVEL_HIGH>;
+-			clocks = <&rtc_ccu CLK_RTC_DCXO>, <&osc32k>;
++			clocks = <&rtc_ccu CLK_RTC_DCXO>, <&rtc CLK_OSC32K>;
+ 			clock-names = "hosc", "losc";
+ 		};
+ 
+@@ -2634,7 +2634,7 @@
+ 			reg = <0x0 0x07025000 0x0 0x800>;
+ 			interrupts = <GIC_SPI 198 IRQ_TYPE_LEVEL_HIGH>,
+ 				     <GIC_SPI 200 IRQ_TYPE_LEVEL_HIGH>;
+-			clocks = <&r_ccu CLK_R_APB0>, <&osc24M>, <&osc32k>;
++			clocks = <&r_ccu CLK_R_APB0>, <&osc24M>, <&rtc CLK_OSC32K>;
+ 			clock-names = "apb", "hosc", "losc";
+ 			gpio-controller;
+ 			#gpio-cells = <3>;
+@@ -3074,15 +3074,26 @@
+ 		 * Linear 16-bit day counter plus hour/minute/second (9.1.7.5,
+ 		 * 9.1.7.6): the r329 fallback selects that layout in rtc-sun6i.
+ 		 * One interrupt, RTC_ALARM = INTID 228 = SPI 196 (UM 12, IRQ
+-		 * table). No clocks and no #clock-cells: with SUN6I_RTC_CCU off
+-		 * this node provides none, and RTC_BGR_REG (PRCM 0x20c) resets
+-		 * to gate pass / reset de-asserted and is not modelled (`arm64-dts-a733-add-the-rtc-timekeeper`).
++		 * table). RTC_BGR_REG (PRCM 0x20c) resets to gate pass / reset
++		 * de-asserted and is not modelled (`arm64-dts-a733-add-the-rtc-timekeeper`).
++		 *
++		 * Also the LOSC half of the block's clocks, through ccu-sun6i-rtc
++		 * (`clk-sunxi-ng-sun6i-rtc-a733-losc-half-on-a-split-rtc-block`): CLK_OSC32K, the LOSC_SRC_SEL mux (LOSC_CTRL bit 0,
++		 * 9.1.7.1) every 32k consumer runs from, and CLK_IOSC, the RC16M.
++		 * The one input is the crystal. assigned-clock-rates = 32768
++		 * selects it: the RC path is 16 MHz / 32 / (INTOSC_CLK_PRESCAL
++		 * 0xf + 1) = 31250 Hz, so only the crystal matches (`arm64-dts-a733-run-losc-from-the-32k-crystal`).
+ 		 */
+ 		rtc: rtc@7090000 {
+ 			compatible = "allwinner,sun60i-a733-rtc",
+ 				     "allwinner,sun50i-r329-rtc";
+ 			reg = <0x0 0x07090000 0x0 0x15c>;
+ 			interrupts = <GIC_SPI 196 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&ext_osc32k>;
++			clock-names = "ext-osc32k";
++			#clock-cells = <1>;
++			assigned-clocks = <&rtc CLK_OSC32K>;
++			assigned-clock-rates = <32768>;
+ 		};
+ 
+ 		/*

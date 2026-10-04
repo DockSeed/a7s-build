@@ -1,0 +1,155 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] drm: a733: DP -- say why training failed, not just that it did
+
+A failed link training reports one line, `training failed at 2700 Mb/s over 4
+lanes: -5`, and that line is the same for faults that are not the same. The
+three ways clock recovery can give up -- every lane at maximum swing, five
+attempts at a drive level the sink never changes, and the round budget spent --
+are all `dev_dbg`, so on a delivery kernel they are invisible and the errno is
+identical. The two equalisation exits have the same problem.
+
+Worse, the failure line carries no answer from the sink at all. On 2026-08-22 a
+board session spent an hour on the hypothesis that lanes 2 and 3 were not
+reaching clock recovery, which a single reading of DPCD 0x202 refutes in one
+second: it read 0x00, so lanes 0 and 1 were not recovering either and the fault
+was upstream of any per-lane question. That reading had to be taken by hand,
+through debugfs, on a boot that had already been disturbed by the taking.
+
+So: promote the five give-up paths from dev_dbg to dev_warn, because each is a
+single event on a failure path and not a per-round trace; record the round
+counters on the failing paths too, so `CR 0 round(s)` stops being what a
+failure always prints; and keep the last link status the sink returned, so the
+failure line can carry DPCD 0x202-0x207 with it.
+
+No behaviour changes. Every edit is a print, a counter or a memcpy into a field
+that nothing reads back; the training sequence, its exits and its return values
+are untouched.
+
+DP_TX_LANE_REMAP_CONTROL goes with it: defined in `drm-a733-dp-link-training`, never referenced.
+
+Assisted-by: Claude
+
+diff --git a/drivers/gpu/drm/sun60i/sun60i-dp.c b/drivers/gpu/drm/sun60i/sun60i-dp.c
+--- a/drivers/gpu/drm/sun60i/sun60i-dp.c
++++ b/drivers/gpu/drm/sun60i/sun60i-dp.c
+@@ -346,6 +346,13 @@ struct sun60i_dp {
+ 	unsigned int		train_attempts;
+ 	unsigned int		train_cr_rounds;
+ 	unsigned int		train_eq_rounds;
++	/* The last link status the sink returned while an attempt was failing.
++	 * Kept because the errno is the same for faults that are not: a failure
++	 * with DPCD 0x202 at 0x00 means the sink sees nothing at all, and one at
++	 * 0x11 means clock recovery worked and equalisation did not. Without this
++	 * the difference is invisible from dmesg and costs a board session.
++	 */
++	u8			train_last_status[DP_LINK_STATUS_SIZE];
+ 	/* The main video stream. The second reg window is eDP_REG_PAD at
+ 	 * 0x05760000, which the AUX path measurably never needs and video
+ 	 * cannot do without; a DT with one window still gets a working AUX
+@@ -1448,7 +1455,6 @@ static int sun60i_dp_link_configure(struct sun60i_dp *dp, unsigned int rate_mbps
+ #define  TX_TRAINING_PATTERN		GENMASK(2, 0)
+ #define DP_TX_SCRAMBLING_DISABLE	0x0014		/* 15.4.7.6 */
+ #define  TX_SCRAMBLING_DISABLE		BIT(0)
+-#define DP_TX_LANE_REMAP_CONTROL	0x002c		/* 15.4.7.11 */
+ #define DP_TX_PHY_STATUS		0x0280		/* 15.4.7.38, read-only */
+ 
+ /*
+@@ -1665,23 +1671,28 @@ static int sun60i_dp_train_cr(struct sun60i_dp *dp,
+ 			return ret;
+ 		}
+ 
++		memcpy(dp->train_last_status, link_status,
++		       sizeof(dp->train_last_status));
++
+ 		if (drm_dp_clock_recovery_ok(link_status, dp->link_lanes)) {
+ 			dp->train_cr_rounds = round;
+ 			return 0;
+ 		}
+ 
+ 		if (sun60i_dp_train_at_max_swing(dp, lv)) {
+-			dev_dbg(dp->dev,
+-				"CR round %u: every lane at maximum swing and still no lock\n",
+-				round);
++			dp->train_cr_rounds = round;
++			dev_warn(dp->dev,
++				 "CR round %u: every lane at maximum swing and still no lock\n",
++				 round);
+ 			return -EIO;
+ 		}
+ 
+ 		if (!sun60i_dp_train_adjust(dp, lv, link_status)) {
+ 			if (++same_voltage >= SUN60I_DP_CR_MAX_SAME_VOLTAGE) {
+-				dev_dbg(dp->dev,
+-					"CR round %u: %u attempts at an unchanged drive level\n",
+-					round, same_voltage);
++				dp->train_cr_rounds = round;
++				dev_warn(dp->dev,
++					 "CR round %u: %u attempts at an unchanged drive level\n",
++					 round, same_voltage);
+ 				return -EIO;
+ 			}
+ 		} else {
+@@ -1693,8 +1704,9 @@ static int sun60i_dp_train_cr(struct sun60i_dp *dp,
+ 			return ret;
+ 	}
+ 
+-	dev_dbg(dp->dev, "CR gave up after %u rounds\n",
+-		SUN60I_DP_CR_MAX_ROUNDS);
++	dp->train_cr_rounds = SUN60I_DP_CR_MAX_ROUNDS;
++	dev_warn(dp->dev, "CR gave up after %u rounds\n",
++		 SUN60I_DP_CR_MAX_ROUNDS);
+ 
+ 	return -EIO;
+ }
+@@ -1743,10 +1755,14 @@ static int sun60i_dp_train_eq(struct sun60i_dp *dp,
+ 			return ret;
+ 		}
+ 
++		memcpy(dp->train_last_status, link_status,
++		       sizeof(dp->train_last_status));
++
+ 		if (!drm_dp_clock_recovery_ok(link_status, dp->link_lanes)) {
+-			dev_dbg(dp->dev,
+-				"EQ round %u: clock recovery was LOST during equalisation\n",
+-				round);
++			dp->train_eq_rounds = round;
++			dev_warn(dp->dev,
++				 "EQ round %u: clock recovery was LOST during equalisation\n",
++				 round);
+ 			return -ENOLINK;
+ 		}
+ 
+@@ -1761,8 +1777,9 @@ static int sun60i_dp_train_eq(struct sun60i_dp *dp,
+ 			return ret;
+ 	}
+ 
+-	dev_dbg(dp->dev, "EQ gave up after %u rounds with clock recovery intact\n",
+-		SUN60I_DP_EQ_MAX_ROUNDS);
++	dp->train_eq_rounds = SUN60I_DP_EQ_MAX_ROUNDS;
++	dev_warn(dp->dev, "EQ gave up after %u rounds with clock recovery intact\n",
++		 SUN60I_DP_EQ_MAX_ROUNDS);
+ 
+ 	return -EPROTO;
+ }
+@@ -2049,6 +2066,7 @@ static int sun60i_dp_train(struct sun60i_dp *dp, unsigned int rate_mbps,
+ 	dp->train_attempts = 0;
+ 	dp->train_cr_rounds = 0;
+ 	dp->train_eq_rounds = 0;
++	memset(dp->train_last_status, 0, sizeof(dp->train_last_status));
+ 
+ 	ret = sun60i_dp_link_probe(dp);
+ 	if (ret)
+@@ -2087,8 +2105,11 @@ static int sun60i_dp_train(struct sun60i_dp *dp, unsigned int rate_mbps,
+ 			}
+ 
+ 			dev_warn(dp->dev,
+-				 "training failed at %u Mb/s over %u lanes: %d\n",
+-				 rungs[rung], lanes, ret);
++				 "training failed at %u Mb/s over %u lanes: %d (CR %u round(s), EQ %u, sink DPCD 0x202-0x207 %*ph)\n",
++				 rungs[rung], lanes, ret,
++				 dp->train_cr_rounds, dp->train_eq_rounds,
++				 (int)sizeof(dp->train_last_status),
++				 dp->train_last_status);
+ 
+ 			/* Clock recovery proved out and only equalisation
+ 			 * failed: the clock is fine and the problem is

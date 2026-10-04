@@ -1,0 +1,1392 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] drm: a733: dp: link training -- CR and EQ against drm_dp_helper, with fallback
+
+[Recipe cut: regenerated: context only, the removed debugfs knobs of earlier
+patches are not touched here.]
+
+The last piece of the pixel path that was still a shell script. As of
+2026-08-19 the clocks, TCON_TV1 and the eDP video stream are driver code and
+HW-proven -- a 1920x1200 picture came up from
+`clk-sunxi-ng-a733-video-plls-and-edp-tv-pixel-clock`,
+`arm64-dts-a733-tcon-tv1-and-the-dp-phy-pad-window`,
+`drm-a733-tcon-tv1-timing-generator-and-video-source` and
+`drm-a733-dp-the-main-video-stream` alone --
+with a by-hand shell script still doing the training in between.
+
+WHAT THE DRM CORE ALREADY DOES, AND WHAT IT DOES NOT
+-----------------------------------------------------
+
+Checked before writing anything, because "call the core, write almost nothing"
+would have been the right answer if it were true. It is not:
+
+  drivers/gpu/drm/display/drm_dp_helper.c provides PREDICATES and DELAYS --
+  drm_dp_clock_recovery_ok(), drm_dp_channel_eq_ok(),
+  drm_dp_get_adjust_request_voltage/pre_emphasis(),
+  drm_dp_dpcd_read_link_status(), drm_dp_link_train_clock_recovery_delay(),
+  drm_dp_link_train_channel_eq_delay(), drm_dp_read_*_delay(), the LTTPR
+  helpers, drm_dp_link_rate_to_bw_code(), drm_dp_max_link_rate/lane_count(),
+  drm_dp_tps3_supported(), drm_dp_enhanced_frame_cap().
+
+  It does NOT provide a state machine. There is no generic drm_dp_link_train().
+  Fourteen drivers in 6.18.36 each write their own CR/EQ loop, and the "five
+  attempts at an unchanged voltage swing" rule of DP 1.4 section 3.5.1.2.2 is
+  implemented NINE times in nine different ways -- the number 5 does not appear
+  in a single core header (grep MAX_TRAINING_TRIES/voltage_tries include/drm/
+  returns nothing).
+
+⚠ A trap worth naming: drm_dp_link_train() DOES exist, at
+drivers/gpu/drm/tegra/dp.c:792, together with a whole drm_dp_link_* family that
+looks generic. It is Tegra-private -- zero EXPORT_SYMBOL in that file -- and its
+loops are `for (repeat = 1; repeat < 5; repeat++)` with no per-voltage counter at
+all. Not callable, and not a model.
+
+So: every helper the core has is called here and none is open-coded. The loop
+shape follows zynqmp_dp_link_train() (drivers/gpu/drm/xlnx/zynqmp_dp.c:694-1010)
+and the fallback ladder follows hibmc_dp_link_training()
+(drivers/gpu/drm/hisilicon/hibmc/dp/dp_link.c:310-420) -- the two cleanest of
+the fourteen, both of which use the core predicates throughout.
+
+AND NOTHING UPSTREAM TARGETS ALLWINNER DP
+------------------------------------------
+
+Verified rather than inherited from an earlier note: drivers/gpu/drm/sun4i/ has
+no DisplayPort at all (its only "edp" hits are a reset-line NAME in
+sun4i_tcon.c:1145,1151), there is no allwinner DP/eDP binding in
+Documentation/devicetree/bindings/display/, and every allwinner PHY binding is
+USB or MIPI-DPHY. dw-dp.c is a Synopsys DesignWare library with exactly one
+consumer, dw_dp-rockchip.c, bound to "rockchip,rk3588-dp" -- different IP from
+the Trilinear core at 0x05740000, so its registers do not apply here. Its loop
+is also unbounded in CR, has no lane fallback, and leaves a union
+phy_configure_opts uninitialised on the stack (dw-dp.c:559).
+
+WHERE THE VENDOR DRIVER DIFFERS, AND WHAT THIS PATCH DOES
+---------------------------------------------------------
+
+The following are points where the vendor driver differs from what this
+patch does:
+
+  vendor                                     | ours
+  -------------------------------------------+---------------------------------
+  no rate or lane fallback at all            | rate ladder then lane ladder, DP
+                                             | 1.4 section 3.5.1.2.1. ⚠ see
+                                             | "what this cannot do" below
+  ONE attempt at maximum swing where DP 1.4  | ten CR rounds, five at an
+  section 3.5.1.2.2 requires five            | UNCHANGED request, and a separate
+                                             | max-swing exit
+  edp_get_link_status()'s return DISCARDED at| checked at every read; a
+  both call sites, over a buffer zeroed      | NACK/DEFER/timeout is reported as
+  first -- a dead AUX channel is             | itself and aborts the attempt
+  indistinguishable from "CR not done"       |
+  declares the link trained on the strength  | the sink is asked AGAIN once the
+  of status read DURING training and never   | training pattern is cleared and
+  asks again                                 | the scrambler is on, and success
+                                             | is its answer, not the loop's.
+                                             | See the section below -- the
+                                             | first cut of THIS patch had the
+                                             | same defect and the board found
+                                             | it
+  EQ never re-checks CR_DONE, so CR lost     | re-checked every EQ round, DP 1.4
+  during equalisation is undetected          | section 3.5.1.2.3, and returned as
+                                             | a DIFFERENT errno (-ENOLINK) from
+                                             | "the rounds ran out with CR
+                                             | intact" (-EPROTO), because the
+                                             | ladder has to tell them apart
+  DPCD 0x107 DOWNSPREAD_CTRL and 0x108       | both written. 0x107 is written
+  MAIN_LINK_CHANNEL_CODING_SET never written | ZERO on purpose: this PHY has no
+                                             | SSC arm and refuses
+                                             | phy_configure() with ssc set, so
+                                             | promising the sink a spread clock
+                                             | would describe a source that does
+                                             | not exist
+  TR_PHY_STATUS declared, never read         | read and logged before TPS1, and
+                                             | deliberately NOT gated on -- see
+                                             | below
+  unbounded per-lane index from sysfs into   | clamped to DP 1.4 Table 3-1 here
+  dp_lv_table[sw][pre]                       | AND refused in the PHY (`phy-allwinner-a733-combophy-dp-swing-and-pre-emphasis`)
+  folds the two adjust bytes into one value  | per lane. DPCD 0x206 carries lanes
+                                             | 0/1 and 0x207 lanes 2/3 and on
+                                             | this board they differ
+
+TR_PHY_STATUS -- READ IT, OR SAY WHY NOT
+-----------------------------------------
+
+An earlier analysis left this open as "read it, or say why not". Read: it
+is PHY_STATUS at 0x0280, UM 15.4.7.38, and the UM defines NO bits -- the field
+only defers to a note about whichever PHY is actually used.
+There is no such application note in this tree. So a "PHY ready"
+predicate built on any bit of it would be an invented predicate, and none
+is built. It is read and printed at dev_dbg immediately before TPS1 and
+in the `train` file, so the value is on record; nothing branches on it.
+
+ONE VALUE THE UM SETTLED THAT THIS FILE HAD WRONG
+--------------------------------------------------
+
+An earlier analysis listed LINK_BW_SET, LANE_COUNT_SET and
+ENHANCED_FRAME_EN among the registers the sequence writes. ENHANCED_FRAME_EN
+(0x0008) is READ-ONLY: UM 15.4.7.3 describes it as hard-wired
+to 1. So the source is in enhanced framing whatever anyone writes, DPCD 0x101
+bit 7 is the source DESCRIBING itself rather than choosing, and a sink without
+ENHANCED_FRAME_CAP cannot be framed correctly by this transmitter at all. That
+gets one dev_warn naming both sides rather than a silent mismatch.
+
+THE DEFECT THE BOARD FOUND IN THIS PATCH, AND WHAT ANSWERS IT
+--------------------------------------------------------------
+
+A board run on 2026-08-19, on a fixture that PASSED the acceptance script's
+alt-mode preflight -- so this is not a dead-fixture artefact, it is the driver
+being wrong about a link that was there. `echo 0 > .../train` returned EXIT 0 and
+this driver reported:
+
+    state         : trained at 2700 Mb/s over 4 lanes     <- the driver
+    attempts      : 1 (CR 1 round(s), EQ 3)
+
+while the sink's own bytes, read through the same file, said:
+
+    DPCD 0x202-207: 00 00 80 00 00 00                     <- the sink
+    clock recovery: NOT done
+    equalisation  : NOT done
+    sink in sync  : no
+    symbol errors : lane 0: 329, lanes 1/2/3: 32767 (saturated)
+
+CR and EQ were judged from link status taken DURING training and never asked
+again once the training pattern was cleared and the scrambler enabled. That is
+a vendor defect this tree must not port, in a worse form:
+the vendor discards a return value, this discarded the question. The table above
+now carries the row.
+
+ANSWERED BY sun60i_dp_train_verify(), which runs after sun60i_dp_train_stop()
+and before success is returned. It reads DPCD 0x202..0x207 once with
+drm_dp_dpcd_read_link_status() and requires drm_dp_clock_recovery_ok() AND
+drm_dp_channel_eq_ok() -- i.e. CR_DONE on every active lane, CHANNEL_EQ_DONE and
+SYMBOL_LOCKED on every active lane, and INTERLANE_ALIGN_DONE. Both predicates
+are the core's; neither is open-coded. That is the shell instrument's
+LANE0_1=0x77 LANE2_3=0x77 ALIGN=0x01 bar in the core's own terms.
+
+ONE READ, NO RETRY. A second look after a failed first one would turn "this link
+does not hold once training stops" into "it held the second time", which is the
+question, not noise to average away.
+
+And `train`'s `state` line is now built from that reading instead of from
+dp->trained. The driver's own flag is still printed -- it is what tells an A/B
+run apart from a shell-trained link -- but under its own label, below the sink's
+verdict, and labelled as a claim.
+
+IS IT A MISSING CHECK, OR AN ENABLE-ORDER DEFECT? BOTH, AND THE EVIDENCE SAYS
+WHICH IS WHICH
+------------------------------------------------------------------------------
+
+Worth answering rather than assuming, because "the link loses lock the moment
+scrambling is enabled" is the kind of symptom that gets a retry bolted onto it.
+
+⚠ It is NOT the ordering inside sun60i_dp_train_stop(). That sequence -- source
+TRAINING_PATTERN_SET to 0, settle, DPCD 0x102 to 0, then source
+SCRAMBLING_DISABLE to 0 -- is step for step what the by-hand shell script
+does, on the runs that produced 77 77 01 01 and a picture
+(the 8 GiB board, 2026-08-18 and 2026-08-19). Rearranging ordering that has silicon behind
+it, to fix a symptom it demonstrably does not cause, is exactly the unforced
+deviation this branch already had to take back once. It stays as it is.
+
+⚠ What the driver omits is the step the instrument takes IMMEDIATELY afterwards,
+and this tree already recorded why it is load-bearing. `drm-a733-dp-the-main-video-stream` (on main, HW-proven)
+says it in its own header and again in the code comment above
+sun60i_dp_video_stream_enable():
+
+    "with training cleared and the stream not enabled the core sends idle and
+     the sink loses the lock it just gained, which is what happened here on the
+     first successful training, 2026-08-18"
+
+`echo 0 > train` ends in precisely that state. So the sink's 00 00 80 00 00 00
+is not only the fingerprint of a missing check -- it is also the documented
+resting state of an unfinished sequence, and a check that ignored that would
+have replaced one wrong verdict with the opposite one.
+
+Which is why SINK=0x01 -- the fourth number of the instrument's bar -- is NOT
+required by sun60i_dp_train_verify(). DPCD 0x205 RECEIVE_PORT_0_STATUS describes
+the sink's synchronisation to a received STREAM, not the outcome of training.
+Mainline polls it for 1 only after the video stream starts and back to 0 after
+it stops -- edp_receiver_ready_T7() and _T9(), the eDP stream-on / stream-off
+timings, drivers/gpu/drm/amd/display/dc/link/protocols/link_edp_panel_control.c
+:480 and :455 -- and no DisplayPort driver in 6.18.36 gates training on it; the
+only other readers of 0x205 take the DP 2.0 INTRA_HOP bit
+(drivers/gpu/drm/i915/display/intel_dp_link_training.c:1109,
+.../link/protocols/link_dp_training.c:1037). i915 says the rest out loud at
+intel_dp_link_training.c:1127: what a source transmits after training "is
+platform specific ... on older platforms it's HW specific if/how an idle pattern
+is generated".
+
+So the bit is required exactly where it IS defined, which is two places and not
+none:
+
+  - in sun60i_dp_train_verify() itself WHEN A STREAM IS ALREADY RUNNING
+    (dp->video_on) -- the re-training case, which is what a KMS driver will do on
+    an IRQ_HPD link-status change. There the fourth number of the bar is
+    meaningful at the end of training, and it is required.
+  - in sun60i_dp_video_stream_enable(), which now waits for it, bounded, and
+    refuses to report the stream started until the sink says it is receiving it.
+
+Bounded POLLING, not a retry -- nothing is re-driven between reads, and the wait
+is the eDP T7 allowance mainline polls for in the same shape (the by-hand
+sequence waits 500 ms before it reads). The stream is left enabled on failure,
+because the next thing a human does with a black screen is read the registers.
+
+The only case where the bit is not asked for is the first training of a link that
+has no stream behind it yet, and there it is skipped with a dev_dbg line saying
+so rather than silently.
+
+⬜ ONE THING THIS DOES NOT SETTLE, named rather than buried: whether the link
+bits (CR / EQ / symbol lock / interlane align) hold on this core's idle at all.
+If they do not, sun60i_dp_train_verify() will refuse a link that trained
+perfectly, and the answer is that `train` and the stream cannot be separate verbs
+on this part. That is a sharp, falsifiable outcome and the acceptance below asks
+for it directly -- it is not something to pre-empt with a workaround.
+
+⬜ And one residue of the proven order, recorded rather than changed: between the
+DPCD 0x102 write and the source's SCRAMBLING_DISABLE write, the sink descrambles
+a source that is still sending unscrambled output -- one AUX transaction wide.
+The instrument has the same window and survives it. Falsifier for it mattering:
+symbol-error counters that are non-zero at the end of a link that otherwise
+reads 0x77/0x77/0x01/0x01.
+
+WHAT THIS CANNOT DO TODAY, STATED RATHER THAN IMPLIED
+------------------------------------------------------
+
+⚠ The rate ladder is one rung long. The PHY has exactly one PMA rate table,
+2700 Mb/s (`phy-allwinner-a733-combophy-dp-rate-2700`); every other rung is refused by phy_validate() and never
+entered. So RATE fallback is plumbing waiting for a second table -- only the LANE
+fallback (4 -> 2 -> 1) can actually change anything today. What a second rate
+would need is a second 163-word PMA table in the PHY, its own reset-bracket run,
+and its own swing table; none of that is here and none of it is guessed at.
+
+Rate before lanes, which keeps bandwidth: four lanes at a lower rate carry more
+than two lanes at the same rate. The exception is an EQ-only failure -- clock
+recovery proved out, so the clock is fine and the problem is inter-lane, which
+fewer lanes can fix and a lower rate need not. That case skips the rest of the
+rate ladder and drops the lane count, which is why train_eq() returns -EPROTO
+there and -ENOLINK when CR was lost. hibmc_dp_link_training() makes the same
+distinction (dp_link.c:310-338).
+
+The rungs are rebuilt when the lane count drops, because a PHY may allow a rate
+at two lanes that it refuses at four -- and phy_validate() is asked before each
+attempt rather than after tearing a working link down to find out. The vendor
+maps both -EOPNOTSUPP and -EINVAL from phy_validate() to "pass"
+(sunxi_drm_edp.c:846-868), so its one real rejection is discarded again.
+
+THE INTERFACE
+-------------
+
+A `train` debugfs file beside `link` and `video`, for the same reason those two
+are debugfs: this tree has no KMS driver and no HPD path into one, so there is
+nothing else to call sun60i_dp_train(). Writing "<rate Mb/s> [lanes]" trains
+exactly that; writing "0" walks the ladder. READING it asks the SINK -- the
+`state` line included, and everything below it, all of it back over AUX from
+DPCD 0x202..0x207 and 0x210.., not from a register of ours reading back.
+
+    state         : sink confirms the link at 2700 Mb/s over 4 lanes
+    driver claim  : trained (this driver's own flag; not evidence)
+
+Two lines, deliberately, and in that order. They agree on a healthy link and
+they are the two halves of the A/B: a link the sink confirms while the driver
+does not claim it was trained by the by-hand shell script.
+
+⚠ The symbol-error counters are printed with their VALID bit, not just their
+count: bit 15 clear means the sink is not counting, which is not the same as
+zero errors, and a reader that prints only the count reports a perfect link on a
+sink that has none.
+
+sun60i_dp_video_stream_enable() WARNS when the link was not trained by this
+driver rather than refusing. That is deliberate and temporary:
+the by-hand shell script is still the A/B arm until this patch is
+HW-proven, and refusing would make the two impossible to compare on one kernel.
+The warning is what tells the two runs apart in a log.
+
+WHAT IT OWES
+------------
+
+Every item is a reading on the 8 GiB board with a DP sink on J4, on a kernel carrying
+`phy-allwinner-a733-combophy-dp-lane-map-and-inverts` + `phy-allwinner-a733-combophy-dp-swing-and-pre-emphasis` + this patch. Driven by a shell script, which now
+REFUSES to run unless DP alt mode is genuinely entered -- see the gate below.
+
+  0. THE FIXTURE IS ALIVE, and this is a gate rather than a check because on
+     2026-08-19 it was not: a Type-C recovery had left DP alt mode, the four
+     COMB0 lanes were in reset, and a full page of confident-looking failures
+     came out of a dead fixture. A DPCD read succeeding does NOT establish alt
+     mode -- AUX runs over the SBU pair through its own PHY (`phy-allwinner-a733-aux-hpd-phy`) and answers
+     perfectly well with the main link in reset. The gate asked TCPM alone
+     (`port0-partner.0/active`), which answers "did the partner enter an alt
+     mode", not "are the four COMB0 lanes carrying DisplayPort". It now needs
+     three witnesses, all required: TCPM's `active` = yes, the combo-PHY's own
+     handover line in dmesg ("DP alt mode pin assignment <C|E>: handing all four
+     COMB0 lanes to DisplayPort", with no later "DP alt mode left"), and
+     `dp_active : 1` in the combo-PHY's debugfs `state`.
+     FALSIFIED BY: any of the three missing -- in which case nothing below this
+     line means anything and the script exits 2.
+     ⚠ RECOVERY IS A POWER CYCLE. The unbind/bind of the rt1711h i2c device is
+     NOT a safe recovery: its second use on 2026-08-19 LEFT DP alt mode outright
+     ("DP alt mode left, COMB0 links back in reset") and the kernel then wedged
+     with RCU stalls on one CPU until the board was power-cycled anyway.
+
+  1. THE LINK TRAINS FROM THE DRIVER, AND THE SINK AGREES.
+     echo 1 > /sys/kernel/debug/5740000.displayport/aux_enable
+     echo 0 > /sys/kernel/debug/5740000.displayport/train
+     Expected: exit 0, dmesg "link trained: 2700 Mb/s over 4 lanes, CR in 1
+     round(s), EQ in 1", and `cat train` showing
+     "state         : sink confirms the link", "driver claim  : trained",
+     clock recovery done, equalisation done, four symbol-error counters valid
+     at 0. "sink in sync" reads NO here and that is correct -- it is a stream
+     bit; item 3 is where it counts.
+     FALSIFIED BY: a non-zero exit; "PHY refused the drive levels" (`phy-allwinner-a733-combophy-dp-swing-and-pre-emphasis` not in
+     the kernel); "the sink does not confirm ... once the training pattern is
+     cleared", which is the loop believing itself; CR completing only after
+     several rounds where the shell script does it in one on the same cable and
+     monitor (the drive levels this writes would then not be the ones the script
+     writes).
+
+  2. THE DRIVE LEVELS REACHED THE PMA. TX_TXCC_MGNFS_MULT_000, lanes 0..3, at
+     0x06C880A0 / 0x06C884A0 / 0x06C888A0 / 0x06C88CA0 -- that is
+     0x06C80000 + ((0x4000 + lane*0x200 + 0x50) << 1), the address
+     a733_combophy_dp_set_voltages() writes and the one `phy-allwinner-a733-combophy-dp-rate-2700`'s rate table names
+     as 0x4050/0x4250/0x4450/0x4650.
+     Expected: each inside 0x0009..0x0028, the band every legal non-maximum cell
+     of `phy-allwinner-a733-combophy-dp-swing-and-pre-emphasis`'s table occupies, with both 16-bit halves equal.
+     FALSIFIED BY: 0x002A, which is what `phy-allwinner-a733-combophy-dp-rate-2700`'s rate table leaves, i.e.
+     set_voltages never ran; 0x0000, which is either no write at all or a link
+     resting at maximum drive; anything outside the band, which no cell produces.
+
+  3. A PICTURE, from the drivers only, and the sink says it is receiving it.
+     echo configure > .../video ; echo 0 > .../train ; echo stream > .../video
+     Expected: `echo stream` exits 0 -- which now means the sink reported
+     RECEIVE_PORT_0_STATUS within the bounded wait -- a 1920x1200 test pattern on
+     the screen, `cat train` showing "sink in sync  : yes" AND still
+     "state         : sink confirms the link", and NO "the main link was not
+     trained by this driver" line in dmesg.
+     FALSIFIED BY: "the sink does not report itself in sync with the stream
+     after N ms"; a black screen with every register right, which is what
+     happened on 2026-08-18 and is why nothing here replaces the eye.
+
+  4. THE SHELL SCRIPT IS NO LONGER NEEDED -- and the A/B arm proves it. Same
+     kernel, same board, once with the driver's `train` and once with
+     the shell script given 4 and 2700: both must give 77 77 01 01.
+     FALSIFIED BY: the script training a link the driver cannot.
+
+  5. LANE FALLBACK, the only ladder arm that can move today. Force it:
+     echo "2700 4" > train on a two-lane pin assignment, or unplug two lanes.
+     Expected: the attempt at 4 fails, the driver retries at 2, and `train`
+     reports 2 lanes with attempts >= 2.
+     FALSIFIED BY: the driver stopping at the first failure.
+
+  6. THE FIVE-TRIES RULE ACTUALLY BOUNDS. With no sink able to lock (a
+     deliberately bad cable), training must return in bounded time and log
+     "attempts at an unchanged drive level" or "every lane at maximum swing",
+     not hang.
+     FALSIFIED BY: an unbounded loop, or a single attempt.
+
+  7. HELD. All of items 1 and 3 unchanged over minutes, not sampled once.
+
+  8. ⬜ THE OPEN QUESTION THIS PATCH DELIBERATELY DOES NOT PRE-EMPT: do the link
+     bits hold on this core's idle? Item 1 answers it either way. If `train`
+     alone reports "the sink does not confirm ... once the training pattern is
+     cleared" while item 3 then produces a picture and 77 77 01 01, the answer
+     is no -- the core's idle does not hold the sink -- and `train` and `stream`
+     cannot be separate verbs on this part. That is a design change to make with
+     the measurement in hand, not a retry to add now.
+
+Explicitly NOT proof: a green build, the `train` file existing, or the driver's
+own `trained` flag -- which is why every number the file prints, `state`
+included, comes from the sink.
+
+WHICH OF THE THREE IS HARDWARE-PROVEN, PLAINLY
+-----------------------------------------------
+
+  `phy-allwinner-a733-combophy-dp-lane-map-and-inverts`  ✅ HW-PROVEN, the 8 GiB board, 2026-08-19. Lane map 0x00003210 at 0x06C06C24,
+        lane invert 0xf, with the debug instrumentation never touched (`forced: no`), so the
+        values reach the production path from the mux callback.
+  `phy-allwinner-a733-combophy-dp-swing-and-pre-emphasis`  ⬜ NOT proven, in either direction. Nothing in that session exercised it.
+  `drm-a733-dp-link-training`  ⬜ NOT proven -- and its first cut was REFUTED by that run: it reported a
+        link the sink denied, on a fixture whose alt-mode preflight had passed.
+        That defect is fixed above.
+
+Whether the CR/EQ loop can train a HEALTHY link is still neither proven nor
+refuted. The run answered "does the driver tell the truth about the link" (it did
+not, and now it must) and left "can this loop train a link" open: the attempts
+made after the Type-C recovery could not answer it, because that recovery had
+left DP alt mode ("DP alt mode left, COMB0 links back in reset") and the lanes
+were in reset. The same failure reproduced on a kernel WITHOUT these
+patches, which rules the patches out as its cause.
+
+⚠ RECOVERY IS A POWER CYCLE. The unbind/bind of the rt1711h i2c device is not a
+safe recovery: its second use on 2026-08-19 left DP alt mode outright and the
+kernel then wedged with RCU stalls on CPU 7 until the board was power-cycled
+anyway. Item 0 of the acceptance now refuses to run in that state instead of
+measuring it.
+
+Build check: the series applies at --fuzz=0 on a freshly unpacked 6.18.36 tree,
+drivers/gpu/drm/sun60i/ builds clean at W=1, checkpatch 0/0.
+
+Assisted-by: Claude
+
+diff --git a/drivers/gpu/drm/sun60i/sun60i-dp.c b/drivers/gpu/drm/sun60i/sun60i-dp.c
+--- a/drivers/gpu/drm/sun60i/sun60i-dp.c
++++ b/drivers/gpu/drm/sun60i/sun60i-dp.c
+@@ -14,9 +14,10 @@
+  * The main link is the second, and it is a PHY consumer's job: COMB0 belongs to
+  * the combo-PHY driver, and a DisplayPort controller reaches it through
+  * phy_configure() with a union phy_configure_opts_dp, the way every DP
+- * controller in mainline does. What is still absent is link training and video:
+- * no training pattern sequence, no DPCD 0x100/0x102 writes, no mode setting, no
+- * KMS.
++ * controller in mainline does. Link training is the third, and with it the last
++ * piece of the pixel path that was still a shell script. What is still absent
++ * is KMS: no connector, no CRTC, no modeset -- the mode is a built-in constant
++ * and the verbs are debugfs files.
+  *
+  * Every register offset and field below comes from the UM's own register list
+  * (chapter 15.4.7 of the A733 user manual) and
+@@ -64,6 +65,7 @@
+ #include <linux/seq_file.h>
+ #include <linux/sprintf.h>
+ #include <linux/uaccess.h>
++#include <linux/unaligned.h>
+ 
+ #include <drm/display/drm_dp.h>
+ #include <drm/display/drm_dp_helper.h>
+@@ -141,6 +143,7 @@
+ static const unsigned int sun60i_dp_link_rates[] = { 810000, 540000, 270000, 162000 };
+ 
+ #define SUN60I_DP_RATE_TO_MBPS(r)	((unsigned int)(r) / 100)
++#define SUN60I_DP_MBPS_TO_RATE(m)	((int)(m) * 100)
+ 
+ /*
+  * ---------------------------------------------------------------------------
+@@ -296,6 +299,16 @@ struct sun60i_dp {
+ 	bool			dpcd_valid;
+ 	unsigned int		link_rate;
+ 	unsigned int		link_lanes;
++	/* Link training. `trained` is this driver's own answer and therefore not
++	 * evidence -- the sink's answer is DPCD 0x202..0x205 and the `train`
++	 * file reads it every time it is opened. The three counters exist
++	 * because "it trained" and "it trained on the first attempt" are
++	 * different results and only the second one is a healthy link.
++	 */
++	bool			trained;
++	unsigned int		train_attempts;
++	unsigned int		train_cr_rounds;
++	unsigned int		train_eq_rounds;
+ 	/* The main video stream. The second reg window is eDP_REG_PAD at
+ 	 * 0x05760000, which the AUX path measurably never needs and video
+ 	 * cannot do without; a DT with one window still gets a working AUX
+@@ -899,6 +912,78 @@ static int sun60i_dp_video_configure(struct sun60i_dp *dp)
+ 	return ret;
+ }
+ 
++/*
++ * THE SINK'S OWN ANSWER ABOUT THE STREAM IT IS RECEIVING.
++ *
++ * DPCD 0x205 bit 0 RECEIVE_PORT_0_STATUS, and the link bits underneath it. This
++ * is the point at which all four numbers of the by-hand instrument's final
++ * check are defined at once -- LANE0_1=0x77 LANE2_3=0x77 ALIGN=0x01 SINK=0x01
++ * (the shell script) -- and the only point, because SINK is a
++ * STREAM bit: mainline polls it for 1 only once the stream has started
++ * (edp_receiver_ready_T7(),
++ * drivers/gpu/drm/amd/display/dc/link/protocols/link_edp_panel_control.c:480)
++ * and back to 0 when it stops (_T9(), :455). sun60i_dp_train_verify() therefore
++ * requires the other three and this requires all four.
++ *
++ * ⚠ Bounded POLLING, which is not a retry. Nothing is re-driven between reads:
++ * the sink is allowed the time it is entitled to for synchronising to a stream
++ * that has just started -- the eDP T7 timing, which mainline polls for in this
++ * same shape -- and the by-hand sequence waits 500 ms before it reads. A retry
++ * would re-drive the link and destroy the question; this only waits.
++ *
++ * The stream is NOT torn down when the sink refuses to synchronise. The write
++ * reports the failure through its exit status and the registers are left where
++ * they are, because the next thing a human does with a black screen is read
++ * them -- and because `video off` is one write away.
++ */
++#define SUN60I_DP_SINK_SYNC_TIMEOUT_MS	500
++#define SUN60I_DP_SINK_SYNC_POLL_MS	20
++
++static int sun60i_dp_video_sink_confirms_stream(struct sun60i_dp *dp)
++{
++	u8 link_status[DP_LINK_STATUS_SIZE];
++	unsigned int waited;
++	int ret;
++
++	for (waited = 0; ; waited += SUN60I_DP_SINK_SYNC_POLL_MS) {
++		msleep(SUN60I_DP_SINK_SYNC_POLL_MS);
++
++		ret = drm_dp_dpcd_read_link_status(&dp->aux, link_status);
++		if (ret) {
++			dev_err(dp->dev,
++				"the stream is enabled but the sink cannot be asked about it: %d\n",
++				ret);
++			return ret;
++		}
++
++		if (link_status[DP_SINK_STATUS - DP_LANE0_1_STATUS] &
++		    DP_RECEIVE_PORT_0_STATUS)
++			break;
++
++		if (waited >= SUN60I_DP_SINK_SYNC_TIMEOUT_MS) {
++			dev_err(dp->dev,
++				"the sink does not report itself in sync with the stream after %u ms (DPCD 0x202-0x207 %*ph); the stream is left enabled so the registers can be read\n",
++				waited, DP_LINK_STATUS_SIZE, link_status);
++			return -ENOLINK;
++		}
++	}
++
++	/* Both link predicates again, on the reading that has SINK set: a sink
++	 * can be in sync with a stream it is receiving badly, and a symbol-lock
++	 * or interlane-alignment loss here is a different fault from "no
++	 * picture" and has to be named as itself.
++	 */
++	if (!drm_dp_clock_recovery_ok(link_status, dp->link_lanes) ||
++	    !drm_dp_channel_eq_ok(link_status, dp->link_lanes)) {
++		dev_err(dp->dev,
++			"the sink is in sync with the stream but no longer confirms the link (DPCD 0x202-0x207 %*ph)\n",
++			DP_LINK_STATUS_SIZE, link_status);
++		return -ENOLINK;
++	}
++
++	return 0;
++}
++
+ /*
+  * Start the stream. This runs AFTER link training: with training cleared and
+  * the stream not enabled the core sends idle and the sink loses the lock it
+@@ -928,6 +1013,16 @@ static int sun60i_dp_video_stream_enable(struct sun60i_dp *dp)
+ 	if (ret)
+ 		return ret;
+ 
++	/* Warned, not refused. Until this driver's training is HW-proven,
++	 * the shell script is still the A/B arm and it trains the
++	 * same link behind this driver's back -- refusing here would make the
++	 * two impossible to compare on one kernel. The line is what tells the
++	 * two runs apart in a log.
++	 */
++	if (!dp->trained)
++		dev_warn(dp->dev,
++			 "the main link was not trained by this driver; enabling the stream anyway\n");
++
+ 	writel(SOFT_RESET_VIDEO, dp->base + DP_SOFT_RESET);
+ 	usleep_range(5000, 6000);
+ 
+@@ -935,7 +1030,16 @@ static int sun60i_dp_video_stream_enable(struct sun60i_dp *dp)
+ 	writel(SRC0_STREAM_ENABLE, dp->base + DP_SRC0_STREAM_ENABLE);
+ 
+ 	dp->video_on = true;
+-	dev_info(dp->dev, "video stream enabled, %d kHz over %u lanes\n",
++
++	/* Enabling the two registers is not the same claim as the sink
++	 * receiving the stream, and only the second one is worth printing.
++	 */
++	ret = sun60i_dp_video_sink_confirms_stream(dp);
++	if (ret)
++		return ret;
++
++	dev_info(dp->dev,
++		 "video stream enabled, %d kHz over %u lanes; the sink reports it in sync (DPCD 0x205)\n",
+ 		 dp->mode.clock, dp->link_lanes);
+ 
+ 	return 0;
+@@ -984,6 +1088,7 @@ static void sun60i_dp_link_release(struct sun60i_dp *dp)
+ 	dp->link_phy_inited = false;
+ 	dp->link_rate = 0;
+ 	dp->link_lanes = 0;
++	dp->trained = false;
+ }
+ 
+ static void sun60i_dp_aux_disable(struct sun60i_dp *dp)
+@@ -1057,7 +1162,9 @@ static int sun60i_dp_link_probe(struct sun60i_dp *dp)
+ }
+ 
+ /*
+- * Pick the highest rate the sink offers that the PHY says it can produce.
++ * Build the rate ladder: every rate the sink offers that the PHY says it can
++ * actually produce, highest first. Training walks it; a caller that only wants
++ * the best rate takes the first rung.
+  *
+  * phy_validate() is what makes this a question rather than a guess, and it has
+  * one ambiguity worth naming: phy_core returns -EOPNOTSUPP both for "this PHY
+@@ -1069,11 +1176,13 @@ static int sun60i_dp_link_probe(struct sun60i_dp *dp)
+  * "pass", so a PHY that rejects a lane count is indistinguishable from one that
+  * has no opinion.
+  */
+-static unsigned int sun60i_dp_link_best_rate(struct sun60i_dp *dp,
+-					     unsigned int lanes)
++static unsigned int sun60i_dp_link_rate_ladder(struct sun60i_dp *dp,
++					       unsigned int lanes,
++					       unsigned int *rungs)
+ {
+ 	unsigned int sink_max = drm_dp_max_link_rate(dp->dpcd);
+ 	union phy_configure_opts opts;
++	unsigned int n = 0;
+ 	unsigned int i;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(sun60i_dp_link_rates); i++) {
+@@ -1087,14 +1196,28 @@ static unsigned int sun60i_dp_link_best_rate(struct sun60i_dp *dp,
+ 
+ 		if (!phy_validate(dp->link_phy, PHY_MODE_DP, PHY_SUBMODE_DP,
+ 				  &opts))
+-			return mbps;
++			rungs[n++] = mbps;
+ 	}
+ 
+-	dev_warn(dp->dev,
+-		 "no link rate up to %u Mb/s validated by the PHY; asking for the sink maximum anyway\n",
+-		 SUN60I_DP_RATE_TO_MBPS(sink_max));
++	if (!n) {
++		dev_warn(dp->dev,
++			 "no link rate up to %u Mb/s validated by the PHY; asking for the sink maximum anyway\n",
++			 SUN60I_DP_RATE_TO_MBPS(sink_max));
++		rungs[n++] = SUN60I_DP_RATE_TO_MBPS(sink_max);
++	}
+ 
+-	return SUN60I_DP_RATE_TO_MBPS(sink_max);
++	return n;
++}
++
++/* The top rung, for a caller that only wants one rate. */
++static unsigned int sun60i_dp_link_best_rate(struct sun60i_dp *dp,
++					     unsigned int lanes)
++{
++	unsigned int rungs[ARRAY_SIZE(sun60i_dp_link_rates)];
++
++	sun60i_dp_link_rate_ladder(dp, lanes, rungs);
++
++	return rungs[0];
+ }
+ 
+ /*
+@@ -1194,6 +1317,10 @@ static int sun60i_dp_link_configure(struct sun60i_dp *dp, unsigned int rate_mbps
+ 	 * computing these values instead of carrying them exists to prevent.
+ 	 */
+ 	dp->video_configured = false;
++	/* And so does the training: LINK_BW_SET, LANE_COUNT_SET and the PMA all
++	 * just moved under it.
++	 */
++	dp->trained = false;
+ 
+ 	dev_info(dp->dev, "main link configured: %u Mb/s, %u lanes\n",
+ 		 rate_mbps, lanes);
+@@ -1201,6 +1328,714 @@ static int sun60i_dp_link_configure(struct sun60i_dp *dp, unsigned int rate_mbps
+ 	return 0;
+ }
+ 
++/*
++ * ---------------------------------------------------------------------------
++ * Link training
++ * ---------------------------------------------------------------------------
++ *
++ * The DRM core has no link-training state machine -- it has predicates, adjust
++ * decoders and the two inter-round delays, and every DisplayPort driver in the
++ * tree writes its own loop around them. So this loop calls
++ * drm_dp_clock_recovery_ok(), drm_dp_channel_eq_ok(),
++ * drm_dp_get_adjust_request_voltage/pre_emphasis(),
++ * drm_dp_dpcd_read_link_status() and the two *_delay() helpers, and open-codes
++ * none of them. Its shape follows zynqmp_dp_link_train() and the fallback
++ * ladder follows hibmc_dp_link_training(), the two cleanest of the fourteen.
++ *
++ * ⚠ There IS a drm_dp_link_train() in this tree -- drivers/gpu/drm/tegra/dp.c
++ * -- and it is Tegra-private with no EXPORT_SYMBOL. It is not callable from
++ * here and it does not implement the five-tries rule.
++ */
++
++/* The DisplayPort core's own link registers, UM 15.4.7.1 to 15.4.7.6.
++ *
++ * ⚠ The DP_ prefix is already taken. <drm/display/drm_dp.h> defines
++ * DP_LINK_BW_SET, DP_LANE_COUNT_SET and DP_TRAINING_PATTERN_SET as the DPCD
++ * ADDRESSES 0x100/0x101/0x102, and this driver writes both ends of exactly
++ * those three. Same names, different address space, one compiler error if they
++ * collide and a much worse bug if they merely shadow -- hence DP_TX_.
++ */
++#define DP_TX_LINK_BW_SET		0x0000		/* 15.4.7.1 */
++#define DP_TX_LANE_COUNT_SET		0x0004		/* 15.4.7.2 */
++#define DP_TX_ENHANCED_FRAME_EN		0x0008		/* 15.4.7.3, read-only */
++#define DP_TX_TRAINING_PATTERN_SET	0x000c		/* 15.4.7.4 */
++#define  TX_TRAINING_PATTERN		GENMASK(2, 0)
++#define DP_TX_SCRAMBLING_DISABLE	0x0014		/* 15.4.7.6 */
++#define  TX_SCRAMBLING_DISABLE		BIT(0)
++#define DP_TX_LANE_REMAP_CONTROL	0x002c		/* 15.4.7.11 */
++#define DP_TX_PHY_STATUS		0x0280		/* 15.4.7.38, read-only */
++
++/*
++ * DPCD 0x210.., the DPRX symbol-error counters. mainline names only the LTTPR
++ * copy (DP_SYMBOL_ERROR_COUNT_LANE0_PHY_REPEATER1, 0xf0035) and has no define
++ * for the DPRX pair, so it is spelled out here: two bytes per lane, little
++ * endian, bit 15 = the count is valid.
++ */
++#define SUN60I_DP_SYMBOL_ERROR_COUNT_LANE0	0x210
++#define SUN60I_DP_SYMBOL_ERROR_VALID		BIT(15)
++#define SUN60I_DP_SYMBOL_ERROR_MASK		GENMASK(14, 0)
++
++/* DP 1.4 Table 3-1: four levels each, and their sum may not exceed 3. */
++#define SUN60I_DP_LEVEL_MAX		3
++
++/*
++ * DP 1.4 section 3.5.1.2.2: the clock-recovery sequence "shall not exceed 10
++ * iterations", and the source shall give up if the sink asks for the SAME
++ * voltage swing five times in a row. The vendor makes ONE attempt at maximum
++ * swing and then declares failure, which is why lanes that would have
++ * recovered did not.
++ */
++#define SUN60I_DP_CR_MAX_ROUNDS		10
++#define SUN60I_DP_CR_MAX_SAME_VOLTAGE	5
++
++/* DP 1.4 section 3.5.1.2.3: the channel-equalisation sequence shall not exceed
++ * 5 iterations.
++ */
++#define SUN60I_DP_EQ_MAX_ROUNDS		5
++
++/* The link soft reset is not documented with a settle time; the by-hand
++ * sequence that trained this board waited 100 ms after it and 100 ms after each
++ * training-pattern write before touching the sink. Kept, because that is the
++ * timing the silicon result was obtained with -- shortening it is a change to
++ * test on a board, not a cleanup to make blind.
++ */
++#define SUN60I_DP_TRAIN_SETTLE_MS	100
++
++/* One training attempt's per-lane drive state. */
++struct sun60i_dp_levels {
++	u8	voltage[SUN60I_DP_MAX_LANES];
++	u8	pre[SUN60I_DP_MAX_LANES];
++};
++
++/*
++ * Both ends of the training pattern, source first.
++ *
++ * ⚠ The two encodings agree for patterns 0 to 3 and DIVERGE at TPS4: the core's
++ * TRAINING_PATTERN_SET[2:0] takes 4 (UM 15.4.7.4, "100 = Training pattern 4")
++ * while DPCD 0x102 takes 7 (DP_TRAINING_PATTERN_4). Nothing here selects TPS4 --
++ * this is 8b/10b at HBR -- but a driver that grows 128b/132b must not assume the
++ * two fields are the same field.
++ */
++static int sun60i_dp_train_pattern(struct sun60i_dp *dp, u8 tps)
++{
++	u8 dpcd = tps;
++
++	writel(FIELD_PREP(TX_TRAINING_PATTERN, tps),
++	       dp->base + DP_TX_TRAINING_PATTERN_SET);
++	msleep(SUN60I_DP_TRAIN_SETTLE_MS);
++
++	/* The sink must not descramble while an unscrambled pattern is on the
++	 * wire; TPS1..3 are unscrambled (UM 15.4.7.6 says the same about the
++	 * source-side bit).
++	 */
++	if (tps != DP_TRAINING_PATTERN_DISABLE)
++		dpcd |= DP_LINK_SCRAMBLING_DISABLE;
++
++	return drm_dp_dpcd_write_byte(&dp->aux, DP_TRAINING_PATTERN_SET, dpcd);
++}
++
++/*
++ * Put the requested swing and pre-emphasis on BOTH ends.
++ *
++ * The PHY goes first and the sink second, which is the order the by-hand
++ * sequence used on the run that trained four lanes. What matters more than the
++ * order is that they are the same values: if the source drives one level and
++ * DPCD 0x103 claims another, the sink evaluates its own measurement against the
++ * wrong assumption and its next adjust request is meaningless. The vendor has a
++ * function for this (edp_lane_training_para_reset) and calls it only once, at
++ * the start.
++ */
++static int sun60i_dp_train_levels(struct sun60i_dp *dp,
++				  const struct sun60i_dp_levels *lv)
++{
++	u8 buf[SUN60I_DP_MAX_LANES];
++	union phy_configure_opts opts;
++	unsigned int i;
++	int ret;
++
++	opts = (union phy_configure_opts){
++		.dp = {
++			.lanes	      = dp->link_lanes,
++			.set_voltages = 1,
++		},
++	};
++
++	for (i = 0; i < dp->link_lanes; i++) {
++		opts.dp.voltage[i] = lv->voltage[i];
++		opts.dp.pre[i] = lv->pre[i];
++
++		buf[i] = lv->voltage[i] |
++			 (lv->pre[i] << DP_TRAIN_PRE_EMPHASIS_SHIFT);
++		if (lv->voltage[i] == SUN60I_DP_LEVEL_MAX)
++			buf[i] |= DP_TRAIN_MAX_SWING_REACHED;
++		if (lv->pre[i] == SUN60I_DP_LEVEL_MAX)
++			buf[i] |= DP_TRAIN_MAX_PRE_EMPHASIS_REACHED;
++	}
++
++	ret = phy_configure(dp->link_phy, &opts);
++	if (ret) {
++		/* Checked, not discarded -- and named, because until the PHY
++		 * implements set_voltages this is the failure the whole loop
++		 * dies of and a silent one would look like a bad cable.
++		 */
++		dev_err(dp->dev,
++			"PHY refused the drive levels for %u lanes: %d\n",
++			dp->link_lanes, ret);
++		return ret;
++	}
++
++	return drm_dp_dpcd_write_data(&dp->aux, DP_TRAINING_LANE0_SET, buf,
++				      dp->link_lanes);
++}
++
++/*
++ * Take what each lane asked for. DPCD 0x206 carries lanes 0 and 1 and 0x207
++ * lanes 2 and 3, and on this board they differ -- folding them into one value
++ * leaves lanes short, which an earlier attempt here did.
++ *
++ * Returns true when anything moved. That is what the five-tries rule counts:
++ * DP 1.4 bounds retries at an UNCHANGED request, not iterations in general.
++ */
++static bool sun60i_dp_train_adjust(struct sun60i_dp *dp,
++				   struct sun60i_dp_levels *lv,
++				   const u8 link_status[DP_LINK_STATUS_SIZE])
++{
++	bool changed = false;
++	unsigned int i;
++
++	for (i = 0; i < dp->link_lanes; i++) {
++		u8 v = drm_dp_get_adjust_request_voltage(link_status, i) >>
++		       DP_TRAIN_VOLTAGE_SWING_SHIFT;
++		u8 p = drm_dp_get_adjust_request_pre_emphasis(link_status, i) >>
++		       DP_TRAIN_PRE_EMPHASIS_SHIFT;
++
++		/* Bounded here as well as in the PHY. A sink can encode a
++		 * combination DP 1.4 Table 3-1 forbids -- two 2-bit fields, no
++		 * hardware interlock -- and the vendor puts that pair straight
++		 * into dp_lv_table[sw][pre] with no check at all.
++		 */
++		v = min_t(u8, v, SUN60I_DP_LEVEL_MAX);
++		p = min_t(u8, p, SUN60I_DP_LEVEL_MAX - v);
++
++		if (v != lv->voltage[i] || p != lv->pre[i])
++			changed = true;
++
++		lv->voltage[i] = v;
++		lv->pre[i] = p;
++	}
++
++	return changed;
++}
++
++/* Every active lane is already at the top of the swing range. One more round
++ * would ask for what is already being driven.
++ */
++static bool sun60i_dp_train_at_max_swing(struct sun60i_dp *dp,
++					 const struct sun60i_dp_levels *lv)
++{
++	unsigned int i;
++
++	for (i = 0; i < dp->link_lanes; i++)
++		if (lv->voltage[i] != SUN60I_DP_LEVEL_MAX)
++			return false;
++
++	return true;
++}
++
++/*
++ * Clock recovery, DP 1.4 section 3.5.1.2.2.
++ *
++ * Three exits the vendor does not have: the round bound, the five-attempts-at-
++ * one-level bound, and maximum swing. And one it has but throws away -- the
++ * link-status read. edp_get_link_status()'s return value is discarded at both
++ * of its call sites over a buffer that was zeroed first, so a dead AUX channel
++ * is indistinguishable there from "CR not done" and the driver keeps escalating
++ * the drive level against a sink that is not answering.
++ */
++static int sun60i_dp_train_cr(struct sun60i_dp *dp,
++			      struct sun60i_dp_levels *lv)
++{
++	unsigned int same_voltage = 0;
++	unsigned int round;
++	int ret;
++
++	/* The caller has already put both ends at *lv and taken the link soft
++	 * reset; this starts at the pattern.
++	 */
++	ret = sun60i_dp_train_pattern(dp, DP_TRAINING_PATTERN_1);
++	if (ret)
++		return ret;
++
++	for (round = 1; round <= SUN60I_DP_CR_MAX_ROUNDS; round++) {
++		u8 link_status[DP_LINK_STATUS_SIZE];
++
++		drm_dp_link_train_clock_recovery_delay(&dp->aux, dp->dpcd);
++
++		ret = drm_dp_dpcd_read_link_status(&dp->aux, link_status);
++		if (ret) {
++			dev_err(dp->dev,
++				"CR round %u: link status unreadable: %d\n",
++				round, ret);
++			return ret;
++		}
++
++		if (drm_dp_clock_recovery_ok(link_status, dp->link_lanes)) {
++			dp->train_cr_rounds = round;
++			return 0;
++		}
++
++		if (sun60i_dp_train_at_max_swing(dp, lv)) {
++			dev_dbg(dp->dev,
++				"CR round %u: every lane at maximum swing and still no lock\n",
++				round);
++			return -EIO;
++		}
++
++		if (!sun60i_dp_train_adjust(dp, lv, link_status)) {
++			if (++same_voltage >= SUN60I_DP_CR_MAX_SAME_VOLTAGE) {
++				dev_dbg(dp->dev,
++					"CR round %u: %u attempts at an unchanged drive level\n",
++					round, same_voltage);
++				return -EIO;
++			}
++		} else {
++			same_voltage = 0;
++		}
++
++		ret = sun60i_dp_train_levels(dp, lv);
++		if (ret)
++			return ret;
++	}
++
++	dev_dbg(dp->dev, "CR gave up after %u rounds\n",
++		SUN60I_DP_CR_MAX_ROUNDS);
++
++	return -EIO;
++}
++
++/*
++ * Channel equalisation, DP 1.4 section 3.5.1.2.3.
++ *
++ * TPS3 when the sink offers it, TPS2 otherwise -- asked of the sink through
++ * drm_dp_tps3_supported() rather than hardcoded, although on the bench sink
++ * DPCD 0x0002 bit 6 is clear and it is always TPS2 here.
++ *
++ * ⚠ CR_DONE is re-read every round. The specification requires it and the
++ * vendor omits it: equalisation can knock a lane out of clock recovery, and a
++ * loop that only looks at the EQ bits keeps equalising a lane that has lost its
++ * clock, then reports failure with no idea which of the two happened.
++ *
++ * The two failures return DIFFERENT errno, because the fallback ladder has to
++ * tell them apart: -ENOLINK when clock recovery was lost (a clock problem, so
++ * drop the rate) and -EPROTO when the rounds ran out with CR intact (an
++ * inter-lane problem, which fewer lanes can fix and a lower rate need not).
++ */
++static int sun60i_dp_train_eq(struct sun60i_dp *dp,
++			      struct sun60i_dp_levels *lv)
++{
++	unsigned int round;
++	u8 tps;
++	int ret;
++
++	tps = drm_dp_tps3_supported(dp->dpcd) ? DP_TRAINING_PATTERN_3
++					      : DP_TRAINING_PATTERN_2;
++
++	ret = sun60i_dp_train_pattern(dp, tps);
++	if (ret)
++		return ret;
++
++	for (round = 1; round <= SUN60I_DP_EQ_MAX_ROUNDS; round++) {
++		u8 link_status[DP_LINK_STATUS_SIZE];
++
++		drm_dp_link_train_channel_eq_delay(&dp->aux, dp->dpcd);
++
++		ret = drm_dp_dpcd_read_link_status(&dp->aux, link_status);
++		if (ret) {
++			dev_err(dp->dev,
++				"EQ round %u: link status unreadable: %d\n",
++				round, ret);
++			return ret;
++		}
++
++		if (!drm_dp_clock_recovery_ok(link_status, dp->link_lanes)) {
++			dev_dbg(dp->dev,
++				"EQ round %u: clock recovery was LOST during equalisation\n",
++				round);
++			return -ENOLINK;
++		}
++
++		if (drm_dp_channel_eq_ok(link_status, dp->link_lanes)) {
++			dp->train_eq_rounds = round;
++			return 0;
++		}
++
++		sun60i_dp_train_adjust(dp, lv, link_status);
++		ret = sun60i_dp_train_levels(dp, lv);
++		if (ret)
++			return ret;
++	}
++
++	dev_dbg(dp->dev, "EQ gave up after %u rounds with clock recovery intact\n",
++		SUN60I_DP_EQ_MAX_ROUNDS);
++
++	return -EPROTO;
++}
++
++/* Stop training on both ends and put the scrambler back. Runs on the way out of
++ * a successful attempt AND of a failed one: a sink left in TPS2 with the source
++ * no longer sending it is a state nothing recovers from except another full
++ * training round.
++ */
++static int sun60i_dp_train_stop(struct sun60i_dp *dp)
++{
++	int ret;
++
++	ret = sun60i_dp_train_pattern(dp, DP_TRAINING_PATTERN_DISABLE);
++	writel(0, dp->base + DP_TX_SCRAMBLING_DISABLE);
++
++	return ret;
++}
++
++/*
++ * WHAT THE SINK CONFIRMS, ASKED AFTER THE TRAINING PATTERN IS GONE.
++ *
++ * The check whose absence blocked this patch the first time. On 2026-08-19,
++ * in a test boot, `echo 0 > train` returned 0 and this driver reported
++ * "trained at 2700 Mb/s over 4 lanes" while the sink's own bytes read DPCD
++ * 0x202-0x207 = 00 00 80 00 00 00: no clock recovery, no equalisation, no
++ * interlane alignment, and every symbol-error counter saturated. CR and EQ had
++ * been judged from link status taken DURING training and never asked again once
++ * the pattern was cleared and the scrambler enabled.
++ *
++ * That is a vendor defect this tree must not port, in a
++ * worse form: the vendor discards edp_get_link_status()'s return value, this
++ * discarded the question. A driver's own `trained` flag is not evidence about a
++ * link; only the sink's bytes are.
++ *
++ * Both predicates are the DRM core's and neither is open-coded:
++ * drm_dp_clock_recovery_ok() is DP_LANE_CR_DONE on every active lane, and
++ * drm_dp_channel_eq_ok() is DP_INTERLANE_ALIGN_DONE plus CHANNEL_EQ_DONE and
++ * SYMBOL_LOCKED on every active lane. Together they are the shell instrument's
++ * LANE0_1=0x77 LANE2_3=0x77 ALIGN=0x01 bar expressed in the core's own terms
++ * (the shell script, final check).
++ *
++ * ONE READ, NO RETRY. Looking again after a failed first look would convert
++ * "this link does not hold once training stops" into "it held the second time",
++ * which is the question being asked, not noise to average away.
++ *
++ * ⚠ THE FOURTH NUMBER OF THAT BAR, SINK=0x01, IS DELIBERATELY NOT REQUIRED
++ * HERE, and this is the one place this file departs from the shell instrument.
++ * DPCD 0x205 RECEIVE_PORT_0_STATUS describes the sink's synchronisation to a
++ * received STREAM, not the outcome of link training. Mainline polls it for 1
++ * only after the video stream starts and back to 0 after it stops --
++ * edp_receiver_ready_T7() and _T9(), the eDP stream-on / stream-off timings
++ * (drivers/gpu/drm/amd/display/dc/link/protocols/link_edp_panel_control.c:480
++ * and :455) -- and no DisplayPort driver in this tree gates training on it (the
++ * only other readers of DPCD 0x205 take the DP 2.0 INTRA_HOP bit:
++ * drivers/gpu/drm/i915/display/intel_dp_link_training.c:1109,
++ * .../link/protocols/link_dp_training.c:1037). The shell instrument reads
++ * SINK=0x01 after it has enabled 0x0800/0x0804, not here.
++ *
++ * Requiring it unconditionally at the end of training would therefore fail every
++ * link trained without a modeset behind it, which is every FIRST training this
++ * debugfs verb does. So it is required exactly where it is defined and nowhere
++ * else, which is two places:
++ *
++ *   - here, WHEN A STREAM IS ALREADY RUNNING (dp->video_on) -- the re-training
++ *     case, which is what a KMS driver will do on an IRQ_HPD link-status change,
++ *     and the one case where the bit is meaningful at this point;
++ *   - and in sun60i_dp_video_stream_enable(), once the stream has been started,
++ *     where all four numbers of the instrument's bar are meaningful at once.
++ */
++static int sun60i_dp_train_verify(struct sun60i_dp *dp)
++{
++	u8 link_status[DP_LINK_STATUS_SIZE];
++	int ret;
++
++	/* The same settle the by-hand sequence allows after every write to the
++	 * training-pattern register. Not a retry window: the read below happens
++	 * once.
++	 */
++	msleep(SUN60I_DP_TRAIN_SETTLE_MS);
++
++	ret = drm_dp_dpcd_read_link_status(&dp->aux, link_status);
++	if (ret) {
++		dev_err(dp->dev,
++			"the loop finished but the sink cannot be asked to confirm the link: %d\n",
++			ret);
++		return ret;
++	}
++
++	if (!drm_dp_clock_recovery_ok(link_status, dp->link_lanes)) {
++		dev_err(dp->dev,
++			"the sink does not confirm clock recovery once the training pattern is cleared (DPCD 0x202-0x207 %*ph)\n",
++			DP_LINK_STATUS_SIZE, link_status);
++		return -ENOLINK;
++	}
++
++	if (!drm_dp_channel_eq_ok(link_status, dp->link_lanes)) {
++		dev_err(dp->dev,
++			"the sink does not confirm equalisation, symbol lock and interlane alignment once the training pattern is cleared (DPCD 0x202-0x207 %*ph)\n",
++			DP_LINK_STATUS_SIZE, link_status);
++		return -EPROTO;
++	}
++
++	if (!dp->video_on) {
++		dev_dbg(dp->dev,
++			"link confirmed by the sink; DPCD 0x205 RECEIVE_PORT_0_STATUS is not asked for -- there is no stream yet for the sink to be in sync with\n");
++		return 0;
++	}
++
++	/* A re-training underneath a running stream. Here the fourth number of
++	 * the bar IS defined, so it is required.
++	 */
++	if (!(link_status[DP_SINK_STATUS - DP_LANE0_1_STATUS] &
++	      DP_RECEIVE_PORT_0_STATUS)) {
++		dev_err(dp->dev,
++			"the sink no longer reports itself in sync with the running stream after re-training (DPCD 0x202-0x207 %*ph)\n",
++			DP_LINK_STATUS_SIZE, link_status);
++		return -ENOLINK;
++	}
++
++	return 0;
++}
++
++/*
++ * Tell BOTH ends the same thing about the link they are about to train. The
++ * source's own registers and the sink's DPCD, in one place, because describing
++ * two different links to the two ends is the failure mode recorded earlier
++ * when only LINK_BW_SET moved.
++ */
++static int sun60i_dp_train_configure_ends(struct sun60i_dp *dp)
++{
++	u8 bw = drm_dp_link_rate_to_bw_code(SUN60I_DP_MBPS_TO_RATE(dp->link_rate));
++	u8 lane_count = dp->link_lanes;
++	int ret;
++
++	/* ENHANCED_FRAME_EN (0x0008) is READ-ONLY and reads 1: UM 15.4.7.3,
++	 * the field is hard-wired to 1. So the source is
++	 * in enhanced framing whatever the sink says, and the DPCD bit is not a
++	 * choice -- it is the source describing itself. A sink without
++	 * ENHANCED_FRAME_CAP cannot be framed correctly by this transmitter at
++	 * all, which is worth one line rather than a silent mismatch.
++	 */
++	if (!drm_dp_enhanced_frame_cap(dp->dpcd))
++		dev_warn(dp->dev,
++			 "sink does not advertise enhanced framing (DPCD 0x0002 = 0x%02x) but ENHANCED_FRAME_EN is read-only 1 (0x%08x); the link is framed enhanced regardless\n",
++			 dp->dpcd[DP_MAX_LANE_COUNT],
++			 readl(dp->base + DP_TX_ENHANCED_FRAME_EN));
++	lane_count |= DP_LANE_COUNT_ENHANCED_FRAME_EN;
++
++	writel(bw, dp->base + DP_TX_LINK_BW_SET);
++	writel(dp->link_lanes, dp->base + DP_TX_LANE_COUNT_SET);
++	writel(TX_SCRAMBLING_DISABLE, dp->base + DP_TX_SCRAMBLING_DISABLE);
++
++	ret = drm_dp_dpcd_write_byte(&dp->aux, DP_LINK_BW_SET, bw);
++	if (!ret)
++		ret = drm_dp_dpcd_write_byte(&dp->aux, DP_LANE_COUNT_SET,
++					     lane_count);
++	/* Two bytes the vendor never writes at all. DOWNSPREAD_CTRL is written
++	 * ZERO on purpose: this PHY has no SSC arm in its rate table and
++	 * refuses phy_configure() with ssc set, so telling the sink to expect a
++	 * spread clock would describe a source that does not exist.
++	 */
++	if (!ret)
++		ret = drm_dp_dpcd_write_byte(&dp->aux, DP_DOWNSPREAD_CTRL, 0);
++	if (!ret)
++		ret = drm_dp_dpcd_write_byte(&dp->aux,
++					     DP_MAIN_LINK_CHANNEL_CODING_SET,
++					     DP_SET_ANSI_8B10B);
++	if (ret)
++		dev_err(dp->dev, "sink refused the link configuration: %d\n",
++			ret);
++
++	return ret;
++}
++
++/*
++ * One attempt at one rate and one lane count: configure the PHY, tell both ends
++ * the same thing, then CR and EQ.
++ */
++static int sun60i_dp_train_once(struct sun60i_dp *dp, unsigned int rate_mbps,
++				unsigned int lanes)
++{
++	struct sun60i_dp_levels lv = { };
++	int ret;
++
++	/* The PHY first: LINK_BW_SET and DPCD 0x100 without the PMA behind them
++	 * is exactly the half-move that made every rate other than 2700 Mb/s
++	 * fail -- a rate change is a PHY teardown and rebuild on this part.
++	 */
++	ret = sun60i_dp_link_configure(dp, rate_mbps, lanes);
++	if (ret)
++		return ret;
++
++	ret = sun60i_dp_train_configure_ends(dp);
++	if (ret)
++		return ret;
++
++	/* Both ends at swing 0 / pre 0, BEFORE the link soft reset -- that is
++	 * the order the by-hand sequence used on the run that trained four
++	 * lanes, and the reset does not clear these anyway (it is the DP core's
++	 * link controller; the drive levels live in the SERDES PMA). Ordering
++	 * that has silicon behind it is not rearranged for tidiness.
++	 */
++	ret = sun60i_dp_train_levels(dp, &lv);
++	if (ret)
++		return ret;
++
++	/* After the bandwidth and lane writes, which it does not clear
++	 * (UM 15.4.7.15).
++	 */
++	writel(SOFT_RESET_LINK, dp->base + DP_SOFT_RESET);
++	msleep(SUN60I_DP_TRAIN_SETTLE_MS);
++
++	/* PHY_STATUS is read and printed and NOT gated on, and the reason is in
++	 * the UM: bits 31:0 are a live copy of PHY status signals,
++	 * and the field only defers to a note about whichever PHY is
++	 * actually used (15.4.7.38). There is no such
++	 * application note in this tree, so every bit here is undescribed and a
++	 * ready check built on one would be an invented predicate. The vendor
++	 * declares the register and never reads it; this at least records what
++	 * it says at the moment training starts.
++	 */
++	dev_dbg(dp->dev, "PHY_STATUS before TPS1: 0x%08x\n",
++		readl(dp->base + DP_TX_PHY_STATUS));
++
++	ret = sun60i_dp_train_cr(dp, &lv);
++	if (!ret)
++		ret = sun60i_dp_train_eq(dp, &lv);
++
++	if (sun60i_dp_train_stop(dp) && !ret)
++		ret = -EIO;
++
++	/* The loop's own verdict is not the verdict. Ask the sink again now that
++	 * the training pattern is cleared on both ends and the scrambler is back
++	 * on -- sun60i_dp_train_verify() is what makes "trained" mean something
++	 * the sink also believes.
++	 */
++	if (!ret)
++		ret = sun60i_dp_train_verify(dp);
++
++	return ret;
++}
++
++/*
++ * Train the main link, walking down the rate ladder and then the lane count.
++ *
++ * THE FALLBACK IS THE POINT. The vendor has none: one rate, one lane count, and
++ * a failure is a failure. DP 1.4 section 3.5.1.2.1 requires a source to reduce
++ * the link rate and then the lane count and try again, and this board is the
++ * argument for it -- the four-lane result exists because somebody walked that
++ * ladder by hand.
++ *
++ * Rate before lanes, which is hibmc's order and the one that keeps bandwidth:
++ * four lanes at a lower rate carry more than two lanes at the same rate. When
++ * CR succeeded and only EQ failed, lanes go first instead -- CR proving out
++ * means the clock is fine and the problem is inter-lane, which fewer lanes can
++ * fix and a lower rate need not.
++ *
++ * ⚠ WHAT THIS CANNOT DO TODAY, stated rather than implied: the PHY has exactly
++ * one PMA rate table, 2700 Mb/s. Every other rung is refused by phy_validate()
++ * and never entered, so the rate ladder is one rung long and only the LANE
++ * fallback can actually change anything. That is honest plumbing waiting for a
++ * second table, not working rate fallback.
++ */
++static int sun60i_dp_train(struct sun60i_dp *dp, unsigned int rate_mbps,
++			   unsigned int lanes)
++{
++	unsigned int rungs[ARRAY_SIZE(sun60i_dp_link_rates)];
++	unsigned int nrungs, rung;
++	int ret = -EINVAL;
++
++	if (!dp->enabled) {
++		dev_err(dp->dev, "the AUX channel is down\n");
++		return -ENODEV;
++	}
++
++	if (!dp->link_phy) {
++		dev_err(dp->dev,
++			"no main-link PHY: this node needs phys = <&combophy0> with phy-names \"dp\"\n");
++		return -ENODEV;
++	}
++
++	dp->trained = false;
++	dp->train_attempts = 0;
++	dp->train_cr_rounds = 0;
++	dp->train_eq_rounds = 0;
++
++	ret = sun60i_dp_link_probe(dp);
++	if (ret)
++		return ret;
++
++	if (!lanes)
++		lanes = drm_dp_max_lane_count(dp->dpcd);
++	lanes = min_t(unsigned int, lanes, SUN60I_DP_MAX_LANES);
++	if (!lanes) {
++		dev_err(dp->dev,
++			"sink reports 0 lanes (DPCD 0x0002 = 0x%02x); nothing to train\n",
++			dp->dpcd[DP_MAX_LANE_COUNT]);
++		return -EINVAL;
++	}
++
++	if (rate_mbps) {
++		nrungs = 1;
++		rungs[0] = rate_mbps;
++	} else {
++		nrungs = sun60i_dp_link_rate_ladder(dp, lanes, rungs);
++	}
++
++	for (; lanes; lanes >>= 1) {
++		for (rung = 0; rung < nrungs; rung++) {
++			dp->train_attempts++;
++
++			ret = sun60i_dp_train_once(dp, rungs[rung], lanes);
++			if (!ret) {
++				dev_info(dp->dev,
++					 "link trained: %u Mb/s over %u lanes, CR in %u round(s), EQ in %u\n",
++					 dp->link_rate, dp->link_lanes,
++					 dp->train_cr_rounds,
++					 dp->train_eq_rounds);
++				dp->trained = true;
++				return 0;
++			}
++
++			dev_warn(dp->dev,
++				 "training failed at %u Mb/s over %u lanes: %d\n",
++				 rungs[rung], lanes, ret);
++
++			/* Clock recovery proved out and only equalisation
++			 * failed: the clock is fine and the problem is
++			 * inter-lane, which fewer lanes can fix and a lower rate
++			 * need not. So skip the rest of the rate ladder and drop
++			 * the lane count instead -- hibmc_dp_link_training()
++			 * makes the same distinction
++			 * (drivers/gpu/drm/hisilicon/hibmc/dp/dp_link.c:310-338).
++			 */
++			if (ret == -EPROTO)
++				break;
++		}
++
++		if (lanes == 1)
++			break;
++
++		/* The rungs were validated for the lane count they were built
++		 * with; a PHY may allow a rate at two lanes that it refuses at
++		 * four, so the ladder is rebuilt rather than reused.
++		 */
++		if (!rate_mbps)
++			nrungs = sun60i_dp_link_rate_ladder(dp, lanes >> 1,
++							    rungs);
++	}
++
++	/* Nothing is left half-trained: sun60i_dp_train_once() always stops the
++	 * pattern on both ends, so the sink is not sitting in TPS2 waiting for
++	 * a source that has moved on. What the PHY keeps is whatever it last
++	 * accepted, and `link` reports it.
++	 */
++	return ret;
++}
++
+ static void sun60i_dp_teardown(void *data)
+ {
+ 	struct sun60i_dp *dp = data;
+@@ -1319,5 +2154,5 @@ static struct platform_driver sun60i_dp_driver = {
+ };
+ module_platform_driver(sun60i_dp_driver);
+ 
+-MODULE_DESCRIPTION("Allwinner A733 DisplayPort AUX channel");
++MODULE_DESCRIPTION("Allwinner A733 DisplayPort transmitter");
+ MODULE_LICENSE("GPL");

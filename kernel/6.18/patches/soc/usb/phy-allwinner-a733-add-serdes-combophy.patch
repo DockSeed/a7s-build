@@ -1,0 +1,1058 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] phy: allwinner: A733 SERDES combo-PHY -- port the branch the vendor takes
+
+The PMA config this driver programmed was a faithful port of the wrong half of
+an if statement, so USB3 never left CSFTRST: LINK_STUS0 stayed 0x001 for the
+full 500 ms poll -- CLK_EN_ACK (bit4) and POWER_STATE_ACK (bits [13:8]) never
+set although the common PLL had locked (PMA_CMN_READY = 1) -- and dwc3 then
+died with -110.
+
+combo0_usb_param_config() forks immediately:
+
+	if (sunxi_cphy->udp_supported) {
+		combo0_configure_usb_dp(combo0);
+		return;
+	}
+
+udp_supported is !device_property_read_bool(dev, "udp-disable"), and
+"udp-disable" appears nowhere in the vendor device trees, so on this SoC the
+vendor always takes combo0_configure_usb_dp() and returns. Our table was ported
+from the code below that return -- 169 writes that never execute on this part.
+
+The two branches differ in 58 PMA registers (42 the vendor writes and we did
+not, 15 written with a different value, 1 we wrote and it does not). Deciding
+between them from the vendor source alone would be exactly the mistake that got
+us here, so the branch was settled against silicon instead: the 8 GiB board's vendor
+capture taken with SuperSpeed linked at 10 Gbps covers 30 of those 58 registers.
+
+	silicon agrees with the udp branch : 29
+	silicon agrees with the old table  :  0
+	neither                            :  1  (0x01C1, changed by training)
+	outside the captured window        : 28
+
+That window gap is now closed on a second board. The 6 GiB board runs 6.18.36-edge with the
+BSP combophy and a live SuperSpeed Plus Gen 2x1 link, so the whole 128 KiB
+aperture could be read (python3 mmap on /dev/mem; read() gives EFAULT on arm64,
+STRICT_DEVMEM is off).
+All 58 registers are readable there:
+
+	silicon agrees with the udp branch : 54
+	silicon agrees with the old table  :  0
+	neither                            :  4
+	unreadable                         :  0
+
+of which the previously-unreachable upper half alone is 25 / 0 / 3. Two boards,
+two kernel vintages, both linked, both against the table this patch removes.
+
+The 4 "neither" are 0x01C1, 0xC011, 0xE003 and 0xE005: they match neither table,
+i.e. hardware or link training rewrites them, so they are not config constants.
+0xE003 is worth naming -- we wrote 0x0001, the vendor writes it on neither path,
+and silicon reads 0x001B.
+
+Control for the decode: over the 49 registers where both branches agree, the
+same address mapping reproduces silicon 49/49, so the idx<<1 / 16-bit-in-32-bit
+read-back is validated rather than assumed.
+
+So a733_pma_cfg[] is regenerated from combo0_configure_usb_dp() (orientation
+NORMAL, ssc_en = 0 -- the vendor never parses ssc_en, its DT hook is commented
+out): 231 writes in three blocks, split by the two non-PMA writes the vendor
+performs in the middle of the sequence. That ordering is kept, not normalised:
+LINK_CTRL1 is written as an absolute 0x01100001 after the CMN/lane-0-1 block,
+and TYPEC_CONN_DIR is cleared before the lane-2/3 block rather than at the end.
+0xE003 = 0x0001 is dropped (the udp path never writes it; upstream
+phy-cadence-torrent.c only touches PHY_PMA_PLL_RAW_CTRL on the DP rate-change
+path, and raw-forcing PLL0 while the link expects sideband control is a
+plausible way to get CMN_READY without CLK_EN_ACK -- untested either way).
+
+Second change, same root: the bring-up moves out of probe() into phy_ops.init.
+dwc3 calls phy_init() four lines before its own soft reset (dwc3_phy_setup ->
+dwc3_phy_init -> dwc3_core_soft_reset), i.e. after it has deasserted RST_USB_2
+and written GUSB3PIPECTL. Doing the PIPE handshake in probe means dwc3 re-toggles
+its side afterwards and nothing re-runs it. probe() does supplies and the
+RST_BUS_SERDES deassert and nothing that touches the link; phy_ops.init does the
+rest and phy_ops.exit puts the PHY back in IDDQ. This split alone was HW-tested
+earlier in a test build and was necessary but not sufficient -- with the wrong table
+it could not be anything else.
+
+Third change, from 2026-07-29: the SERDES subsystem page at 0x06C00000 is not
+this driver's. Its two USB3 bus gates and the companion-PHY reset-n were written
+from here, which is what made the dwc3 core's ability to identify itself depend
+on this driver probing first -- an ordering fw_devlink stopped honouring once the
+Type-C connector's graph closed a ring. They are a clock and a reset and they
+belong to the provider added in `clk-sunxi-ng-a733-add-serdes-subsystem-clocks` (gates) and to the companion PHY driver
+`phy-allwinner-a733-add-usb2-companion-phy` (its own reset). Three consequences here: reg window 0 is gone, so the
+windows are re-indexed -- link first, because a node's name has to be its first
+reg and the link block is what this PHY is; and the block reset becomes shared,
+because that provider holds it deasserted and asserting it from here would take
+its registers away. Dropping the window also ends this driver's exclusive claim
+on 4 KiB it shares with the PCIe bus gates at 0x0004 -- those read
+0x00070000 on the 6 GiB board, i.e. in use. And third, the shared deassert is now balanced by a
+devres action, so an unbind gives the line back instead of pinning it deasserted
+forever -- the previous code only asserted it on a probe error path.
+
+Checked against the A733 user manual, not just the vendor tree:
+  - LINK_CTRL0..3 / LINK_STUS0 offsets and bit meanings are anchored to
+    the A733 user manual; the absolute 0x01100001 is
+    the value read live on the 8 GiB board with SS up.
+  - Two offsets this driver writes had no documentation anchor when this was
+    written and are marked open rather than implied covered:
+    USB3P1_PIPE_RXD_MAP_CTRL (top2 + 0x0104; only its 0x0100 CLK_MAP twin was
+    anchored) and DP_PHY_CFG_DATA_EN, bit0 of DP_RAWS_TXDW_CONV_CTRL (only
+    [11:8] and [7:4] were anchored). Both come from the vendor sequence and are
+    unverified; `phy-allwinner-a733-combophy-dp-reset-sequence` later anchors
+    bit0 as TX_PHY_CFG_DATA_EN (UM V0.92 18.2.6.24).
+  - the PMA body itself is NOT covered by any register documentation
+    available to this work. Every PMA claim here
+    therefore rests on the silicon capture plus upstream phy-cadence-torrent.c
+    block geometry, and is labelled as such. No manual anchor is
+    implied where none exists.
+  - window bounds: the highest index written is 0xE006 -> byte 0x1C00C, which is
+    inside COMBPHY0's aperture 0x06C80000..0x06C9FFFF.
+    That entry's "64K" size cell contradicts its own range -- an inconsistency
+    in the UM's memory map (the same holds for COMBPHY1/GMAC0/PCIE0).
+    We follow the range, as does the vendor DT;
+    both it and our `arm64-dts-a733-add-usb3-dwc3-combophy` map 0x20000. Not silicon-checked above 0x06C8FFFF yet.
+
+Board scope, since a vendor driver serves more than one board: the udp path is
+not another board's configuration. This board's own vendor DTS puts DP-alt and
+USB3 on the same Type-C (combo0_dp + combo0_usb, extcon on &serdes); USB-C J4
+carries DP-alt and SuperSpeed, mutually exclusive. The board-specific arrays
+lane_invert/lane_remap/typec_remap do exist in that DTS, but combo0_configure_
+usb_dp() (1892-2311) never references them -- they are consumed by the DP-side
+functions -- so nothing board-specific was dropped from what is ported here.
+What IS a limitation: orientation is hard-coded NORMAL. The vendor picks the
+REVERSE variant from TCPC input, which we have no source for, so a flipped
+Type-C plug may not train until that is wired up.
+
+Honest limits: matching a working board's end state is a witness argument, not a
+mechanism proof -- it says what a linked PHY looks like, not which write is the
+gate. Read-back also cannot see a write whose value equals the reset default, and
+the 4 hardware-rewritten registers above are invisible to this method by
+construction. The reading itself is now first-hand and complete, but "this is the
+config a 10 Gbps link runs" is not the same claim as "this makes our link train".
+
+HW-pending, single observable: on the 8 GiB board, LINK_STUS0 @0x06C01900 must go from
+0x001 to bit4 and bits[13:8] set inside the existing 500 ms poll, CSFTRST must
+clear, and dwc3 must probe without -110.
+
+Based on drivers/phy/sunxi-cadence-combophy.c from radxa/allwinner-bsp
+(commit b36af3872d4e, "aiot-linux-v1.4.6 release"; the file is unchanged on
+the branches cubie-aiot-v1.4.6 and cubie-aiot-v1.4.8), GPL-2.0,
+Copyright(c) 2020 - 2023 Allwinner Technology Co.,Ltd. and
+Copyright (C) 2024 Allwinner Electronics Co., Ltd. The PMA table is ported
+from its combo0_configure_usb_dp(), the init sequence from
+combo0_usb_phy_init() and combo0_usb_phy_reset():
+https://github.com/radxa/allwinner-bsp/blob/b36af3872d4e6e91da6e929f4ccf4822b3ea9d66/drivers/phy/sunxi-cadence-combophy.c
+
+Assisted-by: Claude
+
+diff --git a/drivers/phy/allwinner/Kconfig b/drivers/phy/allwinner/Kconfig
+index fb584518b..35e8e1d54 100644
+--- a/drivers/phy/allwinner/Kconfig
++++ b/drivers/phy/allwinner/Kconfig
+@@ -57,3 +57,18 @@ config PHY_SUN50I_USB3
+ 	  part of Allwinner H6 SoC.
+ 
+ 	  This driver controls each individual USB 2+3 host PHY combo.
++
++config PHY_SUN60I_A733_COMBO
++	tristate "Allwinner A733 SERDES combo-PHY (USB3 SuperSpeed) driver"
++	depends on ARCH_SUNXI || COMPILE_TEST
++	depends on HAS_IOMEM && OF
++	depends on RESET_CONTROLLER
++	# The driver registers a Type-C orientation switch. IS_ENABLED() is true
++	# for TYPEC=m as well, so a built-in PHY with a modular TYPEC would fail
++	# to link -- same guard the qualcomm and freescale PHYs use.
++	depends on TYPEC || TYPEC=n
++	select GENERIC_PHY
++	help
++	  Enable this to bring up the COMB0 SERDES combo-PHY on the Allwinner
++	  A733 (sun60iw2) in USB3.1 SuperSpeed mode. DP-alt and PCIe modes of
++	  the same PHY are not handled by this driver.
+diff --git a/drivers/phy/allwinner/Makefile b/drivers/phy/allwinner/Makefile
+index bd74901a1..2a9ea32be 100644
+--- a/drivers/phy/allwinner/Makefile
++++ b/drivers/phy/allwinner/Makefile
+@@ -3,3 +3,4 @@ obj-$(CONFIG_PHY_SUN4I_USB)		+= phy-sun4i-usb.o
+ obj-$(CONFIG_PHY_SUN6I_MIPI_DPHY)	+= phy-sun6i-mipi-dphy.o
+ obj-$(CONFIG_PHY_SUN9I_USB)		+= phy-sun9i-usb.o
+ obj-$(CONFIG_PHY_SUN50I_USB3)		+= phy-sun50i-usb3.o
++obj-$(CONFIG_PHY_SUN60I_A733_COMBO)	+= phy-sun60i-a733-combophy.o
+diff --git a/drivers/phy/allwinner/phy-sun60i-a733-combophy.c b/drivers/phy/allwinner/phy-sun60i-a733-combophy.c
+new file mode 100644
+--- a/drivers/phy/allwinner/phy-sun60i-a733-combophy.c
++++ b/drivers/phy/allwinner/phy-sun60i-a733-combophy.c
+@@ -0,0 +1,873 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Allwinner A733 (sun60iw2) COMB0 combo-PHY — USB3.1 SuperSpeed mode.
++ *
++ * The A733 SERDES block is an Allwinner-wrapped Cadence combo PHY that carries
++ * USB3.1-SS / DP-alt / PCIe on COMB0 (Type-C J4). This driver brings up the
++ * USB3-SS personality on COMB0 only; DP-alt and PCIe are out of scope.
++ *
++ * Bring-up = the vendor combo0_usb_phy_init + combo0_usb_phy_reset sequence
++ * (drivers/phy/sunxi-cadence-combophy.c in radxa/allwinner-bsp), USB3 subset:
++ * regulators -> serdes/dcxo clocks -> IDDQ clear
++ * -> refclk/PIPE route -> param_config -> reset handshake. The param_config step
++ * writes the Cadence PMA/CMN-PLL config (divider/charge-pump/VCO); WITHOUT it the
++ * Common PLL never locks and PMA_CMN_READY stays 0 — the DP-guarded PMA block is a
++ * separate, larger set. HW basis: the 8 GiB board wakes the DWC3 core with the wrapper
++ * alone (xHCI CAPLENGTH 0x01200030) but the PMA only locks once param_config runs.
++ *
++ * What this driver does NOT own: the SERDES subsystem page at 0x06C00000. Its two USB3 bus gates
++ * and the companion-PHY reset-n used to be written from here, which made the dwc3 core's ability
++ * to identify itself depend on this driver probing first. They are a clock and a reset, now in
++ * the sun60i-a733-serdes-ccu provider; the page is shared with PCIe, so claiming all 4 KiB of it
++ * from a PHY driver was a latent conflict too. The block reset is shared for the same reason:
++ * that provider holds it deasserted, and asserting it here would take its registers away.
++ *
++ * Copyright (c) 2026 DockSeed. PMA tables and init sequence from sunxi-cadence-combophy.c,
++ * Copyright(c) 2020 - 2023 Allwinner Technology Co.,Ltd., (C) 2024 Allwinner Electronics Co., Ltd.
++ */
++
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/phy/phy.h>
++#include <linux/platform_device.h>
++#include <linux/mutex.h>
++#include <linux/regulator/consumer.h>
++#include <linux/usb/typec_mux.h>
++#include <linux/reset.h>
++
++/* --- serdes top part-2 (reg[1], base 0x06c06000) --- */
++#define DP_RAWS_TXDW_CONV_CTRL		0x0004
++#define  DP_PHY_CFG_DATA_EN		BIT(0)
++#define  DP_PHY_CFG_LN_EN		GENMASK(7, 4)
++#define  DP_PHY_CFG_LN_RSTN		GENMASK(11, 8)
++#define USB3P1_PIPE_CLK_MAP_CTRL	0x0100
++#define USB3P1_PIPE_RXD_MAP_CTRL	0x0104
++#define  USB3P1_PIPE_MAP_MASK		GENMASK(3, 0)
++#define  USB3P1_PIPE_MAP_COMB0		0x0	/* 0 = PHY0 (COMB0) */
++
++/* --- combophy0 top (reg[0], base 0x06c01000) --- */
++#define COMB0_LINK_CTRL0		0x0000
++#define  PHY0_TYPEC_CONN_DIR		BIT(12)
++#define  PHY0_DP_LINK_RESET_N_SOFT	BIT(8)
++#define  PHY0_PIPE_LINK_RESET_N_SOFT	BIT(4)
++#define  PHY0_RESET_N			BIT(0)
++#define COMB0_LINK_CTRL1		0x0004
++#define  PHY0_PMA_CMN_PLL1_REFCLK_SEL	BIT(24)
++#define  PHY0_PMA_CMN_PLL0_REFCLK_SEL	BIT(20)
++#define  PHY0_PMA_CMN_REFCLK_DIG_SEL	BIT(0)
++/* = 0x01100001, the value read live on the 8 GiB board with SS up.
++ * The vendor sets these bits with a read-modify-write in clk_set and then writes
++ * the same value absolutely, mid-config; both are reproduced.
++ */
++#define  COMB0_LINK_CTRL1_USB3		(PHY0_PMA_CMN_PLL1_REFCLK_SEL | \
++					 PHY0_PMA_CMN_PLL0_REFCLK_SEL | \
++					 PHY0_PMA_CMN_REFCLK_DIG_SEL)
++#define COMB0_LINK_CTRL2		0x0008
++#define  PHY0_IDDQ_EN_SEL		BIT(1)
++#define  PHY0_IDDQ_EN_SOFT		BIT(0)
++#define COMB0_LINK_CTRL3		0x000C
++#define  PHY0_PMA_XCVR_POWER_STATE_REQ_LN(n)	(((n) & 0x3f) << 4)
++#define  PHY0_PMA_XCVR_PLLCLK_EN_LN	BIT(0)
++#define COMB0_LINK_STUS0		0x0900
++#define  PHY0_PMA_CMN_READY		BIT(0)
++#define  PHY0_PMA_XCVR_CLK_EN_ACK	BIT(4)
++#define  PHY0_PMA_XCVR_POWER_STATE_ACK	GENMASK(13, 8)
++
++/*
++ * PMA nudge (reg[2], base 0x06c80000). The Cadence PMA is word-indexed: byte
++ * offset = index << 1. Vendor clears bits [11:8] of index 0xC008 when the link
++ * status stalls with PMA_CMN_READY=0. 0xC008<<1 = 0x18010 > 64K, so the PMA
++ * window must be mapped at least 0x20000.
++ */
++#define PMA_NUDGE_OFF			(0xC008 << 1)
++#define  PMA_NUDGE_CLR			(0xF << 8)
++
++#define SERDES_REFCLK_RATE		100000000	/* serdes-phy-cfg = 100 MHz */
++#define PHY_LOCK_TIMEOUT_US		2000
++#define PMA_READY_TIMEOUT_US		10000
++
++struct a733_combophy {
++	struct device		*dev;
++	void __iomem		*link;	/* combophy0 top   0x06c01000 */
++	void __iomem		*top2;	/* serdes top part-2 0x06c06000 */
++	void __iomem		*pma;	/* combophy0 PMA   0x06c80000 */
++	struct clk		*serdes_clk;
++	struct clk		*dcxo_clk;
++	struct reset_control	*reset;
++	struct regulator	*avdd_h;
++	struct regulator	*avdd_c;
++	struct regulator	*avdd_d;
++
++	/* Orientation arrives from TCPM long after dwc3 has called phy_init(),
++	 * so it has to be both cached (for the next init) and applied live (for
++	 * the port that is already up). The lock serialises the two paths.
++	 */
++	struct mutex		lock;
++	struct typec_switch_dev	*sw;
++	enum typec_orientation	orientation;
++	bool			inited;
++};
++
++static void a733_rmw(void __iomem *base, u32 off, u32 clr, u32 set)
++{
++	u32 v = readl(base + off);
++
++	v &= ~clr;
++	v |= set;
++	writel(v, base + off);
++}
++
++/* combo0_usb_clk_set(true): refclk sel + PIPE clk/rxd map -> COMB0.
++ * Produces LINK_CTRL1 = 0x01100001, the value read live on the 8 GiB board with SS up.
++ */
++static void a733_combophy_clk_route(struct a733_combophy *cp)
++{
++	a733_rmw(cp->link, COMB0_LINK_CTRL1, 0,
++		 PHY0_PMA_CMN_PLL1_REFCLK_SEL | PHY0_PMA_CMN_PLL0_REFCLK_SEL |
++		 PHY0_PMA_CMN_REFCLK_DIG_SEL);
++
++	a733_rmw(cp->top2, USB3P1_PIPE_CLK_MAP_CTRL,
++		 USB3P1_PIPE_MAP_MASK, USB3P1_PIPE_MAP_COMB0);
++	a733_rmw(cp->top2, USB3P1_PIPE_RXD_MAP_CTRL,
++		 USB3P1_PIPE_MAP_MASK, USB3P1_PIPE_MAP_COMB0);
++}
++
++/* combo0_usb_pwr_set(false): clear IDDQ -> power the PHY up */
++static void a733_combophy_power_up(struct a733_combophy *cp)
++{
++	a733_rmw(cp->link, COMB0_LINK_CTRL2, PHY0_IDDQ_EN_SEL, 0);
++	a733_rmw(cp->link, COMB0_LINK_CTRL2, PHY0_IDDQ_EN_SOFT, 0);
++}
++
++struct a733_pma_write { u16 idx; u16 val; };
++
++/* combo0_usb_param_config USB3 tail (orientation NORMAL, SSC on), ported 1:1
++ * from vendor sunxi-cadence-combophy.c. The CMN-PLL divider/lock + PMA config
++ * that makes PMA_CMN_READY lock. Fixed driver config (ref-clock dependent, not
++ * per-die). idx = Cadence PMA word index; byte offset = idx << 1.
++ */
++/* a_common: 2 writes */
++static const struct a733_pma_write a733_pma_a_common[] = {
++	{ 0xE005, 0x0003 },
++	{ 0xE006, 0x1124 },
++};
++
++/* fork1: 30 writes — orientation-dependent (lane n -> 3-n) */
++static const struct a733_pma_write a733_pma_fork1[] = {
++	{ 0x4100, 0x00FF },
++	{ 0x4300, 0x00FF },
++	{ 0x4102, 0x04AE },
++	{ 0x4302, 0x04AE },
++	{ 0x4103, 0x04AE },
++	{ 0x4303, 0x04AE },
++	{ 0x8000, 0x0000 },
++	{ 0x8200, 0x091D },
++	{ 0x8002, 0x0000 },
++	{ 0x8202, 0x0900 },
++	{ 0x8003, 0x0000 },
++	{ 0x8203, 0x0000 },
++	{ 0x8006, 0x0000 },
++	{ 0x8206, 0x010F },
++	{ 0x40EA, 0x00FF },
++	{ 0x42EA, 0x00FF },
++	{ 0x8108, 0x0000 },
++	{ 0x8308, 0x0009 },
++	{ 0x8110, 0x0000 },
++	{ 0x8310, 0x0009 },
++	{ 0x8118, 0x0000 },
++	{ 0x8318, 0x000D },
++	{ 0x4040, 0x2A84 },
++	{ 0x4240, 0x2A84 },
++	{ 0x40C6, 0x00A3 },
++	{ 0x42C6, 0x00A3 },
++	{ 0x4050, 0x0000 },
++	{ 0x4250, 0x0000 },
++	{ 0x404C, 0x001C },
++	{ 0x424C, 0x001C },
++};
++
++/* b_pre: 40 writes */
++static const struct a733_pma_write a733_pma_b_pre[] = {
++	{ 0x0022, 0x001A },
++	{ 0x002A, 0x0034 },
++	{ 0x002C, 0x00DA },
++	{ 0x0032, 0x0034 },
++	{ 0x0034, 0x00DA },
++	{ 0x0064, 0x0082 },
++	{ 0x0065, 0x0082 },
++	{ 0x0074, 0x001A },
++	{ 0x0104, 0x0020 },
++	{ 0x0105, 0x0007 },
++	{ 0x010C, 0x0020 },
++	{ 0x010D, 0x0007 },
++	{ 0x0114, 0x030C },
++	{ 0x0115, 0x0007 },
++	{ 0x0124, 0x0007 },
++	{ 0x0125, 0x0003 },
++	{ 0x0126, 0x000F },
++	{ 0x0128, 0x0132 },
++	{ 0x8044, 0x001A },
++	{ 0x8244, 0x001A },
++	{ 0x8444, 0x001A },
++	{ 0x8644, 0x001A },
++	{ 0x8045, 0x0082 },
++	{ 0x8245, 0x0082 },
++	{ 0x8445, 0x0082 },
++	{ 0x8645, 0x0082 },
++	{ 0x804C, 0x001A },
++	{ 0x824C, 0x001A },
++	{ 0x844C, 0x001A },
++	{ 0x864C, 0x001A },
++	{ 0x804D, 0x0082 },
++	{ 0x824D, 0x0082 },
++	{ 0x844D, 0x0082 },
++	{ 0x864D, 0x0082 },
++	{ 0x4123, 0x0A28 },
++	{ 0x4323, 0x0A28 },
++	{ 0x4523, 0x0A28 },
++	{ 0x4723, 0x0A28 },
++	{ 0x01A1, 0x8600 },
++	{ 0x01C1, 0x0701 },
++};
++
++/* fork2: 16 writes — orientation-dependent (lane n -> 3-n) */
++static const struct a733_pma_write a733_pma_fork2[] = {
++	{ 0x44E5, 0x0012 },
++	{ 0x46E5, 0x0012 },
++	{ 0x40E6, 0x0000 },
++	{ 0x42E6, 0x0000 },
++	{ 0x40E7, 0x0001 },
++	{ 0x42E7, 0x0001 },
++	{ 0x40E5, 0x0012 },
++	{ 0x42E5, 0x0012 },
++	{ 0x40E5, 0x0041 },
++	{ 0x42E5, 0x0041 },
++	{ 0x44E6, 0x0001 },
++	{ 0x46E6, 0x0001 },
++	{ 0x44E7, 0x0001 },
++	{ 0x46E7, 0x0001 },
++	{ 0x44E5, 0x0019 },
++	{ 0x46E5, 0x0019 },
++};
++
++/* b_post: 42 writes */
++static const struct a733_pma_write a733_pma_b_post[] = {
++	{ 0x0094, 0x0004 },
++	{ 0x00D4, 0x0004 },
++	{ 0x01A4, 0x0509 },
++	{ 0x01C4, 0x0509 },
++	{ 0x01A5, 0x0F00 },
++	{ 0x01C5, 0x0F00 },
++	{ 0x01A6, 0x0F08 },
++	{ 0x01C6, 0x0F08 },
++	{ 0x0090, 0x0180 },
++	{ 0x00D0, 0x019F },
++	{ 0x0091, 0x9D8A },
++	{ 0x00D1, 0x6276 },
++	{ 0x0092, 0x0002 },
++	{ 0x00D2, 0x0002 },
++	{ 0x0093, 0x0102 },
++	{ 0x00D3, 0x0116 },
++	{ 0x01A0, 0x0002 },
++	{ 0x01C0, 0x0002 },
++	{ 0x0098, 0x0001 },
++	{ 0x00D8, 0x0002 },
++	{ 0x0099, 0x045F },
++	{ 0x00D9, 0x04C4 },
++	{ 0x009A, 0x006B },
++	{ 0x00DA, 0x006A },
++	{ 0x009B, 0x0004 },
++	{ 0x00DB, 0x0004 },
++	{ 0x0084, 0x0104 },
++	{ 0x00C4, 0x0104 },
++	{ 0x0085, 0x0005 },
++	{ 0x00C5, 0x0005 },
++	{ 0x0086, 0x0337 },
++	{ 0x00C6, 0x0337 },
++	{ 0x0088, 0x0335 },
++	{ 0x00C8, 0x0335 },
++	{ 0x0082, 0x0003 },
++	{ 0x00C2, 0x0003 },
++	{ 0x009C, 0x00CF },
++	{ 0x00DC, 0x00CF },
++	{ 0x009E, 0x00CE },
++	{ 0x00DE, 0x00CE },
++	{ 0x009F, 0x0005 },
++	{ 0x00DF, 0x0005 },
++};
++
++/* c_pre: 7 writes */
++static const struct a733_pma_write a733_pma_c_pre[] = {
++	{ 0xC010, 0x5100 },
++	{ 0xC011, 0x0100 },
++	{ 0xC018, 0x0A0A },
++	{ 0xC01A, 0x1000 },
++	{ 0xC01B, 0x0010 },
++	{ 0x0041, 0x8200 },
++	{ 0x0047, 0x8200 },
++};
++
++/* fork3: 60 writes — orientation-dependent (lane n -> 3-n) */
++static const struct a733_pma_write a733_pma_fork3[] = {
++	{ 0x4700, 0x00FF },
++	{ 0x4701, 0x04AF },
++	{ 0x4702, 0x04AE },
++	{ 0x4703, 0x04AE },
++	{ 0x8400, 0x091D },
++	{ 0x8401, 0x091D },
++	{ 0x8402, 0x0900 },
++	{ 0x8403, 0x0000 },
++	{ 0x4640, 0x2A84 },
++	{ 0x464D, 0x0011 },
++	{ 0x8490, 0x000C },
++	{ 0x8508, 0x0009 },
++	{ 0x8549, 0x0C02 },
++	{ 0x8577, 0x06F6 },
++	{ 0x8578, 0x4606 },
++	{ 0x44EB, 0x0006 },
++	{ 0x8571, 0x0519 },
++	{ 0x8572, 0x0519 },
++	{ 0x85E8, 0x1002 },
++	{ 0x85E5, 0x0B98 },
++	{ 0x85E2, 0x0C01 },
++	{ 0x85E3, 0x0000 },
++	{ 0x85F5, 0x0000 },
++	{ 0x85F4, 0x0311 },
++	{ 0x85FF, 0x0000 },
++	{ 0x87FF, 0x0000 },
++	{ 0x8480, 0x010A },
++	{ 0x8482, 0x0003 },
++	{ 0x46EA, 0x00FF },
++	{ 0x44EA, 0x00FF },
++	{ 0x4100, 0x02FF },
++	{ 0x4101, 0x06AF },
++	{ 0x4102, 0x06AE },
++	{ 0x4103, 0x06AE },
++	{ 0x8200, 0x0D1D },
++	{ 0x8201, 0x0D1D },
++	{ 0x8202, 0x0D00 },
++	{ 0x8203, 0x0500 },
++	{ 0x4040, 0x2A82 },
++	{ 0x404D, 0x0014 },
++	{ 0x8290, 0x0013 },
++	{ 0x8308, 0x0000 },
++	{ 0x8349, 0x0C02 },
++	{ 0x8377, 0x0330 },
++	{ 0x8378, 0x0300 },
++	{ 0x42EB, 0x0003 },
++	{ 0x8371, 0x0019 },
++	{ 0x8372, 0x0019 },
++	{ 0x83E8, 0x1004 },
++	{ 0x83E5, 0x00F9 },
++	{ 0x83E2, 0x0C01 },
++	{ 0x83E3, 0x0002 },
++	{ 0x83F5, 0x0000 },
++	{ 0x83F4, 0x0031 },
++	{ 0x83FF, 0x0001 },
++	{ 0x81FF, 0x0002 },
++	{ 0x8280, 0x018C },
++	{ 0x8282, 0x0003 },
++	{ 0x40EA, 0x000F },
++	{ 0x42EA, 0x00F0 },
++};
++
++/* c_mid: 2 writes */
++static const struct a733_pma_write a733_pma_c_mid[] = {
++	{ 0xE005, 0x000B },
++	{ 0xE006, 0x2224 },
++};
++
++/* fork4: 30 writes — orientation-dependent (lane n -> 3-n) */
++static const struct a733_pma_write a733_pma_fork4[] = {
++	{ 0x4500, 0x00FB },
++	{ 0x4700, 0x00FB },
++	{ 0x4502, 0x04AA },
++	{ 0x4702, 0x04AA },
++	{ 0x4503, 0x04AA },
++	{ 0x4703, 0x04AA },
++	{ 0x8400, 0x0000 },
++	{ 0x8600, 0x0000 },
++	{ 0x8402, 0x0000 },
++	{ 0x8602, 0x0000 },
++	{ 0x8403, 0x0000 },
++	{ 0x8603, 0x0000 },
++	{ 0x8406, 0x0000 },
++	{ 0x8606, 0x0000 },
++	{ 0x44EA, 0x000F },
++	{ 0x46EA, 0x000F },
++	{ 0x8508, 0x0000 },
++	{ 0x8708, 0x0000 },
++	{ 0x8510, 0x0000 },
++	{ 0x8710, 0x0000 },
++	{ 0x8518, 0x0000 },
++	{ 0x8718, 0x0000 },
++	{ 0x4440, 0x08A4 },
++	{ 0x4640, 0x08A4 },
++	{ 0x44C6, 0x0003 },
++	{ 0x46C6, 0x0003 },
++	{ 0x4450, 0x002A },
++	{ 0x4650, 0x002A },
++	{ 0x444C, 0x0000 },
++	{ 0x464C, 0x0000 },
++};
++
++/* c_post: 2 writes */
++static const struct a733_pma_write a733_pma_c_post[] = {
++	{ 0x0103, 0x007F },
++	{ 0x010B, 0x007F },
++};
++
++
++/*
++ * A flipped Type-C plug mirrors the four COMB0 lanes n -> 3-n. The lane stride in
++ * the PMA index space is 0x200, so three lanes is 0x600 and the mirror is a plain
++ * XOR on the index -- lane0 (SSTX1, pins A2/A3) swaps with lane3 (SSTX2, B2/B3)
++ * and lane1 (SSRX1, B10/B11) with lane2 (SSRX2, A10/A11), exactly what rotating
++ * the plug does to the receptacle.
++ *
++ * The vendor writes the mirrored values out as a second literal table; the XOR
++ * reproduces it. Verified mechanically against both branches of
++ * combo0_configure_usb_dp(): in all four orientation forks the mirrored NORMAL
++ * table equals the vendor's REVERSE table as a multiset, 136 of 231 writes
++ * differing. Only the fork blocks are mirrored -- applying it to the common
++ * blocks would corrupt them (0xE005 would become 0xE605).
++ */
++#define PMA_LANE_MIRROR		0x0600
++
++static void a733_pma_write_all(struct a733_combophy *cp,
++			       const struct a733_pma_write *tbl, size_t n,
++			       u16 mirror)
++{
++	size_t i;
++
++	for (i = 0; i < n; i++)
++		writew(tbl[i].val, cp->pma + ((tbl[i].idx ^ mirror) << 1));
++}
++
++/*
++ * combo0_usb_param_config() -> combo0_configure_usb_dp(), orientation NORMAL,
++ * ssc_en = 0. The three PMA blocks are split by the two non-PMA writes the
++ * vendor performs in the middle of the sequence, and the order is load-bearing:
++ * LINK_CTRL1 is written as an absolute value after the CMN/lane-0-1 block, and
++ * TYPEC_CONN_DIR is cleared before the lane-2/3 block, not at the end.
++ */
++static void a733_combophy_param_config(struct a733_combophy *cp)
++{
++	bool flip = cp->orientation == TYPEC_ORIENTATION_REVERSE;
++	u16 m = flip ? PMA_LANE_MIRROR : 0;
++
++	a733_pma_write_all(cp, a733_pma_a_common, ARRAY_SIZE(a733_pma_a_common), 0);
++	a733_pma_write_all(cp, a733_pma_fork1, ARRAY_SIZE(a733_pma_fork1), m);
++
++	/* vendor writes LINK_CTRL1 absolutely here (= our clk_route bits) */
++	writel(COMB0_LINK_CTRL1_USB3, cp->link + COMB0_LINK_CTRL1);
++
++	a733_pma_write_all(cp, a733_pma_b_pre, ARRAY_SIZE(a733_pma_b_pre), 0);
++	a733_pma_write_all(cp, a733_pma_fork2, ARRAY_SIZE(a733_pma_fork2), m);
++	a733_pma_write_all(cp, a733_pma_b_post, ARRAY_SIZE(a733_pma_b_post), 0);
++
++	/* LINK_CTRL0 bit12 TYPEC_CONN_DIR: 1 = flipped plug. UM-derived field,
++	 * (A733 user manual).
++	 */
++	a733_rmw(cp->link, COMB0_LINK_CTRL0, PHY0_TYPEC_CONN_DIR,
++		 flip ? PHY0_TYPEC_CONN_DIR : 0);
++
++	a733_pma_write_all(cp, a733_pma_c_pre, ARRAY_SIZE(a733_pma_c_pre), 0);
++	a733_pma_write_all(cp, a733_pma_fork3, ARRAY_SIZE(a733_pma_fork3), m);
++	a733_pma_write_all(cp, a733_pma_c_mid, ARRAY_SIZE(a733_pma_c_mid), 0);
++	a733_pma_write_all(cp, a733_pma_fork4, ARRAY_SIZE(a733_pma_fork4), m);
++	a733_pma_write_all(cp, a733_pma_c_post, ARRAY_SIZE(a733_pma_c_post), 0);
++}
++
++/* combo0_usb_phy_reset(true): reset pulse, DP-lane conv, PLL enable, the
++ * POWER_STATE handshake, and the PMA_CMN_READY wait (+ one PMA nudge).
++ */
++static int a733_combophy_reset_seq(struct a733_combophy *cp)
++{
++	u32 v;
++	u16 w;
++	int ret;
++
++	/* pulse PHY0_RESET_N low->high */
++	a733_rmw(cp->link, COMB0_LINK_CTRL0, PHY0_RESET_N, 0);
++	mdelay(1);
++	a733_rmw(cp->link, COMB0_LINK_CTRL0, 0, PHY0_RESET_N);
++
++	/* DP raw-serdes lane conversion: data + lane enable + lane reset-n */
++	a733_rmw(cp->top2, DP_RAWS_TXDW_CONV_CTRL, 0,
++		 DP_PHY_CFG_DATA_EN | DP_PHY_CFG_LN_EN | DP_PHY_CFG_LN_RSTN);
++
++	ret = readl_poll_timeout(cp->link + COMB0_LINK_CTRL0, v,
++				 v & PHY0_RESET_N, 1, PHY_LOCK_TIMEOUT_US);
++	if (ret)
++		dev_warn(cp->dev, "PHY reset deassert timeout\n");
++	mdelay(1);
++
++	a733_rmw(cp->link, COMB0_LINK_CTRL0, 0, PHY0_PIPE_LINK_RESET_N_SOFT);
++
++	a733_rmw(cp->link, COMB0_LINK_CTRL3, 0, PHY0_PMA_XCVR_PLLCLK_EN_LN);
++	ret = readl_poll_timeout(cp->link + COMB0_LINK_CTRL3, v,
++				 v & PHY0_PMA_XCVR_PLLCLK_EN_LN, 1,
++				 PHY_LOCK_TIMEOUT_US);
++	if (ret)
++		dev_warn(cp->dev, "PHY PLL enable timeout\n");
++
++	/* XCVR power state request A0 (one-hot), then DP link reset-n */
++	a733_rmw(cp->link, COMB0_LINK_CTRL3, 0,
++		 PHY0_PMA_XCVR_POWER_STATE_REQ_LN(1));
++	a733_rmw(cp->link, COMB0_LINK_CTRL0, 0, PHY0_DP_LINK_RESET_N_SOFT);
++
++	/* The PHY answers the two requests above in LINK_STUS0 (bit4 CLOCK_EN_ACK,
++	 * bits [13:8] POWER_STATE_ACK). dwc3's CSFTRST cannot
++	 * clear until the PIPE clock runs, so a stall here is the -110 we chase --
++	 * report the raw status rather than leaving it to a debug patch.
++	 */
++	ret = readl_poll_timeout(cp->link + COMB0_LINK_STUS0, v,
++				 (v & PHY0_PMA_XCVR_CLK_EN_ACK) &&
++				 (v & PHY0_PMA_XCVR_POWER_STATE_ACK), 10,
++				 PMA_READY_TIMEOUT_US);
++	if (ret)
++		dev_warn(cp->dev,
++			 "PIPE handshake stalled, LINK_STUS0 = 0x%08x (want bit4 + bits[13:8])\n",
++			 v);
++
++	v = readl(cp->link + COMB0_LINK_STUS0);
++	if (v & PHY0_PMA_CMN_READY)
++		return 0;
++
++	/* stalled: one PMA nudge (vendor clears index 0xC008 bits [11:8]) */
++	mdelay(10);
++	w = readw(cp->pma + PMA_NUDGE_OFF);
++	w &= ~PMA_NUDGE_CLR;
++	writew(w, cp->pma + PMA_NUDGE_OFF);
++
++	ret = readl_poll_timeout(cp->link + COMB0_LINK_STUS0, v,
++				 v & PHY0_PMA_CMN_READY, 5, PMA_READY_TIMEOUT_US);
++	if (ret)
++		dev_warn(cp->dev, "PMA_CMN_READY timeout — core is up, SS link may not train\n");
++	return 0;
++}
++
++static void a733_combophy_assert_reset(void *data)
++{
++	reset_control_assert(data);
++}
++
++/* Undo a733_combophy_prepare(). Only reachable from the probe error paths, so
++ * it must not touch the clocks -- those belong to phy_ops.init/exit. The reset
++ * is not asserted here: since it is balanced by a devres action, doing it in
++ * both places would decrement the shared count twice.
++ */
++static void a733_combophy_teardown(struct a733_combophy *cp)
++{
++	if (cp->avdd_c)
++		regulator_disable(cp->avdd_c);
++	if (cp->avdd_d)
++		regulator_disable(cp->avdd_d);
++	if (cp->avdd_h)
++		regulator_disable(cp->avdd_h);
++}
++
++/*
++ * Vendor phase P (sunxi_cadence_phy_serdes_init, probe context): supplies, then
++ * the SERDES block reset. The wrapper AHB/AXI gates that used to follow here are
++ * the serdes-ccu's clocks now, because the dwc3 core needs them before any PHY
++ * op runs. Nothing that touches the PIPE link happens here -- see
++ * a733_combophy_init() for why that matters.
++ */
++static int a733_combophy_prepare(struct a733_combophy *cp)
++{
++	int ret;
++
++	if (cp->avdd_h) {
++		ret = regulator_enable(cp->avdd_h);
++		if (ret)
++			return ret;
++	}
++	if (cp->avdd_d) {
++		ret = regulator_enable(cp->avdd_d);
++		if (ret)
++			goto err_d;
++	}
++	if (cp->avdd_c) {
++		ret = regulator_enable(cp->avdd_c);
++		if (ret)
++			goto err_c;
++	}
++
++	ret = reset_control_deassert(cp->reset);
++	if (ret)
++		goto err_reset;
++
++	/*
++	 * Balance it on unbind. Without this the shared deassert_count only ever
++	 * grows, and the serdes-ccu that shares this line could never assert it
++	 * again -- which makes "shared, and therefore balanced" false for every
++	 * rmmod even though the boot path never notices.
++	 */
++	ret = devm_add_action_or_reset(cp->dev, a733_combophy_assert_reset,
++				       cp->reset);
++	if (ret)
++		goto err_reset;
++
++	return 0;
++
++err_reset:
++	if (cp->avdd_c)
++		regulator_disable(cp->avdd_c);
++err_c:
++	if (cp->avdd_d)
++		regulator_disable(cp->avdd_d);
++err_d:
++	if (cp->avdd_h)
++		regulator_disable(cp->avdd_h);
++	return ret;
++}
++
++/*
++ * Vendor phase I (combo0_usb_phy_init) -- and it runs from phy_ops.init, not
++ * from probe, on purpose. dwc3 calls phy_init() four lines before its own
++ * CSFTRST (core.c: dwc3_phy_setup -> dwc3_phy_init -> dwc3_core_soft_reset),
++ * i.e. after it has deasserted RST_USB_2 and written GUSB3PIPECTL. Running the
++ * PIPE handshake earlier, from probe, means the controller side of the PIPE
++ * interface is re-toggled underneath us afterwards and nothing ever re-runs it.
++ */
++static int a733_combophy_bringup(struct a733_combophy *cp)
++{
++	int ret;
++
++	ret = clk_set_rate(cp->serdes_clk, SERDES_REFCLK_RATE);
++	if (ret) {
++		dev_err(cp->dev, "set serdes clk 100MHz failed: %d\n", ret);
++		return ret;
++	}
++	ret = clk_prepare_enable(cp->serdes_clk);
++	if (ret)
++		return ret;
++	ret = clk_prepare_enable(cp->dcxo_clk);
++	if (ret)
++		goto err_dcxo;
++
++	a733_combophy_power_up(cp);
++	a733_combophy_clk_route(cp);
++	a733_combophy_param_config(cp);
++	ret = a733_combophy_reset_seq(cp);
++	if (ret)
++		goto err_seq;
++
++	return 0;
++
++err_seq:
++	clk_disable_unprepare(cp->dcxo_clk);
++err_dcxo:
++	clk_disable_unprepare(cp->serdes_clk);
++	return ret;
++}
++
++static int a733_combophy_init(struct phy *phy)
++{
++	struct a733_combophy *cp = phy_get_drvdata(phy);
++	int ret;
++
++	mutex_lock(&cp->lock);
++	ret = a733_combophy_bringup(cp);
++	if (!ret)
++		cp->inited = true;
++	mutex_unlock(&cp->lock);
++
++	return ret;
++}
++
++static int a733_combophy_exit(struct phy *phy)
++{
++	struct a733_combophy *cp = phy_get_drvdata(phy);
++
++	mutex_lock(&cp->lock);
++	cp->inited = false;
++	a733_rmw(cp->link, COMB0_LINK_CTRL2, 0,
++		 PHY0_IDDQ_EN_SEL | PHY0_IDDQ_EN_SOFT);	/* IDDQ = power down */
++	clk_disable_unprepare(cp->dcxo_clk);
++	clk_disable_unprepare(cp->serdes_clk);
++	mutex_unlock(&cp->lock);
++
++	return 0;
++}
++
++/*
++ * TCPM hands us the plug orientation through the Type-C switch framework. The
++ * ordering is fixed and awkward: combophy0 probes, dwc3 probes and calls
++ * phy_init(), and only then does the TCPC attach and report which way round the
++ * cable is. dwc3 never re-inits the PHY, so caching the value is not enough --
++ * a port that is already up has to be reprogrammed in place.
++ *
++ * That is safe here: the vendor does exactly this on an orientation change and
++ * nothing more -- combo0_usb_param_config() alone, no reset pulse, no clock
++ * cycle (sunxi-cadence-combophy.c:3197).
++ */
++static int a733_combophy_typec_set(struct typec_switch_dev *sw,
++				   enum typec_orientation orientation)
++{
++	struct a733_combophy *cp = typec_switch_get_drvdata(sw);
++
++	/* typec_set_orientation() has no changed-value filter, so this also
++	 * fires on unplug and on hard reset / error recovery / DR_SWAP with an
++	 * unchanged value. Re-running the lane config for those would glitch a
++	 * live link for nothing.
++	 */
++	if (orientation == TYPEC_ORIENTATION_NONE ||
++	    orientation == cp->orientation)
++		return 0;
++
++	mutex_lock(&cp->lock);
++	cp->orientation = orientation;
++	if (cp->inited)
++		a733_combophy_param_config(cp);
++	mutex_unlock(&cp->lock);
++
++	/* A non-zero return here aborts TCPM's attach, so failures are logged,
++	 * not propagated.
++	 */
++	return 0;
++}
++
++static void a733_combophy_sw_unregister(void *data)
++{
++	typec_switch_unregister(data);
++}
++
++static const struct phy_ops a733_combophy_ops = {
++	.init	= a733_combophy_init,
++	.exit	= a733_combophy_exit,
++	.owner	= THIS_MODULE,
++};
++
++static struct regulator *a733_get_opt_supply(struct device *dev, const char *id)
++{
++	struct regulator *r = devm_regulator_get_optional(dev, id);
++
++	if (IS_ERR(r)) {
++		if (PTR_ERR(r) == -ENODEV)
++			return NULL;
++		return r;
++	}
++	return r;
++}
++
++static int a733_combophy_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct a733_combophy *cp;
++	struct phy_provider *provider;
++	struct phy *phy;
++	int ret;
++
++	cp = devm_kzalloc(dev, sizeof(*cp), GFP_KERNEL);
++	if (!cp)
++		return -ENOMEM;
++	cp->dev = dev;
++	mutex_init(&cp->lock);
++	cp->orientation = TYPEC_ORIENTATION_NORMAL;
++
++	cp->link = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(cp->link))
++		return PTR_ERR(cp->link);
++	cp->top2 = devm_platform_ioremap_resource(pdev, 1);
++	if (IS_ERR(cp->top2))
++		return PTR_ERR(cp->top2);
++	cp->pma = devm_platform_ioremap_resource(pdev, 2);
++	if (IS_ERR(cp->pma))
++		return PTR_ERR(cp->pma);
++
++	cp->serdes_clk = devm_clk_get(dev, "serdes");
++	if (IS_ERR(cp->serdes_clk))
++		return dev_err_probe(dev, PTR_ERR(cp->serdes_clk), "serdes clk\n");
++	cp->dcxo_clk = devm_clk_get(dev, "dcxo-serdes0");
++	if (IS_ERR(cp->dcxo_clk))
++		return dev_err_probe(dev, PTR_ERR(cp->dcxo_clk), "dcxo clk\n");
++
++	cp->reset = devm_reset_control_get_shared(dev, NULL);
++	if (IS_ERR(cp->reset))
++		return dev_err_probe(dev, PTR_ERR(cp->reset), "serdes reset\n");
++
++	cp->avdd_h = a733_get_opt_supply(dev, "avdd-h");
++	if (IS_ERR(cp->avdd_h))
++		return PTR_ERR(cp->avdd_h);
++	cp->avdd_c = a733_get_opt_supply(dev, "avdd-c");
++	if (IS_ERR(cp->avdd_c))
++		return PTR_ERR(cp->avdd_c);
++	cp->avdd_d = a733_get_opt_supply(dev, "avdd-d");
++	if (IS_ERR(cp->avdd_d))
++		return PTR_ERR(cp->avdd_d);
++
++	/* Supplies, reset and wrapper gates only. The PIPE bring-up runs from
++	 * phy_ops.init, which dwc3 calls immediately before its core soft reset.
++	 */
++	ret = a733_combophy_prepare(cp);
++	if (ret)
++		return dev_err_probe(dev, ret, "combo-PHY prepare failed\n");
++
++	phy = devm_phy_create(dev, NULL, &a733_combophy_ops);
++	if (IS_ERR(phy)) {
++		a733_combophy_teardown(cp);
++		return PTR_ERR(phy);
++	}
++	phy_set_drvdata(phy, cp);
++
++	provider = devm_of_phy_provider_register(dev, of_phy_simple_xlate);
++	if (IS_ERR(provider)) {
++		a733_combophy_teardown(cp);
++		return PTR_ERR(provider);
++	}
++
++	/* Register as a Type-C orientation switch so TCPM can tell us which way
++	 * the plug went in. The framework matches on the *device* fwnode of the
++	 * endpoint's remote parent, so this must be dev_fwnode(dev) and the
++	 * "orientation-switch" property must sit on this node, not on a port
++	 * subnode. A mis-wired graph fails silently -- typec_switch_match()
++	 * returns NULL rather than an error and typec_switch_set() then no-ops --
++	 * so if orientation never arrives, suspect the DT graph first.
++	 */
++	if (IS_ENABLED(CONFIG_TYPEC) &&
++	    device_property_present(dev, "orientation-switch")) {
++		struct typec_switch_desc sw_desc = {
++			.fwnode  = dev_fwnode(dev),
++			.set     = a733_combophy_typec_set,
++			.drvdata = cp,
++		};
++
++		cp->sw = typec_switch_register(dev, &sw_desc);
++		if (IS_ERR(cp->sw)) {
++			a733_combophy_teardown(cp);
++			return dev_err_probe(dev, PTR_ERR(cp->sw),
++					     "typec switch register\n");
++		}
++		ret = devm_add_action_or_reset(dev, a733_combophy_sw_unregister,
++					       cp->sw);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++static const struct of_device_id a733_combophy_of_match[] = {
++	{ .compatible = "allwinner,sun60i-a733-usb3-combophy" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, a733_combophy_of_match);
++
++static struct platform_driver a733_combophy_driver = {
++	.probe	= a733_combophy_probe,
++	.driver	= {
++		.name		= "sun60i-a733-combophy",
++		.of_match_table	= a733_combophy_of_match,
++	},
++};
++module_platform_driver(a733_combophy_driver);
++
++MODULE_DESCRIPTION("Allwinner A733 COMB0 combo-PHY (USB3 SuperSpeed)");
++MODULE_LICENSE("GPL");

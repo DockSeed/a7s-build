@@ -1,0 +1,141 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: allwinner: A733 minimal — add USB2.0 (EHCI/OHCI + PHY)
+
+Milestone-3. Adds the three USB2.0 controllers to the minimal A733 boot
+DT: USB0 (USB2.0 DRD/OTG, Type-C J16), USB1 (USB2.0 Host, upstream of the
+on-board CH334F hub -> USB-A J8 + WiFi/BT), and the shared 2-port USB PHY.
+They reuse the in-tree drivers via the "generic-ehci"/"generic-ohci" and
+"allwinner,sun20i-d1-usb-phy" fallback compatibles -- no new driver code.
+They consume the USB clocks/resets added by patch `clk-sunxi-ng-a733-add-usb2-clocks`.
+
+Bases and the base+0 split are silicon-confirmed on the 8 GiB board and the 6 GiB board, not lifted
+from a BSP: ehci1 @0x04200000 reads the textbook EHCI HCCR 0x01000010
+(CAPLENGTH 0x10, HCIVERSION 0x0100), and usb@0x04100000 reads the DRD/musb
+block (0x1dd00008), exactly as the UM controller classes predict. The
+companion register windows (ehci0/ohci0 @0x04101000/1400, the PMU windows
+@0x04101800 / 0x04200800) mirror the register-compatible parent
+sun55i-a523; these specific offsets are a523-derived and still owe an A733
+silicon read -- ehci1 base+0 is the proven anchor.
+
+Interrupts are the A733 GIC SPIs (INTID-32): USB0 device/EHCI/OHCI =
+156/157/158 (INTID 188/189/190), USB1 EHCI/OHCI = 159/160 (INTID 191/192),
+from the UM interrupt table. CD/hub topology from the
+board schematic v1.10 (p11/p13): USB1 -> CH334F -> J8 + FCU760K.
+
+The OTG/musb node is defined but left disabled: USB0 runs here as a plain
+host through its EHCI/OHCI companion (the sun4i-usb PHY's phy0 dual-route
+falls back to host when the musb block is absent), which needs no musb
+driver or gadget stack. Enable it (and USB_MUSB_SUNXI) when dual-role is
+wanted. All USB2 host + PHY Kconfig (USB_EHCI/OHCI_HCD_PLATFORM,
+PHY_SUN4I_USB, USB_STORAGE) is already =y in the arm64 defconfig; build.sh
+pins PHY_SUN4I_USB so a defconfig drift cannot drop it.
+
+HW proof (a USB stick enumerates + reads on J8, not just "it booted") is
+pending -- this is compile/dtc-gated only.
+
+Assisted-by: Claude
+---
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -1014,5 +1014,101 @@
+ 			#size-cells = <0>;
+ 			status = "okay";
+ 		};
++
++		/*
++		 * USB2.0. Three controllers (A733 UM): USB0 =
++		 * USB2.0 DRD/OTG (Type-C J16), USB1 = USB2.0 Host (upstream of the
++		 * CH334F hub -> USB-A J8 + on-board WiFi/BT), USB2 = USB3.1 combo
++		 * (later milestone). Bases + the EHCI-at-base+0 (USB1) / musb-at-
++		 * base+0 (USB0) split are silicon-confirmed on the 8 GiB board and the 6 GiB board: ehci1
++		 * @0x04200000 reads the textbook EHCI HCCR 0x01000010, usb@0x04100000
++		 * reads the DRD/musb block. Layout mirrors the register-compatible
++		 * parent sun55i-a523; reused via the "generic-ehci"/"-ohci" and
++		 * "sun20i-d1-usb-phy" fallbacks -- no new driver code.
++		 *
++		 * The OTG/musb node is defined but left disabled: USB0 runs here as a
++		 * host through its EHCI/OHCI companion (phy0 dual-route falls back to
++		 * host when musb is absent), which needs no musb driver/gadget stack.
++		 * Enable it (+ USB_MUSB_SUNXI) when dual-role is wanted.
++		 */
++		usb_otg: usb@4100000 {
++			compatible = "allwinner,sun60i-a733-musb",
++				     "allwinner,sun8i-a33-musb";
++			reg = <0x0 0x04100000 0x0 0x0400>;
++			interrupts = <GIC_SPI 156 IRQ_TYPE_LEVEL_HIGH>;
++			interrupt-names = "mc";
++			clocks = <&ccu CLK_BUS_OTG>;
++			resets = <&ccu RST_BUS_OTG>;
++			extcon = <&usbphy 0>;
++			phys = <&usbphy 0>;
++			phy-names = "usb";
++			dr_mode = "host";
++			status = "disabled";
++		};
++
++		usbphy: phy@4100400 {
++			compatible = "allwinner,sun60i-a733-usb-phy",
++				     "allwinner,sun20i-d1-usb-phy";
++			reg = <0x0 0x04100400 0x0 0x0100>,
++			      <0x0 0x04101800 0x0 0x0100>,
++			      <0x0 0x04200800 0x0 0x0100>;
++			reg-names = "phy_ctrl", "pmu0", "pmu1";
++			clocks = <&osc24M>, <&osc24M>;
++			clock-names = "usb0_phy", "usb1_phy";
++			resets = <&ccu RST_USB_PHY0>, <&ccu RST_USB_PHY1>;
++			reset-names = "usb0_reset", "usb1_reset";
++			#phy-cells = <1>;
++			status = "okay";
++		};
++
++		ehci0: usb@4101000 {
++			compatible = "allwinner,sun60i-a733-ehci",
++				     "generic-ehci";
++			reg = <0x0 0x04101000 0x0 0x0100>;
++			interrupts = <GIC_SPI 157 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&ccu CLK_BUS_OHCI0>, <&ccu CLK_BUS_EHCI0>,
++				 <&ccu CLK_USB_OHCI0>;
++			resets = <&ccu RST_BUS_OHCI0>, <&ccu RST_BUS_EHCI0>;
++			phys = <&usbphy 0>;
++			phy-names = "usb";
++			status = "okay";
++		};
++
++		ohci0: usb@4101400 {
++			compatible = "allwinner,sun60i-a733-ohci",
++				     "generic-ohci";
++			reg = <0x0 0x04101400 0x0 0x0100>;
++			interrupts = <GIC_SPI 158 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&ccu CLK_BUS_OHCI0>, <&ccu CLK_USB_OHCI0>;
++			resets = <&ccu RST_BUS_OHCI0>;
++			phys = <&usbphy 0>;
++			phy-names = "usb";
++			status = "okay";
++		};
++
++		ehci1: usb@4200000 {
++			compatible = "allwinner,sun60i-a733-ehci",
++				     "generic-ehci";
++			reg = <0x0 0x04200000 0x0 0x0100>;
++			interrupts = <GIC_SPI 159 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&ccu CLK_BUS_OHCI1>, <&ccu CLK_BUS_EHCI1>,
++				 <&ccu CLK_USB_OHCI1>;
++			resets = <&ccu RST_BUS_OHCI1>, <&ccu RST_BUS_EHCI1>;
++			phys = <&usbphy 1>;
++			phy-names = "usb";
++			status = "okay";
++		};
++
++		ohci1: usb@4200400 {
++			compatible = "allwinner,sun60i-a733-ohci",
++				     "generic-ohci";
++			reg = <0x0 0x04200400 0x0 0x0100>;
++			interrupts = <GIC_SPI 160 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&ccu CLK_BUS_OHCI1>, <&ccu CLK_USB_OHCI1>;
++			resets = <&ccu RST_BUS_OHCI1>;
++			phys = <&usbphy 1>;
++			phy-names = "usb";
++			status = "okay";
++		};
+ 	};
+ };

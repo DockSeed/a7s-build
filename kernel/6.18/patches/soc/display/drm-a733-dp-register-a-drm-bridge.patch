@@ -1,0 +1,894 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] drm: a733: dp: register a drm_bridge -- the DP half of Stage 2
+
+[Recipe cut: regenerated: the probe message no longer points at the removed
+aux_enable file.]
+
+The planned architecture for Stage 2 makes the DP a drm_bridge and an
+encoder component, modelled on dw_dp-rockchip.c (150 lines) and
+sun8i_dw_hdmi.c (302 lines). sun60i-dp.c keeps its debugfs verbs -- the tree's
+diagnostics rule says those lines are never deleted -- and gains
+drm_bridge_add(), .attach (with drm_dp_aux_register() moved there), .detect,
+.edid_read, .mode_valid and .atomic_enable/disable around the link training.
+
+This is that bridge, and NOTHING ELSE. It is the half that can be written
+without a drm_device: the encoder needs one (drmm_encoder_init() takes it) and
+so does the connector, and this tree has no component master yet. So the bridge
+is published with drm_bridge_add() -- the mechanism whose whole purpose is a
+bridge that exists BEFORE the encoder that will attach it -- and the KMS half
+finds it with of_drm_find_bridge()/devm_drm_of_get_bridge() on our of_node.
+
+WHAT RUNS TODAY, EXACTLY
+-------------------------
+
+One list insertion at probe. Nothing in this tree creates an encoder, so nothing
+calls drm_bridge_attach(), so .attach, .detach, .detect, .edid_read,
+.mode_valid, .hpd_notify, .atomic_enable and .atomic_disable HAVE NEVER
+EXECUTED -- not on hardware, not anywhere. Everything that worked before this
+patch still works through the same debugfs verbs (aux_enable, dpcd, edid, link,
+train, video), which are untouched.
+
+That is also why the vendor-comparison table below is short on measurements and
+long on structure: this patch adds shape, not register content.
+
+HOW THE VENDOR STACK DOES IT, AND WHAT THIS DOES INSTEAD
+--------------------------------------------------------
+
+This table covers the connect/detect path specifically. The
+AUX, link-rate and training rows are already answered by `drm-allwinner-a733-displayport-aux`, `drm-a733-dp-configure-the-main-link-phy` and `drm-a733-dp-link-training` and
+are not repeated.
+
+| vendor | ours |
+|---|---|
+| "detect" is a POLL: edp_sink_extcon_evt() reschedules drm_edp_typec_hpd_monitor() once a second for up to 30 rounds, each round issuing DPCD reads into a front end whose bias is off -- measured on the 8 GiB board with nothing in Type-C J4: eDP binds at 1.646 s and logs 34 "edp wait aux reply timeout!" between 1.69 s and 6.21 s, every boot | .detect reads NO register and issues NO transaction. It returns what .hpd_notify recorded. The channel is opened once, when the alternate mode says a sink is there |
+| that poll runs whether or not the mux is in a DP state, so "no sink" is expressed as a stream of error-level timeouts | "no sink" is a state: .detect returns connector_status_disconnected and logs nothing, on every one of the ten-second polls the DRM core will run for ever |
+| the sink's presence is inferred from an extcon the driver polls | the alternate mode's own HPD, delivered by drm_connector_oob_hotplug_event() from typec_displayport.ko -- the path drm_connector.c's kerneldoc describes as being for "some USB Type-C setups where the hardware muxes the DisplayPort data and aux-lines but does not pass the altmode HPD status bit to the GPU's DP HPD pin", which is this board |
+| ships hdmi-toggle-once.service ENABLED: sleep 15, wait 20 s for SDDM's X cookie, switch to the second EDID mode and back, once per boot behind a lock file -- a timing workaround in userspace for a modeset that does not come up right | a modeset that does not need one; if ours ever does, that is a driver bug with a log line |
+| its eDP driver takes phy_power_on() and phy_configure() on a combo PHY it leaves to "other module" to initialise (sunxi_drm_edp.c:826-843) | unchanged from `drm-a733-dp-configure-the-main-link-phy`: phy_init()/phy_exit() taken by the consumer, refcounted |
+
+THE THREE DECISIONS THAT ARE NOT STYLE
+---------------------------------------
+
+1. NO DRM_BRIDGE_OP_HPD. The op means "this bridge detects hot-plug and calls
+   drm_bridge_hpd_notify()". This one cannot. HPD_INPUT_STATE, eDP0 offset
+   0x0128, absolute 0x05740128, reads 0x00000000 on this board while a picture
+   is on the wire -- read on 2026-08-19 against the VENDOR's live link, so it is
+   the board and not our bring-up (the pad is not
+   routed to the connector). Claiming the op would give the connector
+   DRM_CONNECTOR_POLL_HPD, which waits for a notification that can never arrive:
+   a display that never returns after a re-plug. DRM_BRIDGE_OP_DETECT|_EDID
+   instead, which makes the connector POLL_CONNECT|POLL_DISCONNECT
+   (drm_bridge_connector.c:845-848) -- and that is affordable only because
+   .detect touches nothing.
+
+2. THE AUX TRANSFER PATH GAINS A GUARD, AND WITHOUT IT THIS PATCH IS A
+   REGRESSION. `drm-allwinner-a733-displayport-aux` deliberately did not create the /dev/drm_dp_auxN chardev --
+   "the part that needs the DRM parent" -- so until now every route into
+   sun60i_dp_aux_transfer() came through a debugfs verb or through an i2c
+   adapter that exists only while the block is enabled. drm_dp_aux_register()
+   creates both a chardev any process can drive and an adapter that survives
+   `echo 0 > aux_enable`. Both would land in the transfer function with the bus
+   clock gated and the reset asserted -- the state in which `drm-allwinner-a733-displayport-aux` MEASURED the
+   whole 4 KiB window reading zero -- and produce a 3 ms poll ending in a
+   timeout that says nothing about the sink. `if (!dp->enabled) return -ENODEV;`
+   is the answer, and -ENODEV rather than -ETIMEDOUT because the core retries a
+   timeout and cannot retry its way to a different answer here.
+
+3. ONE PIXEL CLOCK IN .mode_valid, and the restriction is honest rather than
+   conservative. `clk-sunxi-ng-a733-video-plls-and-edp-tv-pixel-clock`'s own header names what it owes: "a SECOND mode. Nothing
+   has ever asked this PLL for one" -- a mode whose pixel clock is not an
+   integer divisor of a reachable VCO lands on the nearest lower rate, and the
+   falsifier it names is SRC0_MVID not computing back to the requested clock.
+   Until that measurement exists, a connector with an EDID mode list would hand
+   this driver clocks nothing has ever produced, with only `drm-a733-tcon-tv1-timing-generator-and-video-source`'s 1 % readback
+   between that and a silently wrong raster. So the mode list is gated on the
+   one clock this tree has driven. It sits in the bridge only because the CRTC
+   does not exist yet; it belongs to whoever owns clk_round_rate() on the pixel
+   clock, which is TCON_TV1.
+
+WHAT IS REUSED, NAMED
+----------------------
+
+  drm_bridge_add / devm_drm_bridge_add / devm_drm_bridge_alloc  drm_bridge.c
+  drm_atomic_helper_bridge_{reset,duplicate_state,destroy_state}
+                                                  drm_atomic_state_helper.c
+  drm_atomic_helper_bridge_propagate_bus_fmt      drm_atomic_helper.c
+  drm_dp_aux_register / _unregister               drm_dp_helper.c
+  drm_dp_max_dprx_data_rate                       drm_dp_helper.c
+  drm_edid_read_ddc                               drm_edid.c
+  drm_atomic_get_new_connector_for_encoder        drm_atomic.c
+
+Genuinely A733: which ops may be claimed (the HPD measurement above), the
+link-budget question being asked of phy_validate() rather than of the sink, the
+ddc-ownership handover, and the AUX guard.
+
+Kconfig gains `select DRM_KMS_HELPER`, because the four atomic bridge-state
+helpers live in drm_kms_helper.ko (drivers/gpu/drm/Makefile: drm_kms_helper-y +=
+drm_atomic_state_helper.o). It is already =m on this board -- but only because
+DRM_SUN4I selects it, a driver that binds nothing here and that any cleanup
+deletes. That is the same kind of accident that once held up
+the console chain, and it is not relied on twice. drm_kms_helper.ko is already
+in A733_MODULE_FILES, so this adds no packing debt.
+
+VERIFIED
+---------
+
+  applies clean : yes, `patch -p1 --fuzz=0`
+  builds        : yes -- drivers/gpu/drm/sun60i/ compiles with no warning,
+                  native aarch64 gcc 14.2.0, a733_defconfig-configured tree.
+                  Every new undefined symbol checked against an EXPORT_SYMBOL
+                  in a module this config builds.
+  on silicon    : NO. Not hardware-proven, and stronger than that: not
+                  hardware-EXERCISED. See "what runs today" above.
+
+⚠ Applies clean is not the same claim as composes with the parallel display
+work. Checked separately: this patch also applies together with
+`drm-a733-display-engine-dram-into-tcon-tv1`, `clk-sunxi-ng-a733-display-engine-clock-gate-reset` and `arm64-dts-a733-display-engine-node-and-de-to-tcon-edge` and `drm-a733-dp-link-training` of this series, and that union compiles. It edits no file the display
+engine edits.
+
+OPEN, EACH AS ONE OBSERVABLE
+-----------------------------
+
+1. THE OUT-OF-BAND HPD MAY NOT REACH THE CONNECTOR, and this patch cannot fix
+   it. drm_connector_find_by_fwnode() matches connector->fwnode, which
+   drm_bridge_connector sets from the LAST bridge's of_node -- our DP node --
+   while dp_altmode_probe() takes the Type-C port's own fwnode unless that port
+   carries a `displayport` property naming another (displayport.c:800-804). Two
+   different nodes, so the event would be dropped. That property is read by the
+   code and documented in NO binding: usb-connector.yaml is
+   `unevaluatedProperties: false` and documents only an `altmodes/displayport`
+   CHILD NODE, which is not a property and does not satisfy the lookup; no DT in
+   6.18.36 uses it. Observable, once a connector exists: plug the monitor and
+   watch /sys/class/drm/<card>-DP-1/status. If it does not change, the fwnode
+   did not match. The fix is a DT edit plus a binding, and it belongs with the
+   connector, not here.
+
+2. .edid_read MAY RETIRE the earlier two-block EDID reader's CAP. The earlier two-block EDID reader (not carried in this recipe) reads at most two blocks
+   because this core's AUX sends a one-byte offset, and its header records the
+   E-DDC segment pointer as arriving "with the display stack instead of being
+   hand-rolled now". drm_edid_read_ddc() writes that pointer itself. Untested:
+   the bench sink declares exactly one extension block and cannot tell the two
+   apart. Observable: a sink with three or more blocks, compared against what
+   the `edid` debugfs file reports it skipped.
+
+3. THE TWO-DRIVERS-ONE-MODE INVARIANT IS NOT CLOSED. sun60i-display.h exists
+   because TCON_TV1 and this transmitter must describe the SAME mode; the
+   hardware reports a disagreement as SRC0_USER_FIFO_STATUS != 0, flagging a
+   mismatch with the current video mode. From here the transmitter
+   takes its mode from the atomic state -- the retirement path that header names
+   -- while the TCON still takes the constant until it gains a CRTC, and `drm-a733-display-engine-dram-into-tcon-tv1`
+   takes it too. Observable: SRC0_USER_FIFO_STATUS non-zero on the first modeset
+   where the two disagree; the driver already reads and prints it.
+
+4. NOTHING ATTACHES THE BRIDGE. Observable that closes it: `dmesg` showing this
+   driver's .attach message on a boot where a component master built a
+   drm_device, and /sys/class/drm/ carrying a DP connector.
+
+Assisted-by: Claude
+
+diff --git a/drivers/gpu/drm/sun60i/Kconfig b/drivers/gpu/drm/sun60i/Kconfig
+--- a/drivers/gpu/drm/sun60i/Kconfig
++++ b/drivers/gpu/drm/sun60i/Kconfig
+@@ -1,20 +1,33 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ config DRM_SUN60I_DP
+-	tristate "Allwinner A733 (sun60iw2) DisplayPort AUX"
++	tristate "Allwinner A733 (sun60iw2) DisplayPort transmitter"
+ 	depends on DRM && OF
+ 	depends on ARCH_SUNXI || COMPILE_TEST
+ 	select DRM_DISPLAY_HELPER
+ 	select DRM_DISPLAY_DP_HELPER
++	# drm_atomic_helper_bridge_{reset,duplicate_state,destroy_state} and
++	# drm_atomic_helper_bridge_propagate_bus_fmt live in drm_kms_helper.ko
++	# (drivers/gpu/drm/Makefile: drm_kms_helper-y += drm_atomic_state_helper.o).
++	# It is =m on this board today only because DRM_SUN4I selects it -- a
++	# driver that binds nothing here and that any cleanup deletes, which is
++	# the same kind of accident that once held up the
++	# console chain. Selected explicitly so this driver stops depending on it.
++	select DRM_KMS_HELPER
+ 	select GENERIC_PHY
+ 	help
+ 	  Enable this for the DisplayPort transmitter of the Allwinner A733
+-	  (sun60iw2). At present this driver implements the AUX channel only --
+-	  the path that carries DPCD and EDID -- and no link training, no video
+-	  and no mode setting. It is the first piece of that block whose result
+-	  can be checked against what the sink says about itself.
++	  (sun60iw2): the AUX channel that carries DPCD and EDID, the main link
++	  and its training, the video stream, and a drm_bridge for a KMS driver
++	  to attach.
++
++	  It is not a KMS driver and creates no encoder, CRTC or connector --
++	  those need a drm_device, which this tree does not have yet. Without one
++	  the bridge callbacks are never reached and the driver behaves exactly
++	  as it did before them: the AUX channel and the video path are driven
++	  through its debugfs files.
+ 
+ 	  Say M here if you want DisplayPort alternate mode over the Type-C
+-	  port to be able to identify the attached sink.
++	  port to be able to identify the attached sink and drive it.
+ 
+ config DRM_SUN60I_TCON_TV
+ 	tristate "Allwinner A733 (sun60iw2) TCON_TV1 timing controller"
+diff --git a/drivers/gpu/drm/sun60i/sun60i-dp.c b/drivers/gpu/drm/sun60i/sun60i-dp.c
+--- a/drivers/gpu/drm/sun60i/sun60i-dp.c
++++ b/drivers/gpu/drm/sun60i/sun60i-dp.c
+@@ -15,9 +15,22 @@
+  * the combo-PHY driver, and a DisplayPort controller reaches it through
+  * phy_configure() with a union phy_configure_opts_dp, the way every DP
+  * controller in mainline does. Link training is the third, and with it the last
+- * piece of the pixel path that was still a shell script. What is still absent
+- * is KMS: no connector, no CRTC, no modeset -- the mode is a built-in constant
+- * and the verbs are debugfs files.
++ * piece of the pixel path that was still a shell script.
++ *
++ * The fourth is this file's half of KMS: a struct drm_bridge, published with
++ * drm_bridge_add() so that the encoder half -- which needs a drm_device this
++ * tree does not have yet -- can find it by of_node and attach it. The shape
++ * follows dw_dp-rockchip.c (150 lines) and sun8i_dw_hdmi.c (302 lines), the two
++ * mainline worked examples of a SoC-side output that is a bridge plus an
++ * encoder; the callbacks follow drivers/gpu/drm/bridge/synopsys/dw-dp.c, a
++ * different IP core with the same job.
++ *
++ * WHAT IS STILL ABSENT, precisely, so nobody reads a bridge as a display stack:
++ * nothing in this tree creates an encoder, so nothing calls drm_bridge_attach(),
++ * so .attach, .detect, .edid_read, .mode_valid, .hpd_notify, .atomic_enable and
++ * .atomic_disable have never run -- on hardware or anywhere else. What changes
++ * on a running board is one list insertion. Every path that works today still
++ * works.
+  *
+  * Every register offset and field below comes from the UM's own register list
+  * (chapter 15.4.7 of the A733 user manual) and
+@@ -69,6 +82,12 @@
+ 
+ #include <drm/display/drm_dp.h>
+ #include <drm/display/drm_dp_helper.h>
++#include <drm/drm_atomic.h>
++#include <drm/drm_atomic_helper.h>
++#include <drm/drm_atomic_state_helper.h>
++#include <drm/drm_bridge.h>
++#include <drm/drm_connector.h>
++#include <drm/drm_crtc.h>
+ #include <drm/drm_edid.h>
+ #include <drm/drm_modes.h>
+ 
+@@ -275,6 +294,24 @@ static const unsigned int sun60i_dp_link_rates[] = { 810000, 540000, 270000, 162
+ /* MVID is a measurement, so it is compared with a tolerance, not for equality. */
+ #define MVID_TOLERANCE_PERCENT		1
+ 
++/*
++ * Who owns the I2C-over-AUX adapter. It is one variable rather than two flags
++ * because "both" and "neither while enabled" are not states this driver can be
++ * in, and an enum says so; two bools would let a future edit invent them.
++ *
++ * DRIVER is the pre-KMS path -- sun60i_dp_aux_enable() adds the adapter by hand
++ * because drm_dp_aux_register() needs a drm_device. DRM is the attached path,
++ * where the core registered the same struct plus the /dev/drm_dp_auxN chardev
++ * and owns its lifetime. Getting this wrong is not cosmetic: adding the same
++ * i2c_adapter twice fails with -EBUSY, and removing it under a live connector
++ * takes EDID away from it.
++ */
++enum sun60i_dp_ddc_owner {
++	SUN60I_DP_DDC_NONE,
++	SUN60I_DP_DDC_DRIVER,
++	SUN60I_DP_DDC_DRM,
++};
++
+ struct sun60i_dp {
+ 	struct device		*dev;
+ 	void __iomem		*base;
+@@ -319,6 +356,12 @@ struct sun60i_dp {
+ 	u8			bpc;
+ 	bool			video_configured;
+ 	bool			video_on;
++	/* The KMS half. Not a pointer: devm_drm_bridge_alloc() allocates this
++	 * whole struct with the bridge embedded in it, which is why the
++	 * container_of() below is the standard shape for a bridge driver.
++	 */
++	struct drm_bridge	bridge;
++	enum sun60i_dp_ddc_owner ddc_owner;
+ };
+ 
+ static inline struct sun60i_dp *aux_to_dp(struct drm_dp_aux *aux)
+@@ -326,6 +369,11 @@ static inline struct sun60i_dp *aux_to_dp(struct drm_dp_aux *aux)
+ 	return container_of(aux, struct sun60i_dp, aux);
+ }
+ 
++static inline struct sun60i_dp *bridge_to_dp(struct drm_bridge *bridge)
++{
++	return container_of(bridge, struct sun60i_dp, bridge);
++}
++
+ /*
+  * One AUX transaction, in the order the UM prescribes: address first, payload
+  * next when there is one, command last, because writing the command register
+@@ -342,6 +390,30 @@ static ssize_t sun60i_dp_aux_transfer(struct drm_dp_aux *aux,
+ 	bool is_read;
+ 	int ret, i;
+ 
++	/*
++	 * ⚠ THE BRIDGE CREATED THE NEED FOR THIS GUARD, AND WITHOUT IT THE
++	 * BRIDGE WOULD BE A REGRESSION -- a blind-AUX path of exactly the kind
++	 * this driver's rules forbid (no AUX traffic without a sink), only ours.
++	 *
++	 * Until drm_dp_aux_register() had a caller, every route into this
++	 * function ran through a debugfs verb or through an i2c adapter that
++	 * only exists while the block is enabled. drm_dp_aux_register() adds two
++	 * that do not: the /dev/drm_dp_auxN chardev, which any process holding
++	 * it open can drive at any instant, and an adapter that stays registered
++	 * across an `echo 0 > aux_enable`. Both land here with the bus clock
++	 * gated and the reset asserted -- the state in which `drm-allwinner-a733-displayport-aux` MEASURED the
++	 * whole 4 KiB window reading zero. The first readl() would then see
++	 * "no request in progress", the AUX_COMMAND write would go nowhere, and
++	 * the poll below would burn its full 3 ms before reporting a timeout
++	 * that says nothing about the sink.
++	 *
++	 * -ENODEV, not -ETIMEDOUT: the DRM core retries a timeout (32 times, per
++	 * drm_dp_dpcd_access()) and does not retry a missing device, and no
++	 * number of retries can change this answer.
++	 */
++	if (!dp->enabled)
++		return -ENODEV;
++
+ 	if (msg->size > AUX_MAX_PAYLOAD)
+ 		return -E2BIG;
+ 
+@@ -501,24 +573,32 @@ static int sun60i_dp_aux_enable(struct sun60i_dp *dp)
+ 	writel(rate_mhz, dp->base + DP_AUX_CLOCK_DIVIDER);
+ 
+ 	/*
+-	 * Not drm_dp_aux_register(): that one opens with
+-	 * WARN_ON_ONCE(!aux->drm_dev), and this tree has no drm_device to give
+-	 * it -- there is no KMS driver for this SoC yet. Its own kerneldoc names
+-	 * this case: "drivers which need to use the aux channel before either of
+-	 * the two points mentioned above need to call drm_dp_aux_init()". So the
++	 * Not drm_dp_aux_register() ON THIS PATH: that one opens with
++	 * WARN_ON_ONCE(!aux->drm_dev), and a board on which nothing has attached
++	 * the bridge has no drm_device to give it. Its own kerneldoc names this
++	 * case: "drivers which need to use the aux channel before either of the
++	 * two points mentioned above need to call drm_dp_aux_init()". So the
+ 	 * init is done at probe and what is added here is the one thing the
+ 	 * register path would add on top and that we do need: the I2C-over-AUX
+ 	 * adapter, which is what carries EDID. The chardev is deliberately left
+ 	 * out -- it is the part that needs the DRM parent.
++	 *
++	 * Once the bridge IS attached the core owns the same struct, so this is
++	 * conditional rather than unconditional. See enum sun60i_dp_ddc_owner.
+ 	 */
+-	dp->aux.ddc.owner = THIS_MODULE;
+-	dp->aux.ddc.dev.parent = dp->dev;
+-	strscpy(dp->aux.ddc.name, dev_name(dp->dev), sizeof(dp->aux.ddc.name));
++	if (dp->ddc_owner == SUN60I_DP_DDC_NONE) {
++		dp->aux.ddc.owner = THIS_MODULE;
++		dp->aux.ddc.dev.parent = dp->dev;
++		strscpy(dp->aux.ddc.name, dev_name(dp->dev),
++			sizeof(dp->aux.ddc.name));
+ 
+-	ret = i2c_add_adapter(&dp->aux.ddc);
+-	if (ret) {
+-		dev_err(dp->dev, "I2C-over-AUX adapter: %d\n", ret);
+-		goto err_phy_off;
++		ret = i2c_add_adapter(&dp->aux.ddc);
++		if (ret) {
++			dev_err(dp->dev, "I2C-over-AUX adapter: %d\n", ret);
++			goto err_phy_off;
++		}
++
++		dp->ddc_owner = SUN60I_DP_DDC_DRIVER;
+ 	}
+ 
+ 	dp->enabled = true;
+@@ -1095,7 +1175,13 @@ static void sun60i_dp_aux_disable(struct sun60i_dp *dp)
+ {
+ 	sun60i_dp_video_disable(dp);
+ 	sun60i_dp_link_release(dp);
+-	i2c_del_adapter(&dp->aux.ddc);
++	/* Only the adapter this function's counterpart added. The core's one
++	 * outlives an aux_enable cycle and is removed by .detach.
++	 */
++	if (dp->ddc_owner == SUN60I_DP_DDC_DRIVER) {
++		i2c_del_adapter(&dp->aux.ddc);
++		dp->ddc_owner = SUN60I_DP_DDC_NONE;
++	}
+ 	phy_power_off(dp->aux_phy);
+ 	phy_exit(dp->aux_phy);
+ 	reset_control_assert(dp->reset);
+@@ -2036,6 +2122,436 @@ static int sun60i_dp_train(struct sun60i_dp *dp, unsigned int rate_mbps,
+ 	return ret;
+ }
+ 
++/*
++ * ---------------------------------------------------------------------------
++ * The DRM bridge
++ * ---------------------------------------------------------------------------
++ *
++ * The planned shape: the DE joins sun4i-drm,
++ * the TCON stays ours and gains a CRTC, and the DP becomes a drm_bridge and an
++ * encoder component. This is the bridge. The encoder is not here, and cannot
++ * be: drmm_encoder_init() takes a struct drm_device, and creating one is the
++ * component master's job in the half of Stage 2 that this file does not own.
++ *
++ * WHAT THIS ADDS THAT `drm-allwinner-a733-displayport-aux` DELIBERATELY LEFT OUT. `drm-allwinner-a733-displayport-aux`'s header says the
++ * chardev "is the part that needs the DRM parent" and does not create it.
++ * drm_dp_aux_register() does, so from the first attach this device has a
++ * /dev/drm_dp_auxN that any process can drive. That is a new way into
++ * sun60i_dp_aux_transfer() which does not pass through a debugfs verb, and the
++ * guard at the top of that function is its answer -- see the block there.
++ *
++ * WHY drm_bridge_add() RATHER THAN A BIND CALLBACK. dw_dp-rockchip.c builds its
++ * bridge inside component .bind, where a drm_device already exists; it can,
++ * because the same driver owns both halves. Here the two halves are separate
++ * devices with separate DT nodes, so the bridge has to exist BEFORE the encoder
++ * that will attach it -- which is what drm_bridge_add() is for and what
++ * of_drm_find_bridge()/devm_drm_of_get_bridge() look in. That also keeps the
++ * dependency one-way: this driver never has to know the KMS half exists.
++ *
++ * WHY NOT DRM_BRIDGE_OP_HPD, and this is a measurement, not taste. The op means
++ * "this bridge detects hot-plug and calls drm_bridge_hpd_notify()". This one
++ * cannot: HPD_INPUT_STATE, eDP0 offset 0x0128, absolute 0x05740128, reads zero
++ * on this board while a picture is on the wire -- read on 2026-08-19 against
++ * the VENDOR's live link, so it is the board and not our bring-up.
++ * The pad is not routed to the connector. Claiming
++ * the op would give the connector DRM_CONNECTOR_POLL_HPD, which waits for a
++ * drm_bridge_hpd_notify() that can never come -- a display that never returns
++ * after a re-plug.
++ *
++ * WHERE HPD ACTUALLY COMES FROM, and it is already in the tree. The alternate
++ * mode carries it: drivers/usb/typec/altmodes/displayport.c calls
++ * drm_connector_oob_hotplug_event() on every HPD change, and drm_connector.c's
++ * own kerneldoc names this exact board -- "some USB Type-C setups where the
++ * hardware muxes the DisplayPort data and aux-lines but does not pass the
++ * altmode HPD status bit to the GPU's DP HPD pin". drm_bridge_connector
++ * implements .oob_hotplug_event, sets connector->status from it and then calls
++ * .hpd_notify on every bridge in the chain (drm_bridge_connector.c:135-161), so
++ * the callback below is the far end of a path that already runs on this board
++ * -- typec_displayport.ko is shipped and DRM is pinned in A733_CONFIGS for
++ * exactly that symbol.
++ *
++ * ⬜ ONE LINK IN THAT PATH IS NOT PROVEN AND IS NOT PROVEN BY THIS PATCH.
++ * drm_connector_find_by_fwnode() matches connector->fwnode, which
++ * drm_bridge_connector sets from the LAST bridge's of_node -- our DP node --
++ * while dp_altmode_probe() takes the Type-C port's own fwnode unless the port
++ * carries a `displayport` property pointing elsewhere (displayport.c:800-804).
++ * The two are different nodes, so on this board the event would be dropped. The
++ * property exists in the code and in NO binding: usb-connector.yaml is
++ * `unevaluatedProperties: false` and documents only an `altmodes/displayport`
++ * CHILD NODE, which is not a property and does not satisfy that lookup, and no
++ * DT in the tree uses it. Falsified/closed by one observation once a connector
++ * exists: plug the monitor and watch /sys/class/drm/<card>-DP-1/status. It is
++ * NOT this patch's to fix -- the DT edit belongs with the connector.
++ *
++ * WHY .detect TOUCHES NO REGISTER. With DRM_BRIDGE_OP_DETECT and no HPD op,
++ * drm_bridge_connector sets connector->polled to POLL_CONNECT|POLL_DISCONNECT
++ * (drm_bridge_connector.c:845-848) and the probe helper calls .detect every ten
++ * seconds, for ever, with nothing attached. A .detect that talked on AUX would
++ * therefore reproduce the vendor's own defect -- 7 hardware retries per read
++ * into a powered-down front end, forever instead of only at bind. So .detect
++ * reports state that .hpd_notify recorded, and only .hpd_notify opens the
++ * channel.
++ */
++
++/*
++ * The best payload rate the PHY can carry at the full lane count, in kB/s, or
++ * zero if nothing can be asked.
++ *
++ * This is deliberately NOT sun60i_dp_link_rate_ladder(): that one starts from
++ * the sink's DPCD, and drm_bridge_funcs.mode_valid's kerneldoc forbids looking
++ * at anything but the mode and "configuration-invariant hardware constraints".
++ * The PHY's rate table is such a constraint -- there is exactly one of it, it
++ * does not depend on what is plugged in, and phy_validate() is side-effect free
++ * by construction (phy-sun60i-a733-combophy.c). The sink's own limit is applied
++ * where it belongs, by the DRM core, out of the EDID.
++ */
++static int sun60i_dp_bridge_link_budget(struct sun60i_dp *dp)
++{
++	union phy_configure_opts opts;
++	int best = 0;
++	unsigned int i;
++
++	if (!dp->link_phy)
++		return 0;
++
++	for (i = 0; i < ARRAY_SIZE(sun60i_dp_link_rates); i++) {
++		unsigned int mbps = SUN60I_DP_RATE_TO_MBPS(sun60i_dp_link_rates[i]);
++
++		sun60i_dp_fill_opts(&opts, mbps, SUN60I_DP_MAX_LANES);
++		if (phy_validate(dp->link_phy, PHY_MODE_DP, PHY_SUBMODE_DP,
++				 &opts))
++			continue;
++
++		best = max(best,
++			   drm_dp_max_dprx_data_rate(sun60i_dp_link_rates[i],
++						     SUN60I_DP_MAX_LANES));
++	}
++
++	return best;
++}
++
++static enum drm_mode_status
++sun60i_dp_bridge_mode_valid(struct drm_bridge *bridge,
++			    const struct drm_display_info *info,
++			    const struct drm_display_mode *mode)
++{
++	struct sun60i_dp *dp = bridge_to_dp(bridge);
++	unsigned int bpp = (info && info->bpc ? info->bpc : 8) * 3;
++	unsigned int need;
++	int budget;
++
++	if (mode->clock <= 0)
++		return MODE_CLOCK_LOW;
++
++	/*
++	 * TCON_TV1 refuses an interlaced mode outright and says why
++	 * (sun60i-tcon-tv.c, check_mode): the progressive-only fields are the
++	 * only ones this tree has ever programmed. Answering here as well keeps
++	 * the mode out of the connector's list rather than failing the commit.
++	 */
++	if (mode->flags & DRM_MODE_FLAG_INTERLACE)
++		return MODE_NO_INTERLACE;
++
++	/*
++	 * ⚠ ONE PIXEL CLOCK, AND THE RESTRICTION IS HONEST RATHER THAN
++	 * CONSERVATIVE. `clk-sunxi-ng-a733-video-plls-and-edp-tv-pixel-clock` models PLL_VIDEO1 as real clk_ops with rate
++	 * propagation, and its own header names what it owes: "a SECOND mode.
++	 * Nothing has ever asked this PLL for one" -- a mode whose pixel clock
++	 * is not an integer divisor of a reachable VCO lands on the nearest
++	 * lower rate, and the falsifier it names is SRC0_MVID not computing back
++	 * to the requested clock. Until that measurement exists, a connector
++	 * whose EDID offers a mode list would hand this driver clocks nothing
++	 * has ever produced, and the only thing between that and a silently
++	 * wrong raster is `drm-a733-tcon-tv1-timing-generator-and-video-source`'s readback -- one 1 % check, after the fact.
++	 *
++	 * So the mode list is gated on the one clock this tree has driven, and
++	 * the gate carries the observation that removes it. It sits here rather
++	 * than in the CRTC only because the CRTC does not exist yet; it belongs
++	 * to whoever owns clk_round_rate() on the pixel clock, which is
++	 * TCON_TV1, and it moves there when that half lands.
++	 *
++	 * Closed by: asking PLL_VIDEO1 for a second mode -- 1280x1024 at
++	 * 108 MHz is the one `clk-sunxi-ng-a733-video-plls-and-edp-tv-pixel-clock` names -- and reading SRC0_MVID back. If it
++	 * computes to the requested clock, this test becomes a
++	 * clk_round_rate() tolerance check instead.
++	 */
++	if (mode->clock != sun60i_display_mode_1920x1200.clock)
++		return MODE_CLOCK_RANGE;
++
++	budget = sun60i_dp_bridge_link_budget(dp);
++	if (!budget)
++		return MODE_OK;
++
++	/* kB/s on both sides: mode->clock counts kHz and drm_dp_max_dprx_data_
++	 * rate() returns kB/s, so pixels/s * bytes/pixel is the comparison.
++	 */
++	need = DIV_ROUND_UP((unsigned int)mode->clock * bpp, 8);
++	if (need > (unsigned int)budget)
++		return MODE_CLOCK_HIGH;
++
++	return MODE_OK;
++}
++
++static enum drm_connector_status
++sun60i_dp_bridge_detect(struct drm_bridge *bridge,
++			struct drm_connector *connector)
++{
++	struct sun60i_dp *dp = bridge_to_dp(bridge);
++
++	guard(mutex)(&dp->lock);
++
++	/*
++	 * dpcd_valid, not `enabled`: the AUX channel being powered says this
++	 * driver opened it, the sink's own capability bytes say something
++	 * answered. No sink is a STATE, not an error -- so this
++	 * returns disconnected quietly and logs nothing on the ten-second poll.
++	 */
++	return dp->dpcd_valid ? connector_status_connected
++			      : connector_status_disconnected;
++}
++
++static const struct drm_edid *
++sun60i_dp_bridge_edid_read(struct drm_bridge *bridge,
++			   struct drm_connector *connector)
++{
++	struct sun60i_dp *dp = bridge_to_dp(bridge);
++
++	guard(mutex)(&dp->lock);
++
++	if (!dp->enabled)
++		return NULL;
++
++	/*
++	 * ⬜ THIS MAY RETIRE the earlier two-block EDID reader's CAP, AND THAT IS A CLAIM, NOT A RESULT.
++	 * The earlier two-block EDID reader reads at most two EDID blocks and says so out loud, because this
++	 * core's AUX block sends a ONE-BYTE offset and block 2 onwards needs the
++	 * E-DDC segment pointer -- which the earlier reader's header records as arriving "with
++	 * the display stack instead of being hand-rolled now". This is that
++	 * display stack: drm_edid_read_ddc() writes the segment pointer itself,
++	 * as a separate one-byte i2c write to DDC_SEGMENT_ADDR, which is an
++	 * ordinary transaction for this AUX block.
++	 *
++	 * Untested: the bench sink declares exactly ONE extension block, so it
++	 * cannot tell the two apart. Falsified/confirmed by a sink with three or
++	 * more blocks -- `edid` prints how many it skipped and why, and the
++	 * connector's own EDID is then the comparison. That file stays either
++	 * way; this tree does not delete diagnostics.
++	 */
++	return drm_edid_read_ddc(connector, &dp->aux.ddc);
++}
++
++/*
++ * The far end of the Type-C alternate mode's HPD. This is the ONE place that
++ * opens the AUX channel by itself, and that is the whole rule: the
++ * channel is opened when something has said a sink is there, never at bind and
++ * never on a poll.
++ */
++static void sun60i_dp_bridge_hpd_notify(struct drm_bridge *bridge,
++					enum drm_connector_status status)
++{
++	struct sun60i_dp *dp = bridge_to_dp(bridge);
++	int ret;
++
++	guard(mutex)(&dp->lock);
++
++	if (status != connector_status_connected) {
++		if (dp->enabled)
++			sun60i_dp_aux_disable(dp);
++		return;
++	}
++
++	if (!dp->enabled) {
++		ret = sun60i_dp_aux_enable(dp);
++		if (ret)
++			return;
++	}
++
++	/* Failure is reported by sun60i_dp_link_probe() itself and leaves
++	 * dpcd_valid false, which is what .detect will then answer. Nothing is
++	 * retried here -- the DRM core owns AUX retries.
++	 */
++	sun60i_dp_link_probe(dp);
++}
++
++static void sun60i_dp_bridge_atomic_enable(struct drm_bridge *bridge,
++					   struct drm_atomic_state *state)
++{
++	struct sun60i_dp *dp = bridge_to_dp(bridge);
++	struct drm_connector_state *conn_state;
++	struct drm_crtc_state *crtc_state;
++	struct drm_connector *connector;
++	int ret;
++
++	connector = drm_atomic_get_new_connector_for_encoder(state,
++							     bridge->encoder);
++	if (!connector) {
++		dev_err(dp->dev, "atomic enable with no connector\n");
++		return;
++	}
++
++	conn_state = drm_atomic_get_new_connector_state(state, connector);
++	if (!conn_state || !conn_state->crtc) {
++		dev_err(dp->dev, "atomic enable with no CRTC\n");
++		return;
++	}
++
++	crtc_state = drm_atomic_get_new_crtc_state(state, conn_state->crtc);
++	if (!crtc_state) {
++		dev_err(dp->dev, "atomic enable with no CRTC state\n");
++		return;
++	}
++
++	guard(mutex)(&dp->lock);
++
++	/*
++	 * ⚠ THE INVARIANT sun60i-display.h EXISTS FOR IS NOT CLOSED HERE.
++	 * TCON_TV1 and this transmitter must describe the SAME mode; the
++	 * hardware reports a disagreement as SRC0_USER_FIFO_STATUS != 0,
++	 * flagging a mismatch with the current video mode. From
++	 * here the transmitter takes its mode from the atomic state, which is
++	 * the retirement path that header names -- but the TCON still takes the
++	 * constant until it gains a CRTC, which is the other half of Stage 2.
++	 * Until both read the same atomic state, the invariant is held only by
++	 * .mode_valid and by the constant, and the observable that would catch a
++	 * mismatch is the one the driver already reads and prints.
++	 */
++	drm_mode_copy(&dp->mode, &crtc_state->adjusted_mode);
++	if (connector->display_info.bpc)
++		dp->bpc = connector->display_info.bpc;
++
++	/* Auto on both: the rate ladder asks the sink and the PHY, and the lane
++	 * ladder is the fallback DP 1.4 section 3.5.1.2.1 requires. A modeset must not
++	 * hardcode either -- that is the vendor behaviour `drm-a733-dp-link-training` replaced.
++	 */
++	ret = sun60i_dp_train(dp, 0, 0);
++	if (ret) {
++		/*
++		 * Stopping here is NOT the thing this tree rejected. What was
++		 * rejected is making the VIDEO path refuse a link this driver
++		 * did not train -- sun60i_dp_video_stream_enable() warns
++		 * instead, so that a test script stays usable
++		 * as the A/B arm on the same kernel. That still holds: the
++		 * debugfs verbs reach the video path without coming through
++		 * here. This is our own training returning an error, which
++		 * means the ladder ran out of rungs -- streaming pixels into a
++		 * link that reported itself untrained would produce a black
++		 * screen and no line saying why.
++		 */
++		dev_err(dp->dev, "link training failed: %d\n", ret);
++		return;
++	}
++
++	ret = sun60i_dp_video_configure(dp);
++	if (ret) {
++		dev_err(dp->dev, "video configure failed: %d\n", ret);
++		return;
++	}
++
++	ret = sun60i_dp_video_stream_enable(dp);
++	if (ret)
++		dev_err(dp->dev, "video stream enable failed: %d\n", ret);
++}
++
++static void sun60i_dp_bridge_atomic_disable(struct drm_bridge *bridge,
++					    struct drm_atomic_state *state)
++{
++	struct sun60i_dp *dp = bridge_to_dp(bridge);
++
++	guard(mutex)(&dp->lock);
++
++	/*
++	 * The stream, and deliberately not the link. sun60i_dp_link_release()
++	 * calls phy_exit() on COMB0, which dwc3 also holds; it is refcounted, so
++	 * it would not pull SuperSpeed down -- but a modeset off is not the
++	 * event that should release a PHY the Type-C mux handed us. That is
++	 * .hpd_notify's disconnect, or the driver going away.
++	 */
++	sun60i_dp_video_disable(dp);
++}
++
++static int sun60i_dp_bridge_attach(struct drm_bridge *bridge,
++				   struct drm_encoder *encoder,
++				   enum drm_bridge_attach_flags flags)
++{
++	struct sun60i_dp *dp = bridge_to_dp(bridge);
++	int ret;
++
++	/*
++	 * The legacy path, where the bridge creates its own connector, is
++	 * refused rather than implemented -- and not on style grounds. The
++	 * out-of-band HPD above reaches a connector only through
++	 * drm_bridge_connector, which is what sets connector->fwnode from
++	 * bridge->of_node and implements .oob_hotplug_event. A hand-rolled
++	 * connector here would compile, probe, and silently never see a
++	 * hot-plug on this board.
++	 */
++	if (!(flags & DRM_BRIDGE_ATTACH_NO_CONNECTOR)) {
++		dev_err(dp->dev,
++			"attach without DRM_BRIDGE_ATTACH_NO_CONNECTOR: this bridge needs drm_bridge_connector_init(), because Type-C alt-mode HPD arrives out of band and only that connector receives it\n");
++		return -EINVAL;
++	}
++
++	guard(mutex)(&dp->lock);
++
++	/*
++	 * A user may already have opened AUX through the debugfs verb, in
++	 * which case this driver holds the ddc adapter. Hand it over: it is the
++	 * same struct i2c_adapter, and drm_dp_aux_register() adds it again.
++	 */
++	if (dp->ddc_owner == SUN60I_DP_DDC_DRIVER) {
++		i2c_del_adapter(&dp->aux.ddc);
++		dp->ddc_owner = SUN60I_DP_DDC_NONE;
++	}
++
++	dp->aux.drm_dev = bridge->dev;
++	ret = drm_dp_aux_register(&dp->aux);
++	if (ret) {
++		dev_err(dp->dev, "DP AUX register: %d\n", ret);
++		return ret;
++	}
++
++	dp->ddc_owner = SUN60I_DP_DDC_DRM;
++
++	return 0;
++}
++
++static void sun60i_dp_bridge_detach(struct drm_bridge *bridge)
++{
++	struct sun60i_dp *dp = bridge_to_dp(bridge);
++
++	guard(mutex)(&dp->lock);
++
++	/* Down first, so nothing is left holding a channel whose adapter is
++	 * about to disappear. aux_disable() will not touch the adapter while
++	 * the core owns it.
++	 */
++	if (dp->enabled)
++		sun60i_dp_aux_disable(dp);
++
++	drm_dp_aux_unregister(&dp->aux);
++	dp->aux.drm_dev = NULL;
++	dp->ddc_owner = SUN60I_DP_DDC_NONE;
++}
++
++static const struct drm_bridge_funcs sun60i_dp_bridge_funcs = {
++	/* The three state helpers are what make this bridge atomic at all --
++	 * drm_bridge_is_atomic() tests for .atomic_reset (drm_bridge.c:382), and
++	 * without it the chain would never call .atomic_enable.
++	 */
++	.atomic_reset		= drm_atomic_helper_bridge_reset,
++	.atomic_duplicate_state	= drm_atomic_helper_bridge_duplicate_state,
++	.atomic_destroy_state	= drm_atomic_helper_bridge_destroy_state,
++	.atomic_get_input_bus_fmts = drm_atomic_helper_bridge_propagate_bus_fmt,
++	.attach			= sun60i_dp_bridge_attach,
++	.detach			= sun60i_dp_bridge_detach,
++	.mode_valid		= sun60i_dp_bridge_mode_valid,
++	.detect			= sun60i_dp_bridge_detect,
++	.edid_read		= sun60i_dp_bridge_edid_read,
++	.hpd_notify		= sun60i_dp_bridge_hpd_notify,
++	.atomic_enable		= sun60i_dp_bridge_atomic_enable,
++	.atomic_disable		= sun60i_dp_bridge_atomic_disable,
++};
++
+ static void sun60i_dp_teardown(void *data)
+ {
+ 	struct sun60i_dp *dp = data;
+@@ -2052,9 +2568,18 @@ static int sun60i_dp_probe(struct platform_device *pdev)
+ 	struct sun60i_dp *dp;
+ 	int ret;
+ 
+-	dp = devm_kzalloc(dev, sizeof(*dp), GFP_KERNEL);
+-	if (!dp)
+-		return -ENOMEM;
++	/*
++	 * devm_drm_bridge_alloc() rather than devm_kzalloc(): a drm_bridge is
++	 * reference counted since 6.16 and the core may hold a reference past
++	 * driver removal, so the struct that CONTAINS it has to be freed on the
++	 * refcount, not on devm. The macro allocates this whole struct, zeroed,
++	 * with the embedded bridge initialised and its count at one, and drops
++	 * that one reference through devm.
++	 */
++	dp = devm_drm_bridge_alloc(dev, struct sun60i_dp, bridge,
++				   &sun60i_dp_bridge_funcs);
++	if (IS_ERR(dp))
++		return PTR_ERR(dp);
+ 
+ 	dp->dev = dev;
+ 	dp->mode = sun60i_display_mode_1920x1200;
+@@ -2129,11 +2654,39 @@ static int sun60i_dp_probe(struct platform_device *pdev)
+ 	dp->aux.transfer = sun60i_dp_aux_transfer;
+ 	drm_dp_aux_init(&dp->aux);
+ 
++	/*
++	 * of_node is what of_drm_find_bridge() matches on, so it is what lets
++	 * the encoder half find this bridge without either driver knowing about
++	 * the other. type reaches drm_bridge_connector_init(), which takes the
++	 * LAST bridge's type as the connector type -- and, on the same pass,
++	 * copies of_node into connector->fwnode, which is the node the
++	 * out-of-band hot-plug is matched against.
++	 *
++	 * ops carries DETECT and EDID and NOT HPD: see the block above
++	 * sun60i_dp_bridge_link_budget() for the measurement that decides it.
++	 */
++	dp->bridge.of_node = dev->of_node;
++	dp->bridge.type = DRM_MODE_CONNECTOR_DisplayPort;
++	dp->bridge.ops = DRM_BRIDGE_OP_DETECT | DRM_BRIDGE_OP_EDID;
++
+ 	ret = devm_add_action_or_reset(dev, sun60i_dp_teardown, dp);
+ 	if (ret)
+ 		return ret;
+ 
+-	dev_info(dev, "A733 DisplayPort AUX on %s, idle until a consumer enables it\n",
++	/*
++	 * Last in probe, and the order matters in both directions. Forwards:
++	 * from this call the bridge is on the global list and an encoder can
++	 * attach it, so everything it needs -- registers mapped, PHYs resolved,
++	 * debugfs up -- is already done. Backwards: devm unwinds in reverse, so
++	 * drm_bridge_remove() runs BEFORE sun60i_dp_teardown() disables AUX, and
++	 * before the bridge itself is freed by the alloc above. No window exists
++	 * in which a bridge on the list points at a torn-down device.
++	 */
++	ret = devm_drm_bridge_add(dev, &dp->bridge);
++	if (ret)
++		return dev_err_probe(dev, ret, "drm_bridge_add\n");
++
++	dev_info(dev, "A733 DisplayPort on %s: bridge registered, AUX idle until a hot-plug\n",
+ 		 dev_name(dev));
+ 
+ 	return 0;

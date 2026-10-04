@@ -1,0 +1,64 @@
+Description: Do not run the channel callback for defaults xfwm4 writes itself
+ On a first start the xfwm4 xfconf channel has no properties yet.
+ loadXfconfData() writes every default back with xfconf_channel_set_property(),
+ which emits "property-changed" on the same channel synchronously, from inside
+ loadSettings(): xfconf's cache emits the signal in the very call that sets the
+ property (xfconf/xfconf-cache.c, xfconf_cache_set), not from the main loop.
+ cb_xfwm4_channel_property_changed() then reloads the settings recursively (15
+ loadSettings() calls instead of 1 on a clean profile) and, for
+ "use_compositing", calls compositorActivateScreen() -> compositorManageScreen()
+ before loadSettings() has stored vblank_mode. The compositor starts with
+ vblank_mode == VBLANK_OFF: neither GLX nor XPresent vsync, so windows tear.
+ init_compositor_screen() then calls compositorManageScreen() a second time,
+ which finds _NET_WM_CM_S<n> owned by xfwm4's own window and logs "Another
+ compositing manager is running on screen 0"; XFWM4_COMPOSITING_MANAGER is
+ never acquired.
+ The defaults are applied from rc[] when loadXfconfData() returns, so block
+ the callback while they are written.
+ .
+ Reproduced in a trixie container (Xvfb + xfce4-session, fresh HOME): the
+ warning on the first start and not on the second, gone with this patch; a
+ channel that lacks only use_compositing triggers it as well.
+ Upstream status: not yet reported. The code is unchanged in xfwm4 master
+ (d30886f7b, 2026-10); no issue in gitlab.xfce.org/xfce/xfwm4, Debian's BTS or
+ Launchpad matches (searched 2026-10-03).
+From: DockSeed <dockseed@proton.me>
+Forwarded: no
+Last-Update: 2026-10-03
+Assisted-by: Claude
+---
+--- a/src/settings.c
++++ b/src/settings.c
+@@ -214,6 +214,21 @@
+ loadXfconfData (ScreenInfo *screen_info, Settings *rc)
+ {
+     gint i;
++
++    /*
++       Writing a default back to the channel makes xfconf emit "property-changed"
++       on this very channel, synchronously, from within xfconf_channel_set_property().
++       cb_xfwm4_channel_property_changed() would then reload the settings
++       recursively and, for "use_compositing", start the compositor, while
++       loadSettings() is still running: before vblank_mode is loaded, so with
++       no vsync, and before init_compositor_screen(), which then finds the
++       compositor selection already owned by xfwm4 itself.
++       The defaults are applied from rc[] when this function returns, so the
++       callback has nothing to do for these writes.
++     */
++    g_signal_handlers_block_by_func (screen_info->xfwm4_channel,
++                                     cb_xfwm4_channel_property_changed,
++                                     screen_info);
+     for (i = XPM_COLOR_SYMBOL_SIZE; rc[i].option; ++i)
+     {
+         gchar *property_name = g_strconcat("/general/", rc[i].option, NULL);
+@@ -238,7 +253,9 @@
+         }
+         g_free(property_name);
+     }
+-
++    g_signal_handlers_unblock_by_func (screen_info->xfwm4_channel,
++                                       cb_xfwm4_channel_property_changed,
++                                       screen_info);
+ }
+ 
+ static int

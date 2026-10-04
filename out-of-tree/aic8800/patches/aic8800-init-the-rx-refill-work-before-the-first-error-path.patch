@@ -1,0 +1,191 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] aic8800: init the rx refill work before the first error path
+
+From code reading (pinned tag plus the earlier patches of this series; kernel 6.18.53).
+
+aicwf_usb_init() in both modules jumps to `error` from each allocation --
+the rx URBs, the tx URBs, the msg-out URB, and in aic8800_fdrv the msg-in rx
+URBs -- but initialises rx_urb_work (and aic8800_fdrv's msg_rx_urb_work)
+only at its end (aic_load_fw aicwf_usb.c:829, aic8800_fdrv :2106-2109 before
+this patch). `error` calls aicwf_usb_deinit(), whose first statement is
+cancel_work_sync() on that work. usb_dev comes from kzalloc(), so the work
+has no func: __cancel_work_sync() -> __flush_work() hits
+WARN_ON(!work->func) (kernel/workqueue.c:4287, 6.18.53). The msg-out branch
+also sets `ret = ENOMEM`, positive, so the probe returns +12 where the
+driver core expects a negative errno.
+
+Only an allocation failure at probe takes this path. All eight copies of
+aicwf_usb.c in the pinned tag carry both defects (our two and six under
+src/USB/patch/); none fixes them.
+
+In the vendor driver: the error path cleans up something the function
+has not set up yet, and one branch returns the error with the wrong sign.
+
+What changes, in both modules: the work items are initialised with the
+anchors, before the first allocation, and the msg-out branch returns
+-ENOMEM. Nothing else moves; on a probe that allocates everything the
+order of events is the same.
+
+Test stimulus under /sys/module/<module>/parameters, both modules:
+usb_init_inject_alloc_fail (0644) makes the next aicwf_usb_init() skip one
+allocation and take its failure branch, once: 1 rx URBs, 2 tx URBs,
+3 msg-out URB, 4 msg-in rx URBs (aic8800_fdrv only). What follows is the
+path a real failure takes.
+
+Falsifier, on the board, with the part at its loaded id (a reload after the
+radio came up):
+  modprobe -r aic8800_fdrv aic_load_fw
+  modprobe aic_load_fw usb_init_inject_alloc_fail=3
+Without the fix: a WARNING from __flush_work() and a positive probe
+return; with it: "aicwf_usb_init err -12", no WARNING. The same with
+aic8800_fdrv (values 1-4). One WARNING from __flush_work() on this path
+with the fix refutes it.
+
+HW-proven, 8 GiB board, 2026-09-24 (6.18.53): the stimulus alone gave the
+WARNING (aic_load_fw once, aic8800_fdrv twice, one per work) and probe
+error +12; with this patch, values 1 and 3 (aic_load_fw) and 3 and 4
+(aic8800_fdrv) gave -12 and no WARNING.
+
+Assisted-by: Claude
+
+diff --git a/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/aicwf_usb.c b/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/aicwf_usb.c
+index 7b6eca0..e7524f9 100644
+--- a/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/aicwf_usb.c
++++ b/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/aicwf_usb.c
+@@ -2039,9 +2039,17 @@ static void aicwf_usb_msg_rx_urb_work(struct work_struct *work)
+ }
+ #endif
+ 
++static int usb_init_inject_alloc_fail;
++module_param(usb_init_inject_alloc_fail, int, 0644);
++MODULE_PARM_DESC(usb_init_inject_alloc_fail, "Test stimulus: the next aicwf_usb_init() fails one allocation, once (1 rx URBs, 2 tx URBs, 3 msg_out URB, 4 msg-in rx URBs)");
++
+ static int aicwf_usb_init(struct aic_usb_dev *usb_dev)
+ {
+     int ret = 0;
++    /* Stimulus: the error path below, taken without an allocation failing. */
++    int inject = usb_init_inject_alloc_fail;
++
++    usb_init_inject_alloc_fail = 0;
+ 
+     usb_dev->tbusy = false;
+     usb_dev->state = USB_DOWN_ST;
+@@ -2053,6 +2061,13 @@ static int aicwf_usb_init(struct aic_usb_dev *usb_dev)
+ 		init_usb_anchor(&usb_dev->msg_rx_submitted);
+ 	}
+ #endif
++    /* Before the first `goto error`: aicwf_usb_deinit() cancels these works. */
++    INIT_WORK(&usb_dev->rx_urb_work, aicwf_usb_rx_urb_work);
++#ifdef CONFIG_USB_MSG_IN_EP
++	if(usb_dev->msg_in_pipe){
++		INIT_WORK(&usb_dev->msg_rx_urb_work, aicwf_usb_msg_rx_urb_work);
++	}
++#endif
+ 
+     spin_lock_init(&usb_dev->tx_free_lock);
+     spin_lock_init(&usb_dev->tx_post_lock);
+@@ -2078,17 +2093,17 @@ static int aicwf_usb_init(struct aic_usb_dev *usb_dev)
+     usb_dev->tx_free_count = 0;
+     usb_dev->tx_post_count = 0;
+ 
+-    ret =  aicwf_usb_alloc_rx_urb(usb_dev);
++    ret = inject == 1 ? -ENOMEM : aicwf_usb_alloc_rx_urb(usb_dev);
+     if (ret) {
+         goto error;
+     }
+-    ret =  aicwf_usb_alloc_tx_urb(usb_dev);
++    ret = inject == 2 ? -ENOMEM : aicwf_usb_alloc_tx_urb(usb_dev);
+     if (ret) {
+         goto error;
+     }
+ #ifdef CONFIG_USB_MSG_IN_EP
+ 	if(usb_dev->msg_in_pipe){
+-		ret =  aicwf_usb_alloc_msg_rx_urb(usb_dev);
++		ret = inject == 4 ? -ENOMEM : aicwf_usb_alloc_msg_rx_urb(usb_dev);
+ 		if (ret) {
+ 			goto error;
+ 		}
+@@ -2096,20 +2111,13 @@ static int aicwf_usb_init(struct aic_usb_dev *usb_dev)
+ #endif
+ 
+ 
+-    usb_dev->msg_out_urb = usb_alloc_urb(0, GFP_ATOMIC);
++    usb_dev->msg_out_urb = inject == 3 ? NULL : usb_alloc_urb(0, GFP_ATOMIC);
+     if (!usb_dev->msg_out_urb) {
+         usb_err("usb_alloc_urb (msg out) failed\n");
+-        ret = ENOMEM;
++        ret = -ENOMEM;
+         goto error;
+     }
+ 
+-    INIT_WORK(&usb_dev->rx_urb_work, aicwf_usb_rx_urb_work);
+-#ifdef CONFIG_USB_MSG_IN_EP
+-	if(usb_dev->msg_in_pipe){
+-		INIT_WORK(&usb_dev->msg_rx_urb_work, aicwf_usb_msg_rx_urb_work);
+-	}
+-#endif
+-
+     return ret;
+     error:
+     usb_err("failed!\n");
+diff --git a/src/USB/driver_fw/drivers/aic8800/aic_load_fw/aicwf_usb.c b/src/USB/driver_fw/drivers/aic8800/aic_load_fw/aicwf_usb.c
+index 8d31a5f..ca98bb3 100644
+--- a/src/USB/driver_fw/drivers/aic8800/aic_load_fw/aicwf_usb.c
++++ b/src/USB/driver_fw/drivers/aic8800/aic_load_fw/aicwf_usb.c
+@@ -786,9 +786,17 @@ static void aicwf_usb_rx_urb_work(struct work_struct *work)
+     aicwf_usb_rx_submit_all_urb(usb_dev);
+ }
+ 
++static int usb_init_inject_alloc_fail;
++module_param(usb_init_inject_alloc_fail, int, 0644);
++MODULE_PARM_DESC(usb_init_inject_alloc_fail, "Test stimulus: the next aicwf_usb_init() fails one allocation, once (1 rx URBs, 2 tx URBs, 3 msg_out URB)");
++
+ static int aicwf_usb_init(struct aic_usb_dev *usb_dev)
+ {
+     int ret = 0;
++    /* Stimulus: the error path below, taken without an allocation failing. */
++    int inject = usb_init_inject_alloc_fail;
++
++    usb_init_inject_alloc_fail = 0;
+ 
+     usb_dev->tbusy = false;
+     usb_dev->app_cmp = false;
+@@ -796,6 +804,8 @@ static int aicwf_usb_init(struct aic_usb_dev *usb_dev)
+ 
+     init_waitqueue_head(&usb_dev->msg_wait);
+     init_usb_anchor(&usb_dev->rx_submitted);
++    /* Before the first `goto error`: aicwf_usb_deinit() cancels this work. */
++    INIT_WORK(&usb_dev->rx_urb_work, aicwf_usb_rx_urb_work);
+ 
+     spin_lock_init(&usb_dev->tx_free_lock);
+     spin_lock_init(&usb_dev->tx_post_lock);
+@@ -809,25 +819,23 @@ static int aicwf_usb_init(struct aic_usb_dev *usb_dev)
+     usb_dev->tx_free_count = 0;
+     usb_dev->tx_post_count = 0;
+ 
+-    ret =  aicwf_usb_alloc_rx_urb(usb_dev);
++    ret = inject == 1 ? -ENOMEM : aicwf_usb_alloc_rx_urb(usb_dev);
+     if (ret) {
+         goto error;
+     }
+-    ret =  aicwf_usb_alloc_tx_urb(usb_dev);
++    ret = inject == 2 ? -ENOMEM : aicwf_usb_alloc_tx_urb(usb_dev);
+     if (ret) {
+         goto error;
+     }
+ 
+ 
+-    usb_dev->msg_out_urb = usb_alloc_urb(0, GFP_ATOMIC);
++    usb_dev->msg_out_urb = inject == 3 ? NULL : usb_alloc_urb(0, GFP_ATOMIC);
+     if (!usb_dev->msg_out_urb) {
+         usb_err("usb_alloc_urb (msg out) failed\n");
+-        ret = ENOMEM;
++        ret = -ENOMEM;
+         goto error;
+     }
+ 
+-    INIT_WORK(&usb_dev->rx_urb_work, aicwf_usb_rx_urb_work);
+-
+     return ret;
+     error:
+     usb_err("failed!\n");

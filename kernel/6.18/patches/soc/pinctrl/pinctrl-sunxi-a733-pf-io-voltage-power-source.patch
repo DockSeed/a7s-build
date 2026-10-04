@@ -1,0 +1,181 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] pinctrl: sunxi: A733 PF I/O voltage via PIN_CONFIG_POWER_SOURCE
+
+License: GPL-2.0 (driver patch).
+
+Implement the generic PIN_CONFIG_POWER_SOURCE pinconf for the A733
+(sun60iw2) pinctrl so the SD/MMC UHS 1.8 V signalling switch needs no
+variable vqmmc regulator. During UHS negotiation the mmc core calls
+pinctrl_select_state() for the "mmc_1v8" state (1.8 V) or the default
+(3.3 V); each state carries a power-source pinconf, and this new handler
+writes the SoC PF-voltage register for it.
+
+Mechanism and register
+-----------------------
+GPIO_POW_VAL_SET_CTL lives at pinctrl-base offset 0x0070 (a global PIO
+register, not per-bank). bit 0 = VCC_PF_PWR_VOL_SEL, R/W, reset default
+0x1. Encoding: 0 = 1.8 V, 1 = 3.3 V. Only bank PF is SoC-settable this
+way.
+
+  sunxi_pconf_set_power_source(): under pctl->lock, read the register and
+  for arg == 1800000 CLEAR bit 0, else SET it. NOTE the polarity is the
+  OPPOSITE of the existing io-bias code (which uses uV<=1800000 ? 1 : 0) --
+  here 1.8 V clears the bit. Gated on a new per-controller desc flag
+  pf_power_switch (true only in a733_pinctrl_data) and on the pin being in
+  bank PF (PF_BASE / PINS_PER_BANK), returning -ENOTSUPP otherwise, so every
+  other SoC's desc and code path stays byte-identical.
+
+  sunxi_pconf_set(): intercept PIN_CONFIG_POWER_SOURCE at the top of the
+  per-config loop, before sunxi_pconf_reg() -- which returns -ENOTSUPP for
+  this param and would otherwise abort. The argument contract is MICROVOLTS
+  (1800000 / 3300000), matching the device tree power-source values (patch
+  `arm64-dts-allwinner-a733-sd-uhs-sdr104`); a comment records the unit contract.
+
+Evidence
+--------
+ - A733 user manual (offset 0x0070, GPIO_POW_VAL_SET_CTL, default
+   0x00000001).
+ - A733 UM v0.92, register table for GPIO_POW_VAL_SET_CTL: VCC_PF_PWR_VOL_SEL,
+   0 = 1.8 V, 1 = 3.3 V.
+ - Silicon readback on two 6 GiB boards, 2026-07-29: both boards read
+   0x0070 = 0x0 while running SDR104 / 1.8 V signalling, i.e. bit 0 clear
+   for 1.8 V, matching the encoding above.
+
+Based on drivers/pinctrl/sunxi/pinctrl-sun55i-a523.c and the shared sunxi
+core, Copyright (C) 2023 Arm Ltd.
+
+⚠ **This patch shipped once, on 2026-07-29, and did nothing.** The board test
+showed GPIO_POW_VAL_SET_CTL still at its reset default: the handler below is
+correct but was never called, because sunxi supplies its own dt_node_to_map()
+and its config builder knew only drive-strength and bias, so the DT's
+power-source property was parsed by nobody. Four independent readings shared the
+assumption that is_generic = true routes these nodes through the generic parser;
+it does not. **`pinctrl-sunxi-parse-the-generic-power-source-property` fixes that** and is what makes this handler reachable at all.
+Nothing here changed as a result -- the register, the polarity and the bank gate
+were never the defect.
+
+HW-effect PENDING: a green build only shows that it builds. The
+polarity and the whole 1.8 V switch are unproven on silicon until a board
+test on the 8 GiB board observes the SD card enumerating at SDR104 and 0x0070 reading
+0x0 during 1.8 V signalling driven by our driver (not the boot chain).
+
+Assisted-by: Claude
+---
+diff --git a/drivers/pinctrl/sunxi/pinctrl-sun60iw2.c b/drivers/pinctrl/sunxi/pinctrl-sun60iw2.c
+index 3093d419b..e4b9aa5ab 100644
+--- a/drivers/pinctrl/sunxi/pinctrl-sun60iw2.c
++++ b/drivers/pinctrl/sunxi/pinctrl-sun60iw2.c
+@@ -44,6 +44,12 @@ static const u8 a733_irq_bank_muxes[SUNXI_PINCTRL_MAX_BANKS] =
+ 	{  0, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14 };
+ 
+ static struct sunxi_pinctrl_desc a733_pinctrl_data = {
++	/*
++	 * Bank PF I/O voltage is selected in the SoC via GPIO_POW_VAL_SET_CTL,
++	 * so the generic PIN_CONFIG_POWER_SOURCE handler can drive the SD UHS
++	 * 1.8 V signalling switch from the mmc_1v8 pinctrl state.
++	 */
++	.pf_power_switch = true,
+ 	.irq_banks = ARRAY_SIZE(a733_irq_bank_map),
+ 	.irq_bank_map = a733_irq_bank_map,
+ 	.irq_read_needs_mux = true,
+diff --git a/drivers/pinctrl/sunxi/pinctrl-sunxi.c b/drivers/pinctrl/sunxi/pinctrl-sunxi.c
+index 4a0f52232..70dc62f6e 100644
+--- a/drivers/pinctrl/sunxi/pinctrl-sunxi.c
++++ b/drivers/pinctrl/sunxi/pinctrl-sunxi.c
+@@ -653,6 +653,45 @@ static int sunxi_pconf_group_get(struct pinctrl_dev *pctldev,
+ 	return sunxi_pconf_get(pctldev, g->pin, config);
+ }
+ 
++/*
++ * PIN_CONFIG_POWER_SOURCE for the bank PF I/O voltage (A733).
++ *
++ * The mmc core drives the SD UHS 1.8 V switch by selecting a pinctrl state
++ * whose power-source pinconf names the target signalling voltage; this handler
++ * writes the SoC PF-voltage bit for it (no variable vqmmc regulator needed).
++ *
++ * @pin is already pin_base-relative. Argument contract: MICROVOLTS
++ * (1800000 / 3300000), matching the device-tree power-source values.
++ *
++ * Register GPIO_POW_VAL_SET_CTL bit 0 = VCC_PF_PWR_VOL_SEL, 0 = 1.8 V /
++ * 1 = 3.3 V (A733 UM v0.92). NOTE the polarity is the OPPOSITE of the io-bias
++ * code below: here 1.8 V CLEARS bit 0.
++ */
++static int sunxi_pconf_set_power_source(struct sunxi_pinctrl *pctl,
++					unsigned pin, u32 arg)
++{
++	unsigned long flags;
++	u32 val;
++
++	if (!pctl->desc->pf_power_switch)
++		return -ENOTSUPP;
++
++	/* Only bank PF is SoC-settable through this register. */
++	if (pin / PINS_PER_BANK != PF_BASE / PINS_PER_BANK)
++		return -ENOTSUPP;
++
++	raw_spin_lock_irqsave(&pctl->lock, flags);
++	val = readl(pctl->membase + A733_POW_VAL_SET_CTL_REG);
++	if (arg == 1800000)
++		val &= ~BIT(0);
++	else
++		val |= BIT(0);
++	writel(val, pctl->membase + A733_POW_VAL_SET_CTL_REG);
++	raw_spin_unlock_irqrestore(&pctl->lock, flags);
++
++	return 0;
++}
++
+ static int sunxi_pconf_set(struct pinctrl_dev *pctldev, unsigned pin,
+ 			   unsigned long *configs, unsigned num_configs)
+ {
+@@ -670,6 +709,19 @@ static int sunxi_pconf_set(struct pinctrl_dev *pctldev, unsigned pin,
+ 		param = pinconf_to_config_param(configs[i]);
+ 		arg = pinconf_to_config_argument(configs[i]);
+ 
++		/*
++		 * POWER_SOURCE (bank PF I/O voltage) is not a bank register the
++		 * way pull/drive are; sunxi_pconf_reg() returns -ENOTSUPP for it
++		 * and would abort the loop. Handle it here. Unit contract:
++		 * MICROVOLTS, same as the device-tree power-source value.
++		 */
++		if (param == PIN_CONFIG_POWER_SOURCE) {
++			ret = sunxi_pconf_set_power_source(pctl, pin, arg);
++			if (ret)
++				return ret;
++			continue;
++		}
++
+ 		ret = sunxi_pconf_reg(pctl, pin, param, &reg, &shift, &mask);
+ 		if (ret < 0)
+ 			return ret;
+diff --git a/drivers/pinctrl/sunxi/pinctrl-sunxi.h b/drivers/pinctrl/sunxi/pinctrl-sunxi.h
+index 2b8e5eff1..408d99c13 100644
+--- a/drivers/pinctrl/sunxi/pinctrl-sunxi.h
++++ b/drivers/pinctrl/sunxi/pinctrl-sunxi.h
+@@ -69,6 +69,13 @@
+ #define A733_IRQ_DEBOUNCE_REG		0xd8
+ #define A733_IRQ_MEM_SIZE		0x80
+ #define A733_POW_MOD_SEL_REG		0x40
++/*
++ * GPIO_POW_VAL_SET_CTL. bit 0 = VCC_PF_PWR_VOL_SEL: 0 = 1.8 V, 1 = 3.3 V,
++ * reset 0x1 (A733 UM v0.92). Global register (not per-bank); only
++ * bank PF is SoC-settable this way. Used by the PIN_CONFIG_POWER_SOURCE handler
++ * for the SD UHS 1.8 V signalling switch.
++ */
++#define A733_POW_VAL_SET_CTL_REG	0x70
+ 
+ #define PINS_PER_BANK		32
+ 
+@@ -158,6 +165,12 @@ struct sunxi_pinctrl_desc {
+ 	const unsigned int		*irq_bank_map;
+ 	bool				irq_read_needs_mux;
+ 	bool				disable_strict_mode;
++	/*
++	 * Set on SoCs whose bank PF I/O voltage is selected in the SoC itself
++	 * via GPIO_POW_VAL_SET_CTL (A733). Gates the PIN_CONFIG_POWER_SOURCE
++	 * handler so every other SoC's desc stays byte-identical.
++	 */
++	bool				pf_power_switch;
+ 	enum sunxi_desc_bias_voltage	io_bias_cfg_variant;
+ 	/*
+ 	 * IRQ register block. Zero keeps the classic layout (IRQ_CFG_REG and

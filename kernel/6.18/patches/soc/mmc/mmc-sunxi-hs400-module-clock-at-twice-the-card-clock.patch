@@ -1,0 +1,101 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] mmc: sunxi: run the HS400 module clock at twice the card clock
+
+HS400 is 8-bit DDR: the card drives data on both edges of the card clock, so
+the controller has to move two bytes per card clock. The driver did not double
+the module clock for it -- the DDR52 branch tests for MMC_TIMING_MMC_DDR52 and
+HS400 is a different timing constant, so it fell through with div = 1.
+
+Silicon, read under load on the 8 GiB board with `mmc-sunxi-set-the-dma-mask-from-the-descriptor-shift` applied:
+
+  SMHC2_CLK   ours 0x81000003   vendor 0x83000001
+  SMHC_CLKDIV      0x00010000          0x00010000
+
+Decoded per the A733 user manual (CLK_SRC_SEL 001 = PERI0_800M,
+011 = PERI1_800M): ours is 800/4/1 = 200 MHz module against a 200 MHz card
+clock, the vendor's is 800/2/1 = 400 MHz against the same 200 MHz card clock.
+
+The cost is exactly what one edge per clock buys. mmc tracepoints over a
+64 MiB direct read, 1 MiB per request, with the mmc IRQ and the reader both on
+an A76:
+
+  requests=64  bus_time avg=6129 us per MiB  dead_time avg=182 us (3 %)
+  wall 0.4037 s -> 166 MB/s
+
+97 % of the time is inside the transfer, not between requests, and 171 MB/s on
+the bus is HS200 speed on a bus that is meant to be twice that. The vendor
+reaches 325 MB/s on the same card at the same card clock.
+
+The two comments this replaces contradicted each other in the same function --
+one said HS400 shares the DDR52 doubling and cited a 400 MHz module clock, the
+next said it does not and pointed at HS200 as the precedent. HS200 is SDR, so
+it is not a precedent for a DDR mode; that comparison is where the 1x came
+from.
+
+CCLK_DIV stays 0, unchanged: the UM requires it cleared while HS400_MD_EN is
+set, and that is independent of the module clock.
+
+Not hardware-tested yet. The test is a cold boot that reaches HS400, passes
+read/write/md5, and shows bus_time per MiB dropping toward 3000 us.
+
+Assisted-by: Claude
+---
+--- a/drivers/mmc/host/sunxi-mmc.c
++++ b/drivers/mmc/host/sunxi-mmc.c
+@@ -918,36 +918,31 @@
+ 		return 0;
+ 
+ 	/*
+-	 * Under the old timing mode, 8 bit DDR requires the module
+-	 * clock to be double the card clock. Under the new timing
+-	 * mode, all DDR modes require a doubled module clock. HS400 is
+-	 * 8-bit DDR and uses the same 2x module clock: silicon shows a
+-	 * 200 MHz HS400 card (module 400 MHz, CCLK_DIV=0) sustains reads,
+-	 * whereas a 4x module (800 MHz) is too fast and no data-strobe
+-	 * delay locks. So HS400 shares the DDR52 divider here.
++	 * Under the old timing mode, 8 bit DDR requires the module clock to be
++	 * double the card clock. Under the new timing mode, all DDR modes
++	 * require a doubled module clock.
++	 *
++	 * HS400 is 8-bit DDR and needs that doubling for the same reason: the
++	 * card drives data on both clock edges, so the controller has to move
++	 * two bytes per card clock. Running the module clock at 1x lets the
++	 * bus initialise and transfer correctly, but it cannot fill it --
++	 * measured on the Cubie A7S, 6129 us per MiB, which is 171 MB/s where
++	 * the vendor stack reaches 325 MB/s on the same card at the same
++	 * 200 MHz card clock. 171 MB/s is HS200 speed: exactly what one edge
++	 * per clock buys.
++	 *
++	 * CCLK_DIV stays 0 for HS400 either way (it must be 0 while
++	 * HS400_MD_EN is set, UM SMHC_CLKDIV), which is what
++	 * clkdiv = 1 encodes here -- the register takes clkdiv - 1.
+ 	 */
+-	if (ios->timing == MMC_TIMING_MMC_DDR52 &&
+-	    (host->use_new_timings ||
+-	     ios->bus_width == MMC_BUS_WIDTH_8)) {
++	if ((ios->timing == MMC_TIMING_MMC_DDR52 &&
++	     (host->use_new_timings ||
++	      ios->bus_width == MMC_BUS_WIDTH_8)) ||
++	    ios->timing == MMC_TIMING_MMC_HS400) {
+ 		div = 2;
+ 		clock <<= 1;
+ 	}
+ 
+-	/*
+-	 * HS400 does NOT take the DDR52 doubling. Under the new timing mode
+-	 * the module clock already equals the card clock and the controller
+-	 * derives the DDR edges itself -- which is exactly how HS200 runs on
+-	 * this board: 200 MHz module, 200 MHz card, NTSR MODE_SEL set, and
+-	 * not a single data error. The A/B that established this is
+-	 * the following: one
+-	 * kernel, one card, HS200 versus HS400 with only the DT property
+-	 * removed, eight of eleven controller registers byte-identical, and
+-	 * the whole difference in the timing mode plus the module/card ratio.
+-	 *
+-	 * CCLK_DIV stays 0 regardless (it must be 0 while HS400_MD_EN is set,
+-	 * UM SMHC_CLKDIV), which is what clkdiv = 1 encodes
+-	 * here -- the register takes clkdiv - 1.
+-	 */
+ 	if (ios->timing == MMC_TIMING_MMC_HS400)
+ 		clkdiv = 1;
+ 

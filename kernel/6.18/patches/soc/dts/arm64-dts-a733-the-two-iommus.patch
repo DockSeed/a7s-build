@@ -1,0 +1,120 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Thu, 17 Sep 2026 17:00:00 +0200
+Subject: [PATCH] arm64: dts: a733: the two IOMMUs
+
+Describe IOMMU0 and IOMMU1 for the driver of `iommu-sun60i-add-the-allwinner-a733-iommu-driver`, with the clocks and
+resets of `clk-sunxi-ng-a733-iommu-gates-and-resets`. No consumer yet; `arm64-dts-a733-display-engine-behind-iommu1` puts the display engine behind
+IOMMU1.
+
+  reg         per the A733 user manual: IOMMU0 0x03900000, IOMMU1
+              0x03910000, 64 KiB each.
+  interrupts  per the A733 user manual: INTID 202 / 203 =
+              GIC SPI 170 / 171, level high.
+  clocks      IOMMUn_BGR_REG bits 0-2 and MBUS_MAT_CLK_GATING bit 0 / 1.
+  resets      IOMMUn_BGR_REG bit 16.
+  #iommu-cells  1, the master index within the IOMMU: IOMMU0 USB0_USB1 0,
+              CSI 1, ISP 2, VE_ENC 3; IOMMU1 VE_MBUS0 0, VE_MBUS1 1, DE0 2,
+              DI 3, G2D 4, EINK 5. The block counts,
+              four and six, were read on silicon (2026-09-15).
+
+⚠ TWO NODES, WHERE THE VENDOR HAS ONE. The vendor DT describes both IOMMUs
+as one node with reg 0x20000, a second cell for bypass, and master numbers
+running 0-11 across both; its driver writes every global register to both
+blocks. The hardware has two register blocks, two interrupts, two gate sets
+and two resets, and a page table per TTB register -- so two nodes, two
+iommu groups, and each IOMMU keeps its own table. The one-node form is also
+what made the vendor call the display engine "master 8" (6 + 2).
+
+What a node without a consumer does: the driver probes, de-asserts a reset
+that already reads de-asserted, reads VERSION, and registers. It writes no
+IOMMU register until a device is attached, so IOMMU0's masters -- the USB
+host among them -- stay in bypass, their reset state.
+
+A523 VALUE REJECTED: none taken. sun55i-a523.dtsi in 6.18.36 has no IOMMU
+node (searched for "iommu" over arch/arm64/boot/dts/allwinner/: only the H6,
+H616 and our A733 files match), and the mainline binding files the A523
+under the H616 fallback compatible, i.e. the H6 register layout; the driver patch
+`iommu-sun60i-add-the-allwinner-a733-iommu-driver` shows that the A733 does not use that layout.
+
+VERIFIED HERE: applies with fuzz 0 on top of the full series; the dtb built
+with cpp + dtc carries iommu@3900000 and iommu@3910000 with the values
+above.
+
+HARDWARE-PROVEN on the 8 GiB board 2026-09-18, with a test build of this
+series: both nodes bind
+sun60i-a733-iommu -- 3900000.iommu and 3910000.iommu each carry the driver in
+sysfs -- and each prints "version 0x16, ENABLE 0x0, TTB 0x0" at probe, so both
+windows and both interrupts describe real blocks.
+
+NOT RUN: a build without `arm64-dts-a733-display-engine-behind-iommu1` (these nodes without a consumer).
+The full series was booted instead. What that build would have added is covered
+in the same boot by IOMMU0, which has no consumer: it probes, keeps ENABLE 0
+and TTB 0, leaves its four masters in bypass, and USB is unaffected.
+
+Assisted-by: Claude
+---
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -1027,6 +1027,61 @@
+ 		};
+ 
+ 		/*
++		 * The two IOMMUs (UM chapter 10). Each translates for its own
++		 * masters through its own page table; the cell of `iommus` is
++		 * the master index:
++		 *
++		 *   iommu0  USB0_USB1 0, CSI 1, ISP 2, VE_ENC 3
++		 *   iommu1  VE_MBUS0 0, VE_MBUS1 1, DE0 2, DI 3, G2D 4, EINK 5
++		 *
++		 * (four and six master blocks read on
++		 * silicon on 2026-09-15.)
++		 *
++		 *
++		 *   reg         the memory map of the A733 user manual: IOMMU0 0x03900000, IOMMU1
++		 *               0x03910000, 64 KiB each.
++		 *               ⚠ The vendor DT describes both as ONE node,
++		 *               reg 0x20000; its driver writes every global register to
++		 *               both blocks. Two nodes is what the hardware has:
++		 *               two register blocks, two interrupts, two gate
++		 *               sets and two resets.
++		 *   interrupts  INTID 202/203 = SPI 170/171
++		 *               (A733 user manual).
++		 *   clocks      IOMMUn_BGR_REG bits 0-2 and MBUS_MAT_CLK_GATING
++		 *               bit 0/1, all CLK_IS_CRITICAL (`clk-sunxi-ng-a733-iommu-gates-and-resets` says why).
++		 *   resets      IOMMUn_BGR_REG bit 16.
++		 *
++		 * No consumer on iommu0: its masters stay in bypass, which is
++		 * their reset state, and the driver writes nothing to a block
++		 * without a translating master.
++		 */
++		iommu0: iommu@3900000 {
++			compatible = "allwinner,sun60i-a733-iommu";
++			reg = <0x0 0x03900000 0x0 0x10000>;
++			interrupts = <GIC_SPI 170 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&ccu CLK_IOMMU0_SYS_MCLK>,
++				 <&ccu CLK_IOMMU0_SYS_PCLK>,
++				 <&ccu CLK_IOMMU0_SYS_HCLK>,
++				 <&ccu CLK_MBUS_IOMMU0>;
++			clock-names = "mclk", "pclk", "hclk", "mbus";
++			resets = <&ccu RST_BUS_IOMMU0>;
++			#iommu-cells = <1>;
++		};
++
++		iommu1: iommu@3910000 {
++			compatible = "allwinner,sun60i-a733-iommu";
++			reg = <0x0 0x03910000 0x0 0x10000>;
++			interrupts = <GIC_SPI 171 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&ccu CLK_IOMMU1_SYS_MCLK>,
++				 <&ccu CLK_IOMMU1_SYS_PCLK>,
++				 <&ccu CLK_IOMMU1_SYS_HCLK>,
++				 <&ccu CLK_MBUS_IOMMU1>;
++			clock-names = "mclk", "pclk", "hclk", "mbus";
++			resets = <&ccu RST_BUS_IOMMU1>;
++			#iommu-cells = <1>;
++		};
++
++		/*
+ 		 * PCK-600 power controller (Arm CoreLink PCK-600 / PPU). Provides
+ 		 * the SoC power domains; PD_USB2 (index 8) is boot-on (on silicon,
+ 		 * the 8 GiB board: status @0x07068008 = 0x8). Attach-only driver variant

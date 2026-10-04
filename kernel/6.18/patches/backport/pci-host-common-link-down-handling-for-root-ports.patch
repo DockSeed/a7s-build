@@ -1,0 +1,135 @@
+From 4c99bace4f4efdb8dbeddf71cde4a4793f5f2228 Mon Sep 17 00:00:00 2001
+From: Manivannan Sadhasivam <manivannan.sadhasivam@oss.qualcomm.com>
+Date: Wed, 29 Jul 2026 10:22:29 +0530
+Subject: PCI: host-common: Add link down handling for Root Ports
+
+[ Upstream commit 4c99bace4f4efdb8dbeddf71cde4a4793f5f2228 ]
+
+The PCIe link, when down, needs to be recovered to bring it back. But on
+some platforms, that cannot be done in a generic way as link recovery
+procedure is platform specific. Add a new pci_host_handle_link_down() that
+could be called by the host bridge drivers for a specific Root Port when
+the link goes down.
+
+pci_host_handle_link_down() accepts a 'pci_dev' corresponding to the Root
+Port that observed the link down event. If CONFIG_PCIEAER is enabled, it
+calls pcie_do_recovery() with 'pci_channel_io_frozen' as the state.  This
+will result in the execution of the AER Fatal error handling code.  Since
+the link down recovery is pretty much the same as AER Fatal error handling,
+reuse pcie_do_recovery() here.
+
+The AER .error_detected() callback will be triggered for all of the
+downstream devices, but not for the Root Port itself as there is nothing to
+do for the Root Ports in the callbacks. Finally, pci_host_reset_root_port()
+will be called for the Root Port, which will reset the Root Port using the
+.reset_root_port() callback to recover the link. Once that's done, resume
+message will be broadcasted to the bridge and the downstream devices,
+indicating successful link recovery.
+
+But if CONFIG_PCIEAER is not enabled in the kernel, only
+pci_host_reset_root_port() will be called, which will in turn call
+pci_bus_error_reset() to just reset the Root Port as there is no way we
+could inform the drivers about link recovery.
+
+Signed-off-by: Manivannan Sadhasivam <manivannan.sadhasivam@linaro.org>
+Signed-off-by: Manivannan Sadhasivam <manivannan.sadhasivam@oss.qualcomm.com>
+Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+Tested-by: Brian Norris <briannorris@chromium.org>
+Tested-by: Krishna Chaitanya Chundru <krishna.chundru@oss.qualcomm.com>
+Tested-by: Richard Zhu <hongxing.zhu@nxp.com>
+Reviewed-by: Frank Li <Frank.Li@nxp.com>
+Link: https://patch.msgid.link/20260729-pci-port-reset-v9-3-53570b92064d@oss.qualcomm.com
+[ adapted: not in Linux 6.18; carried together with 3fc686d550f6 for the
+  sun60i-a733 root port recovery after a link down. In 6.18,
+  pci_bus_error_reset() still contains the slot/bus reset logic that
+  upstream has since moved into pci_reset_bridge(), so the
+  EXPORT_SYMBOL_GPL(pci_bus_error_reset) line was placed after it by hand
+  (at fuzz 2, patch put it after the wrong function). The
+  pci-host-common.c/.h contexts differ (6.18's file is shorter); the added
+  code is verbatim. ]
+Assisted-by: Claude
+---
+diff --git a/drivers/pci/controller/pci-host-common.c b/drivers/pci/controller/pci-host-common.c
+--- a/drivers/pci/controller/pci-host-common.c
++++ b/drivers/pci/controller/pci-host-common.c
+@@ -12,9 +12,11 @@
+ #include <linux/of.h>
+ #include <linux/of_address.h>
+ #include <linux/of_pci.h>
++#include <linux/pci.h>
+ #include <linux/pci-ecam.h>
+ #include <linux/platform_device.h>
+ 
++#include "../pci.h"
+ #include "pci-host-common.h"
+ 
+ static void gen_pci_unmap_cfg(void *ptr)
+@@ -109,5 +111,38 @@
+ }
+ EXPORT_SYMBOL_GPL(pci_host_common_remove);
+ 
++static pci_ers_result_t pci_host_reset_root_port(struct pci_dev *dev)
++{
++	int ret;
++
++	pci_lock_rescan_remove();
++	ret = pci_bus_error_reset(dev);
++	pci_unlock_rescan_remove();
++	if (ret) {
++		pci_err(dev, "Failed to reset Root Port: %d\n", ret);
++		return PCI_ERS_RESULT_DISCONNECT;
++	}
++
++	pci_info(dev, "Root Port has been reset\n");
++
++	return PCI_ERS_RESULT_RECOVERED;
++}
++
++static void pci_host_recover_root_port(struct pci_dev *port)
++{
++#if IS_ENABLED(CONFIG_PCIEAER)
++	pcie_do_recovery(port, pci_channel_io_frozen, pci_host_reset_root_port);
++#else
++	pci_host_reset_root_port(port);
++#endif
++}
++
++void pci_host_handle_link_down(struct pci_dev *port)
++{
++	pci_info(port, "Recovering Root Port due to Link Down\n");
++	pci_host_recover_root_port(port);
++}
++EXPORT_SYMBOL_GPL(pci_host_handle_link_down);
++
+ MODULE_DESCRIPTION("Common library for PCI host controller drivers");
+ MODULE_LICENSE("GPL v2");
+diff --git a/drivers/pci/controller/pci-host-common.h b/drivers/pci/controller/pci-host-common.h
+--- a/drivers/pci/controller/pci-host-common.h
++++ b/drivers/pci/controller/pci-host-common.h
+@@ -16,6 +16,7 @@
+ int pci_host_common_init(struct platform_device *pdev,
+ 			 const struct pci_ecam_ops *ops);
+ void pci_host_common_remove(struct platform_device *pdev);
++void pci_host_handle_link_down(struct pci_dev *port);
+ 
+ struct pci_config_window *pci_host_common_ecam_create(struct device *dev,
+ 	struct pci_host_bridge *bridge, const struct pci_ecam_ops *ops);
+diff --git a/drivers/pci/pci.c b/drivers/pci/pci.c
+--- a/drivers/pci/pci.c
++++ b/drivers/pci/pci.c
+@@ -5599,6 +5599,7 @@
+ 	mutex_unlock(&pci_slot_mutex);
+ 	return pci_bus_reset(bridge->subordinate, PCI_RESET_DO_RESET);
+ }
++EXPORT_SYMBOL_GPL(pci_bus_error_reset);
+ 
+ /**
+  * pci_probe_reset_bus - probe whether a PCI bus can be reset
+diff --git a/drivers/pci/pcie/err.c b/drivers/pci/pcie/err.c
+--- a/drivers/pci/pcie/err.c
++++ b/drivers/pci/pcie/err.c
+@@ -292,3 +292,4 @@
+ 
+ 	return status;
+ }
++EXPORT_SYMBOL_GPL(pcie_do_recovery);

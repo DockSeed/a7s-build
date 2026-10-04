@@ -1,0 +1,182 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: a733: name bank PH's I/O supply
+
+Bank PH's pads are supplied from VCC-PH = SWOUT2 at 3.3 V
+(from Allwinner's A733_PINOUT_V0.91 sheet "Pin
+Description", column "I/O Power Supply[7]"; SWOUT2 is the rail the eMMC node
+already consumes as its vmmc). Patch `arm64-dts-a733-bank-pc-io-supply` left this bank unwired on the
+grounds that PH "is already at 3.3 V and reads back correctly; wiring it
+changes nothing observable". That is measurably wrong, and why it is wrong
+is the point of this patch.
+
+Without the phandle the bank reaches the rail anyway
+----------------------------------------------------
+`sunxi_pmx_request()` builds the supply id as "vcc-p%c" from the bank index
+(pinctrl-sunxi.c:1043) and calls regulator_get() (:1044). With no
+vcc-ph-supply in the tree, regulator_dev_lookup() (regulator/core.c:2001)
+falls past the phandle and the empty board map to its last resort,
+regulator_lookup_by_name() (:2037) -> regulator_match() (:1961) ->
+rdev_get_name() (:103), which compares against the DT property
+regulator-name. SWOUT2 carries regulator-name = "vcc-ph", byte-equal to the
+id the driver asks for, so the bank binds the real rail whenever that rail
+is already registered -- and a successful match logs nothing at all. Only
+the failing path prints "supply ... not found, using dummy regulator"
+(core.c:2235).
+
+The bank's per-request cache is cleared on release (pinctrl-sunxi.c:1091),
+so a consumer whose probe defers after its pins were bound gives the bank
+back -- dd.c:735 -> device_unbind_cleanup() -> devres_release_all() ->
+devm_pinctrl_release() -> pinctrl_free() -> pinmux_disable_setting() ->
+pin_free() -> sunxi_pmx_free() -- and the next request performs a fresh
+regulator_get(). There is no "already biased" flag, so whichever get first
+finds the rail also runs sunxi_pinctrl_set_io_bias_cfg() (:1062): 3300000 uV
+is above 1800000, giving POW_MOD_SEL_2BIT_3V3 = 0b10 at shift 14
+(pinctrl-sun60iw2.c:75).
+
+What that costs, measured
+-------------------------
+GPIO_POW_MOD_SEL 0x02000040 differs between boots of one image on the 8 GiB board,
+2026-09-17:
+
+    0x01159570   PH 15:14 = 10 = 3.3 V   consumer under the real vcc-ph rail
+    0x01155570   PH 15:14 = 01 = auto    consumer under regulator-dummy
+
+and a boot log of that image
+carries three separate "supply vcc-ph not found" lines in a single boot. A
+cached regulator cannot log twice, so those are three distinct failed gets;
+the fourth one wins and prints nothing, which is why the register moves with
+nothing in the log to say so. On a board running the vendor 6.6 kernel the
+same register reads 0x01155550, i.e. the vendor stack writes neither field.
+
+So the phandle does not decide whether the rail binds. It decides how the
+race fails: with it, a rail not yet registered yields -EPROBE_DEFER
+(of_regulator.c:676) which pinctrl-sunxi.c:1046 propagates, so the consumer
+-- gmac0, through rgmii0_pins, PH's only claimant in this tree -- retries
+deterministically. Without it, the same instant yields the dummy, the -22,
+and a silent rebind later.
+
+No new dependency, no new risk
+------------------------------
+SWOUT2 is regulator-always-on and the eMMC node already consumes it, so the
+regulator_enable() at pinctrl-sunxi.c:1050 and the refcounted
+regulator_disable() in sunxi_pmx_free() (:1089) cannot drop a rail anyone
+else needs -- the same argument `arm64-dts-a733-bank-pc-io-supply` made for CLDO5. Unlike PL, whose
+consumer is the I2C bus the PMIC itself sits on, a deferral on PH costs a
+retry of the ethernet controller and nothing more.
+
+The patch also corrects the node comment's entry for PB, which `arm64-dts-a733-bank-pc-io-supply` grouped
+with PH. PB's case is not "already correct", it is "no field exists": the UM
+names bits 25:24 VCCIO_PWR_MOD_SEL and ties them to the VCC-IO net rather
+than to a bank, and a733_io_bias_field_shift[] marks PB NO_FIELD
+(pinctrl-sun60iw2.c:70). A vcc-pb-supply would replace the -22 warning with
+a "left alone" dev_dbg and change no register.
+
+This patch carries no hardware proof yet. What would close it is:
+GPIO_POW_MOD_SEL 15:14 reading 0b10 in every boot of a recorded cold-boot
+series, no "supply vcc-ph not found" line, and the consumer under the real
+rail every time.
+
+It also corrects three entries of the node comment that `arm64-dts-a733-bank-pc-io-supply` wrote, all
+refuted since:
+
+ - PB was grouped with PH as "already correct". Its case is "no field
+   exists": the UM ties bits 25:24 to the VCC-IO net (VCCIO_PWR_MOD_SEL)
+   rather than to a bank, and a733_io_bias_field_shift[] marks PB NO_FIELD
+   (pinctrl-sun60iw2.c:70). A vcc-pb-supply would swap the -22 for a
+   "left alone" dev_dbg and write no register.
+ - PD and PJ were said to hang off BLDO2, with R251 bridging that node to
+   SWOUT1. R251 sits between SoC ball 1N7 (PD) and VCC33-LCD; PJ's ball
+   1L6 is on VCC33-LCD directly, with no series part; BLDO2 reaches the
+   SoC only at ball 1N6 (VCC-LVDS). Same conclusion, different mechanism.
+ - PM was said to need a CLDO1 node. Ball 1P22 reaches VCC-PL = ALDO1 at
+   3.3 V through RA13 (0R 1%); the net named VCC-PM has two nodes, CLDO1
+   and one capacitor, and no SoC ball. A CLDO1 phandle would write
+   11 = 1.8 V onto a 3.3 V bank, so that entry was not merely stale.
+
+Comment-only edits, measured rather than assumed: building the DTB, adding
+a comment and rebuilding gives a byte-identical blob, so these corrections
+cannot change what was put on the board.
+
+Assisted-by: Claude
+---
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -727,8 +727,27 @@
+ 			 * (V0.92 read it as Invalid). PE and PK read 00 as
+ 			 * well, every 3.3 V bank reads 10.
+ 			 *
+-			 * Only PC is wired, and the other six banks that log
+-			 * the dummy-regulator line are deliberately left alone:
++			 * Bank PH's pads are supplied from VCC-PH = SWOUT2,
++			 * 3.3 V (per the pinout sheet; the eMMC node already
++			 * consumes the same rail as its vmmc). It is named here
++			 * for a different reason than PC. Without the phandle
++			 * the bank still reaches that rail: the regulator core's
++			 * last-resort lookup matches the requested supply id
++			 * against a registered regulator's regulator-name
++			 * (core.c:2037 -> :1961 -> :103), and SWOUT2's name is
++			 * "vcc-ph". That match is silent and depends on probe
++			 * order, so GPIO_POW_MOD_SEL 15:14 came up 01 (auto) in
++			 * some boots and 10 (3.3 V) in others from one image:
++			 * 0x01155570 and 0x01159570, both measured on the 8 GiB board on
++			 * 2026-09-17. The phandle does not decide whether the
++			 * rail binds, it decides how the race fails -- a rail
++			 * not yet registered then yields -EPROBE_DEFER and the
++			 * consumer (gmac0, via rgmii0_pins) retries, instead of
++			 * taking the dummy and rebinding later without a word.
++			 * 
++			 *
++			 * PC and PH are wired; the banks that still log the
++			 * dummy-regulator line are deliberately left alone:
+ 			 *
+ 			 *  - PL is fatal. Its consumer is r_i2c0 (PL0/PL1), the
+ 			 *    bus the PMIC itself sits on, and it requests its
+@@ -740,21 +759,35 @@
+ 			 *  - PF has no single rail: its supply is selectable
+ 			 *    (VCC18-PF / VCC-IO) and the SoC-side switch is
+ 			 *    already owned by GPIO_POW_VAL_SET_CTL, patch `mmc-sunxi-pad-io-voltage-switch-without-vqmmc`.
+-			 *  - PJ and PD nominally hang off BLDO2, but R251 (0 R)
+-			 *    binds the node to SWOUT1. BLDO2's own register
+-			 *    reads 1800 mV on the 8 GiB board and 3300 mV on the 6 GiB board while
+-			 *    both banks measure 3.3 V, so the LDO is the wrong
+-			 *    phandle and the bridge is not describable in DT.
+-			 *  - PM needs a CLDO1 node, and CLDO1 also carries
+-			 *    VDD18-LPDDR. A regulator node without
+-			 *    regulator-always-on is switched off by
+-			 *    regulator_late_cleanup(), so getting that node
+-			 *    wrong drops the LPDDR5 1.8 V rail.
+-			 *  - PB and PH are already at 3.3 V and read back
+-			 *    correctly; wiring them changes nothing observable,
+-			 *    so they wait for a reason.
++			 *  - PD and PJ are on VCC33-LCD from SWOUT1, not on
++			 *    BLDO2: ball 1N7 (PD) reaches it through R251
++			 *    (0R 1%) and ball 1L6 (PJ) directly, while BLDO2
++			 *    reaches the SoC only at ball 1N6 (VCC-LVDS). That
++			 *    is why BLDO2's register reads 1800 mV on the 8 GiB board and
++			 *    3300 mV on the 6 GiB board while both banks measure 3.3 V.
++			 *    A SWOUT1 phandle would be describable, but neither
++			 *    bank needs one: both read back correctly and the
++			 *    rail is a load switch with no voltage of its own.
++			 *    (Until 2026-09-18 this comment said R251 bridges a
++			 *    BLDO2 node to SWOUT1. It does not.)
++			 *  - PM is not on CLDO1 at all. Ball 1P22 reaches
++			 *    VCC-PL = ALDO1, 3.3 V, through RA13 (0R 1%); the
++			 *    net named VCC-PM has two nodes, CLDO1 and one
++			 *    capacitor, and no SoC ball. Its withstand field
++			 *    already holds 10 = 3.3 V from the reset default,
++			 *    so an ALDO1 phandle would write what is there and
++			 *    take an enable on the rail that pulls up the PMIC's
++			 *    own I2C bus. A CLDO1 phandle would write 11 = 1.8 V
++			 *    onto a 3.3 V bank. Neither is wired.
++			 *  - PB has no POW_MOD_SEL field at all. Its pads hang
++			 *    on VCC-IO, and the UM names that register's 25:24
++			 *    field VCCIO_PWR_MOD_SEL without tying it to a bank;
++			 *    a733_io_bias_field_shift[] marks PB NO_FIELD. A
++			 *    vcc-pb-supply would only replace the -22 with a
++			 *    "left alone" dev_dbg, so it buys a log line.
+ 			 */
+ 			vcc-pc-supply = <&reg_cldo5>;
++			vcc-ph-supply = <&reg_swout2>;
+ 
+ 			uart0_pb_pins: uart0-pb-pins {
+ 				pins = "PB9", "PB10";

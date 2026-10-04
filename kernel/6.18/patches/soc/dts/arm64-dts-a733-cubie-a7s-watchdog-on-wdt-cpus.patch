@@ -1,0 +1,131 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Tue, 15 Sep 2026 12:00:00 +0200
+Subject: [PATCH] arm64: dts: a733: cubie-a7s: watchdog on WDT_CPUS, WDT0 disabled
+
+WDT0 (0x02050000) resets this board intermittently. The watchdog in the
+CPUS domain, WDT_CPUS (0x07021000), reset it in every run so far (3 panics
+pinned to CPU2, 1 unfed timeout) -- and it is the block BL31 already
+resets the board with.
+
+WHY
+
+  * Measured on the 8 GiB board, 2026-09-15: WDT0 alone
+    reset a halted panic (panic=0) in 7 of 13 runs over two days, whichever
+    CPU panicked and whoever fed it, and a hard hang of all eight CPUs in 1
+    of 2; a missing reset did not come late. WDT_CPUS, armed from Linux
+    with busybox devmem, reset 3 of 3 of those panics pinned to CPU2 and
+    one unfed timeout without a stimulus; its own reset disarms it. A
+    panic on CPU0 and a hard hang were not run against WDT_CPUS.
+  * Upstream does the same on the H6: sun50i-h6.dtsi disables its main
+    watchdog@30090a0 ("Broken on some H6 boards") and keeps r_watchdog in
+    the CPUS domain.
+  * The pinned TF-A implements PSCI SYSTEM_RESET as a write to the SRST
+    register at SUNXI_R_WDOG_BASE = 0x07021000
+    (plat/allwinner/common/sunxi_native_pm.c,
+    plat/allwinner/sun60i_a733/include/sunxi_mmap.h).
+
+WHERE EACH VALUE COMES FROM
+
+  * reg: A733 UM 8.3.5 lists WDT_CPUS at 0x07021000 with "the same"
+    registers as WDT0_CPUX;
+    0x20 covers that set up to WDT_OCFG_REG at +0x18, as in the WDT0 node.
+    Read on the 8 GiB board (2026-09-14):
+    CFG 0x1, MODE 0x0, OCFG 0x1F -- the documented defaults, block unused.
+  * interrupts: A733 UM Table 12-1, INTID 223 "S_WDT" -> GIC SPI 191.
+  * clocks: the same two selectable sources as WDT0 (UM 8.3.3,
+    WDT_CFG_REG bit[8]); bit 8 reads 0, RTC_32K. The phandles are WDT0's
+    from `arm64-dts-a733-feed-the-watchdog-hosc-from-the-dcxo`; sunxi_wdt never calls clk_get().
+  * compatible: WDT0's (`watchdog-sunxi-a733-add-wdt0`). The sun55i-a523-wdt register offsets
+    (CTRL 0x0c, CFG 0x10, MODE 0x14) match UM 8.3.6 for both blocks; writes
+    to those offsets with busybox devmem armed WDT_CPUS on silicon on
+    2026-09-15. No driver path (start, ping, stop, timeout decode)
+    has run on WDT_CPUS yet.
+
+A523 VALUE REJECTED: none taken -- sun55i-a523.dtsi describes no watchdog
+in the CPUS domain.
+
+WHAT THIS DOES NOT DO
+
+  * It pairs with the U-Boot patch `sunxi-cubie-a7s-watchdog-on-wdt-cpus`
+    in both directions. A U-Boot that still arms
+    WDT0 (the U-Boot watchdog-autostart patch alone) hands it to a kernel with this patch, which neither
+    stops nor feeds WDT0. A U-Boot with that patch hands an armed WDT_CPUS to any
+    kernel without this patch -- an older kernel on the same card, or
+    another system on the board -- and nothing there feeds it: reset about
+    16 s in. Kernel and boot chain come from the same image build.
+  * The image is designed as the only system on the board, whatever it
+    boots from. The vendor system on the eMMC of one test board knows only
+    WDT0; booted by a
+    U-Boot with that patch it is reset, and is reached by `wdt stop` at the
+    U-Boot prompt.
+  * Which /dev/watchdogN WDT_CPUS becomes, and that PID 1 holds it, is
+    expected from the DT (no other watchdog node is enabled) and not yet
+    read on silicon.
+
+VERIFIED HERE: applies with fuzz 0 on top of the full series; the dtb,
+built with cpp + dtc, decompiles to watchdog@2050000 with
+status = "disabled" and watchdog@7021000 with reg <0x00 0x7021000 0x00 0x20>
+and interrupts <0x00 0xbf 0x04>.
+
+NOT YET VERIFIED ON HARDWARE.
+
+Assisted-by: Claude
+---
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -1000,6 +1000,12 @@
+ 		 *        neither rate (sunxi_wdt never calls clk_get); what the
+ 		 *        phandle does change is probe order, because fw_devlink
+ 		 *        makes the RTC-CCU a supplier of this node (patch `arm64-dts-a733-feed-the-watchdog-hosc-from-the-dcxo`).
++		 * status disabled, the way the H6's main watchdog is upstream
++		 *        ("Broken on some H6 boards"). Measured 2026-09-15
++		 *        on the 8 GiB board: WDT0 reset a halted panic 7 of 13 times and a
++		 *        hard hang of all eight CPUs 1 of 2; WDT_CPUS reset 3 of
++		 *        3 of those panics on CPU2 and its own unfed timeout.
++		 *        r_watchdog below is the one to feed.
+ 		 */
+ 		wdt: watchdog@2050000 {
+ 			compatible = "allwinner,sun60i-a733-wdt",
+@@ -1008,6 +1014,7 @@
+ 			interrupts = <GIC_SPI 106 IRQ_TYPE_LEVEL_HIGH>;
+ 			clocks = <&rtc_ccu CLK_RTC_DCXO>, <&osc32k>;
+ 			clock-names = "hosc", "losc";
++			status = "disabled";
+ 		};
+ 
+ 		gic: interrupt-controller@3400000 {
+@@ -2318,6 +2325,33 @@
+ 			interrupts = <GIC_SPI 188 IRQ_TYPE_LEVEL_HIGH>;
+ 		};
+ 
++		/*
++		 * WDT_CPUS, the watchdog in the CPUS domain -- the one this board
++		 * is reset with. BL31's PSCI SYSTEM_RESET already writes its SRST
++		 * register (TF-A sun60i_a733 SUNXI_R_WDOG_BASE 0x07021000).
++		 *
++		 * reg    A733 UM 8.3.5 register list: WDT_CPUS @ 0x07021000, the
++		 *        same set as WDT0_CPUX (block
++		 *        S_WDG, 4K); 0x20 spans that register set, as in the
++		 *        WDT0 node. Read on the 8 GiB board (2026-09-14): CFG 0x1,
++		 *        MODE 0x0, OCFG 0x1F -- the documented defaults, unused.
++		 *
++		 * irq    A733 UM Table 12-1, INTID 223 "S_WDT" -> GIC SPI
++		 *        223 - 32 = 191.
++		 * clocks the same two selectable sources as WDT0 (UM 8.3.3,
++		 *        WDT_CFG_REG bit[8]); bit8 read 0 (RTC_32K) with the
++		 *        CFG value above. Same phandles as the WDT0 node.
++		 * name   r_watchdog, as the H6's CPUS-domain watchdog upstream.
++		 */
++		r_watchdog: watchdog@7021000 {
++			compatible = "allwinner,sun60i-a733-wdt",
++				     "allwinner,sun55i-a523-wdt";
++			reg = <0x0 0x07021000 0x0 0x20>;
++			interrupts = <GIC_SPI 191 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&rtc_ccu CLK_RTC_DCXO>, <&osc32k>;
++			clock-names = "hosc", "losc";
++		};
++
+ 		r_pio: pinctrl@7025000 {
+ 			compatible = "allwinner,sun60i-a733-r-pinctrl",
+ 				     "allwinner,sun55i-a523-r-pinctrl";

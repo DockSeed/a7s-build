@@ -1,0 +1,396 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] clk: sunxi-ng: A733 add the SERDES subsystem bus gates and USB2-PHY reset
+
+The dwc3 core reads GSNPSID in dwc3_core_is_valid() right after enabling its
+own clocks and long before it calls a single PHY op (core.c:2249,:2253). That
+register only answers once the USB3 block's AHB and AXI bus clocks run, and
+those two gates are not in the CCU: they are bits 16 and 17 of
+SUBSYS_USB3P1_BGR at 0x06C00008. Until now the only code that set them was the
+combo-PHY driver's probe (`phy-allwinner-a733-add-serdes-combophy`), which made the controller depend on another
+driver probing first -- an ordering Linux does not promise and, since the
+Type-C connector's graph closed a devlink ring, no longer delivers.
+
+So model them as what the UM calls them: clocks.
+
+  0x0008 SUBSYS_USB3P1_BGR  bit17 ACLK_EN, bit16 HCLK_EN, bit4 USB2P0_PHY_RSTN
+
+Field names and offsets from the A733 UM register tables. The UM describes the
+two gates as the AXI and AHB clock enables of the USB 3.1 block (USB3P1) and bit4 as the PHY
+reset-n. Silicon cross-check on a board with a live SuperSpeed link reads
+0x00030010 = both gates on, USB2 PHY out of reset
+(a vendor-BSP capture on the 8 GiB board, 2026-07-19, not a reading from our stack).
+
+Three things about the shape, each measured rather than assumed:
+
+- The reg window covers 0x0000..0x000f, not just the one register. The
+  neighbour at 0x0004 is SUBSYS_PCIE_BGR with the PCIe bus gates and PERSTN,
+  and on the 6 GiB board it reads 0x00070000, i.e. in use. A driver
+  that claims the whole 4 KiB page for the combo-PHY -- which is what `phy-allwinner-a733-add-serdes-combophy` did
+  until this series -- would collide with the PCIe milestone. This one claims
+  16 bytes and leaves room to add those gates here later.
+
+- The whole page is dead while the SERDES block reset is asserted. Measured on
+  the 8 GiB board, 2026-07-29: clearing SERDES_BGR_REG (main CCU 0x13C4) bit16 makes
+  0x0008 read 0x00000000 and swallow writes; restoring the bit brings back
+  0x00030010. Only offset 0x0008 was probed that way -- "the whole page" is the
+  reasonable reading of one register's behaviour, not a second measurement. The
+  driver therefore consumes that reset and deasserts it before registering
+  anything. "Reset first, gates second" is hardware here, not a
+  convention inherited from the vendor. It is taken shared because the
+  combo-PHY behind the same block needs it too, and asserting it would take
+  this controller's own registers away.
+
+- The two gates stay two clocks. Folding one into the other's parent would
+  enable both through one handle, but it would also state a parent relationship
+  that does not exist in silicon, and it would state it in clk_summary where
+  the next reader takes it for fact. The consumer takes both by name.
+
+- The provider holds its two input gates enabled for as long as it is bound
+  (devm_clk_get_enabled), the way ccu-sun9i-a80-usb.c holds its bus clock. This
+  is the one thing here that is measured rather than reasoned, and it was
+  measured the hard way. Three boots on the 8 GiB board, 2026-08-01:
+
+    without the hold, no clk_ignore_unused -> board hangs at 9.4 s, dead console,
+                                                no oops, no dwc3 line
+    without the hold, clk_ignore_unused    -> xHCI unattended at 10.2 s
+    with this hold, no flag                -> xHCI unattended at 10.28 s
+
+  The third boot is the experiment that carries the claim, because the only
+  build-relevant difference between those two kernels is this hold. The second
+  boot on its own would not: clk_ignore_unused is global and kept six other
+  modelled clocks alive as well.
+
+  Why the flag was needed at all: clk_disable_unused() closes both matrix gates
+  at late_initcall_sync, and a CLK_IGNORE_UNUSED child does not count as a user
+  of its parent, so flagging the gates below did not keep them open -- the
+  provider itself has to be the user.
+
+  What is NOT established: which access then stalls the bus. Every consumer in
+  this series reaches its SERDES registers through a clk_enable whose parent
+  chain re-opens the matrix gate first, so no unguarded access site has been
+  identified. The one path that provably needs this hold and has neither a
+  consumer nor a flag is ccu_gate_is_enabled() reading 0x06C00008 for the two
+  gates below. Naming the actual failing access needs initcall_debug plus a
+  clk_summary and a devmem readback of 0x020025C0 bit8 / 0x020025E0 bit28 across
+  "Disabling unused clocks"; until someone does that, this patch has a proven
+  effect and an unproven mechanism, and says so.
+
+- The gates below are CLK_IGNORE_UNUSED as well, for the layer the above does
+  not cover: their only consumer is a module, and the glue pulses the
+  controller's reset before enabling clocks (dwc3-generic-plat.c does
+  reset/udelay/deassert, then the bulk clock get). That would put the reset edge
+  on a block whose own bus clock is gated. Given what the boot above did to this
+  board, that is not a risk worth taking on a guess.
+
+Each gate takes as its parent the bus-matrix gate for its side of the bus: AHB
+from SERDES_AHB_GATE_SW_CFG (0x05C0 bit8), AXI from SERDES_MBUS_GATE_SW_CFG
+(0x05E0 bit28), both named in the A733 user manual and added to the main CCU by `clk-sunxi-ng-a733-add-serdes-combophy-clock`. That these two are the
+upstream of SUBSYS_USB3P1_BGR bits 16/17 specifically -- rather than some other
+port of the same matrix -- is an inference from the register names and the
+subsystem they gate; the UM does not draw the tree. Marked here as inferred. An earlier version of this patch claimed the CCU had no
+SERDES bus gate to name and hung both on the SoC AHB root; that was wrong, as the A733 user manual shows.
+
+bit4 becomes a reset line instead of a third clock, because that is what it is:
+the reset-n of the USB2.0 companion UTMI+ PHY. ccu_reset_ops already implements
+active-low the right way round (assert clears, deassert sets). Its consumer is
+the companion PHY driver (`phy-allwinner-a733-add-usb2-companion-phy`); `phy-allwinner-a733-add-serdes-combophy` wrote it from the combo-PHY's phy_init,
+which is neither its device nor its layer.
+
+Verified: applies at fuzz 0, builds, and the two gate bits and the reset bit
+appear in the built object. On hardware (the 8 GiB board, 2026-08-01): with the
+matrix gates left enabled, xHCI registers unattended at 10.2 s -- bus 5 and 6,
+"Host supports USB 3.1 Enhanced SuperSpeed", no "not a DesignWare USB3 DRD Core"
+and no cut in the connector graph (the log still reports the fw_devlink cycle;
+it simply no longer matters). Without them the board hangs at 9.4 s. NOT verified
+on hardware: the mechanism -- see above. The effect is measured, the failing
+access is not named.
+
+Assisted-by: Claude
+
+diff --git a/drivers/clk/sunxi-ng/Kconfig b/drivers/clk/sunxi-ng/Kconfig
+--- a/drivers/clk/sunxi-ng/Kconfig
++++ b/drivers/clk/sunxi-ng/Kconfig
+@@ -72,6 +72,16 @@
+ 	default ARCH_SUNXI
+ 	depends on ARM64 || COMPILE_TEST
+ 
++config SUN60I_A733_SERDES_CCU
++	tristate "Support for the Allwinner A733 SERDES subsystem CCU"
++	default ARCH_SUNXI
++	depends on ARM64 || COMPILE_TEST
++	help
++	  Bus clock gates and resets of the devices behind the A733 combo-PHYs
++	  (USB3 today, PCIe later). The USB3 controller cannot be identified
++	  before these gates run, so the A733 dwc3 support needs this at
++	  runtime; without it that controller only ever defers.
++
+ config SUN55I_A523_CCU
+ 	tristate "Support for the Allwinner A523/T527 CCU"
+ 	default ARCH_SUNXI
+diff --git a/drivers/clk/sunxi-ng/Makefile b/drivers/clk/sunxi-ng/Makefile
+--- a/drivers/clk/sunxi-ng/Makefile
++++ b/drivers/clk/sunxi-ng/Makefile
+@@ -37,6 +37,7 @@
+ obj-$(CONFIG_SUN60I_A733_R_CCU)	+= ccu-sun60iw2-r.o
+ obj-$(CONFIG_SUN60I_A733_RTC_CCU)	+= ccu-sun60i-a733-rtc.o
+ obj-$(CONFIG_SUN60I_A733_CPU_CCU)	+= ccu-sun60i-a733-cpu.o
++obj-$(CONFIG_SUN60I_A733_SERDES_CCU)	+= ccu-sun60i-a733-serdes.o
+ obj-$(CONFIG_SUN55I_A523_CCU)	+= sun55i-a523-ccu.o
+ obj-$(CONFIG_SUN55I_A523_MCU_CCU)	+= sun55i-a523-mcu-ccu.o
+ obj-$(CONFIG_SUN55I_A523_R_CCU)	+= sun55i-a523-r-ccu.o
+diff --git a/drivers/clk/sunxi-ng/ccu-sun60i-a733-serdes.c b/drivers/clk/sunxi-ng/ccu-sun60i-a733-serdes.c
+new file mode 100644
+--- a/drivers/clk/sunxi-ng/ccu-sun60i-a733-serdes.c
++++ b/drivers/clk/sunxi-ng/ccu-sun60i-a733-serdes.c
+@@ -0,0 +1,211 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Allwinner A733 (sun60iw2) SERDES subsystem clock/reset controller.
++ *
++ * The page at 0x06C00000 (UM module SERDES_SUBSYS_APP) is not combo-PHY glue:
++ * it carries the bus-clock gates and the resets of the devices that sit behind
++ * the two combo-PHYs. Two registers matter today, one per device:
++ *
++ *   0x0004 SUBSYS_PCIE_BGR    bit18 SLV_ACLK_EN, bit17 MST_ACLK_EN,
++ *                             bit16 HCLK_EN, bit1 PCIE_PERSTN
++ *   0x0008 SUBSYS_USB3P1_BGR  bit21 USB2P0_UTMI_CLK_SEL, bit20 ONLY_PIPE_CLK_SEL,
++ *                             bit17 ACLK_EN, bit16 HCLK_EN, bit4 USB2P0_PHY_RSTN
++ *
++ * (from the A733 UM register
++ * tables; the two USB3 gates are the AXI (ACLK_EN) and AHB (HCLK_EN) clock
++ * enables of the USB 3.1 (USB3P1) block.)
++ *
++ * Only the USB3 half is modelled here. The PCIe gates are left to the PCIe
++ * milestone, but the reg window deliberately covers both so that adding them is
++ * an edit to this driver rather than a second device fighting for the page.
++ *
++ * Why this exists as a clock provider at all: the dwc3 core reads GSNPSID in
++ * dwc3_core_is_valid() before it calls any PHY op, and that register only
++ * answers once these two gates run. Whoever enables them therefore has to run
++ * before the controller is even created — which is a clock, not a side effect of
++ * some other driver's probe order.
++ *
++ * Silicon: on a board with a live SuperSpeed link this register reads
++ * 0x00030010, i.e. both gates on and the USB2 PHY out of reset
++ *.
++ *
++ * The two bus-matrix gates one level up in the CCU are held enabled for as long
++ * as this controller is bound, the way ccu-sun9i-a80-usb.c holds its bus clock
++ * and for the same reason: the registers below them do not answer otherwise.
++ * That is measured, not assumed. On the 8 GiB board, 2026-08-01, the identical kernel and
++ * dtb hung the board hard at 9.4 s — dead console, no oops — without
++ * clk_ignore_unused, and brought xHCI up at 10.2 s with it. The only thing that
++ * flag changes here is that clk_disable_unused() stops closing those two gates
++ * at late_initcall_sync, after which the first access to a SERDES register
++ * stalls the bus. A CLK_IGNORE_UNUSED child does not count as a user of its
++ * parent, so flagging the gates below was not enough; the provider has to be
++ * the user.
++ *
++ * The whole page is dead while the SERDES block reset is asserted — measured on
++ * the 8 GiB board, 2026-07-29: with SERDES_BGR_REG (main CCU 0x13C4) bit16 cleared, 0x0008
++ * reads 0x00000000 and ignores writes; restoring the bit brings back 0x00030010.
++ * So this driver consumes that reset and deasserts it before registering
++ * anything, and the ordering "SERDES reset first, gates second" is a property of
++ * the hardware rather than a convention copied from the vendor.
++ */
++
++#include <linux/clk.h>
++#include <linux/clk-provider.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/reset.h>
++
++#include "ccu_common.h"
++#include "ccu_gate.h"
++#include "ccu_reset.h"
++
++#include <dt-bindings/clock/sun60i-a733-serdes-ccu.h>
++#include <dt-bindings/reset/sun60i-a733-serdes-ccu.h>
++
++#define SUN60I_A733_SUBSYS_USB3P1_BGR_REG	0x0008
++
++/*
++ * Each gate takes the bus-matrix gate that actually feeds it, one level up in
++ * the CCU: the AHB side from SERDES_AHB_GATE_SW_CFG (0x05C0 bit8) and the AXI
++ * side from SERDES_MBUS_GATE_SW_CFG (0x05E0 bit28), both named in the A733
++ * user manual and modelled in the main CCU by
++ * `clk-sunxi-ng-a733-add-serdes-combophy-clock`. So the tree states what the hardware is: AHB/MBUS -> matrix gate ->
++ * subsystem gate -> block.
++ *
++ * They stay two independent clocks rather than one being the parent of the
++ * other: they are two bits in one register, and a parent relationship the
++ * silicon does not have would show up as fact in clk_summary.
++ *
++ * CLK_IGNORE_UNUSED, and not as a convenience. Their only consumer is the USB3
++ * controller's driver, which is a module; without this flag clk_disable_unused()
++ * closes both gates at late_initcall_sync, and the glue then pulses the
++ * controller's reset BEFORE it enables clocks (dwc3-generic-plat.c: reset,
++ * udelay, deassert, then devm_clk_bulk_get_all_enabled). That would put the
++ * reset edge on a block with no bus clock — a sequence no working boot on this
++ * board has ever run; every one of them had these gates on beforehand. Whether
++ * the block tolerates the other order is answered by no doc line and no
++ * measurement we have, so this keeps the boot-chain state until the consumer
++ * takes over instead of guessing.
++ */
++static const struct clk_parent_data sun60i_a733_serdes_ahb_parent[] = {
++	{ .fw_name = "ahb" },
++};
++static const struct clk_parent_data sun60i_a733_serdes_mbus_parent[] = {
++	{ .fw_name = "mbus" },
++};
++
++static SUNXI_CCU_GATE_DATA(usb3_aclk_clk, "usb3-aclk",
++			   sun60i_a733_serdes_mbus_parent,
++			   SUN60I_A733_SUBSYS_USB3P1_BGR_REG, BIT(17),
++			   CLK_IGNORE_UNUSED);
++static SUNXI_CCU_GATE_DATA(usb3_hclk_clk, "usb3-hclk",
++			   sun60i_a733_serdes_ahb_parent,
++			   SUN60I_A733_SUBSYS_USB3P1_BGR_REG, BIT(16),
++			   CLK_IGNORE_UNUSED);
++
++static struct ccu_common *sun60i_a733_serdes_ccu_clks[] = {
++	&usb3_aclk_clk.common,
++	&usb3_hclk_clk.common,
++};
++
++static struct clk_hw_onecell_data sun60i_a733_serdes_ccu_hw_clks = {
++	.hws	= {
++		[CLK_USB3_ACLK]	= &usb3_aclk_clk.common.hw,
++		[CLK_USB3_HCLK]	= &usb3_hclk_clk.common.hw,
++	},
++	.num	= 2,
++};
++
++/*
++ * USB2P0_PHY_RSTN is active-low ("Resetn"), which is what ccu_reset_ops already
++ * implements: assert clears the bit, deassert sets it.
++ */
++static const struct ccu_reset_map sun60i_a733_serdes_ccu_resets[] = {
++	[RST_USB3_USB2PHY] = { SUN60I_A733_SUBSYS_USB3P1_BGR_REG, BIT(4) },
++};
++
++static const struct sunxi_ccu_desc sun60i_a733_serdes_ccu_desc = {
++	.ccu_clks	= sun60i_a733_serdes_ccu_clks,
++	.num_ccu_clks	= ARRAY_SIZE(sun60i_a733_serdes_ccu_clks),
++
++	.hw_clks	= &sun60i_a733_serdes_ccu_hw_clks,
++
++	.resets		= sun60i_a733_serdes_ccu_resets,
++	.num_resets	= ARRAY_SIZE(sun60i_a733_serdes_ccu_resets),
++};
++
++static void sun60i_a733_serdes_ccu_assert(void *data)
++{
++	reset_control_assert(data);
++}
++
++static int sun60i_a733_serdes_ccu_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct reset_control *rst;
++	void __iomem *reg;
++	struct clk *clk;
++	int ret;
++
++	reg = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(reg))
++		return PTR_ERR(reg);
++
++	/*
++	 * Take the two matrix gates as consumer clocks and keep them on. They
++	 * are also the parents of the gates registered below, but a parent is
++	 * only enabled while a child is, and the children are not enabled until
++	 * a module binds the USB3 controller. In the gap, clk_disable_unused()
++	 * closes them and the next SERDES register access hangs the bus.
++	 */
++	clk = devm_clk_get_enabled(dev, "ahb");
++	if (IS_ERR(clk))
++		return dev_err_probe(dev, PTR_ERR(clk),
++				     "couldn't enable the serdes ahb gate\n");
++
++	clk = devm_clk_get_enabled(dev, "mbus");
++	if (IS_ERR(clk))
++		return dev_err_probe(dev, PTR_ERR(clk),
++				     "couldn't enable the serdes mbus gate\n");
++
++	/*
++	 * Shared, not exclusive: the combo-PHY behind the same block needs it
++	 * deasserted too, and it must stay deasserted for as long as either of
++	 * them is alive — asserting it takes this controller's own registers
++	 * away.
++	 */
++	rst = devm_reset_control_get_shared(dev, NULL);
++	if (IS_ERR(rst))
++		return dev_err_probe(dev, PTR_ERR(rst),
++				     "couldn't get the serdes block reset\n");
++
++	ret = reset_control_deassert(rst);
++	if (ret)
++		return dev_err_probe(dev, ret,
++				     "couldn't deassert the serdes block reset\n");
++
++	ret = devm_add_action_or_reset(dev, sun60i_a733_serdes_ccu_assert, rst);
++	if (ret)
++		return ret;
++
++	return devm_sunxi_ccu_probe(dev, reg, &sun60i_a733_serdes_ccu_desc);
++}
++
++static const struct of_device_id sun60i_a733_serdes_ccu_ids[] = {
++	{ .compatible = "allwinner,sun60i-a733-serdes-ccu" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, sun60i_a733_serdes_ccu_ids);
++
++static struct platform_driver sun60i_a733_serdes_ccu_driver = {
++	.probe	= sun60i_a733_serdes_ccu_probe,
++	.driver	= {
++		.name		= "sun60i-a733-serdes-ccu",
++		.of_match_table	= sun60i_a733_serdes_ccu_ids,
++	},
++};
++module_platform_driver(sun60i_a733_serdes_ccu_driver);
++
++MODULE_IMPORT_NS("SUNXI_CCU");
++MODULE_DESCRIPTION("Allwinner A733 SERDES subsystem CCU (USB3 bus gates)");
++MODULE_LICENSE("GPL");
+diff --git a/include/dt-bindings/clock/sun60i-a733-serdes-ccu.h b/include/dt-bindings/clock/sun60i-a733-serdes-ccu.h
+new file mode 100644
+--- a/include/dt-bindings/clock/sun60i-a733-serdes-ccu.h
++++ b/include/dt-bindings/clock/sun60i-a733-serdes-ccu.h
+@@ -0,0 +1,15 @@
++/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
++/*
++ * A733 (sun60iw2) SERDES subsystem clock indices.
++ *
++ * SERDES_SUBSYS_APP at 0x06C00000 gates the bus clocks of the devices sitting
++ * behind the two combo-PHYs: USB3 at offset 0x0008, PCIe at 0x0004. Only the
++ * USB3 pair is modelled here; the PCIe gates are added with the PCIe milestone.
++ */
++#ifndef _DT_BINDINGS_CLK_SUN60I_A733_SERDES_CCU_H_
++#define _DT_BINDINGS_CLK_SUN60I_A733_SERDES_CCU_H_
++
++#define CLK_USB3_ACLK		0
++#define CLK_USB3_HCLK		1
++
++#endif
+diff --git a/include/dt-bindings/reset/sun60i-a733-serdes-ccu.h b/include/dt-bindings/reset/sun60i-a733-serdes-ccu.h
+new file mode 100644
+--- a/include/dt-bindings/reset/sun60i-a733-serdes-ccu.h
++++ b/include/dt-bindings/reset/sun60i-a733-serdes-ccu.h
+@@ -0,0 +1,15 @@
++/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
++/*
++ * A733 (sun60iw2) SERDES subsystem reset indices.
++ *
++ * SUBSYS_USB3P1_BGR bit4 is the reset-n of the USB2.0 companion UTMI+ PHY that
++ * belongs to the USB3 DRD. The SERDES block reset itself is not here — it lives
++ * in the main CCU (SERDES_BGR_REG 0x13C4 bit16) and gates access to this whole
++ * page, so this controller consumes it rather than providing it.
++ */
++#ifndef _DT_BINDINGS_RST_SUN60I_A733_SERDES_CCU_H_
++#define _DT_BINDINGS_RST_SUN60I_A733_SERDES_CCU_H_
++
++#define RST_USB3_USB2PHY	0
++
++#endif

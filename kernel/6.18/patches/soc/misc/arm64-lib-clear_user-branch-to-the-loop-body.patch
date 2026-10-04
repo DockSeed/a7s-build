@@ -1,0 +1,96 @@
+From: DockSeed <dockseed@proton.me>
+Date: Tue, 16 Sep 2026 15:40:00 +0200
+Subject: [PATCH] arm64: lib: clear_user: branch to the loop body, not to its padding
+
+The 8-byte store loop in __arch_clear_user() carries its alignment
+directive behind the loop label:
+
+	1:	.p2align 4
+	USER(9f, sttr	xzr, [x0])
+		add	x0, x0, #8
+		subs	x1, x1, #8
+		b.hi	1b
+
+`.p2align 4` makes the assembler pad to the next 16-byte boundary, but
+`1:` is resolved before that padding, so `1b` is the address of the first
+NOP rather than the address of the first store. The padding is inside the
+loop and runs on every iteration. How much of it there is depends on where
+the function happens to land: the assembler emits zero to three NOPs, so
+the loop costs four to seven instructions per eight bytes cleared, and an
+unrelated change elsewhere in the kernel can move it from one end of that
+range to the other.
+
+Move the directive above the label. The padding then sits in front of the
+branch target and executes once, on entry from the size check above it,
+while the loop body keeps the 16-byte alignment the directive was added
+for. The generated loop drops from six instructions to four:
+
+	before				after
+	 28: nop			 28: nop
+	 2c: nop			 2c: nop
+	 30: sttr  xzr, [x0]		 30: sttr  xzr, [x0]
+	 34: add   x0, x0, #0x8		 34: add   x0, x0, #0x8
+	 38: subs  x1, x1, #0x8		 38: subs  x1, x1, #0x8
+	 3c: b.hi  28			 3c: b.hi  30
+
+The ordering changed in fe59e0358d9b ("arm64: lib: Use MOPS for usercopy
+routines"). Before it, `.p2align 4` stood in front of SYM_FUNC_START(), so
+the loop head inherited its alignment from the function entry and no label
+captured the padding. Every arm64 CPU without FEAT_MOPS runs this loop.
+
+MEASURED
+
+  The two loops differ in the branch target and in nothing else: same
+  instructions, same padding, same buffer, alternated and repeated, median
+  of five. Allwinner A733, 1 MiB buffer, cleared 2000 times per run, fixed
+  clocks:
+
+    Cortex-A55, 1794 MHz   4.43 -> 6.64 GiB/s   (+49.9%)
+    Cortex-A76, 2002 MHz   9.62 -> 11.91 GiB/s  (+23.8%)
+
+  The A55 figure is the instruction count on its own: six instructions per
+  eight bytes against four is 1.5x, and an in-order core pays it in full.
+
+  The same ratio shows up in the kernel path. Reading /dev/zero on this
+  kernel retires 795k instructions per MiB inside __arch_clear_user() where
+  a 6.6 kernel built from the same config retires 541k, with equal IPC and
+  equal cache miss rates; throughput is 23% (Cortex-A55) to 25%
+  (Cortex-A76) lower.
+
+UPSTREAM STATUS
+
+  Not posted. The symptom is known upstream and the cause is not: Luke
+  Yang reported a ~30% /dev/zero read regression on 2025-11-21 and read it
+  as the loop straddling an I-cache line, proposing `.p2align 6` in front
+  of SYM_FUNC_START(). Will Deacon objected that nothing makes this
+  function special. The thread stopped there and mainline is unchanged as
+  of 2026-09-16.
+
+  That report is consistent with this patch and explains itself through it:
+  aligning the function entry fixes the symptom by accident, because it
+  moves the loop head onto a 16-byte boundary and the assembler then has no
+  padding left to emit. The next change in front of the loop re-rolls it.
+
+  Luke Yang, "[PATCH] arm64: clear_user: align __arch_clear_user() to
+  128B for I-cache efficiency", LKML, 2025-11-21,
+  Message-Id: CAL2CeByu46f48j8O9=237fvhpPUCsKjOZkFuuHU3xrr3wVF5Eg@mail.gmail.com
+  Link: https://lore.kernel.org/all/CAL2CeByu46f48j8O9=237fvhpPUCsKjOZkFuuHU3xrr3wVF5Eg@mail.gmail.com/
+
+  No Signed-off-by yet: this patch has not been submitted, and the DCO line
+  is the submitter's to add.
+
+Fixes: fe59e0358d9b ("arm64: lib: Use MOPS for usercopy routines")
+Assisted-by: Claude
+
+--- a/arch/arm64/lib/clear_user.S
++++ b/arch/arm64/lib/clear_user.S
+@@ -37,7 +37,8 @@
+ 	subs	x1, x1, #8
+ 	b.mi	2f
+ 
+-1:	.p2align 4
++	.p2align 4
++1:
+ USER(9f, sttr	xzr, [x0])
+ 	add	x0, x0, #8
+ 	subs	x1, x1, #8

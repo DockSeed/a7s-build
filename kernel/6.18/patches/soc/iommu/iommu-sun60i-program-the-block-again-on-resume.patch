@@ -1,0 +1,188 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] iommu: sun60i: program the block again on resume
+
+The driver had no PM callbacks, and everything it writes into the block
+lives only in the registers: ENABLE (+0x014), TTB (+0x020), TLB_PREFETCH
+(+0x02c), the two invalidation modes (+0x040, +0x060), INT_ENABLE (+0x080),
+and per master with a user BYP (+0x404 + 0x200 * m) and INT_ENABLE (+0x30 of
+the same block). If the block loses its state -- a system suspend that
+removes its power, or a domain that is ever allowed to drop -- the display
+engine comes back with BYP at its reset value 1 and scans an IOVA as a
+physical address: no fault, a garbage screen, and every register reading
+plausibly. Reset values as read on the 8 GB board: ENABLE 0, TLB_PREFETCH 0x00030000, BYP 1.
+
+WHAT CHANGES
+
+A resume_early callback that programs the block again from the driver's own
+state, the way attach does: sun60i_iommu_hw_enable() with the current
+domain's L1 table (TTB, prefetch, both invalidation modes, INT_ENABLE, the
+flush in the flush_all() order, ENABLE), then each master with a user: INT_ENABLE,
+its micro TLB flush, BYP 0. That master sequence moves out of
+sun60i_iommu_master_translate() into sun60i_iommu_master_program(), so attach
+and resume share it; attach still takes the port gate first. With no domain
+every master is in bypass, which is the reset state, and resume writes
+nothing. The callback logs what it found and what it did, at info level
+until the hardware proof exists.
+
+  - Nothing is saved and there is no suspend callback: every value follows
+    from iommu->domain and iommu->users[], and the page tables are in DRAM,
+    which keeps its contents across a suspend.
+  - No clock is touched on either side. The register interface needs
+    SYS_MCLK, and an access with it gated stalls the bus (measured
+    2026-09-22);
+    the driver enables it at probe and never gates it. A master's MBUS port
+    gate is held while the master has a user, so every master block
+    written here answers. Masters without a user are not touched.
+  - resume_early, not resume_noirq. The noirq phase is where genpd powers a
+    gateable domain back on, from the consumer's own noirq callback, and
+    there is no device link between an IOMMU and its consumers: "iommus" is
+    an optional supplier (drivers/of/property.c, of_supplier_bindings), and
+    of_link_property() skips optional ones unless fw_devlink.strict is set.
+    Every early callback runs after every noirq callback and before any
+    device's normal resume. mtk_iommu uses the late/early pair too
+    (SET_LATE_SYSTEM_SLEEP_PM_OPS); ipmmu-vmsa has the same no-save design
+    (ipmmu_resume_noirq(), from its own context state) in the noirq phase.
+
+WHAT THE VENDOR DOES
+
+The BSP has a sunxi_iommu_suspend; its stack was reported to take a NULL
+dereference there. Its code was not read for this patch, and nothing is
+taken from it.
+
+NOT TAKEN
+
+  - Saving registers on suspend: they would have to be read back from master
+    blocks, and the driver knows every value already.
+  - Switching translation off on suspend: the display engine driver has no PM
+    callbacks and keeps scanning through a system suspend.
+  - Runtime PM: the block has no power domain of its own in the device tree,
+    its clocks stay on for the life of the device, and gating SYS_MCLK would
+    have to be ordered against every register access, including the fault
+    handler's, to avoid the bus stall. No gain has been measured.
+
+VERIFIED HERE (2026-09-25, not on the board)
+
+Applies at fuzz 0 in the series. compile-check (A733_TEST_KERNEL=1) OK;
+drivers/iommu/sun60i-iommu.o builds with W=1 and no warning, with the test
+options on and off (native gcc 14.2). The object carries
+sun60i_iommu_resume_early.
+
+FALSIFIER, with a test-only patch (iommu-sun60i-lose-state-across-system-sleep, not carried) and
+pm_test = platform: without this patch, the regs file of IOMMU1 reads ENABLE
+0, TTB 0 and master 2 BYP 1 after the resume, and the display shows garbage;
+with it, the regs read what they read before the suspend (ENABLE 0x1, the
+same TTB, master 2 BYP 0 INT_ENABLE 0x1, INT_ENABLE 0x3) and the log carries
+"resume: found ENABLE 0 TTB 0; programmed again, masters 0x4". One regs read
+after the resume that differs from before refutes it.
+
+Assisted-by: Claude
+
+--- a/drivers/iommu/sun60i-iommu.c
++++ b/drivers/iommu/sun60i-iommu.c
+@@ -427,6 +427,21 @@
+ }
+ 
+ /*
++ * Program master @m's block to translate: interrupts on, micro TLB flushed,
++ * bypass off. Its port gate must be held.
++ */
++static void sun60i_iommu_master_program(struct sun60i_iommu *iommu,
++					unsigned int m)
++{
++	lockdep_assert_held(&iommu->lock);
++
++	sun60i_mwrite(iommu, m, SUN60I_IOMMU_M_INT_ENABLE, 1);
++	sun60i_iommu_cmd(iommu, SUN60I_IOMMU_MASTER_BASE(m) +
++			 SUN60I_IOMMU_M_TLB_FLUSH, BIT(0));
++	sun60i_mwrite(iommu, m, SUN60I_IOMMU_M_BYP, 0);
++}
++
++/*
+  * The first user of master @m: take its port gate, then program its block.
+  * The gate stays enabled until sun60i_iommu_master_bypass(), so the block is
+  * never gated while it holds this driver's state -- whether it would keep
+@@ -445,10 +460,7 @@
+ 		return ret;
+ 	}
+ 
+-	sun60i_mwrite(iommu, m, SUN60I_IOMMU_M_INT_ENABLE, 1);
+-	sun60i_iommu_cmd(iommu, SUN60I_IOMMU_MASTER_BASE(m) +
+-			 SUN60I_IOMMU_M_TLB_FLUSH, BIT(0));
+-	sun60i_mwrite(iommu, m, SUN60I_IOMMU_M_BYP, 0);
++	sun60i_iommu_master_program(iommu, m);
+ 
+ 	dev_dbg(iommu->dev, "master %u translating\n", m);
+ 	return 0;
+@@ -1163,6 +1175,64 @@
+ 	return 0;
+ }
+ 
++/*
++ * System sleep. Nothing is saved: everything this driver writes into the
++ * block follows from its own state -- the domain's L1 table, the masters
++ * with a user -- and the tables themselves are in DRAM, which keeps its
++ * contents across a suspend. So there is no suspend callback, and resume
++ * programs the block again from that state, exactly as attach does:
++ * sun60i_iommu_hw_enable(), then each master with a user. A block that kept
++ * its state is programmed with the values it already holds.
++ *
++ * The clocks are not touched on either side. The register interface needs
++ * SYS_MCLK, and an access with it gated stalls the bus; the driver enables it
++ * at probe and never gates it, and a master's port gate stays held for as
++ * long as the master has a user, so every block written here answers.
++ *
++ * resume_early, not resume_noirq: the noirq phase is where genpd powers a
++ * gateable domain back on, and it does so from the consumer's own noirq
++ * callback. With no device link between an IOMMU and its consumers ("iommus"
++ * is an optional supplier for fw_devlink), nothing orders that before this
++ * resume. Every early callback runs after every noirq one and before any
++ * consumer's normal resume, where DMA starts again.
++ */
++static int sun60i_iommu_resume_early(struct device *dev)
++{
++	struct sun60i_iommu *iommu = dev_get_drvdata(dev);
++	bool translating;
++	unsigned long flags;
++	unsigned int m;
++	u32 enable, ttb, users;
++
++	spin_lock_irqsave(&iommu->lock, flags);
++
++	enable = sun60i_read(iommu, SUN60I_IOMMU_ENABLE_REG);
++	ttb = sun60i_read(iommu, SUN60I_IOMMU_TTB_REG);
++	translating = iommu->domain;
++	users = sun60i_iommu_user_mask(iommu);
++
++	if (translating) {
++		sun60i_iommu_hw_enable(iommu, iommu->domain);
++		for (m = 0; m < SUN60I_IOMMU_MAX_MASTERS; m++)
++			if (iommu->users[m])
++				sun60i_iommu_master_program(iommu, m);
++	}
++
++	spin_unlock_irqrestore(&iommu->lock, flags);
++
++	/* Visible until HW-proven: diagnostics stay on by default. */
++	dev_info(dev, "resume: found ENABLE %#x TTB %#x; %s, masters %#x\n",
++		 enable, ttb,
++		 translating ? "programmed again" : "all in bypass, nothing to do",
++		 users);
++
++	return 0;
++}
++
++static const struct dev_pm_ops sun60i_iommu_pm_ops = {
++	LATE_SYSTEM_SLEEP_PM_OPS(NULL, sun60i_iommu_resume_early)
++};
++
+ static const struct of_device_id sun60i_iommu_of_match[] = {
+ 	{ .compatible = "allwinner,sun60i-a733-iommu" },
+ 	{ /* sentinel */ }
+@@ -1174,6 +1244,7 @@
+ 	.driver = {
+ 		.name			= "sun60i-a733-iommu",
+ 		.of_match_table		= sun60i_iommu_of_match,
++		.pm			= pm_sleep_ptr(&sun60i_iommu_pm_ops),
+ 		.suppress_bind_attrs	= true,
+ 	},
+ };

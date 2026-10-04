@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# Debian packages the kernel stages need in the builder (cross build for arm64).
+git
+curl
+ca-certificates
+make
+build-essential
+gcc-aarch64-linux-gnu
+binutils-aarch64-linux-gnu
+bc
+bison
+flex
+libssl-dev
+libelf-dev
+libncurses-dev
+kmod
+cpio
+xz-utils
+rsync
+patch
+python3
+device-tree-compiler

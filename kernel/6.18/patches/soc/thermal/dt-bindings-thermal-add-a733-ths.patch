@@ -1,0 +1,23 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] dt-bindings: thermal: add allwinner,sun60i-a733-ths
+
+Enum entry only, and that is deliberate. The A733 needs two clocks, so it must
+NOT join the sun20i-d1 / sun50i-a100 / sun50i-h6 / sun50i-h616 branch of the
+first allOf, which caps clocks at one; the else branch with minItems: 2 is the
+correct one and it applies by default. Staying out of the h616 branch also
+leaves allwinner,sram forbidden, which is right -- that is an H616 erratum. And
+staying out of the h3/d1 branch leaves #thermal-sensor-cells free to be 1, which
+a five-sensor part needs.
+
+Assisted-by: Claude
+---
+--- a/Documentation/devicetree/bindings/thermal/allwinner,sun8i-a83t-ths.yaml
++++ b/Documentation/devicetree/bindings/thermal/allwinner,sun8i-a83t-ths.yaml
+@@ -24,6 +24,7 @@
+       - allwinner,sun50i-h5-ths
+       - allwinner,sun50i-h6-ths
+       - allwinner,sun50i-h616-ths
++      - allwinner,sun60i-a733-ths
+ 
+   clocks:
+     minItems: 1

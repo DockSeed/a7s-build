@@ -1,0 +1,53 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: allwinner: A733 eMMC HS400 at 200 MHz
+
+Raises the eMMC (mmc2) from 150 to 200 MHz. The SD node keeps 150 MHz and is
+untouched.
+
+This only makes sense together with `mmc-sunxi-a733-hs400-timing-selection`, and that is the whole point. Until now
+every HS400 attempt on this board ran a *mixed* configuration:
+
+  our timing (MODE_SEL/NEW_SAM_EN/SAM_PH set, CCLK_DIV=1) at 150 MHz
+      -> reads mostly survive on retries, writes fail with cmd 25 WR DCE
+  vendor timing (all four cleared) at 150 MHz          <- `mmc-sunxi-a733-hs400-timing-selection` alone
+      -> reads collapse, partition table unreadable
+
+Neither is a configuration anyone has ever shown to work. The vendor stack runs
+the second timing at 200 MHz and writes this exact eMMC without a single error,
+so the pair - vendor timing AND 200 MHz - is the one combination with evidence
+behind it. Phase relationships scale with the clock; transplanting one half of a
+proven pair onto the other half's frequency is what produced both failures above.
+
+The 150 MHz cap itself came from `arm64-dts-allwinner-a733-add-sd-emmc` and was left in place by `arm64-dts-allwinner-a733-emmc-hs400` with the note
+"200 MHz HS400 never locked on this board". That observation stands, but it was
+made with our timing, which does not fit 200 MHz either - so it never tested this
+combination. The note is not evidence against 200 MHz per se.
+
+Two things this does not claim. It is not a fix for the write failure by itself;
+`mmc-sunxi-a733-hs400-timing-selection` without this is disproved, and this without `mmc-sunxi-a733-hs400-timing-selection` is the state that already
+failed to lock. And the clock path has to be watched: at 200 MHz the driver asks
+for a 400 MHz module clock, and smhc2 carries CLK_SET_RATE_PARENT, so the
+framework may retune a shared PLL output (pll-peri0-800m currently sits at
+300 MHz for exactly that reason) rather than switching to pll-peri1-800m with a
+divider the way the vendor does. Read SMHC2_CLK (0x02002D20) back on the board:
+the vendor value is 0x83000001 (PERI1_800M, M=2 -> 400 MHz module / 200 MHz card).
+
+Assisted-by: Claude
+---
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -803,13 +803,13 @@
+ 			pinctrl-names = "default";
+ 			pinctrl-0 = <&mmc2_pins>, <&mmc2_clk_pins>,
+ 				    <&mmc2_ds_pins>;
+ 			vmmc-supply = <&reg_vcc3v3>;
+ 			vqmmc-supply = <&reg_vcc1v8>;
+ 			bus-width = <8>;
+-			max-frequency = <150000000>;
++			max-frequency = <200000000>;
+ 			non-removable;
+ 			cap-mmc-highspeed;
+ 			mmc-hs200-1_8v;
+ 			mmc-hs400-1_8v;
+ 			cap-mmc-hw-reset;
+ 			#address-cells = <1>;

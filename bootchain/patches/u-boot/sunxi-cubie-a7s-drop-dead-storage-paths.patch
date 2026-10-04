@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000007 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Mon, 21 Sep 2026 00:00:00 +0000
+Subject: [PATCH] sunxi: cubie-a7s: drop storage paths this SoC and board do not have
+
+Radxa's 0031/0032 turned on SPI-NOR, UFS, PCIe and NVMe in one step. Two of
+those describe hardware that is not there, and one of them costs a probe on
+every boot.
+
+  CONFIG_AHCI, CONFIG_SCSI, CONFIG_SCSI_AHCI
+      The A733 has no SATA controller. Not "unpopulated on this board" -- the
+      SoC does not have the IP. And AHCI is what puts `scsi0` into
+      boot_targets (sunxi-common.h: BOOT_TARGET_DEVICES_SCSI is guarded by
+      CONFIG_AHCI), so every boot walks a target that can never answer,
+      between the card and the drive.
+
+  CONFIG_UFS, CONFIG_UFS_SUNXI, CONFIG_CMD_UFS
+      The SoC has a UFS controller and the BROM can boot from it, but no A7S
+      board populates one, and the firmware path is settled: U-Boot is loaded
+      from eMMC where present, otherwise from the card, and from nothing else.
+
+What this deliberately does NOT touch:
+
+  * boot_targets order. The BROM tries SMHC0 (the card) before SMHC2 (eMMC)
+    in every BOOT_MODE variant, including the hardwired ones (A733 UM V1.00,
+    system-boot chapter), and `bootcmd_mmc_auto` then tries whichever medium
+    U-Boot itself came from first. So a bootable card always wins, above any
+    setting we could make, and MMC already precedes NVMe. Moving nvme0 ahead
+    of mmc_auto was considered and rejected: it would let a stale system on
+    the drive outrank a freshly flashed card.
+
+  * The SPI-NOR chip drivers. Whether this board populates a SPI flash is not
+    established here, and removing eight drivers on an assumption is how you
+    find out the hard way. Separate question, separate measurement.
+
+Falsifier: a boot chain built without these, booting unchanged from the card,
+with `printenv boot_targets` no longer listing scsi0 and the drive still
+found by `pci enum` + `nvme scan`.
+
+Assisted-by: Claude
+
+diff --git a/src/configs/radxa-cubie-a7s_defconfig b/src/configs/radxa-cubie-a7s_defconfig
+--- a/src/configs/radxa-cubie-a7s_defconfig
++++ b/src/configs/radxa-cubie-a7s_defconfig
+@@ -11,13 +11,11 @@
+ # CONFIG_SYS_MALLOC_CLEAR_ON_INIT is not set
+ CONFIG_SPL_LOAD_FIT_ADDRESS=0x47a00000
+ CONFIG_BOOTDELAY=3
+-CONFIG_AHCI=y
+ CONFIG_FDT_FIXUP_PARTITIONS=y
+ CONFIG_SPL_RAM_DEVICE=y
+ CONFIG_CMD_DFU=y
+ CONFIG_CMD_I2C=y
+ CONFIG_CMD_MTD=y
+-CONFIG_CMD_UFS=y
+ CONFIG_CMD_SF_TEST=y
+ CONFIG_CMD_SPI=y
+ CONFIG_NET_RANDOM_ETHADDR=y
+@@ -61,11 +59,7 @@
+ CONFIG_AW_CADENCE_COMBOPHY=y
+ CONFIG_REGULATOR_AXP=y
+ CONFIG_CMD_PCI=y
+-CONFIG_SCSI=y
+-CONFIG_SCSI_AHCI=y
+ CONFIG_SPI=y
+-CONFIG_UFS=y
+-CONFIG_UFS_SUNXI=y
+ CONFIG_WDT=y
+ CONFIG_WDT_SUNXI=y
+ CONFIG_WATCHDOG=y

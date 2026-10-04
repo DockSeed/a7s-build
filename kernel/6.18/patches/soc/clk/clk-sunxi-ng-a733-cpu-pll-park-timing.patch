@@ -1,0 +1,162 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] clk: sunxi-ng: a733: time the CPU PLL park, busy-poll the lock
+
+What. Two changes to `clk-sunxi-ng-a733-add-cpu-pll-ccu`'s CPU PLL path, both about the time a cluster
+spends on the 26 MHz DCXO while its PLL relocks:
+
+  1. A timing notifier per CPU PLL, registered after `clk-sunxi-ng-a733-add-cpu-pll-ccu`'s mux notifier,
+     so it runs just after the park (PRE_RATE_CHANGE) and just after the
+     release (POST_RATE_CHANGE). pr_debug "<pll>: <old> -> <new> parked
+     <ns> on cpu<N>". set_rate() adds its own line: lock time and set_rate
+     time. Both switched on at run time, func-scoped:
+       echo 'func ccu_a733_park_nb_cb +p' > .../dynamic_debug/control
+       echo 'func ccu_a733_cpu_pll_set_rate +p' > .../dynamic_debug/control
+  2. The lock wait becomes readl_relaxed_poll_timeout_atomic() at 1 us
+     instead of ccu_helper_wait_for_lock()'s 100 us sleeping poll.
+
+Why the timing. A measurement on 2026-09-23 timed the park with ftrace
+clk_set_rate -> clk_set_rate_complete: A55 cluster median ~260 us, A76
+~120 us, 2-5 % of wall time under a bursty load. Two things make that
+number unfit to design a fix on. The tracer writes its events on the parked
+core, at 26 MHz, inside the span it measures. And the span is set_rate()
+only; the park starts at the PRE notifier and ends at the POST notifier,
+with the clk framework's own work on both sides. Every change ran on a CPU
+of the cluster it parked (both kernels), so all
+of that work runs at 26 MHz.
+
+What the first version of this patch showed (the 6 GiB board, 6.18.36-t0035,
+2026-09-23): the PLL locks in 4.2 us median on the A76
+cluster (p99 5.3) and 6.0 us on the A55 cluster (p99 7.8). The ftrace span
+barely moved with the busy poll (A55 264 -> 248 us, A76 120 -> 116 us):
+the PLL_UPDATE poll ahead of it usually outlasts the lock, so the sleeping
+poll rarely slept. That version's falsifier (A55 median below 123 us) was
+met, so the busy poll is not the fix and is kept only because it cannot
+sleep at 26 MHz; the cost sits in software executed at 26 MHz.
+
+What this is for. The fix the numbers point at is to park on something
+faster than the DCXO: the L/B mux also offers CPU_BACK_PLL (101, 975 MHz)
+and PERI0PLL_DIV2 (100) -- the pattern of mediatek-cpufreq's intermediate
+clock. Whether that is worth its risk depends on the real park time, which
+is what this measures.
+
+UM: the PLL_UPDATE/LOCK/20 us order is unchanged (`clk-sunxi-ng-a733-add-cpu-pll-ccu`, UM V1.00 5.1.4.2).
+The UM gives the CPU PLL lock time only as a 1.5 ms bound (Table 4-2,
+V1.00 p. 20); the measured 4-8 us is what `arm64-dts-a733-cpu-opp-tables-and-supply`'s clock-latency-ns can use.
+
+Vendor comparison: the vendor driver ramps N under LFM on the live PLL and
+never parks; it has neither a lock poll nor a park to compare with.
+
+For a comparison run without it: A7S_SKIP_PATCHES=clk-sunxi-ng-a733-cpu-pll-park-timing.
+
+Assisted-by: Claude
+---
+--- a/drivers/clk/sunxi-ng/ccu-sun60i-a733-cpu.c
++++ b/drivers/clk/sunxi-ng/ccu-sun60i-a733-cpu.c
+@@ -71,6 +71,7 @@
+ #include <linux/delay.h>
+ #include <linux/io.h>
+ #include <linux/iopoll.h>
++#include <linux/ktime.h>
+ #include <linux/log2.h>
+ #include <linux/module.h>
+ #include <linux/platform_device.h>
+@@ -327,11 +328,14 @@
+ 	struct ccu_a733_cpu_pll *pll = hw_to_ccu_a733_cpu_pll(hw);
+ 	struct ccu_common *common = &pll->common;
+ 	struct ccu_a733_cpu_pll_cfg cfg;
++	ktime_t ts, t0, t1;
+ 	u32 reg;
+ 
+ 	if (!ccu_a733_cpu_pll_find(parent_rate, rate, &cfg))
+ 		return -EINVAL;
+ 
++	ts = ktime_get();
++
+ 	/* 1. Stop driving the mux from this PLL. */
+ 	ccu_a733_rmw(common, common->reg, A733_PLL_OUTPUT_GATE, 0);
+ 
+@@ -366,8 +370,18 @@
+ 						  reg, !(reg & A733_PLL_UPDATE),
+ 						  1, 10000));
+ 
+-	/* 8. Wait for the loop to report lock. */
+-	ccu_helper_wait_for_lock(common, A733_PLL_LOCK);
++	/*
++	 * 8. Wait for the loop to report lock. Busy-polled at 1 us, not with
++	 *    ccu_helper_wait_for_lock(): its 100 us sleeping poll is paid with
++	 *    the cluster parked on the 26 MHz DCXO, and the timer wake-up runs
++	 *    at that clock too. The CPU that runs this is parked either way.
++	 *    The time is left in the debug line for clock-latency-ns.
++	 */
++	t0 = ktime_get();
++	WARN_ON(readl_relaxed_poll_timeout_atomic(common->base + common->reg,
++						  reg, reg & A733_PLL_LOCK,
++						  1, 10000));
++	t1 = ktime_get();
+ 
+ 	/* 9. UM: the PLL is usable 20 us after it locks. */
+ 	udelay(20);
+@@ -381,6 +395,10 @@
+ 	ccu_a733_rmw(common, common->reg, A733_PLL_OUTPUT_GATE,
+ 		     A733_PLL_OUTPUT_GATE);
+ 
++	pr_debug("%s: N %u lock %lld ns, set_rate %lld ns\n",
++		 clk_hw_get_name(hw), cfg.n, ktime_to_ns(ktime_sub(t1, t0)),
++		 ktime_to_ns(ktime_sub(ktime_get(), ts)));
++
+ 	return 0;
+ }
+ 
+@@ -618,6 +636,42 @@
+ A733_CPU_MUX_NB(cpu_b_mux_nb, cpu_b_clk);
+ A733_CPU_MUX_NB(cpu_dsu_mux_nb, cpu_dsu_clk);
+ 
++/*
++ * How long a cluster really sits on the bypass: PRE_RATE_CHANGE to
++ * POST_RATE_CHANGE, i.e. set_rate() plus the clk framework's walk around it,
++ * all of it executed at 26 MHz when the CPU doing it is in that cluster.
++ * Registered after the mux notifier, so at PRE it runs just after the park and
++ * at POST just after the release. Read without a tracer, whose own event writes
++ * would run on the parked core too. pr_debug, switched on by func-scoped dyndbg.
++ */
++struct ccu_a733_park_nb {
++	struct notifier_block	nb;
++	ktime_t			t0;
++	int			cpu;
++};
++
++static int ccu_a733_park_nb_cb(struct notifier_block *nb, unsigned long event,
++			       void *data)
++{
++	struct ccu_a733_park_nb *p = container_of(nb, struct ccu_a733_park_nb, nb);
++	struct clk_notifier_data *cnd = data;
++
++	if (event == PRE_RATE_CHANGE) {
++		p->t0 = ktime_get();
++		p->cpu = raw_smp_processor_id();
++	} else if (event == POST_RATE_CHANGE) {
++		pr_debug("%s: %lu -> %lu parked %lld ns on cpu%d\n",
++			 __clk_get_name(cnd->clk), cnd->old_rate, cnd->new_rate,
++			 ktime_to_ns(ktime_sub(ktime_get(), p->t0)), p->cpu);
++	}
++
++	return NOTIFY_OK;
++}
++
++static struct ccu_a733_park_nb cpu_l_park_nb = { .nb.notifier_call = ccu_a733_park_nb_cb };
++static struct ccu_a733_park_nb cpu_b_park_nb = { .nb.notifier_call = ccu_a733_park_nb_cb };
++static struct ccu_a733_park_nb cpu_dsu_park_nb = { .nb.notifier_call = ccu_a733_park_nb_cb };
++
+ static const u16 a733_cpu_pll_ctrl_regs[] = {
+ 	A733_PLL_CPU_L_CTRL_REG,
+ 	A733_PLL_CPU_B_CTRL_REG,
+@@ -713,6 +767,9 @@
+ 	ccu_mux_notifier_register(pll_cpu_l_clk.common.hw.clk, &cpu_l_mux_nb);
+ 	ccu_mux_notifier_register(pll_cpu_b_clk.common.hw.clk, &cpu_b_mux_nb);
+ 	ccu_mux_notifier_register(pll_cpu_dsu_clk.common.hw.clk, &cpu_dsu_mux_nb);
++	clk_notifier_register(pll_cpu_l_clk.common.hw.clk, &cpu_l_park_nb.nb);
++	clk_notifier_register(pll_cpu_b_clk.common.hw.clk, &cpu_b_park_nb.nb);
++	clk_notifier_register(pll_cpu_dsu_clk.common.hw.clk, &cpu_dsu_park_nb.nb);
+ 
+ 	dev_info(dev, "A733 CPU PLLs on a %lu Hz reference, N %u..%u\n",
+ 		 dcxo_rate, n_min, n_max);

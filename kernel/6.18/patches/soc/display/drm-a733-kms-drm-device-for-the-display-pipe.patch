@@ -1,0 +1,1944 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] drm: a733: KMS -- one CRTC, one plane, one connector, /dev/fb0
+
+[Recipe cut: regenerated: the hunks that touched the removed DE/TCON debugfs
+knobs are gone.]
+
+The drm_device this pixel path has never had. Eleven of the fourteen patches
+that built the path are HW-proven -- AUX and EDID (`drm-allwinner-a733-displayport-aux`, plus an earlier
+EDID extension-block reader that this recipe does not carry), the main-link
+PHY (`drm-a733-dp-configure-the-main-link-phy`), TCON_TV1's raster (`drm-a733-tcon-tv1-timing-generator-and-video-source`), the DisplayPort video stream (`drm-a733-dp-the-main-video-stream`),
+link training (`drm-a733-dp-link-training`) and the display engine that pulls pixels out of DRAM
+(`drm-a733-display-engine-dram-into-tcon-tv1`, first pixels on 2026-08-19) -- and none of it is reachable except by
+hand, through debugfs, because no drm_device binds on this SoC. Nothing calls
+drm_client_setup(), so there is no /dev/fb0 and there is no console.
+
+This is the second bring-up stage: a component master
+and a drm_driver, one CRTC on TCON_TV1, one plane out of one display-engine
+channel, an encoder and drm_bridge_connector_init() so that `drm-a733-dp-register-a-drm-bridge`'s bridge has
+something to hang on, and drm_client_setup() + drm_fbdev_dma.
+
+WHAT IS PROVEN HERE, AND IT IS NOT MUCH
+----------------------------------------
+
+⬜ NOTHING IN THIS PATCH HAS RUN ON SILICON. It applies at --fuzz=0, it passes
+compile-check, checkpatch --strict is clean on every file it adds or touches,
+and the a733_defconfig round-trip is clean. That is the whole of the claim. The
+blocks underneath are proven; the frame around them is not, and those are
+different statements.
+
+⬜ THE OBSERVABLE THAT WOULD CLOSE IT:
+/dev/fb0 at 1920x1200; a known pattern written into it is on the screen; the
+same pattern read back and compared with cmp matches. FALSIFIED BY: no
+/dev/fb0; a cmp mismatch; or a screen that does not change when the buffer
+does. A small test script is the
+instrument and needs no new code.
+
+⬜ AND ONE GATE IS UNMET BY CONSTRUCTION. `drm-a733-display-engine-dram-into-tcon-tv1`'s register set is not currently
+reproducible -- a test run gave a black screen with a bit-identical set and the
+CCSC correction that answers it has not been on a board. So this patch can put
+a /dev/fb0 in front of an engine that produces no picture, and the two failures
+look nothing alike: no /dev/fb0 is this patch, a black /dev/fb0 that reads back
+correctly is `drm-a733-display-engine-dram-into-tcon-tv1`'s open CCSC question. Read
+`drm-a733-display-engine-dram-into-tcon-tv1`'s header before attributing either.
+
+THE ONE LOAD-BEARING LINE
+--------------------------
+
+  .fb_create = drm_gem_fb_create        NOT drm_gem_fb_create_with_dirty
+
+drm_fbdev_dma_driver_fbdev_probe() branches on fb->funcs->dirty
+(drm_fbdev_dma.c:315). With a .dirty callback the fbdev client allocates a
+SHADOW buffer and defers copies into the real scanout buffer -- so /dev/fb0
+would not be the memory the display engine fetches, reading it back would
+compare a shadow with itself, and a poke into it would not reach the screen.
+Both halves of the falsifier above, silently defeated. This hardware scans DRAM
+continuously and needs no damage tracking.
+
+⚠ THE VENDOR'S OWN DRIVER AGREES, AND THAT IS EVIDENCE OF A KIND CODE USUALLY
+IS NOT: sunxi_drm_gem_fb_funcs (allwinner-bsp, drivers/drm/sunxi_drm_drv.c:
+109-112) carries .destroy and .create_handle and no .dirty, and its fbdev maps
+the client buffer directly (drm_client_buffer_vmap(),
+sunxi_fbdev_platform.c:269). The driver putting a picture on the reference
+board right now also scans out of the buffer userspace writes.
+
+WHAT IT REUSES, WHICH IS MOST OF IT
+------------------------------------
+
+sun4i_drv.c is the model for the component master; the atomic helpers,
+drm_gem_dma, drm_bridge_connector, drm_dp_helper and the fbdev client are used
+as they are. New code is a plane, a CRTC and the wiring: about 600 lines
+including a header comment that is a third of the file.
+
+⚠ WHERE THIS DEVIATES FROM the full-reuse plan, under which
+the display engine should JOIN sun4i-drm rather than be driven from here:
+
+  1. an audit of that move found it
+     costs FOUR changes to shared mainline code -- sun8i_mixer.h's map[6]->[7],
+     a fourth de-top regmap in sun8i_mixer.c, a DE33 base in sun8i_csc.c that
+     is a latent upstream defect nothing shipped has ever executed, and a new
+     compatible in a closed DE2-mixer schema -- three of them
+     mandatory-or-it-does-not-work.
+  2. The move is gated on D0, `drm-a733-display-engine-dram-into-tcon-tv1` reproducing on a board, and D0 is
+     not met (above). The condition for moving is a change of frame around a
+     KNOWN-GOOD register set.
+  3. Nothing here forecloses it. When the mixer entry lands, this file's plane
+     is deleted and the CRTC calls sunxi_engine_layers_init() instead. The
+     device tree does not move at all -- `drm-a733-display-engine-dram-into-tcon-tv1` already claims the DE33 mixer
+     compatible for exactly that reason.
+
+⚠ AND THE CRTC: that plan prefers refactoring mainline's sun4i_crtc.c onto an
+ops struct over mirroring it. Mirrored here, for reasons that are structural
+and not effort:
+
+  - sun4i_crtc is coupled to TWO mainline types. It holds a struct sun4i_tcon *
+    AND a struct sunxi_engine *, and its init calls sunxi_engine_layers_init()
+    to create the planes (sun4i_crtc.c:194-208). Reusing it needs the TCON ops
+    refactor AND our engine to BE a sunxi_engine -- i.e. deviation 1 above.
+  - sun4i_crtc_init() carries no EXPORT_SYMBOL and sun4i_crtc.o links into
+    sun4i-tcon.ko, not sun4i-drm.ko (sun4i/Makefile). A separate module cannot
+    call it without a Makefile move and an export on top of the ops refactor.
+  - What is mirrored is 60 lines, not 256. The rest of sun4i_crtc.c is vblank
+    event handling for hardware whose vblank is wired, colour correction for
+    the composite TV encoder, and an of_graph port lookup for a multi-pipe
+    topology -- all absent here on purpose.
+
+  So the refactor is the right long-term answer and belongs in the same patch
+  as the mixer move, where it is one change instead of two.
+
+THE VENDOR HAS A KMS DRIVER FOR THIS SoC, AND IT WAS READ FIRST
+----------------------------------------------------------------
+
+github.com/radxa/allwinner-bsp, branch cubie-aiot-v1.4.8, drivers/drm/ -- the
+submodule `bsp` of radxa-pkg/linux-aw2511. In it, sunxi_drm_drv.c, sunxi_drm_crtc.c,
+sunxi_device/hardware/lowlevel_de/sunxi_de.c and sunxi_device/sunxi_tcon.c
+answer the same questions this patch does. Code is a HINT, not evidence, so:
+
+CORROBORATED -- decided from the mainline side, and its running driver agrees:
+
+  - the fb funcs above;
+  - CRTC ENABLE BEFORE PLANE COMMIT. sunxi_drm_atomic_helper_commit_tail()
+    (sunxi_drm_drv.c:186-203) hand-rolls exactly what
+    drm_atomic_helper_commit_tail_rpm() gives: disables, modeset enables,
+    commit_planes, drm_atomic_helper_fake_vblank();
+  - THE SOURCE SWITCH BELONGS INSIDE THE TCON PROGRAM SEQUENCE.
+    tcon_tv_src_select(..., LCD_SRC_DE, de_id) sits between the timing
+    registers and tcon_tv_open() (sunxi_tcon.c:800-810), never after. `drm-a733-tcon-tv1-timing-generator-and-video-source`
+    writes TV_SRC_CTL at that same point; this patch changes the argument;
+  - THE VBLANK INTERRUPT IS THE TCON'S (devm_request_irq on the TCON device,
+    sunxi_tcon.c:472-484); the DE's own interrupt is CRC-only
+    (sunxi_de.c:1125-1138). That is INTID 90 = GIC SPI 58 on our node.
+
+TAUGHT -- three rules that are in no register table:
+
+  1. THE BLENDER MUST BE PRODUCING AN OUTPUT SIZE BEFORE THE TCON IS OPENED.
+     The vendor lifts the blender output attributes out of its deferred commit
+     and writes them straight to MMIO because otherwise "tcon will think that
+     de is enabled, but bld has no output, resulting in missing data"
+     (sunxi_de.c:852-858). Here ORDER alone meets it -- `drm-a733-display-engine-dram-into-tcon-tv1` commits by direct
+     store, so BLD_OUTSIZE has landed before the TCON is programmed -- and the
+     CRTC enable says so, because enabling the TCON first would reproduce
+     exactly that fault.
+  2. A DATAPATH WRITE HAS A SAFE WINDOW INSIDE THE FRAME. Before arming its
+     queue the vendor reads the TCON's current line and delays with an hrtimer
+     until it lies in [vtotal/4, 3*vtotal/4] (rcq_update_timer_start(),
+     sunxi_de.c:665-691); the TCON separately derives a per-mode deadline from
+     its start delay and refuses updates past it (sunxi_tcon_calc_judge_line(),
+     sunxi_tcon.c:121-150). Two independent guards on the write our page-flip
+     path does unguarded. Named at sun60i_de_kms_scanout(); stage 3 owns it and
+     needs the TCON interrupt first.
+  3. THE PIXEL CLOCK IS THE MODE'S CLOCK DIVIDED BY PIXEL_MODE.
+     clk_set_rate(mclk, pixel_clk / pixel_mode) with the same factor in
+     TV_GCTL[5:4] (sunxi_tcon.c:801-806), the factor coming from the
+     transmitter, which doubles it when a mode exceeds its own clock limit
+     (edp_adjust_pixel_mode(), sunxi_drm_edp.c:708-721). Both sides of our pipe
+     run one pixel per clock at their reset value, so the invariant holds today
+     by neither half being touched. Recorded at sun60i_tcon_tv_kms_check(),
+     because a mode list wider than one entry must carry the factor through
+     three places at once.
+
+DIFFERENT ON PURPOSE -- where the vendor driver differs at this exact layer,
+and what this patch does instead. This patch does not merely reproduce the
+vendor driver, so the differences are listed:
+
+| The vendor | Ours |
+|---|---|
+| devm_drm_dev_alloc() inside a component master's .bind (drv.c:1232): the drm_device is released when the platform device goes away, not when the master unbinds, so a bind/unbind cycle leaks one | drm_dev_alloc() + drm_dev_put() in .unbind |
+| drm_dev_register()'s return assigned and ignored (drv.c:1283); the function returns 0 either way, so a failed registration reports success | checked, and the bind unwinds |
+| drm_mode_config_cleanup() in the error path (drv.c:1289) after drmm_mode_config_init() already registered that cleanup -- a double teardown | drmm only |
+| the CRTC is configured from new_state->mode_blob, the mode USERSPACE asked for (crtc.c:1923-1926), so any adjustment an encoder makes in .atomic_check is discarded by the engine | both blocks take crtc_state->adjusted_mode |
+| sunxi_de_enable()'s failure is logged and ignored -- scrtc->enabled = true and drm_crtc_vblank_on() run anyway (crtc.c:1955-1959) | the CRTC enable stops, and the engine is put back down if the TCON then fails |
+| drm_crtc_vblank_get() in .atomic_begin (crtc.c:2035) with no drm_crtc_vblank_put() anywhere in that tree: after the first flip the vblank interrupt is pinned on and .disable_vblank is dead | no vblank claimed at all until it is serviced |
+| no plane .atomic_check of any kind (crtc.c:1082-1092): no clipping, no scaling bound, no visibility -- and one of its two plane hooks needs an out-of-tree change to struct drm_plane_helper_funcs | the plane refuses what this datapath cannot do, before the commit |
+| pixel_mode validated only at .atomic_enable, too late to refuse, and the validator accepts 0 and 8 (crtc.c:1945-1953) while the register writer handles 1, 2 and 4 -- 0 reaches pixel_clk / pixel_mode (sunxi_tcon.c:801), and only the eDP path ever sets the field | one mode, one pixel per clock, and the constraint named rather than half-checked |
+| the engine is torn down with no quiesce and no delay between "output off" and clk_disable_unprepare() (sunxi_de.c:968-1010); that the TCON is already closed is guaranteed only by the DRM helper's ordering | sun60i_de_stop() disables the layer, waits a frame time, then drops the clocks |
+| a hand-rolled connector with DRM_CONNECTOR_POLL_HPD (edp.c:4033) on a board whose HPD pad reads zero through a live link, so it is never polled and never notices a plug; and no drm_bridge anywhere, so drm_connector_oob_hotplug_event() from the Type-C alternate mode has no connector->fwnode to find | drm_bridge_connector_init(), which sets that fwnode and implements .oob_hotplug_event |
+| about 1030 lines of its own fbdev (sunxi_fbdev_core.c, sunxi_fbdev_platform.c, sunxi_drmfb_core.c) beside an unused #include <drm/drm_fbdev_dma.h> | drm_client_setup() + drm_fbdev_dma |
+
+And one thing it does better, because the list would be one-sided without it:
+its CRTC survives a second display pipe, a writeback connector, gamma and a
+bootloader handover. This one builds one pipe and refuses anything else by
+name.
+
+TWO OWNERS OF ONE DATAPATH, AND HOW THAT IS PREVENTED
+------------------------------------------------------
+
+`drm-a733-tcon-tv1-timing-generator-and-video-source` and `drm-a733-display-engine-dram-into-tcon-tv1` are driven by debugfs verbs that program the very registers a
+modeset programs, and this tree's diagnostics rule says those verbs are never
+deleted. So the WRITE verbs are refused with -EBUSY while a KMS master holds
+the component, the READ verbs (`state`, `scanout`) are not, and the A/B arm
+survives two ways with no different kernel: boot a device tree without the
+display-engine node, or unbind the sun60i-a733-kms platform device by hand.
+The handshake is the component bind, which also refuses to take a device that
+debugfs has already enabled.
+
+WHAT IS DELIBERATELY ABSENT, named so it is not read as an oversight
+---------------------------------------------------------------------
+
+  - VBLANK. drm_vblank_init() is not called and the CRTC has no
+    .enable_vblank. TCON_TV1's interrupt is in the device tree since `arm64-dts-a733-tcon-tv1-and-the-dp-phy-pad-window` and
+    nothing requests it; `drm-a733-tcon-tv1-timing-generator-and-video-source` writes TV_GINT0 to zero on the stated grounds
+    that "an enabled interrupt with no handler is not a diagnostic, it is a
+    latch nobody clears". Claiming a vblank that never counts would be worse
+    than having none: drm_atomic_helper_wait_for_vblanks() would wait on a
+    stopped counter. Without drm_vblank_init(), drm_dev_has_vblank() is false,
+    every crtc_state->no_vblank is set by drm_atomic_helper_check_modeset(),
+    and drm_atomic_helper_fake_vblank() completes each flip event immediately.
+    Flips therefore return, with no guarantee about where in the frame they
+    landed. That is stage 3, and it is why the tearing test lives there.
+  - MORE THAN ONE PLANE, MORE THAN ONE FORMAT, ANY SCALING. XRGB8888, linear,
+    full-screen at the origin, because that is what `drm-a733-display-engine-dram-into-tcon-tv1` has on silicon. The
+    VSU8 scaler is in the channel datapath unconditionally on this DE
+    generation and `drm-a733-display-engine-dram-into-tcon-tv1` stages it at unity; a scaled or offset plane needs real
+    coefficients, which is stage 4.
+  - A DEVICE-TREE BINDING. No display node in this tree has one -- not the
+    mixer, not the TCON, not the transmitter -- and adding a schema for the
+    pipeline node alone while the blocks it points at have none would describe
+    the least of it. The debt is real and it is the whole display track's.
+  - AN IOMMU. Checked rather than assumed: the framebuffer is allocated against
+    the DRM device and fetched by the display engine, two different devices,
+    and the addresses are interchangeable only while neither is translated.
+    sun60i_kms_check_dma_domain() compares them once at bind and refuses rather
+    than producing a black screen whose every register reads back correct.
+
+CORRECTED 2026-09-22, comments only: SUN60I_KMS_DMA_BITS and the probe
+comment gave the 32-bit mask as a register width. The DE's layers have a
+high-address byte (VI +0x0d0..+0x0e4);
+`drm-a733-display-engine-dram-into-tcon-tv1` does not program it, so the 32-bit limit is a driver
+choice. The plane check's message still names a 32-bit register.
+
+Assisted-by: Claude
+
+diff --git a/drivers/gpu/drm/sun60i/Kconfig b/drivers/gpu/drm/sun60i/Kconfig
+--- a/drivers/gpu/drm/sun60i/Kconfig
++++ b/drivers/gpu/drm/sun60i/Kconfig
+@@ -63,3 +63,32 @@ config DRM_SUN60I_DE
+ 	  reset. It is not a KMS driver and registers no CRTC yet.
+ 
+ 	  Say M here if you want this SoC to be able to scan a framebuffer.
++
++config DRM_SUN60I_KMS
++	tristate "Allwinner A733 (sun60iw2) display pipe (KMS)"
++	depends on DRM && OF
++	depends on ARCH_SUNXI || COMPILE_TEST
++	depends on DRM_SUN60I_DE && DRM_SUN60I_TCON_TV
++	select DRM_BRIDGE_CONNECTOR
++	select DRM_CLIENT_SELECTION
++	select DRM_DISPLAY_HELPER
++	select DRM_GEM_DMA_HELPER
++	select DRM_KMS_HELPER
++	help
++	  Enable this for the KMS driver that ties the A733 display path
++	  together: a drm_device, one CRTC on TCON_TV1, one plane out of one
++	  display-engine channel, and the connector the DisplayPort bridge
++	  hangs on. It is what creates /dev/fb0 and, with
++	  FRAMEBUFFER_CONSOLE, puts a console on the screen.
++
++	  It drives no register itself. Every write goes through the display
++	  engine and TCON drivers it depends on, which is why both are hard
++	  dependencies rather than selects: each is independently useful
++	  without this one, and each has its own debugfs verbs that this
++	  driver takes ownership of while it is bound.
++
++	  The DisplayPort transmitter is NOT a dependency. It publishes a
++	  drm_bridge that this driver finds through the device-tree graph, so
++	  a kernel without it simply has no output on this pipe.
++
++	  Say M here if you want this SoC to be able to run a KMS console.
+diff --git a/drivers/gpu/drm/sun60i/Makefile b/drivers/gpu/drm/sun60i/Makefile
+--- a/drivers/gpu/drm/sun60i/Makefile
++++ b/drivers/gpu/drm/sun60i/Makefile
+@@ -2,3 +2,4 @@
+ obj-$(CONFIG_DRM_SUN60I_DP) += sun60i-dp.o
+ obj-$(CONFIG_DRM_SUN60I_TCON_TV) += sun60i-tcon-tv.o
+ obj-$(CONFIG_DRM_SUN60I_DE) += sun60i-de.o
++obj-$(CONFIG_DRM_SUN60I_KMS) += sun60i-kms.o
+diff --git a/drivers/gpu/drm/sun60i/sun60i-de.c b/drivers/gpu/drm/sun60i/sun60i-de.c
+--- a/drivers/gpu/drm/sun60i/sun60i-de.c
++++ b/drivers/gpu/drm/sun60i/sun60i-de.c
+@@ -104,6 +104,7 @@
+ 
+ #include <linux/bitfield.h>
+ #include <linux/clk.h>
++#include <linux/component.h>
+ #include <linux/debugfs.h>
+ #include <linux/delay.h>
+ #include <linux/device.h>
+@@ -119,6 +120,7 @@
+ #include <drm/drm_modes.h>
+ 
+ #include "sun60i-display.h"
++#include "sun60i-kms.h"
+ 
+ /*
+  * The block map inside the DE0 aperture (0x05000000, 4 MiB,
+@@ -412,6 +414,15 @@ struct sun60i_de {
+ 	bool				enabled;
+ 	bool				layer_on;
+ 	bool				ccsc_on;
++	/*
++	 * A KMS master is bound and owns the datapath. The debugfs verbs that
++	 * WRITE are refused while it is set -- two writers on one datapath is a
++	 * corruption no review would catch, and this driver's verbs program the
++	 * very registers a modeset programs. The verbs that only READ stay
++	 * open, because by design a bring-up
++	 * driver's own output does not get taken away once it works.
++	 */
++	bool				kms_owned;
+ 	struct drm_display_mode		mode;
+ 
+ 	dma_addr_t			fb_dma;
+@@ -1119,21 +1130,105 @@ static void sun60i_de_quiesce(struct sun60i_de *de)
+ 	msleep(DE_QUIESCE_FRAMES * frame_ms);
+ }
+ 
+-static void sun60i_de_disable(struct sun60i_de *de)
++/*
++ * The order is the one derived from what
++ * depends on what: clocks, then the liveness read, then the RCQ disarmed, then
++ * the control plane, then the datapath, then the arm. That last half is
++ * INFERRED and not measured -- the capture is a snapshot and says nothing about
++ * write order -- and ordering is where bring-up usually fails, so it is named
++ * as inferred rather than presented as known.
++ *
++ * NOTHING HERE TOUCHES THE TCON. TV_SRC_CTL bit 0 stays where `drm-a733-tcon-tv1-timing-generator-and-video-source` left it, and
++ * moving it to 0 (the DE becomes the data source) is a separate,
++ * deliberate act through that driver's own `source` file. That separation IS
++ * the acceptance test: the bars are on the screen from the TCON's own pattern
++ * generator, and one write to another driver replaces them with this one's
++ * framebuffer. A driver that reached across and did it itself would have proven
++ * the two together and neither alone.
++ */
++static int sun60i_de_start(struct sun60i_de *de)
+ {
++	int ret;
++
++	ret = sun60i_de_clocks_on(de);
++	if (ret) {
++		dev_err(de->dev, "gates and resets: %d\n", ret);
++		return ret;
++	}
++
++	ret = sun60i_de_check_alive(de);
++	if (ret)
++		goto err_clocks;
++
+ 	/*
+-	 * Layer off, then quiesce, then the clocks, then the memory. The DE has
+-	 * to stop fetching before the pages under it go back to CMA, or a buffer
+-	 * that now belongs to somebody else is still being read at
+-	 * 138 Mpixel/s -- and it has to be given time to finish what is in
+-	 * flight before its reset is asserted underneath it.
++	 * FIRST, and the order is the board's, not a preference: nothing in the
++	 * channel or blender windows accepts a write until these three are set,
++	 * and the reset asserted in sun60i_de_clocks_off() clears them again.
+ 	 */
++	sun60i_de_top_open(de);
++
++	sun60i_de_disarm_rcq(de);
++	sun60i_de_top_setup(de);
++
++	de->commit->begin(de);
++	sun60i_de_channel_quiesce(de);
++	sun60i_de_blender(de);
++	sun60i_de_layer(de);
++	ret = de->commit->arm(de);
++	if (ret) {
++		dev_err(de->dev, "commit (%s): %d\n", de->commit->name, ret);
++		goto err_clocks;
++	}
++
++	/*
++	 * Before any claim of success. The first cut announced "scanning ..."
++	 * over a datapath that had silently refused every write, next to a
++	 * `state` dump that showed the zeros -- intent printed beside the
++	 * evidence against it.
++	 */
++	ret = sun60i_de_verify(de);
++	if (ret)
++		goto err_clocks;
++
++	de->enabled = true;
++	de->layer_on = true;
++
++	dev_info(de->dev,
++		 "scanning %dx%d XRGB8888 from %pad, pitch %u, commit by %s\n",
++		 de->mode.hdisplay, de->mode.vdisplay, &de->fb_dma,
++		 de->fb_pitch, de->commit->name);
++	dev_info(de->dev,
++		 "the TCON still owns the source: clear TV_SRC_CTL bit 0 to show this\n");
++
++	return 0;
++
++err_clocks:
++	sun60i_de_clocks_off(de);
++
++	return ret;
++}
++
++/*
++ * Stop fetching and put the block back to reset, leaving the memory alone.
++ *
++ * Layer off, then quiesce, then the clocks. The DE has to stop fetching before
++ * the pages under it are handed back, or a buffer that now belongs to somebody
++ * else is still being read at 138 Mpixel/s -- and it has to be given time to
++ * finish what is in flight before its reset is asserted underneath it.
++ */
++static void sun60i_de_stop(struct sun60i_de *de)
++{
+ 	sun60i_de_layer_disable(de);
+ 	sun60i_de_quiesce(de);
+ 	sun60i_de_clocks_off(de);
+ 	de->enabled = false;
+ }
+ 
++static void sun60i_de_disable(struct sun60i_de *de)
++{
++	sun60i_de_stop(de);
++}
++
+ struct sun60i_de_reg {
+ 	const char	*name;
+ 	u32		off;
+@@ -1243,6 +1338,144 @@ static int sun60i_de_state_show(struct seq_file *s, void *unused)
+ }
+ DEFINE_SHOW_ATTRIBUTE(sun60i_de_state);
+ 
++/*
++ * ---------------------------------------------------------------------------
++ * The KMS half
++ * ---------------------------------------------------------------------------
++ *
++ * Four entry points for sun60i-kms.ko and nothing else. The scanout memory is
++ * a GEM object the DRM core owns.
++ *
++ * ⚠ THE ADDRESS COMES FROM A DIFFERENT DEVICE, AND THAT IS NOT FREE. The GEM
++ * helpers allocate against the DRM device, this block fetches through its own
++ * bus master, and the two are only interchangeable while neither is behind an
++ * IOMMU -- which is what was measured on 2026-08-19 and what sun60i-kms.c
++ * checks once at bind rather than assuming.
++ */
++int sun60i_de_kms_enable(struct sun60i_de *de,
++			 const struct drm_display_mode *mode,
++			 dma_addr_t scanout, u32 pitch)
++{
++	guard(mutex)(&de->lock);
++
++	if (!de->kms_owned)
++		return -EPERM;
++
++	if (de->enabled)
++		return -EBUSY;
++
++	drm_mode_copy(&de->mode, mode);
++	de->fb_dma = scanout;
++	de->fb_pitch = pitch;
++
++	return sun60i_de_start(de);
++}
++EXPORT_SYMBOL_GPL(sun60i_de_kms_enable);
++
++void sun60i_de_kms_disable(struct sun60i_de *de)
++{
++	guard(mutex)(&de->lock);
++
++	if (!de->enabled)
++		return;
++
++	sun60i_de_stop(de);
++	de->fb_dma = 0;
++	de->fb_pitch = 0;
++}
++EXPORT_SYMBOL_GPL(sun60i_de_kms_disable);
++
++/*
++ * A new scanout address, staged through the same commit path as everything
++ * else. This is the page flip, and what it is NOT is a flip synchronised to
++ * anything: nothing here waits for vblank, because nothing in this tree
++ * services the TCON interrupt yet.
++ *
++ * ⚠ AND THE MISSING GUARD HAS A SHAPE, WHICH IS WORTH MORE THAN "expect
++ * tearing". The vendor does not write the datapath at an arbitrary point in the
++ * frame: it reads the TCON's current line and, if it is outside
++ * [vtotal/4, 3*vtotal/4], arms an hrtimer and waits until it is
++ * (rcq_update_timer_start(), allwinner-bsp sunxi_de.c:665-691), and the TCON
++ * separately derives a per-mode deadline from its own start delay and refuses
++ * an update past it (sunxi_tcon_calc_judge_line(), sunxi_tcon.c:121-150). Two
++ * independent line-window guards on the same write this function does
++ * unguarded. So the risk here is not only a torn line: it is a write that lands
++ * on a frame boundary. Stage 3 owns it, it needs the TCON interrupt first, and
++ * the two functions above are what it should look like.
++ */
++int sun60i_de_kms_scanout(struct sun60i_de *de, dma_addr_t scanout, u32 pitch)
++{
++	guard(mutex)(&de->lock);
++
++	if (!de->enabled)
++		return -ENODEV;
++
++	de->fb_dma = scanout;
++	de->fb_pitch = pitch;
++	sun60i_de_layer_enable(de);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(sun60i_de_kms_scanout);
++
++void sun60i_de_kms_layer_off(struct sun60i_de *de)
++{
++	guard(mutex)(&de->lock);
++
++	if (!de->enabled)
++		return;
++
++	sun60i_de_layer_disable(de);
++}
++EXPORT_SYMBOL_GPL(sun60i_de_kms_layer_off);
++
++/*
++ * The component hooks do no hardware work at all, and that is deliberate: this
++ * driver is started by a modeset, not by a bind, exactly as it is started by a
++ * debugfs write and not by a probe. What bind buys is the ownership handshake
++ * and the framework's guarantee that this device stays bound for as long as the
++ * KMS master holds it -- which is what lets sun60i-kms.c keep a bare pointer to
++ * this struct with no reference of its own.
++ */
++static int sun60i_de_bind(struct device *dev, struct device *master, void *data)
++{
++	struct sun60i_de *de = dev_get_drvdata(dev);
++
++	guard(mutex)(&de->lock);
++
++	if (de->enabled) {
++		dev_err(dev, "already enabled through debugfs; refusing to hand the datapath to a KMS master\n");
++		return -EBUSY;
++	}
++
++	de->kms_owned = true;
++
++	return 0;
++}
++
++static void sun60i_de_unbind(struct device *dev, struct device *master,
++			     void *data)
++{
++	struct sun60i_de *de = dev_get_drvdata(dev);
++
++	guard(mutex)(&de->lock);
++
++	if (de->enabled)
++		sun60i_de_stop(de);
++
++	de->kms_owned = false;
++}
++
++static const struct component_ops sun60i_de_component_ops = {
++	.bind	= sun60i_de_bind,
++	.unbind	= sun60i_de_unbind,
++};
++
++static void sun60i_de_component_remove(void *data)
++{
++	component_del(data, &sun60i_de_component_ops);
++}
++
+ static void sun60i_de_teardown(void *data)
+ {
+ 	struct sun60i_de *de = data;
+@@ -1396,7 +1629,15 @@ static int sun60i_de_probe(struct platform_device *pdev)
+ 	dev_info(dev, "A733 display engine on %s, idle until a KMS master binds\n",
+ 		 dev_name(dev));
+ 
+-	return 0;
++	/*
++	 * Last, because from here a KMS master may bind this device at any
++	 * moment and every resource it will touch has to exist first.
++	 */
++	ret = component_add(dev, &sun60i_de_component_ops);
++	if (ret)
++		return dev_err_probe(dev, ret, "component_add\n");
++
++	return devm_add_action_or_reset(dev, sun60i_de_component_remove, dev);
+ }
+ 
+ /*
+diff --git a/drivers/gpu/drm/sun60i/sun60i-kms.c b/drivers/gpu/drm/sun60i/sun60i-kms.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/gpu/drm/sun60i/sun60i-kms.c
+@@ -0,0 +1,1080 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Allwinner A733 (sun60iw2) KMS -- the drm_device this pixel path never had.
++ *
++ * Every block on the way from DRAM to the monitor is already driver code in
++ * this tree and eleven of the fourteen patches that got them there are proven
++ * on silicon: the AUX channel and the EDID it reads (`drm-allwinner-a733-displayport-aux` and an earlier EDID patch not carried here), the main-link
++ * PHY (`drm-a733-dp-configure-the-main-link-phy`), TCON_TV1's raster (`drm-a733-tcon-tv1-timing-generator-and-video-source`), the DisplayPort video stream (`drm-a733-dp-the-main-video-stream`),
++ * link training (`drm-a733-dp-link-training`) and the display engine that pulls pixels out of DRAM
++ * (`drm-a733-display-engine-dram-into-tcon-tv1`, first pixels on 2026-08-19). What has never existed is the object that
++ * ties them together: no drm_device binds on this SoC, so drm_client_setup() is
++ * never called, there is no /dev/fb0 and nothing above these drivers can ask
++ * for a mode. Everything they do is reached through debugfs by hand.
++ *
++ * This file is that object, and nothing more than that object -- one CRTC on
++ * TCON_TV1, one plane out of one display-engine channel, one encoder, and the
++ * connector `drm-a733-dp-register-a-drm-bridge`'s bridge hangs on.
++ *
++ * WHAT IS PROVEN AND WHAT IS NOT, because a green build is not proof:
++ *
++ *   ⬜ NOTHING IN THIS FILE HAS RUN ON SILICON. It applies and it compiles, and
++ *      that is the whole of the claim. The blocks underneath it are proven; the
++ *      frame around them is not, and the two are different statements.
++ *   ⬜ The observable that closes it is a framebuffer test,
++ *      namely: /dev/fb0 at 1920x1200; a known pattern written into it is
++ *      on the screen; the same pattern read back and compared with cmp matches.
++ *      Falsified by: no /dev/fb0; a cmp mismatch; or a screen that does not
++ *      change when the buffer changes.
++ *   ⬜ VBLANK IS NOT WIRED. TCON_TV1's interrupt (INTID 90 = GIC SPI 58) is in
++ *      the device tree and nothing requests it, so drm_vblank_init() is
++ *      deliberately NOT called -- see the block above sun60i_kms_bind().
++ *
++ * ⚠ THE SINGLE LOAD-BEARING LINE IN THIS FILE IS `.fb_create =
++ * drm_gem_fb_create`, NOT drm_gem_fb_create_with_dirty. That choice IS the
++ * proof above. drm_fbdev_dma_driver_fbdev_probe() branches on
++ * `fb->funcs->dirty` (drm_fbdev_dma.c:315): with a .dirty callback the fbdev
++ * client allocates a SHADOW buffer and defers copies into the real scanout
++ * buffer, so /dev/fb0 is not the memory the display engine fetches. Reading it
++ * back would then compare a shadow with itself, and a poke into it would not
++ * reach the screen without a flush -- the two halves of that falsifier,
++ * both silently defeated. _with_dirty exists for hardware that needs damage
++ * tracking; this one scans DRAM continuously and needs none.
++ *
++ * WHERE THE SHAPE COMES FROM. The design decision is: reuse
++ * the sun4i-drm frame, keep our own TCON because `drm-a733-tcon-tv1-timing-generator-and-video-source` is HW-proven, and let the
++ * DisplayPort side be a drm_bridge. This file is the frame around those blocks.
++ * sun4i_drv.c is the model for the component master and for the fbdev client
++ * call; dw_dp-rockchip.c (150 lines) is the model for the encoder-plus-bridge
++ * half; sun8i_mixer.c's DE33 model is what says our engine's register layout is
++ * already described by mainline.
++ *
++ * ⚠ AND WHERE THIS DEVIATES FROM THE FULL-REUSE PLAN, deliberately and with a reason,
++ * because that plan has the display engine JOIN sun4i-drm rather than be driven from
++ * here:
++ *
++ *   1. an audit of that move found it
++ *      costs FOUR changes to shared mainline code (sun8i_mixer.h's map[6]->[7],
++ *      a fourth de-top regmap in sun8i_mixer.c, a DE33 base in sun8i_csc.c that
++ *      is a latent upstream defect nothing shipped has ever executed, and a new
++ *      compatible in a closed DE2-mixer schema), three of them mandatory-or-it-
++ *      does-not-work. That is not this patch.
++ *   2. The move is gated on D0 -- `drm-a733-display-engine-dram-into-tcon-tv1` reproducing on a board --
++ *      and D0 is NOT met: a test run produced a black screen with a bit-
++ *      identical register set, and `drm-a733-display-engine-dram-into-tcon-tv1`'s current cut carries an untested CCSC
++ *      correction for it. The condition for moving is a change of frame
++ *      around a KNOWN-GOOD register set, and the register set is not known
++ *      good today.
++ *   3. So the frame is built around `drm-a733-display-engine-dram-into-tcon-tv1` as it stands. Nothing here forecloses
++ *      the move: when the mixer entry lands, this file's plane is deleted and
++ *      the CRTC calls sunxi_engine_layers_init() instead. The device tree does
++ *      not move at all -- `drm-a733-display-engine-dram-into-tcon-tv1` already claims the DE33 mixer compatible for
++ *      exactly that reason.
++ *
++ * ⚠ THE OTHER DEVIATION, AND IT IS THE ONE THAT PLAN EXPLICITLY LEFT OPEN. It prefers
++ * refactoring mainline's sun4i_crtc.c onto an ops struct over mirroring it.
++ * Mirrored here, and the reason is not effort:
++ *
++ *   - sun4i_crtc is coupled to TWO mainline types, not one. It holds a
++ *     `struct sun4i_tcon *` AND a `struct sunxi_engine *`, and its init calls
++ *     sunxi_engine_layers_init() to create the planes (sun4i_crtc.c:194-208).
++ *     Reusing it therefore needs the TCON ops refactor AND our engine to BE a
++ *     sunxi_engine -- i.e. deviation 1 above, the move that D0 gates.
++ *   - sun4i_crtc_init() carries no EXPORT_SYMBOL and sun4i_crtc.o is linked into
++ *     sun4i-tcon.ko, not sun4i-drm.ko (sun4i/Makefile). A separate module cannot
++ *     call it at all without a Makefile move and an export on top of the ops
++ *     refactor.
++ *   - What is mirrored is 60 lines, not 256: the parts of sun4i_crtc.c that are
++ *     vblank event handling for hardware whose vblank is wired, colour
++ *     correction for the composite TV encoder, and the of_graph port lookup for
++ *     a multi-pipe topology are all absent here on purpose.
++ *
++ *   So the refactor is the right long-term answer and it belongs in the same
++ *   patch as the mixer move, where it is one change instead of two.
++ *
++ * ---------------------------------------------------------------------------
++ * THE VENDOR HAS A KMS DRIVER FOR THIS SoC, AND IT WAS READ BEFORE THIS WAS
++ * WRITTEN
++ * ---------------------------------------------------------------------------
++ *
++ * github.com/radxa/allwinner-bsp, branch cubie-aiot-v1.4.8, drivers/drm/ --
++ * the submodule `bsp` of radxa-pkg/linux-aw2511.
++ * In it, sunxi_drm_drv.c (the component master),
++ * sunxi_drm_crtc.c (the CRTC), sunxi_device/hardware/lowlevel_de/sunxi_de.c and
++ * sunxi_device/sunxi_tcon.c are the files that answer the same questions this
++ * one does, and sunxi_drm_edp.c is the driver running on the reference board
++ * today. Code is a HINT, not evidence (a green build is evidence that it builds, nothing more), so what follows is
++ * split into what it CORROBORATED, what it TAUGHT that no register could, and
++ * where this file is deliberately different.
++ *
++ * CORROBORATED -- four choices that were made from the mainline side and that
++ * the vendor's running driver independently agrees with:
++ *
++ *   - `.fb_create` WITHOUT a `.dirty` callback. sunxi_drm_gem_fb_funcs
++ *     (sunxi_drm_drv.c:109-112) carries `.destroy` and `.create_handle` and
++ *     nothing else, and its fbdev maps the client buffer directly
++ *     (drm_client_buffer_vmap(), sunxi_fbdev_platform.c:269). The driver that
++ *     is putting a picture on this board right now also scans out of the buffer
++ *     userspace writes. Stage 2's remote proof is therefore a property of the
++ *     hardware path, not of our configuration of it.
++ *   - CRTC ENABLE BEFORE PLANE COMMIT. sunxi_drm_atomic_helper_commit_tail()
++ *     (sunxi_drm_drv.c:186-203) hand-rolls exactly the order
++ *     drm_atomic_helper_commit_tail_rpm() provides: disables, then modeset
++ *     enables, then commit_planes, then drm_atomic_helper_fake_vblank().
++ *   - THE SOURCE SWITCH BELONGS INSIDE THE TCON PROGRAM SEQUENCE.
++ *     tcon_tv_src_select(..., LCD_SRC_DE, de_id) sits between the timing
++ *     registers and tcon_tv_open() in sunxi_tcon_edp_mode_init()
++ *     (sunxi_tcon.c:800-810) -- never after the TCON is running. `drm-a733-tcon-tv1-timing-generator-and-video-source`'s
++ *     sun60i_tcon_tv_program() writes TV_SRC_CTL at the same point, and this
++ *     patch changes only the argument.
++ *   - THE VBLANK INTERRUPT IS THE TCON'S. devm_request_irq() on the TCON device
++ *     (sunxi_tcon.c:472-484), tail-calling the CRTC's handler; the DE's own
++ *     interrupt is CRC-only (sunxi_de.c:1125-1138). That is INTID 90 = GIC SPI
++ *     58 on our TCON_TV1 node, and it is stage 3's.
++ *
++ * TAUGHT -- three hardware rules that are in no register table, each with what
++ * it means here:
++ *
++ *   1. THE BLENDER MUST BE PRODUCING AN OUTPUT SIZE BEFORE THE TCON IS OPENED.
++ *      The vendor writes the blender output attributes straight to MMIO in the
++ *      middle of an otherwise queue-based commit, and says why:
++ *      "rtmx en & tcon en & bld disable (rcq copy needs to wait until the next
++ *      plane update) which will cause tcon to think that de is enabled, but bld
++ *      has no output, resulting in missing data" (sunxi_de.c:852-858).
++ *      ⇒ Here the constraint is met by ORDER alone and no special case is
++ *      needed: `drm-a733-display-engine-dram-into-tcon-tv1` commits by direct CPU store, so sun60i_de_blender()'s
++ *      BLD_OUTSIZE has already landed by the time the TCON is programmed. What
++ *      would break it is enabling the TCON first, or moving `drm-a733-display-engine-dram-into-tcon-tv1` to an RCQ
++ *      backend without carrying this rule across.
++ *   2. A DATAPATH WRITE HAS A SAFE WINDOW INSIDE THE FRAME. Before arming its
++ *      queue the vendor reads the TCON's current line and, if it is outside
++ *      [vtotal/4, 3*vtotal/4], delays with an hrtimer until it is
++ *      (rcq_update_timer_start(), sunxi_de.c:665-691); the TCON separately
++ *      computes a per-mode deadline from its own start delay
++ *      (sunxi_tcon_calc_judge_line(), sunxi_tcon.c:121-150) and refuses updates
++ *      past it. ⇒ Nothing here has such a guard, so a page flip lands wherever
++ *      it lands. That is named at sun60i_de_kms_scanout() and is stage 3's, and
++ *      it is the shape the fix will take rather than a theory about tearing.
++ *   3. THE PIXEL CLOCK IS THE MODE'S CLOCK DIVIDED BY PIXEL_MODE.
++ *      clk_set_rate(mclk, timings->pixel_clk / pixel_mode) with the same factor
++ *      written into TV_GCTL[5:4] (sunxi_tcon.c:801-806), the factor coming from
++ *      the transmitter, which doubles it when a mode exceeds its own clock
++ *      limit (edp_adjust_pixel_mode(), sunxi_drm_edp.c:708-721). ⇒ Both sides
++ *      of our pipe run one pixel per clock and both are at their reset value,
++ *      so the invariant holds today by neither half being touched. Recorded at
++ *      sun60i_tcon_tv_kms_check(), because a mode list wider than one entry has
++ *      to carry the factor through three places at once.
++ *
++ * DIFFERENT ON PURPOSE -- where the vendor driver differs at exactly this
++ * layer, and what is done here instead. Reproducing the vendor's
++ * code unchanged is not the goal, so this list is kept:
++ *
++ *   | The vendor | Ours |
++ *   |---|---|
++ *   | devm_drm_dev_alloc() inside a component master's .bind (drv.c:1232): the
++ *     drm_device is released when the platform device goes away, not when the
++ *     master unbinds, so a bind/unbind cycle leaks one | drm_dev_alloc() +
++ *     drm_dev_put() in .unbind, which is what every component master in
++ *     mainline does |
++ *   | drm_dev_register()'s return value assigned and then ignored (drv.c:1283);
++ *     the function returns 0 either way, so a failed registration is reported
++ *     as success | checked, and the bind unwinds |
++ *   | drm_mode_config_cleanup() in the error path (drv.c:1289) after
++ *     drmm_mode_config_init() has already registered that cleanup -- a double
++ *     teardown on the one path nobody exercises | drmm only |
++ *   | the CRTC is configured from new_state->mode_blob, the mode USERSPACE
++ *     asked for (crtc.c:1923-1926), so any adjustment an encoder makes in
++ *     .atomic_check is silently discarded by the display engine | both blocks
++ *     take crtc_state->adjusted_mode |
++ *   | sunxi_de_enable()'s failure is logged and then ignored -- scrtc->enabled
++ *     = true and drm_crtc_vblank_on() run anyway (crtc.c:1955-1959) | the CRTC
++ *     enable stops, and the engine is put back down if the TCON then fails |
++ *   | drm_crtc_vblank_get() in .atomic_begin (crtc.c:2035) with no
++ *     drm_crtc_vblank_put() anywhere in the tree: after the first page flip the
++ *     vblank interrupt is pinned on and .disable_vblank is dead | no vblank
++ *     claimed at all until it is serviced -- see sun60i_kms_bind() |
++ *   | no plane .atomic_check of any kind (crtc.c:1082-1092): no clipping, no
++ *     scaling bound, no visibility, and one of its two hooks needs an
++ *     out-of-tree change to struct drm_plane_helper_funcs | the plane refuses
++ *     what this datapath cannot do, before the commit |
++ *   | pixel_mode validated only at .atomic_enable, too late to refuse, and the
++ *     validator accepts 0 and 8 (crtc.c:1945-1953) while the register writer
++ *     handles only 1, 2 and 4 -- 0 reaches pixel_clk / pixel_mode
++ *     (sunxi_tcon.c:801) and only eDP ever sets the field | one mode, one pixel
++ *     per clock, and the constraint named rather than half-checked |
++ *   | the display engine is torn down with no quiesce and no delay between
++ *     "output off" and clk_disable_unprepare() (sunxi_de.c:968-1010); that the
++ *     TCON is already closed is guaranteed only by the DRM helper's ordering |
++ *     sun60i_de_stop() disables the layer, waits a frame time, and only then
++ *     drops the clocks |
++ *   | a hand-rolled connector with DRM_CONNECTOR_POLL_HPD (edp.c:4033) on a
++ *     board whose HPD pad reads zero through a live link, so it is never
++ *     polled and never notices a plug; and no drm_bridge anywhere, so
++ *     drm_connector_oob_hotplug_event() from the Type-C alternate mode has no
++ *     connector->fwnode to find | drm_bridge_connector_init(), which is what
++ *     sets that fwnode and implements .oob_hotplug_event |
++ *   | ~1030 lines of its own fbdev (sunxi_fbdev_core.c,
++ *     sunxi_fbdev_platform.c, sunxi_drmfb_core.c) beside an unused
++ *     #include <drm/drm_fbdev_dma.h> | drm_client_setup() + drm_fbdev_dma |
++ *
++ *   And one thing it does better than this file, said because the list would be
++ *   one-sided without it: its CRTC survives a second display pipe, a writeback
++ *   connector, gamma and a bootloader handover. This one builds one pipe and
++ *   refuses anything else by name.
++ *
++ * Copyright (c) 2026 DockSeed
++ *
++ * Based on drivers/gpu/drm/sun4i/sun4i_drv.c and sun4i_crtc.c,
++ *   Copyright (C) 2015 Free Electrons / NextThing Co, Maxime Ripard
++ * and on drivers/gpu/drm/rockchip/dw_dp-rockchip.c for the encoder half.
++ * Hardware behaviour cross-read from the Allwinner BSP DRM driver
++ * (github.com/radxa/allwinner-bsp, drivers/drm), GPL-2.0; no code taken.
++ */
++
++#include <linux/aperture.h>
++#include <linux/component.h>
++#include <linux/dma-mapping.h>
++#include <linux/iommu.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_graph.h>
++#include <linux/of_platform.h>
++#include <linux/platform_device.h>
++
++#include <drm/clients/drm_client_setup.h>
++#include <drm/drm_atomic.h>
++#include <drm/drm_atomic_helper.h>
++#include <drm/drm_bridge.h>
++#include <drm/drm_bridge_connector.h>
++#include <drm/drm_crtc.h>
++#include <drm/drm_drv.h>
++#include <drm/drm_fb_dma_helper.h>
++#include <drm/drm_fbdev_dma.h>
++#include <drm/drm_fourcc.h>
++#include <drm/drm_framebuffer.h>
++#include <drm/drm_gem_dma_helper.h>
++#include <drm/drm_gem_framebuffer_helper.h>
++#include <drm/drm_modeset_helper_vtables.h>
++#include <drm/drm_of.h>
++#include <drm/drm_plane.h>
++#include <drm/drm_probe_helper.h>
++#include <drm/drm_rect.h>
++
++#include "sun60i-kms.h"
++
++/*
++ * The framebuffer bound userspace may allocate against. It is NOT the mode
++ * limit and must not be read as one: what actually refuses a mode is
++ * TCON_TV1's own register field widths (sun60i_tcon_tv_kms_check(), every
++ * bound taken from UM 15.2.10) and the DisplayPort bridge's link budget
++ * (.mode_valid in sun60i-dp.c, from the PHY's rate table and the sink's EDID).
++ * This number only bounds an ioctl argument.
++ */
++#define SUN60I_KMS_MAX_FB_DIM		4096
++
++/* `drm-a733-display-engine-dram-into-tcon-tv1` leaves the layer's high-address byte at 0 (the DE has one, the
++ * driver does not program it), so a scanout address must sit below 4 GiB --
++ * a driver choice, not a register width. Here it applies to a GEM object
++ * userspace chose, so it is a check, not a mask.
++ */
++#define SUN60I_KMS_DMA_BITS		32
++
++struct sun60i_kms {
++	struct drm_device	*drm;
++	struct drm_crtc		crtc;
++	struct drm_encoder	encoder;
++	struct drm_connector	*connector;
++
++	/*
++	 * The two driver-private pointers, pulled out of the component devices
++	 * after component_bind_all(). They stay valid for exactly as long as
++	 * the components stay bound, which is the guarantee the component
++	 * framework exists to give and the reason no extra reference is held.
++	 */
++	struct sun60i_de	*de;
++	struct sun60i_tcon_tv	*tcon;
++};
++
++struct sun60i_kms_plane {
++	struct drm_plane	base;
++	struct sun60i_kms	*kms;
++};
++
++static inline struct sun60i_kms *crtc_to_kms(struct drm_crtc *crtc)
++{
++	return container_of(crtc, struct sun60i_kms, crtc);
++}
++
++static inline struct sun60i_kms_plane *to_kms_plane(struct drm_plane *plane)
++{
++	return container_of(plane, struct sun60i_kms_plane, base);
++}
++
++/*
++ * ---------------------------------------------------------------------------
++ * The plane
++ * ---------------------------------------------------------------------------
++ *
++ * One channel, one layer, XRGB8888, linear, full-screen at the origin. Every
++ * one of those restrictions is what `drm-a733-display-engine-dram-into-tcon-tv1` has on silicon and not one of them is
++ * a placeholder for something that would work if asked:
++ *
++ *   - ONE FORMAT. sun60i_de_attctl() builds a single word with FBFMT =
++ *     OVL_FBFMT_XRGB8888 and RGB_MODE set. The channel's format field is five
++ *     bits wide and the DE can do many more, but each one is a different
++ *     ATTCTL and, for YUV, a different CCSC matrix -- none of which has been on
++ *     a board. Advertising a format the layer would program wrong is worse than
++ *     advertising one.
++ *   - LINEAR ONLY. TFBD (tiled-framebuffer decode) is left at reset by `drm-a733-display-engine-dram-into-tcon-tv1` and
++ *     read back rather than written, so there is no compressed source to
++ *     describe. DRM_FORMAT_MOD_LINEAR is therefore the complete list.
++ *   - FULL SCREEN, NO SCALING, NO POSITIONING. The VSU8 scaler sits in the
++ *     channel datapath unconditionally on this DE generation -- it filters
++ *     every pixel and there is no bypass by omission -- and `drm-a733-display-engine-dram-into-tcon-tv1` stages it at
++ *     unity. A scaled or offset plane would need real VSU coefficients and a
++ *     step, which is stage 4 work, so the check refuses rather than programs
++ *     something plausible.
++ */
++static const u32 sun60i_kms_plane_formats[] = {
++	DRM_FORMAT_XRGB8888,
++};
++
++static const u64 sun60i_kms_plane_modifiers[] = {
++	DRM_FORMAT_MOD_LINEAR,
++	DRM_FORMAT_MOD_INVALID,
++};
++
++static int sun60i_kms_plane_atomic_check(struct drm_plane *plane,
++					 struct drm_atomic_state *state)
++{
++	struct drm_plane_state *new_state =
++		drm_atomic_get_new_plane_state(state, plane);
++	struct drm_crtc_state *crtc_state;
++	dma_addr_t addr;
++	int ret;
++
++	if (!new_state->crtc)
++		return 0;
++
++	crtc_state = drm_atomic_get_new_crtc_state(state, new_state->crtc);
++	if (!crtc_state)
++		return -EINVAL;
++
++	ret = drm_atomic_helper_check_plane_state(new_state, crtc_state,
++						  DRM_PLANE_NO_SCALING,
++						  DRM_PLANE_NO_SCALING,
++						  false, true);
++	if (ret)
++		return ret;
++
++	if (!new_state->visible)
++		return 0;
++
++	if (new_state->dst.x1 || new_state->dst.y1 ||
++	    drm_rect_width(&new_state->dst) != crtc_state->mode.hdisplay ||
++	    drm_rect_height(&new_state->dst) != crtc_state->mode.vdisplay) {
++		drm_dbg_atomic(plane->dev,
++			       "plane must cover the whole mode: the layer geometry and the blender input size are both programmed from the mode, and the scaler is staged at unity\n");
++		return -EINVAL;
++	}
++
++	/*
++	 * Refused HERE rather than at commit time, where the only symptom would
++	 * be a screen that stays black while every register reads back
++	 * correctly -- the failure shape this pipe already paid a session for
++	 * on 2026-08-19.
++	 */
++	addr = drm_fb_dma_get_gem_addr(new_state->fb, new_state, 0);
++	if (upper_32_bits(addr)) {
++		drm_dbg_atomic(plane->dev,
++			       "framebuffer at %pad is above 4 GiB and the layer address register is 32 bits\n",
++			       &addr);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static void sun60i_kms_plane_atomic_update(struct drm_plane *plane,
++					   struct drm_atomic_state *state)
++{
++	struct drm_plane_state *new_state =
++		drm_atomic_get_new_plane_state(state, plane);
++	struct sun60i_kms *kms = to_kms_plane(plane)->kms;
++	dma_addr_t addr;
++	int ret;
++
++	if (!new_state->visible)
++		return;
++
++	addr = drm_fb_dma_get_gem_addr(new_state->fb, new_state, 0);
++
++	ret = sun60i_de_kms_scanout(kms->de, addr, new_state->fb->pitches[0]);
++	if (ret)
++		drm_err(plane->dev, "scanout from %pad: %d\n", &addr, ret);
++}
++
++static void sun60i_kms_plane_atomic_disable(struct drm_plane *plane,
++					    struct drm_atomic_state *state)
++{
++	struct sun60i_kms *kms = to_kms_plane(plane)->kms;
++
++	/*
++	 * Reachable only while the engine is already down: the CRTC refuses a
++	 * state that is active without a primary plane, and
++	 * drm_atomic_helper_commit_tail_rpm() disables CRTCs before planes. The
++	 * call is here anyway and no-ops on a disabled engine, because "cannot
++	 * happen" is not a thing a driver should rely on for correctness.
++	 */
++	sun60i_de_kms_layer_off(kms->de);
++}
++
++static const struct drm_plane_helper_funcs sun60i_kms_plane_helper_funcs = {
++	.atomic_check	= sun60i_kms_plane_atomic_check,
++	.atomic_update	= sun60i_kms_plane_atomic_update,
++	.atomic_disable	= sun60i_kms_plane_atomic_disable,
++};
++
++static const struct drm_plane_funcs sun60i_kms_plane_funcs = {
++	.update_plane		= drm_atomic_helper_update_plane,
++	.disable_plane		= drm_atomic_helper_disable_plane,
++	.reset			= drm_atomic_helper_plane_reset,
++	.atomic_duplicate_state	= drm_atomic_helper_plane_duplicate_state,
++	.atomic_destroy_state	= drm_atomic_helper_plane_destroy_state,
++};
++
++/*
++ * ---------------------------------------------------------------------------
++ * The CRTC -- TCON_TV1 plus the display engine behind it
++ * ---------------------------------------------------------------------------
++ */
++
++static enum drm_mode_status
++sun60i_kms_crtc_mode_valid(struct drm_crtc *crtc,
++			   const struct drm_display_mode *mode)
++{
++	struct sun60i_kms *kms = crtc_to_kms(crtc);
++
++	/*
++	 * The TCON's register field widths, and only those. The display engine
++	 * is deliberately not consulted: its size fields are two 16-bit halves
++	 * and its pitch register is a full word, so every mode the TCON accepts
++	 * fits the engine by a wide margin. A second check that can never fire
++	 * would be a check nobody can test.
++	 *
++	 * The link's own limit is applied where it belongs, by the DRM core,
++	 * out of the bridge's .mode_valid and the sink's EDID.
++	 */
++	if (sun60i_tcon_tv_kms_check(kms->tcon, mode))
++		return MODE_BAD;
++
++	return MODE_OK;
++}
++
++static int sun60i_kms_crtc_atomic_check(struct drm_crtc *crtc,
++					struct drm_atomic_state *state)
++{
++	struct drm_crtc_state *crtc_state =
++		drm_atomic_get_new_crtc_state(state, crtc);
++
++	if (!crtc_state->active)
++		return 0;
++
++	/*
++	 * A raster with no fetch behind it is not a state this pipe can hold.
++	 * The blender's only enabled pipe is fed by the one channel this plane
++	 * drives, so an active CRTC without it would program a scanout address
++	 * that belongs to nothing -- and the screen would go black with every
++	 * register reading back correct.
++	 */
++	return drm_atomic_helper_check_crtc_primary_plane(crtc_state);
++}
++
++/*
++ * The bits-per-component the sink asked for, or 8.
++ *
++ * ⚠ THIS IS ONE HALF OF A HARDWARE INVARIANT, NOT A PREFERENCE. TCON_TV1's
++ * TV_PIXELDEPTH_MODE_REG and the transmitter's MISC0 must describe the same
++ * pixel depth; the hardware reports a disagreement as SRC0_USER_FIFO_STATUS
++ * != 0, which counts as a mode-programming error.
++ * sun60i_dp_bridge_atomic_enable() reads exactly this field for its own half,
++ * so both sides take the number from one place -- which is what retires the
++ * constant in sun60i-display.h that has held the invariant until now.
++ */
++static u8 sun60i_kms_crtc_bpc(struct sun60i_kms *kms,
++			      struct drm_atomic_state *state)
++{
++	struct drm_connector *connector;
++
++	connector = drm_atomic_get_new_connector_for_encoder(state,
++							     &kms->encoder);
++	if (!connector || !connector->display_info.bpc)
++		return 8;
++
++	return connector->display_info.bpc;
++}
++
++/*
++ * The order is the hardware's: the engine is fetching and the blender is
++ * composing BEFORE the TCON is told to take its data from them, and the
++ * transmitter trains its link after both -- that last step is the bridge's
++ * .atomic_enable, which drm_atomic_helper_commit_modeset_enables() runs after
++ * every CRTC in the state has come up.
++ *
++ * ⚠ THAT ORDER IS A HARDWARE RULE AND NOT A PREFERENCE, and the vendor's driver
++ * is where it is stated out loud: it special-cases the blender's output size
++ * out of its deferred commit path and writes it straight to MMIO, because
++ * otherwise "tcon will think that de is enabled, but bld has no output,
++ * resulting in missing data" (allwinner-bsp, sunxi_de.c:852-858). `drm-a733-display-engine-dram-into-tcon-tv1` commits
++ * by direct store, so BLD_OUTSIZE is already in the register by the time
++ * sun60i_de_kms_enable() returns and no special case is needed -- but only
++ * because the engine is brought up first. Enabling the TCON before the engine
++ * would reproduce exactly the fault that comment describes.
++ *
++ * The scanout address comes out of the ATOMIC STATE rather than from the plane
++ * update that has not happened yet, and that is why this driver's
++ * .atomic_commit_tail is drm_atomic_helper_commit_tail_rpm(): the default tail
++ * commits planes BEFORE modeset enables, and on this hardware a plane
++ * programmed before the CRTC is a write into a register window that is not open
++ * -- it does not fail, it reads back zero like unmapped space (`drm-a733-display-engine-dram-into-tcon-tv1`'s own
++ * measurement, and the defect that cost it a test boot).
++ */
++static void sun60i_kms_crtc_atomic_enable(struct drm_crtc *crtc,
++					  struct drm_atomic_state *state)
++{
++	struct drm_crtc_state *crtc_state =
++		drm_atomic_get_new_crtc_state(state, crtc);
++	struct sun60i_kms *kms = crtc_to_kms(crtc);
++	struct drm_plane_state *plane_state;
++	dma_addr_t addr;
++	int ret;
++
++	plane_state = drm_atomic_get_new_plane_state(state, crtc->primary);
++	if (!plane_state || !plane_state->fb) {
++		drm_err(crtc->dev, "enable with no framebuffer on the primary plane\n");
++		return;
++	}
++
++	addr = drm_fb_dma_get_gem_addr(plane_state->fb, plane_state, 0);
++
++	ret = sun60i_de_kms_enable(kms->de, &crtc_state->adjusted_mode, addr,
++				   plane_state->fb->pitches[0]);
++	if (ret) {
++		drm_err(crtc->dev, "display engine: %d\n", ret);
++		return;
++	}
++
++	ret = sun60i_tcon_tv_kms_enable(kms->tcon, &crtc_state->adjusted_mode,
++					sun60i_kms_crtc_bpc(kms, state));
++	if (ret) {
++		drm_err(crtc->dev, "TCON_TV1: %d\n", ret);
++		sun60i_de_kms_disable(kms->de);
++	}
++}
++
++static void sun60i_kms_crtc_atomic_disable(struct drm_crtc *crtc,
++					   struct drm_atomic_state *state)
++{
++	struct sun60i_kms *kms = crtc_to_kms(crtc);
++
++	/*
++	 * Raster first, then the fetch. The engine must not be reading a buffer
++	 * the atomic helpers are about to hand back while a TCON is still
++	 * asking it for pixels; sun60i_de_kms_disable() waits a frame before it
++	 * asserts the engine's reset for the same reason.
++	 */
++	sun60i_tcon_tv_kms_disable(kms->tcon);
++	sun60i_de_kms_disable(kms->de);
++}
++
++static const struct drm_crtc_helper_funcs sun60i_kms_crtc_helper_funcs = {
++	.mode_valid	= sun60i_kms_crtc_mode_valid,
++	.atomic_check	= sun60i_kms_crtc_atomic_check,
++	.atomic_enable	= sun60i_kms_crtc_atomic_enable,
++	.atomic_disable	= sun60i_kms_crtc_atomic_disable,
++};
++
++/*
++ * No .enable_vblank / .disable_vblank, and no drm_vblank_init() below. That is
++ * a stage boundary, not an oversight -- see the block above sun60i_kms_bind().
++ */
++static const struct drm_crtc_funcs sun60i_kms_crtc_funcs = {
++	.reset			= drm_atomic_helper_crtc_reset,
++	.set_config		= drm_atomic_helper_set_config,
++	.page_flip		= drm_atomic_helper_page_flip,
++	.atomic_duplicate_state	= drm_atomic_helper_crtc_duplicate_state,
++	.atomic_destroy_state	= drm_atomic_helper_crtc_destroy_state,
++};
++
++/*
++ * ---------------------------------------------------------------------------
++ * mode_config and the drm_driver
++ * ---------------------------------------------------------------------------
++ */
++
++static const struct drm_mode_config_funcs sun60i_kms_mode_config_funcs = {
++	/*
++	 * ⛔ drm_gem_fb_create, NEVER drm_gem_fb_create_with_dirty. The file
++	 * header says why, and it is the one line here that decides whether
++	 * the framebuffer test can be run at all.
++	 */
++	.fb_create	= drm_gem_fb_create,
++	.atomic_check	= drm_atomic_helper_check,
++	.atomic_commit	= drm_atomic_helper_commit,
++};
++
++static const struct drm_mode_config_helper_funcs sun60i_kms_mode_config_helpers = {
++	/*
++	 * The _rpm tail, and not for runtime PM. It enables CRTCs BEFORE it
++	 * commits planes, which is the order this hardware requires: the
++	 * engine's channel and blender register windows do not accept a write
++	 * until three de_top words have been set, and those are written as part
++	 * of bringing the engine up. It also calls
++	 * drm_atomic_helper_fake_vblank(), which is what completes a flip on a
++	 * CRTC with no vblank interrupt wired.
++	 */
++	.atomic_commit_tail = drm_atomic_helper_commit_tail_rpm,
++};
++
++DEFINE_DRM_GEM_DMA_FOPS(sun60i_kms_fops);
++
++static const struct drm_driver sun60i_kms_driver = {
++	.driver_features	= DRIVER_GEM | DRIVER_MODESET | DRIVER_ATOMIC,
++	.fops			= &sun60i_kms_fops,
++	.name			= "sun60i-kms",
++	.desc			= "Allwinner A733 display pipe",
++	.major			= 1,
++	.minor			= 0,
++	DRM_GEM_DMA_DRIVER_OPS,
++	DRM_FBDEV_DMA_DRIVER_OPS,
++};
++
++/*
++ * ---------------------------------------------------------------------------
++ * Building the pipe
++ * ---------------------------------------------------------------------------
++ */
++
++static int sun60i_kms_plane_init(struct sun60i_kms *kms,
++				 struct drm_plane **out)
++{
++	struct sun60i_kms_plane *plane;
++
++	plane = drmm_universal_plane_alloc(kms->drm, struct sun60i_kms_plane,
++					   base, 0, &sun60i_kms_plane_funcs,
++					   sun60i_kms_plane_formats,
++					   ARRAY_SIZE(sun60i_kms_plane_formats),
++					   sun60i_kms_plane_modifiers,
++					   DRM_PLANE_TYPE_PRIMARY, NULL);
++	if (IS_ERR(plane))
++		return PTR_ERR(plane);
++
++	plane->kms = kms;
++	drm_plane_helper_add(&plane->base, &sun60i_kms_plane_helper_funcs);
++	*out = &plane->base;
++
++	return 0;
++}
++
++/*
++ * The encoder, the bridge and the connector.
++ *
++ * DRM_MODE_ENCODER_TMDS for a DisplayPort output is not a mistake and not a
++ * shortcut: it is what dw_dp-rockchip.c:97 and analogix_dp both register, and
++ * mainline's own sun4i TCON maps TMDS to channel 1 -- the TV channel, which is
++ * the one TCON_TV1 is.
++ *
++ * DRM_BRIDGE_ATTACH_NO_CONNECTOR is mandatory here rather than preferred, and
++ * the bridge enforces it from its side: hot-plug on this board arrives out of
++ * band, through the Type-C alternate mode calling
++ * drm_connector_oob_hotplug_event(), and only a drm_bridge_connector implements
++ * .oob_hotplug_event and sets connector->fwnode from the bridge's of_node. A
++ * bridge-created connector would compile, probe, and never see a re-plug.
++ */
++static int sun60i_kms_output_init(struct sun60i_kms *kms,
++				  struct device_node *tcon_np)
++{
++	struct drm_device *drm = kms->drm;
++	struct drm_bridge *bridge;
++	int ret;
++
++	/*
++	 * drmm_ and not devm_: the two behave identically for a real bridge, but
++	 * where the graph ends in a PANEL the devm variant creates a panel
++	 * bridge tied to the platform device, which outlives the drm_device
++	 * across a bind/unbind cycle. Tie it to the drm_device that is going to
++	 * use it. (There is no panel on this board -- the point is that the
++	 * lifetime is right whether or not one ever appears.)
++	 */
++	bridge = drmm_of_get_bridge(drm, tcon_np, 1, 0);
++	if (IS_ERR(bridge))
++		return dev_err_probe(drm->dev, PTR_ERR(bridge),
++				     "no bridge on TCON_TV1 output port 1\n");
++
++	ret = drmm_encoder_init(drm, &kms->encoder, NULL,
++				DRM_MODE_ENCODER_TMDS, NULL);
++	if (ret)
++		return ret;
++
++	kms->encoder.possible_crtcs = drm_crtc_mask(&kms->crtc);
++
++	ret = drm_bridge_attach(&kms->encoder, bridge, NULL,
++				DRM_BRIDGE_ATTACH_NO_CONNECTOR);
++	if (ret)
++		return ret;
++
++	kms->connector = drm_bridge_connector_init(drm, &kms->encoder);
++	if (IS_ERR(kms->connector))
++		return PTR_ERR(kms->connector);
++
++	return drm_connector_attach_encoder(kms->connector, &kms->encoder);
++}
++
++static int sun60i_kms_mode_config(struct sun60i_kms *kms)
++{
++	struct drm_device *drm = kms->drm;
++	int ret;
++
++	ret = drmm_mode_config_init(drm);
++	if (ret)
++		return ret;
++
++	drm->mode_config.min_width = 1;
++	drm->mode_config.min_height = 1;
++	drm->mode_config.max_width = SUN60I_KMS_MAX_FB_DIM;
++	drm->mode_config.max_height = SUN60I_KMS_MAX_FB_DIM;
++	drm->mode_config.funcs = &sun60i_kms_mode_config_funcs;
++	drm->mode_config.helper_private = &sun60i_kms_mode_config_helpers;
++
++	return 0;
++}
++
++/*
++ * Walk the topology this driver supports, and refuse anything else by name.
++ *
++ * `allwinner,pipelines` is sun4i-drm's property and is reused verbatim so the
++ * device tree does not have to change on the day the engine moves into that
++ * driver. What is NOT reused is sun4i_drv_add_endpoints()' breadth-first search
++ * over the whole graph: this pipe is one display engine and one TCON, the
++ * search would have exactly one answer, and a generic walk that silently
++ * accepts a topology the rest of this file cannot build is worse than a
++ * refusal that names what it expected.
++ */
++static int sun60i_kms_topology(struct device *dev,
++			       struct device_node **engine_np,
++			       struct device_node **tcon_np)
++{
++	struct device_node *engine, *tcon;
++
++	if (of_count_phandle_with_args(dev->of_node, "allwinner,pipelines",
++				       NULL) != 1) {
++		dev_err(dev, "expected exactly one allwinner,pipelines entry -- this driver builds one CRTC\n");
++		return -EINVAL;
++	}
++
++	engine = of_parse_phandle(dev->of_node, "allwinner,pipelines", 0);
++	if (!engine)
++		return -EINVAL;
++
++	/*
++	 * Port 1 is the engine's output, the same numbering mainline's DE2/DE3/
++	 * DE33 mixer binding requires and the same edge `arm64-dts-a733-display-engine-node-and-de-to-tcon-edge` already describes.
++	 */
++	tcon = of_graph_get_remote_node(engine, 1, 0);
++	if (!tcon) {
++		dev_err(dev, "display engine %pOF has no output endpoint on port 1\n",
++			engine);
++		of_node_put(engine);
++		return -EINVAL;
++	}
++
++	*engine_np = engine;
++	*tcon_np = tcon;
++
++	return 0;
++}
++
++/*
++ * ⚠ ONE ADDRESS SPACE, CHECKED RATHER THAN ASSUMED.
++ *
++ * The framebuffer is allocated by the GEM DMA helpers against the DRM device --
++ * this master, which has no register window of its own -- and it is FETCHED by
++ * the display engine, which is a different device on a different node. With no
++ * IOMMU in the path both dma_addr_t values are plain physical addresses and the
++ * two agree; that is what `drm-a733-display-engine-dram-into-tcon-tv1` measured on 2026-08-19, scanning 1920x1200 from
++ * the physical 0xfe400000.
++ *
++ * The day an IOMMU driver and an `iommus` property arrive for the engine, they
++ * would not arrive for this node, and the address handed to the layer register
++ * would be a physical address where the engine expects an IOVA. The screen
++ * would go black with every register reading back correct -- the failure shape
++ * this pipe has already paid for twice. So the two are compared, once, at bind.
++ */
++static int sun60i_kms_check_dma_domain(struct device *master, struct device *de)
++{
++	if (device_iommu_mapped(master) == device_iommu_mapped(de))
++		return 0;
++
++	dev_err(master,
++		"IOMMU mismatch: this device is %sbehind an IOMMU and the display engine is %sbehind one -- the scanout address would be interpreted in the wrong address space\n",
++		device_iommu_mapped(master) ? "" : "NOT ",
++		device_iommu_mapped(de) ? "" : "NOT ");
++
++	return -EINVAL;
++}
++
++static int sun60i_kms_attach_components(struct sun60i_kms *kms,
++					struct device *master,
++					struct device_node *engine_np,
++					struct device_node *tcon_np)
++{
++	struct platform_device *engine, *tcon;
++	int ret = -ENODEV;
++
++	engine = of_find_device_by_node(engine_np);
++	tcon = of_find_device_by_node(tcon_np);
++	if (!engine || !tcon)
++		goto put;
++
++	kms->de = platform_get_drvdata(engine);
++	kms->tcon = platform_get_drvdata(tcon);
++	if (!kms->de || !kms->tcon) {
++		dev_err(master, "a bound component has no driver data\n");
++		goto put;
++	}
++
++	ret = sun60i_kms_check_dma_domain(master, &engine->dev);
++
++put:
++	if (tcon)
++		put_device(&tcon->dev);
++	if (engine)
++		put_device(&engine->dev);
++
++	return ret;
++}
++
++/*
++ * ⬜ WHY drm_vblank_init() IS NOT CALLED, and it is a decision with an
++ * observable consequence rather than a missing line.
++ *
++ * TCON_TV1 has an interrupt -- INTID 90 = GIC SPI 58, in the device tree since
++ * `arm64-dts-a733-tcon-tv1-and-the-dp-phy-pad-window` -- and nothing in this tree requests it. `drm-a733-tcon-tv1-timing-generator-and-video-source` deliberately writes
++ * TV_GINT0_REG to zero on the stated grounds that "an enabled interrupt with no
++ * handler is not a diagnostic, it is a latch nobody clears". Until that handler
++ * exists there is no vblank to count, and claiming one would be worse than
++ * having none: drm_atomic_helper_wait_for_vblanks() would wait on a counter
++ * that never moves.
++ *
++ * Without drm_vblank_init(), drm_dev_has_vblank() is false, so
++ * drm_atomic_helper_check_modeset() sets every crtc_state->no_vblank and
++ * drm_atomic_helper_fake_vblank() -- called from the _rpm commit tail --
++ * completes each flip event immediately. A page flip therefore returns, and it
++ * returns without any guarantee about where in the frame it landed. That is
++ * exactly what stage 3 buys, and it is why stage 3 is where the tearing test
++ * lives.
++ */
++static int sun60i_kms_bind(struct device *dev)
++{
++	struct device_node *engine_np, *tcon_np;
++	struct drm_plane *primary;
++	struct sun60i_kms *kms;
++	struct drm_device *drm;
++	int ret;
++
++	ret = sun60i_kms_topology(dev, &engine_np, &tcon_np);
++	if (ret)
++		return ret;
++
++	kms = devm_kzalloc(dev, sizeof(*kms), GFP_KERNEL);
++	if (!kms) {
++		ret = -ENOMEM;
++		goto put_nodes;
++	}
++
++	/*
++	 * drm_dev_alloc() rather than devm_drm_dev_alloc(), the same choice
++	 * sun4i_drv.c and every other component master in this subsystem makes:
++	 * a devm allocation is released when the platform device goes away, not
++	 * when the master unbinds, so a bind/unbind cycle would leave the first
++	 * drm_device behind.
++	 */
++	drm = drm_dev_alloc(&sun60i_kms_driver, dev);
++	if (IS_ERR(drm)) {
++		ret = PTR_ERR(drm);
++		goto put_nodes;
++	}
++
++	kms->drm = drm;
++	drm->dev_private = kms;
++
++	ret = sun60i_kms_mode_config(kms);
++	if (ret)
++		goto put_drm;
++
++	ret = component_bind_all(dev, drm);
++	if (ret)
++		goto put_drm;
++
++	/*
++	 * The two driver-private pointers. No long-lived reference is taken on
++	 * either device and none is needed: the component framework holds the
++	 * master and every component together between component_bind_all() and
++	 * component_unbind_all(), which is the whole reason these two blocks are
++	 * components rather than devices this driver looks up on its own.
++	 */
++	ret = sun60i_kms_attach_components(kms, dev, engine_np, tcon_np);
++	if (ret)
++		goto unbind_all;
++
++	ret = sun60i_kms_plane_init(kms, &primary);
++	if (ret)
++		goto unbind_all;
++
++	ret = drmm_crtc_init_with_planes(drm, &kms->crtc, primary, NULL,
++					 &sun60i_kms_crtc_funcs, NULL);
++	if (ret)
++		goto unbind_all;
++
++	drm_crtc_helper_add(&kms->crtc, &sun60i_kms_crtc_helper_funcs);
++
++	ret = sun60i_kms_output_init(kms, tcon_np);
++	if (ret)
++		goto unbind_all;
++
++	drm_mode_config_reset(drm);
++
++	/*
++	 * Any early framebuffer the boot chain left mapped over the same
++	 * memory. There is no simple-framebuffer node in this tree's device
++	 * tree today; this is the line that keeps that true the day one
++	 * appears, and it is what sun4i_drv_bind() does at the same point.
++	 */
++	ret = aperture_remove_all_conflicting_devices(sun60i_kms_driver.name);
++	if (ret)
++		goto unbind_all;
++
++	drm_kms_helper_poll_init(drm);
++
++	ret = drm_dev_register(drm, 0);
++	if (ret)
++		goto finish_poll;
++
++	dev_set_drvdata(dev, drm);
++
++	/*
++	 * THE CALL THIS WHOLE FILE EXISTS FOR. It is what creates /dev/fb0 and,
++	 * with CONFIG_FRAMEBUFFER_CONSOLE, puts the boot log and a login prompt
++	 * on the screen with no userspace involved. Every symbol on the path
++	 * from here to a pixel is already pinned in A733_CONFIGS.
++	 */
++	drm_client_setup(drm, NULL);
++
++	of_node_put(tcon_np);
++	of_node_put(engine_np);
++
++	return 0;
++
++finish_poll:
++	drm_kms_helper_poll_fini(drm);
++unbind_all:
++	component_unbind_all(dev, NULL);
++put_drm:
++	drm_dev_put(drm);
++put_nodes:
++	of_node_put(tcon_np);
++	of_node_put(engine_np);
++
++	return ret;
++}
++
++static void sun60i_kms_unbind(struct device *dev)
++{
++	struct drm_device *drm = dev_get_drvdata(dev);
++
++	dev_set_drvdata(dev, NULL);
++	drm_dev_unregister(drm);
++	drm_kms_helper_poll_fini(drm);
++	drm_atomic_helper_shutdown(drm);
++	component_unbind_all(dev, NULL);
++	drm_dev_put(drm);
++}
++
++static const struct component_master_ops sun60i_kms_master_ops = {
++	.bind	= sun60i_kms_bind,
++	.unbind	= sun60i_kms_unbind,
++};
++
++static int sun60i_kms_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct component_match *match = NULL;
++	struct device_node *engine_np, *tcon_np;
++	int ret;
++
++	/*
++	 * The GEM DMA helpers allocate the scanout buffer against THIS device,
++	 * so this is the mask that decides where the buffer lands. Platform
++	 * devices default to 32 bits already; it is stated because the
++	 * constraint is `drm-a733-display-engine-dram-into-tcon-tv1`'s unprogrammed high-address byte, a choice
++	 * of the far side of the pipe and not a property of this node, and a
++	 * default that changes underneath us would be silent.
++	 */
++	ret = dma_set_mask_and_coherent(dev,
++					DMA_BIT_MASK(SUN60I_KMS_DMA_BITS));
++	if (ret)
++		return dev_err_probe(dev, ret, "32-bit DMA mask\n");
++
++	ret = sun60i_kms_topology(dev, &engine_np, &tcon_np);
++	if (ret)
++		return ret;
++
++	drm_of_component_match_add(dev, &match, component_compare_of, engine_np);
++	drm_of_component_match_add(dev, &match, component_compare_of, tcon_np);
++
++	of_node_put(tcon_np);
++	of_node_put(engine_np);
++
++	return component_master_add_with_match(dev, &sun60i_kms_master_ops,
++					       match);
++}
++
++static void sun60i_kms_remove(struct platform_device *pdev)
++{
++	component_master_del(&pdev->dev, &sun60i_kms_master_ops);
++}
++
++static void sun60i_kms_shutdown(struct platform_device *pdev)
++{
++	struct drm_device *drm = platform_get_drvdata(pdev);
++
++	if (drm)
++		drm_atomic_helper_shutdown(drm);
++}
++
++/*
++ * The master node carries no register window: it is the pipeline, not a block.
++ * That is sun4i-drm's shape (`allwinner,sunXi-...-display-engine` with
++ * `allwinner,pipelines` and no reg) and it is reused so that the day the engine
++ * moves into that driver, this compatible moves into sun4i_drv_of_table and the
++ * device tree does not change.
++ */
++static const struct of_device_id sun60i_kms_of_match[] = {
++	{ .compatible = "allwinner,sun60i-a733-display-engine" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, sun60i_kms_of_match);
++
++static struct platform_driver sun60i_kms_platform_driver = {
++	.probe		= sun60i_kms_probe,
++	.remove		= sun60i_kms_remove,
++	.shutdown	= sun60i_kms_shutdown,
++	.driver		= {
++		.name		= "sun60i-a733-kms",
++		.of_match_table	= sun60i_kms_of_match,
++	},
++};
++module_platform_driver(sun60i_kms_platform_driver);
++
++MODULE_DESCRIPTION("Allwinner A733 display pipe (KMS)");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/gpu/drm/sun60i/sun60i-kms.h b/drivers/gpu/drm/sun60i/sun60i-kms.h
+new file mode 100644
+--- /dev/null
++++ b/drivers/gpu/drm/sun60i/sun60i-kms.h
+@@ -0,0 +1,64 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * The seam between the KMS half of this display pipe and the two device
++ * drivers underneath it.
++ *
++ * WHY A SEAM AT ALL, AND WHY IT IS EXPORTED SYMBOLS RATHER THAN ONE MODULE.
++ * The display engine and TCON_TV1 are separate devices on separate register
++ * windows with separate device-tree nodes, separate clocks and separate resets,
++ * and each is independently useful without a drm_device above it: the TCON can
++ * raster its own VDBIST pattern and the engine can scan its own framebuffer,
++ * which is how both were proven on silicon before any of this existed. They are
++ * therefore separate modules, and a caller in a third module reaches them
++ * through exported symbols.
++ *
++ * ⚠ THE DEPENDENCY POINTS ONE WAY ONLY, AND IT HAS TO. sun60i-kms.ko calls into
++ * sun60i-de.ko and sun60i-tcon-tv.ko; neither of them calls back. A callback in
++ * the other direction would be a circular module dependency, which the module
++ * loader cannot resolve at all -- so the KMS half PULLS the two driver-private
++ * pointers out of their platform devices after component_bind_all(), instead of
++ * the components PUSHING themselves into a registry.
++ *
++ * The DisplayPort transmitter is deliberately NOT in this header. It publishes
++ * a drm_bridge with drm_bridge_add() and is found through the device-tree graph
++ * by of_drm_find_bridge(), so the KMS half references no symbol of its own --
++ * that is the shape `drm-a733-dp-register-a-drm-bridge` chose and it is why sun60i-dp.ko is absent here.
++ *
++ * Copyright (c) 2026 DockSeed
++ */
++
++#ifndef _SUN60I_KMS_H_
++#define _SUN60I_KMS_H_
++
++#include <linux/types.h>
++
++struct drm_display_mode;
++struct sun60i_de;
++struct sun60i_tcon_tv;
++
++/*
++ * The display engine -- implemented in sun60i-de.c.
++ *
++ * Ownership is exclusive and it is checked rather than assumed: the same
++ * registers are reachable through that driver's debugfs verbs, and two writers
++ * on one datapath is a corruption nobody would see in a review. A component
++ * bound to a KMS master refuses the debugfs verbs; a driver with no master
++ * bound refuses these. The A/B arm survives either way -- a kernel booted with
++ * no display-engine node in its device tree, or a master unbound by hand, still
++ * has the verbs.
++ */
++int sun60i_de_kms_enable(struct sun60i_de *de,
++			 const struct drm_display_mode *mode,
++			 dma_addr_t scanout, u32 pitch);
++void sun60i_de_kms_disable(struct sun60i_de *de);
++int sun60i_de_kms_scanout(struct sun60i_de *de, dma_addr_t scanout, u32 pitch);
++void sun60i_de_kms_layer_off(struct sun60i_de *de);
++
++/* TCON_TV1 -- implemented in sun60i-tcon-tv.c, same ownership rule. */
++int sun60i_tcon_tv_kms_check(struct sun60i_tcon_tv *tcon,
++			     const struct drm_display_mode *mode);
++int sun60i_tcon_tv_kms_enable(struct sun60i_tcon_tv *tcon,
++			      const struct drm_display_mode *mode, u8 bpc);
++void sun60i_tcon_tv_kms_disable(struct sun60i_tcon_tv *tcon);
++
++#endif /* _SUN60I_KMS_H_ */
+diff --git a/drivers/gpu/drm/sun60i/sun60i-tcon-tv.c b/drivers/gpu/drm/sun60i/sun60i-tcon-tv.c
+--- a/drivers/gpu/drm/sun60i/sun60i-tcon-tv.c
++++ b/drivers/gpu/drm/sun60i/sun60i-tcon-tv.c
+@@ -44,6 +44,7 @@
+ 
+ #include <linux/bitfield.h>
+ #include <linux/clk.h>
++#include <linux/component.h>
+ #include <linux/debugfs.h>
+ #include <linux/delay.h>
+ #include <linux/io.h>
+@@ -59,6 +60,7 @@
+ #include <drm/drm_modes.h>
+ 
+ #include "sun60i-display.h"
++#include "sun60i-kms.h"
+ 
+ /*
+  * TCON_TV1, UM chapter 15.2.10. Reset values are the UM's; the "live" values
+@@ -234,6 +236,13 @@ struct sun60i_tcon_tv {
+ 	struct reset_control	*dpss_reset;	/* optional, see probe() */
+ 	struct mutex		lock;		/* serialises enable/disable */
+ 	bool			enabled;
++	/*
++	 * A KMS master is bound and owns this raster. The debugfs verbs that
++	 * WRITE are refused while it is set; the ones that only READ are not.
++	 * Same rule, and the same two ways back to the instruments, as
++	 * sun60i-de.c documents at its own guard.
++	 */
++	bool			kms_owned;
+ 	struct drm_display_mode	mode;
+ 	u8			bpc;
+ };
+@@ -478,8 +487,17 @@ static void sun60i_tcon_tv_set_source(struct sun60i_tcon_tv *tcon,
+  *     written every modeset into a bypassed block. Nothing here reproduces it.
+  *     Falsified by: the picture needing them, which would mean TV_FILL_EN is
+  *     not the gate the UM says it is.
++ *
++ * THE `vdbist` ARGUMENT IS WHERE THE PICTURE COMES FROM, and it is written here
++ * rather than afterwards on purpose. TV_SRC_CTL is set while the module is
++ * still stopped and TV_EN is asserted last, so the raster never scans one
++ * source and then switches to another mid-frame. The vendor's own driver does
++ * the same thing at the same point -- tcon_tv_src_select(..., LCD_SRC_DE, ...)
++ * sits between the timing registers and tcon_tv_open() in
++ * sunxi_tcon_edp_mode_init() (allwinner-bsp, drivers/drm) -- which is the one
++ * thing its sequence and this one agree on exactly.
+  */
+-static void sun60i_tcon_tv_program(struct sun60i_tcon_tv *tcon)
++static void sun60i_tcon_tv_program(struct sun60i_tcon_tv *tcon, bool vdbist)
+ {
+ 	const struct drm_display_mode *mode = &tcon->mode;
+ 	u32 vblank = mode->vtotal - mode->vdisplay;
+@@ -504,7 +522,7 @@ static void sun60i_tcon_tv_program(struct sun60i_tcon_tv *tcon)
+ 	writel(TV_UNDOC_0FE8_VALUE, tcon->regs + TV_UNDOC_0FE8_REG);
+ 	sun60i_tcon_tv_io(tcon, mode);
+ 	writel(0, tcon->regs + TV_DEBUG_REG);
+-	sun60i_tcon_tv_set_source(tcon, true, 0);
++	sun60i_tcon_tv_set_source(tcon, vdbist, 0);
+ 	sun60i_tcon_tv_pixeldepth(tcon);
+ 	writel(0, tcon->regs + TV_GINT0_REG);
+ 	writel(TV_GCTL_MODULE_EN, tcon->regs + TV_GCTL_REG);
+@@ -604,7 +622,7 @@ static int sun60i_tcon_tv_clocks_on(struct sun60i_tcon_tv *tcon)
+ 	return ret;
+ }
+ 
+-static int sun60i_tcon_tv_enable(struct sun60i_tcon_tv *tcon)
++static int sun60i_tcon_tv_enable(struct sun60i_tcon_tv *tcon, bool vdbist)
+ {
+ 	int ret;
+ 
+@@ -635,7 +653,7 @@ static int sun60i_tcon_tv_enable(struct sun60i_tcon_tv *tcon)
+ 	}
+ 
+ 	sun60i_tcon_tv_route(tcon);
+-	sun60i_tcon_tv_program(tcon);
++	sun60i_tcon_tv_program(tcon, vdbist);
+ 	tcon->enabled = true;
+ 
+ 	dev_info(tcon->dev, "scanning %dx%d, %d kHz, htotal %d vtotal %d\n",
+@@ -667,6 +685,111 @@ static void sun60i_tcon_tv_disable(struct sun60i_tcon_tv *tcon)
+ 	tcon->enabled = false;
+ }
+ 
++/*
++ * ---------------------------------------------------------------------------
++ * The KMS half
++ * ---------------------------------------------------------------------------
++ */
++
++/*
++ * Does this mode fit the registers? The bounds are the ones
++ * sun60i_tcon_tv_check_mode() already carries, every one of them a field width
++ * from UM 15.2.10, and this is the same question a modeset asks earlier and
++ * cheaper.
++ *
++ * ⚠ IT IS NOT THE COMPLETE ANSWER, AND THE MISSING TERM HAS A NAME:
++ * PIXEL_MODE. The transmitter may consume more than one pixel per clock, and
++ * when it does, TV_GCTL[5:4] and this TCON's module clock both have to follow
++ * it -- the vendor divides the pixel clock by that factor
++ * (clk_set_rate(mclk, pixel_clk / pixel_mode) in sunxi_tcon_edp_mode_init())
++ * and writes the same factor into GCTL. This tree runs one pixel per clock on
++ * both sides and both are at their reset value, so the invariant holds today
++ * by both halves being untouched -- but a mode list wider than one entry has to
++ * carry the factor through all three places or the raster is wrong by an
++ * integer ratio. Named here because that is where the next reader will look.
++ */
++int sun60i_tcon_tv_kms_check(struct sun60i_tcon_tv *tcon,
++			     const struct drm_display_mode *mode)
++{
++	return sun60i_tcon_tv_check_mode(tcon, mode);
++}
++EXPORT_SYMBOL_GPL(sun60i_tcon_tv_kms_check);
++
++/*
++ * The raster, taking its source from the display engine rather than from the
++ * TCON's own pattern generator. That single argument is the whole difference
++ * between this and the debugfs verb.
++ */
++int sun60i_tcon_tv_kms_enable(struct sun60i_tcon_tv *tcon,
++			      const struct drm_display_mode *mode, u8 bpc)
++{
++	guard(mutex)(&tcon->lock);
++
++	if (!tcon->kms_owned)
++		return -EPERM;
++
++	if (tcon->enabled)
++		return -EBUSY;
++
++	drm_mode_copy(&tcon->mode, mode);
++	tcon->bpc = bpc;
++
++	return sun60i_tcon_tv_enable(tcon, false);
++}
++EXPORT_SYMBOL_GPL(sun60i_tcon_tv_kms_enable);
++
++void sun60i_tcon_tv_kms_disable(struct sun60i_tcon_tv *tcon)
++{
++	guard(mutex)(&tcon->lock);
++
++	if (!tcon->enabled)
++		return;
++
++	sun60i_tcon_tv_disable(tcon);
++}
++EXPORT_SYMBOL_GPL(sun60i_tcon_tv_kms_disable);
++
++/* No hardware work at bind -- the reasoning is at sun60i_de_bind(). */
++static int sun60i_tcon_tv_bind(struct device *dev, struct device *master,
++			       void *data)
++{
++	struct sun60i_tcon_tv *tcon = dev_get_drvdata(dev);
++
++	guard(mutex)(&tcon->lock);
++
++	if (tcon->enabled) {
++		dev_err(dev, "already scanning from debugfs; refusing to hand the raster to a KMS master\n");
++		return -EBUSY;
++	}
++
++	tcon->kms_owned = true;
++
++	return 0;
++}
++
++static void sun60i_tcon_tv_unbind(struct device *dev, struct device *master,
++				  void *data)
++{
++	struct sun60i_tcon_tv *tcon = dev_get_drvdata(dev);
++
++	guard(mutex)(&tcon->lock);
++
++	if (tcon->enabled)
++		sun60i_tcon_tv_disable(tcon);
++
++	tcon->kms_owned = false;
++}
++
++static const struct component_ops sun60i_tcon_tv_component_ops = {
++	.bind	= sun60i_tcon_tv_bind,
++	.unbind	= sun60i_tcon_tv_unbind,
++};
++
++static void sun60i_tcon_tv_component_remove(void *data)
++{
++	component_del(data, &sun60i_tcon_tv_component_ops);
++}
++
+ static void sun60i_tcon_tv_teardown(void *data)
+ {
+ 	struct sun60i_tcon_tv *tcon = data;
+@@ -786,7 +909,13 @@ static int sun60i_tcon_tv_probe(struct platform_device *pdev)
+ 
+ 	dev_info(dev, "A733 TCON_TV1 on %s, idle until a KMS master binds\n", dev_name(dev));
+ 
+-	return 0;
++	/* Last, for the reason sun60i_de_probe() gives. */
++	ret = component_add(dev, &sun60i_tcon_tv_component_ops);
++	if (ret)
++		return dev_err_probe(dev, ret, "component_add\n");
++
++	return devm_add_action_or_reset(dev, sun60i_tcon_tv_component_remove,
++					dev);
+ }
+ 
+ static const struct of_device_id sun60i_tcon_tv_of_match[] = {

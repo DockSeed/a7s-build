@@ -1,0 +1,259 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: a733: set clock-latency-ns on the CPU OPPs from the measured park
+
+What. clock-latency-ns on every operating point of both CPU OPP tables:
+45000 ns on cluster0 (A55, cpu0-5), 38000 ns on cluster1 (A76, cpu6-7).
+
+Why. `arm64-dts-a733-cpu-opp-tables-and-supply` left the property out on purpose: the vendor's 244144 ns is
+1/4096 s, a constant found in unrelated DTs, and the UM gives only a 1.5 ms
+lock bound (Table 4-2), so the only honest value was a measurement nobody
+had. It was measured: `clk-sunxi-ng-a733-cpu-pll-park-timing`'s notifier times one CPU PLL change from
+PRE_RATE_CHANGE to POST_RATE_CHANGE -- the whole time the cluster is off its
+PLL, the clk framework included. On the 6 GiB board, 6.18.36-t0036 with the clusters
+parked on CPU_BACK_PLL (`clk-sunxi-ng-a733-park-core-clusters-on-cpu-back-pll` + the TF-A patch
+`allwinner-a733-enable-cpu-back-pll`), 2026-09-23, tracer-free,
+under a bursty load: A55 median 39.2 us, p99 44.9 us; A76 median 33.5 us,
+p99 37.2 us. The
+values are those p99s rounded up to the microsecond.
+
+Who reads it: of.c:896 per OPP, the table maximum returned by
+dev_pm_opp_get_max_transition_latency() (core.c:318), added to the volt
+latency (196 us, `arm64-dts-a733-cpu-opp-tables-and-supply`'s ramp delay) and used by cpufreq-dt as
+cpuinfo.transition_latency (cpufreq-dt.c:105-114). schedutil's rate limit
+follows as 1.5 x latency (cpufreq.c:552-555): 294 us before, 361 us with
+this patch. schedutil's tunables are global here, so the A55 policy's value
+serves both clusters.
+
+What it does not cover: a boot chain without the TF-A patch
+`allwinner-a733-enable-cpu-back-pll` leaves
+CPU_BACK_PLL off, `clk-sunxi-ng-a733-park-core-clusters-on-cpu-back-pll` then parks on the 26 MHz DCXO and a change takes
+~322/153 us (A55/A76 median). The kernel says so at probe (`clk-sunxi-ng-a733-park-core-clusters-on-cpu-back-pll`'s warning);
+this value is for the boot chain this recipe builds.
+
+On the board (the 6 GiB board, 6.18.36-t0999, boot chain with the TF-A patch `allwinner-a733-enable-cpu-back-pll`,
+2026-09-23): cpuinfo_transition_latency 241000 ns (policy0) and 234000 ns
+(policy6) = 196 us + 45 / 38 us; schedutil rate_limit_us 361. Whether the rate limit needs more than this is still open; a pending test
+on the 8 GiB board decides it.
+
+For a comparison run without it: A7S_SKIP_PATCHES=arm64-dts-a733-cpu-opp-clock-latency-measured.
+
+Assisted-by: Claude
+---
+
+diff --git a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -3342,6 +3342,13 @@ cluster0_opp: opp-table-cluster0 {
+ 		nvmem-cells = <&cpu_speed_grade>;
+ 		opp-shared;
+ 
++		/*
++		 * clock-latency-ns: the measured park of one PLL change, PRE to
++		 * POST notifier, p99 on the 6 GiB board with the clusters parked on
++		 * CPU_BACK_PLL (`clk-sunxi-ng-a733-park-core-clusters-on-cpu-back-pll` + TF-A `allwinner-a733-enable-cpu-back-pll`): 44.9 us here, 37.2 us on the
++		 * A76 table.
++		 */
++
+ 		/*
+ 		 * Two points below the vendor's floor. The vendor's lowest is
+ 		 * 416 MHz; these are ours, and they exist because the whole
+@@ -3366,6 +3373,7 @@ cluster0_opp: opp-table-cluster0 {
+ 		 */
+ 		opp-247000000 {
+ 			opp-hz = /bits/ 64 <247000000>;
++			clock-latency-ns = <45000>;
+ 			opp-supported-hw = <0x31>;
+ 			opp-microvolt = <800000 800000 1050000>;
+ 			opp-microvolt-speed4 = <800000 800000 1050000>;
+@@ -3374,6 +3382,7 @@ opp-247000000 {
+ 
+ 		opp-494000000 {
+ 			opp-hz = /bits/ 64 <494000000>;
++			clock-latency-ns = <45000>;
+ 			opp-supported-hw = <0x31>;
+ 			opp-microvolt = <800000 800000 1050000>;
+ 			opp-microvolt-speed4 = <800000 800000 1050000>;
+@@ -3382,6 +3391,7 @@ opp-494000000 {
+ 
+ 		opp-416000000 {
+ 			opp-hz = /bits/ 64 <416000000>;
++			clock-latency-ns = <45000>;
+ 			opp-supported-hw = <0x31>;
+ 			opp-microvolt = <800000 800000 1050000>;
+ 			opp-microvolt-speed4 = <800000 800000 1050000>;
+@@ -3390,6 +3400,7 @@ opp-416000000 {
+ 
+ 		opp-780000000 {
+ 			opp-hz = /bits/ 64 <780000000>;
++			clock-latency-ns = <45000>;
+ 			opp-supported-hw = <0x31>;
+ 			opp-microvolt = <800000 800000 1050000>;
+ 			opp-microvolt-speed4 = <800000 800000 1050000>;
+@@ -3398,6 +3409,7 @@ opp-780000000 {
+ 
+ 		opp-1014000000 {
+ 			opp-hz = /bits/ 64 <1014000000>;
++			clock-latency-ns = <45000>;
+ 			opp-supported-hw = <0x31>;
+ 			opp-microvolt = <800000 800000 1050000>;
+ 			opp-microvolt-speed4 = <800000 800000 1050000>;
+@@ -3406,6 +3418,7 @@ opp-1014000000 {
+ 
+ 		opp-1196000000 {
+ 			opp-hz = /bits/ 64 <1196000000>;
++			clock-latency-ns = <45000>;
+ 			opp-supported-hw = <0x31>;
+ 			opp-microvolt = <850000 850000 1050000>;
+ 			opp-microvolt-speed4 = <800000 800000 1050000>;
+@@ -3414,6 +3427,7 @@ opp-1196000000 {
+ 
+ 		opp-1404000000 {
+ 			opp-hz = /bits/ 64 <1404000000>;
++			clock-latency-ns = <45000>;
+ 			opp-supported-hw = <0x31>;
+ 			opp-microvolt = <950000 950000 1050000>;
+ 			opp-microvolt-speed4 = <840000 840000 1050000>;
+@@ -3422,6 +3436,7 @@ opp-1404000000 {
+ 
+ 		opp-1508000000 {
+ 			opp-hz = /bits/ 64 <1508000000>;
++			clock-latency-ns = <45000>;
+ 			opp-supported-hw = <0x31>;
+ 			opp-microvolt = <1000000 1000000 1050000>;
+ 			opp-microvolt-speed4 = <880000 880000 1050000>;
+@@ -3430,6 +3445,7 @@ opp-1508000000 {
+ 
+ 		opp-1612000000 {
+ 			opp-hz = /bits/ 64 <1612000000>;
++			clock-latency-ns = <45000>;
+ 			opp-supported-hw = <0x31>;
+ 			opp-microvolt = <1050000 1050000 1050000>;
+ 			opp-microvolt-speed4 = <920000 920000 1050000>;
+@@ -3438,6 +3454,7 @@ opp-1612000000 {
+ 
+ 		opp-1716000000 {
+ 			opp-hz = /bits/ 64 <1716000000>;
++			clock-latency-ns = <45000>;
+ 			opp-supported-hw = <0x31>;
+ 			opp-microvolt = <1050000 1050000 1050000>;
+ 			opp-microvolt-speed4 = <960000 960000 1050000>;
+@@ -3446,6 +3463,7 @@ opp-1716000000 {
+ 
+ 		opp-1794000000 {
+ 			opp-hz = /bits/ 64 <1794000000>;
++			clock-latency-ns = <45000>;
+ 			opp-supported-hw = <0x31>;
+ 			opp-microvolt = <1050000 1050000 1050000>;
+ 			opp-microvolt-speed4 = <1000000 1000000 1050000>;
+@@ -3514,6 +3532,7 @@ cluster1_opp: opp-table-cluster1 {
+ 		 */
+ 		opp-247000000 {
+ 			opp-hz = /bits/ 64 <247000000>;
++			clock-latency-ns = <38000>;
+ 			opp-supported-hw = <0x31>;
+ 			opp-microvolt = <800000 800000 1050000>;
+ 			opp-microvolt-speed4 = <800000 800000 1050000>;
+@@ -3522,6 +3541,7 @@ opp-247000000 {
+ 
+ 		opp-494000000 {
+ 			opp-hz = /bits/ 64 <494000000>;
++			clock-latency-ns = <38000>;
+ 			opp-supported-hw = <0x31>;
+ 			opp-microvolt = <800000 800000 1050000>;
+ 			opp-microvolt-speed4 = <800000 800000 1050000>;
+@@ -3530,6 +3550,7 @@ opp-494000000 {
+ 
+ 		opp-416000000 {
+ 			opp-hz = /bits/ 64 <416000000>;
++			clock-latency-ns = <38000>;
+ 			opp-supported-hw = <0x31>;
+ 			opp-microvolt = <800000 800000 1050000>;
+ 			opp-microvolt-speed4 = <800000 800000 1050000>;
+@@ -3538,6 +3559,7 @@ opp-416000000 {
+ 
+ 		opp-780000000 {
+ 			opp-hz = /bits/ 64 <780000000>;
++			clock-latency-ns = <38000>;
+ 			opp-supported-hw = <0x31>;
+ 			opp-microvolt = <800000 800000 1050000>;
+ 			opp-microvolt-speed4 = <800000 800000 1050000>;
+@@ -3546,6 +3568,7 @@ opp-780000000 {
+ 
+ 		opp-1014000000 {
+ 			opp-hz = /bits/ 64 <1014000000>;
++			clock-latency-ns = <38000>;
+ 			opp-supported-hw = <0x31>;
+ 			opp-microvolt = <800000 800000 1050000>;
+ 			opp-microvolt-speed4 = <800000 800000 1050000>;
+@@ -3554,6 +3577,7 @@ opp-1014000000 {
+ 
+ 		opp-1196000000 {
+ 			opp-hz = /bits/ 64 <1196000000>;
++			clock-latency-ns = <38000>;
+ 			opp-supported-hw = <0x31>;
+ 			opp-microvolt = <800000 800000 1050000>;
+ 			opp-microvolt-speed4 = <800000 800000 1050000>;
+@@ -3562,6 +3586,7 @@ opp-1196000000 {
+ 
+ 		opp-1404000000 {
+ 			opp-hz = /bits/ 64 <1404000000>;
++			clock-latency-ns = <38000>;
+ 			opp-supported-hw = <0x31>;
+ 			opp-microvolt = <850000 850000 1050000>;
+ 			opp-microvolt-speed4 = <800000 800000 1050000>;
+@@ -3570,6 +3595,7 @@ opp-1404000000 {
+ 
+ 		opp-1508000000 {
+ 			opp-hz = /bits/ 64 <1508000000>;
++			clock-latency-ns = <38000>;
+ 			opp-supported-hw = <0x31>;
+ 			opp-microvolt = <900000 900000 1050000>;
+ 			opp-microvolt-speed4 = <820000 820000 1050000>;
+@@ -3578,6 +3604,7 @@ opp-1508000000 {
+ 
+ 		opp-1612000000 {
+ 			opp-hz = /bits/ 64 <1612000000>;
++			clock-latency-ns = <38000>;
+ 			opp-supported-hw = <0x31>;
+ 			opp-microvolt = <950000 950000 1050000>;
+ 			opp-microvolt-speed4 = <840000 840000 1050000>;
+@@ -3586,6 +3613,7 @@ opp-1612000000 {
+ 
+ 		opp-1716000000 {
+ 			opp-hz = /bits/ 64 <1716000000>;
++			clock-latency-ns = <38000>;
+ 			opp-supported-hw = <0x31>;
+ 			opp-microvolt = <1000000 1000000 1050000>;
+ 			opp-microvolt-speed4 = <870000 870000 1050000>;
+@@ -3594,6 +3622,7 @@ opp-1716000000 {
+ 
+ 		opp-1794000000 {
+ 			opp-hz = /bits/ 64 <1794000000>;
++			clock-latency-ns = <38000>;
+ 			opp-supported-hw = <0x31>;
+ 			opp-microvolt = <1050000 1050000 1050000>;
+ 			opp-microvolt-speed4 = <920000 920000 1050000>;
+@@ -3602,6 +3631,7 @@ opp-1794000000 {
+ 
+ 		opp-1898000000 {
+ 			opp-hz = /bits/ 64 <1898000000>;
++			clock-latency-ns = <38000>;
+ 			opp-supported-hw = <0x31>;
+ 			opp-microvolt = <1050000 1050000 1050000>;
+ 			opp-microvolt-speed4 = <970000 970000 1050000>;
+@@ -3610,6 +3640,7 @@ opp-1898000000 {
+ 
+ 		opp-1950000000 {
+ 			opp-hz = /bits/ 64 <1950000000>;
++			clock-latency-ns = <38000>;
+ 			opp-supported-hw = <0x31>;
+ 			opp-microvolt = <1050000 1050000 1050000>;
+ 			opp-microvolt-speed4 = <1000000 1000000 1050000>;
+@@ -3618,6 +3649,7 @@ opp-1950000000 {
+ 
+ 		opp-2002000000 {
+ 			opp-hz = /bits/ 64 <2002000000>;
++			clock-latency-ns = <38000>;
+ 			opp-supported-hw = <0x31>;
+ 			opp-microvolt = <1050000 1050000 1050000>;
+ 			opp-microvolt-speed4 = <1050000 1050000 1050000>;

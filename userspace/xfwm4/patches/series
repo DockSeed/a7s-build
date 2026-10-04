@@ -1,0 +1,3 @@
+# Applied in this order by the fetch-xfwm4 stage (scripts/stages/xfwm4.sh), at --fuzz=0,
+# as debian/patches of the Debian source package xfwm4 4.20.0-1.
+settings-block-channel-callback-while-writing-defaults.patch

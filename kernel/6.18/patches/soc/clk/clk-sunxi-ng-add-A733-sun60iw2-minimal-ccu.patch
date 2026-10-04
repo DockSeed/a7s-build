@@ -1,0 +1,380 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] clk: sunxi-ng: add Allwinner A733 (sun60iw2) minimal CCU
+
+Milestone-0 minimal clock driver: PLL_REF, PLL_PERI0 (+ taps), the
+AHB/APB bus clocks and the UART module clocks/resets. Modelled on the
+in-tree A523 CCU driver; register values from the vendor BSP but using
+only mainline sunxi-ng primitives (no vendor key-gate/SDM/extended
+ccu_common). Based on ccu-sun55i-a523.c (Copyright (C) 2023 Arm Ltd).
+
+Assisted-by: Claude
+---
+--- /dev/null	2026-07-12 19:39:02.276000000 +0200
++++ b/include/dt-bindings/clock/sun60i-a733-ccu.h	2026-07-16 17:47:28.650073444 +0200
+@@ -0,0 +1,38 @@
++/* SPDX-License-Identifier: (GPL-2.0-only OR MIT) */
++/*
++ * Clock indices for the Allwinner A733 (sun60iw2) CCU.
++ *
++ * Milestone-0 minimal subset: only the PLLs, bus and UART clocks needed to
++ * reach a serial shell. The full clock tree (GPU/NPU/VE/display/net, incl. the
++ * key-gated peripheral clocks) is added in later milestones — indices here are
++ * stable and only appended to, never renumbered.
++ */
++#ifndef _DT_BINDINGS_CLK_SUN60I_A733_CCU_H_
++#define _DT_BINDINGS_CLK_SUN60I_A733_CCU_H_
++
++#define CLK_PLL_REF		0
++#define CLK_PLL_PERI0		1
++#define CLK_PLL_PERI0_2X	2
++#define CLK_PLL_PERI0_800M	3
++#define CLK_PLL_PERI0_480M	4
++#define CLK_PLL_PERI0_600M	5
++#define CLK_PLL_PERI0_400M	6
++#define CLK_PLL_PERI0_300M	7
++#define CLK_PLL_PERI0_200M	8
++#define CLK_PLL_PERI0_160M	9
++#define CLK_PLL_PERI0_150M	10
++
++#define CLK_AHB			11
++#define CLK_APB0		12
++#define CLK_APB1		13
++#define CLK_APB_UART		14
++
++#define CLK_UART0		15
++#define CLK_UART1		16
++#define CLK_UART2		17
++#define CLK_UART3		18
++#define CLK_UART4		19
++#define CLK_UART5		20
++#define CLK_UART6		21
++
++#endif /* _DT_BINDINGS_CLK_SUN60I_A733_CCU_H_ */
+--- /dev/null	2026-07-12 19:39:02.276000000 +0200
++++ b/include/dt-bindings/reset/sun60i-a733-ccu.h	2026-07-16 17:47:28.650073444 +0200
+@@ -0,0 +1,18 @@
++/* SPDX-License-Identifier: (GPL-2.0-only OR MIT) */
++/*
++ * Reset indices for the Allwinner A733 (sun60iw2) CCU.
++ * Milestone-0 minimal subset: UART bus resets only. Appended to, never
++ * renumbered.
++ */
++#ifndef _DT_BINDINGS_RST_SUN60I_A733_CCU_H_
++#define _DT_BINDINGS_RST_SUN60I_A733_CCU_H_
++
++#define RST_BUS_UART0		0
++#define RST_BUS_UART1		1
++#define RST_BUS_UART2		2
++#define RST_BUS_UART3		3
++#define RST_BUS_UART4		4
++#define RST_BUS_UART5		5
++#define RST_BUS_UART6		6
++
++#endif /* _DT_BINDINGS_RST_SUN60I_A733_CCU_H_ */
+--- /dev/null	2026-07-12 19:39:02.276000000 +0200
++++ b/drivers/clk/sunxi-ng/ccu-sun60iw2.c	2026-07-16 17:47:51.374137728 +0200
+@@ -0,0 +1,280 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Clock Control Unit driver for the Allwinner A733 (sun60iw2) SoC.
++ *
++ * Milestone-0 minimal subset: PLLs (ref, peri0 + taps), the AHB/APB bus
++ * clocks and the UART module clocks/resets — just enough to reach a serial
++ * shell on pristine mainline. Modelled on the in-tree A523 CCU driver
++ * (drivers/clk/sunxi-ng/ccu-sun55i-a523.c); register offsets and dividers are
++ * taken from the vendor BSP ccu-sun60iw2.c, but only mainline sunxi-ng
++ * primitives are used — none of the vendor key-gate / SDM / extended
++ * ccu_common machinery. Peripheral clocks (GPU/NPU/VE/display/net) are added
++ * in later milestones.
++ *
++ * Based on drivers/clk/sunxi-ng/ccu-sun55i-a523.c, Copyright (C) 2023 Arm Ltd.
++ * Copyright (c) 2026 DockSeed A733 Debian mainline track
++ */
++
++#include <linux/clk-provider.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++
++#include <dt-bindings/clock/sun60i-a733-ccu.h>
++#include <dt-bindings/reset/sun60i-a733-ccu.h>
++
++#include "ccu_common.h"
++#include "ccu_reset.h"
++
++#include "ccu_div.h"
++#include "ccu_gate.h"
++#include "ccu_mult.h"
++#include "ccu_nm.h"
++
++/*
++ * The 24 MHz oscillator ("hosc") is provided from the device tree. The
++ * low-speed 32 kHz ("losc") and internal RC ("iosc") references are mux
++ * inputs only and, for milestone 0, are never selected — they are listed to
++ * keep the hardware mux indices honest.
++ */
++static const struct clk_parent_data osc24M[] = {
++	{ .fw_name = "hosc" }
++};
++
++/*
++ * PLL_REF: the root PLL feeding the peripheral PLLs. The BSP models extra
++ * output/ldo/lock-enable bits that mainline ccu_nm_ops does not; as in the
++ * A523 driver those bits are forced in probe() instead. We present the output
++ * gate (bit 27) as the enable bit.
++ */
++#define SUN60IW2_PLL_REF_REG		0x0000
++static struct ccu_nm pll_ref_clk = {
++	.enable		= BIT(27),
++	.lock		= BIT(28),
++	.n		= _SUNXI_CCU_MULT_OFFSET_MIN_MAX(8, 8, 1, 80, 116),
++	.m		= _SUNXI_CCU_DIV(16, 7),
++	.min_rate	= 15000000U,
++	.max_rate	= 2800000000U,
++	.common		= {
++		.reg		= SUN60IW2_PLL_REF_REG,
++		.hw.init	= CLK_HW_INIT_PARENTS_DATA("pll-ref", osc24M,
++				&ccu_nm_ops,
++				CLK_SET_RATE_UNGATE | CLK_IS_CRITICAL),
++	},
++};
++static const struct clk_hw *pll_ref_hws[] = { &pll_ref_clk.common.hw };
++
++/*
++ * PLL_PERI0 and its divider taps. PLL_PERI0 has three output-enable bits
++ * (25..27); we present bit 27 as the enable and force 25/26 in probe().
++ */
++#define SUN60IW2_PLL_PERI0_REG		0x00A0
++static struct ccu_nm pll_peri0_clk = {
++	.enable		= BIT(27),
++	.lock		= BIT(28),
++	.n		= _SUNXI_CCU_MULT_OFFSET_MIN_MAX(8, 8, 1, 53, 105),
++	.min_rate	= 1272000000U,
++	.max_rate	= 2520000000U,
++	.common		= {
++		.reg		= SUN60IW2_PLL_PERI0_REG,
++		.hw.init	= CLK_HW_INIT_PARENTS_HW("pll-peri0",
++				pll_ref_hws, &ccu_nm_ops,
++				CLK_SET_RATE_UNGATE | CLK_IS_CRITICAL),
++	},
++};
++static const struct clk_hw *pll_peri0_hws[] = { &pll_peri0_clk.common.hw };
++
++static SUNXI_CCU_M_HWS(pll_peri0_2x_clk, "pll-peri0-2x", pll_peri0_hws,
++		       0x00A0, 20, 3, 0);
++static const struct clk_hw *pll_peri0_2x_hws[] = {
++	&pll_peri0_2x_clk.common.hw
++};
++static SUNXI_CCU_M_HWS(pll_peri0_800m_clk, "pll-peri0-800m", pll_peri0_hws,
++		       0x00A0, 16, 3, 0);
++static SUNXI_CCU_M_HWS(pll_peri0_480m_clk, "pll-peri0-480m", pll_peri0_hws,
++		       0x00A0, 2, 3, 0);
++static const struct clk_hw *pll_peri0_480m_hws[] = {
++	&pll_peri0_480m_clk.common.hw
++};
++
++static CLK_FIXED_FACTOR_HWS(pll_peri0_600m_clk, "pll-peri0-600m",
++			    pll_peri0_2x_hws, 2, 1, 0);
++static const struct clk_hw *pll_peri0_600m_hws[] = {
++	&pll_peri0_600m_clk.hw
++};
++static CLK_FIXED_FACTOR_HWS(pll_peri0_400m_clk, "pll-peri0-400m",
++			    pll_peri0_2x_hws, 3, 1, 0);
++static const struct clk_hw *pll_peri0_400m_hws[] = {
++	&pll_peri0_400m_clk.hw
++};
++static CLK_FIXED_FACTOR_HWS(pll_peri0_300m_clk, "pll-peri0-300m",
++			    pll_peri0_600m_hws, 2, 1, 0);
++static const struct clk_hw *pll_peri0_300m_hws[] = {
++	&pll_peri0_300m_clk.hw
++};
++static CLK_FIXED_FACTOR_HWS(pll_peri0_200m_clk, "pll-peri0-200m",
++			    pll_peri0_400m_hws, 2, 1, 0);
++static CLK_FIXED_FACTOR_HWS(pll_peri0_160m_clk, "pll-peri0-160m",
++			    pll_peri0_480m_hws, 3, 1, 0);
++static CLK_FIXED_FACTOR_HWS(pll_peri0_150m_clk, "pll-peri0-150m",
++			    pll_peri0_300m_hws, 2, 1, 0);
++
++/*
++ * Bus clocks. Mux order matches hardware: index 0 = 24 MHz, so the bus stays
++ * alive on whatever U-Boot left selected. peri0-600m is the fast option.
++ */
++static const struct clk_parent_data ahb_apb_parents[] = {
++	{ .fw_name = "hosc" },			/* sys24M */
++	{ .fw_name = "losc" },			/* osc32k */
++	{ .fw_name = "iosc" },			/* internal RC */
++	{ .hw = &pll_peri0_600m_clk.hw },	/* pll-peri0-600m */
++};
++
++static SUNXI_CCU_M_DATA_WITH_MUX(ahb_clk, "ahb", ahb_apb_parents, 0x0500,
++				 0, 5, 24, 2, CLK_SET_RATE_PARENT);
++static SUNXI_CCU_M_DATA_WITH_MUX(apb0_clk, "apb0", ahb_apb_parents, 0x0510,
++				 0, 5, 24, 2, CLK_SET_RATE_PARENT);
++static SUNXI_CCU_M_DATA_WITH_MUX(apb1_clk, "apb1", ahb_apb_parents, 0x0518,
++				 0, 5, 24, 2, CLK_SET_RATE_PARENT);
++
++static const struct clk_parent_data apb_uart_parents[] = {
++	{ .fw_name = "hosc" },			/* sys24M */
++	{ .fw_name = "losc" },			/* osc32k */
++	{ .fw_name = "iosc" },			/* internal RC */
++	{ .hw = &pll_peri0_600m_clk.hw },	/* pll-peri0-600m */
++	{ .hw = &pll_peri0_480m_clk.common.hw },/* pll-peri0-480m */
++};
++
++static SUNXI_CCU_M_DATA_WITH_MUX(apb_uart_clk, "apb-uart", apb_uart_parents,
++				 0x0538, 0, 5, 24, 3, CLK_SET_RATE_PARENT);
++static const struct clk_hw *apb_uart_hws[] = { &apb_uart_clk.common.hw };
++
++/* UART module gates: reg 0x0E00 + n*4, gate bit 0, reset bit 16. */
++static SUNXI_CCU_GATE_HWS(uart0_clk, "uart0", apb_uart_hws, 0x0E00, BIT(0), 0);
++static SUNXI_CCU_GATE_HWS(uart1_clk, "uart1", apb_uart_hws, 0x0E04, BIT(0), 0);
++static SUNXI_CCU_GATE_HWS(uart2_clk, "uart2", apb_uart_hws, 0x0E08, BIT(0), 0);
++static SUNXI_CCU_GATE_HWS(uart3_clk, "uart3", apb_uart_hws, 0x0E0C, BIT(0), 0);
++static SUNXI_CCU_GATE_HWS(uart4_clk, "uart4", apb_uart_hws, 0x0E10, BIT(0), 0);
++static SUNXI_CCU_GATE_HWS(uart5_clk, "uart5", apb_uart_hws, 0x0E14, BIT(0), 0);
++static SUNXI_CCU_GATE_HWS(uart6_clk, "uart6", apb_uart_hws, 0x0E18, BIT(0), 0);
++
++/* ccu_common-based clocks (registered and reset-mapped by the core). */
++static struct ccu_common *sun60iw2_ccu_clks[] = {
++	&pll_ref_clk.common,
++	&pll_peri0_clk.common,
++	&pll_peri0_2x_clk.common,
++	&pll_peri0_800m_clk.common,
++	&pll_peri0_480m_clk.common,
++	&ahb_clk.common,
++	&apb0_clk.common,
++	&apb1_clk.common,
++	&apb_uart_clk.common,
++	&uart0_clk.common,
++	&uart1_clk.common,
++	&uart2_clk.common,
++	&uart3_clk.common,
++	&uart4_clk.common,
++	&uart5_clk.common,
++	&uart6_clk.common,
++};
++
++static struct clk_hw_onecell_data sun60iw2_hw_clks = {
++	.hws	= {
++		[CLK_PLL_REF]		= &pll_ref_clk.common.hw,
++		[CLK_PLL_PERI0]		= &pll_peri0_clk.common.hw,
++		[CLK_PLL_PERI0_2X]	= &pll_peri0_2x_clk.common.hw,
++		[CLK_PLL_PERI0_800M]	= &pll_peri0_800m_clk.common.hw,
++		[CLK_PLL_PERI0_480M]	= &pll_peri0_480m_clk.common.hw,
++		[CLK_PLL_PERI0_600M]	= &pll_peri0_600m_clk.hw,
++		[CLK_PLL_PERI0_400M]	= &pll_peri0_400m_clk.hw,
++		[CLK_PLL_PERI0_300M]	= &pll_peri0_300m_clk.hw,
++		[CLK_PLL_PERI0_200M]	= &pll_peri0_200m_clk.hw,
++		[CLK_PLL_PERI0_160M]	= &pll_peri0_160m_clk.hw,
++		[CLK_PLL_PERI0_150M]	= &pll_peri0_150m_clk.hw,
++		[CLK_AHB]		= &ahb_clk.common.hw,
++		[CLK_APB0]		= &apb0_clk.common.hw,
++		[CLK_APB1]		= &apb1_clk.common.hw,
++		[CLK_APB_UART]		= &apb_uart_clk.common.hw,
++		[CLK_UART0]		= &uart0_clk.common.hw,
++		[CLK_UART1]		= &uart1_clk.common.hw,
++		[CLK_UART2]		= &uart2_clk.common.hw,
++		[CLK_UART3]		= &uart3_clk.common.hw,
++		[CLK_UART4]		= &uart4_clk.common.hw,
++		[CLK_UART5]		= &uart5_clk.common.hw,
++		[CLK_UART6]		= &uart6_clk.common.hw,
++	},
++	.num	= CLK_UART6 + 1,
++};
++
++static struct ccu_reset_map sun60iw2_ccu_resets[] = {
++	[RST_BUS_UART0]		= { 0x0E00, BIT(16) },
++	[RST_BUS_UART1]		= { 0x0E04, BIT(16) },
++	[RST_BUS_UART2]		= { 0x0E08, BIT(16) },
++	[RST_BUS_UART3]		= { 0x0E0C, BIT(16) },
++	[RST_BUS_UART4]		= { 0x0E10, BIT(16) },
++	[RST_BUS_UART5]		= { 0x0E14, BIT(16) },
++	[RST_BUS_UART6]		= { 0x0E18, BIT(16) },
++};
++
++static const struct sunxi_ccu_desc sun60iw2_ccu_desc = {
++	.ccu_clks	= sun60iw2_ccu_clks,
++	.num_ccu_clks	= ARRAY_SIZE(sun60iw2_ccu_clks),
++
++	.hw_clks	= &sun60iw2_hw_clks,
++
++	.resets		= sun60iw2_ccu_resets,
++	.num_resets	= ARRAY_SIZE(sun60iw2_ccu_resets),
++};
++
++static const u32 pll_regs[] = {
++	SUN60IW2_PLL_REF_REG,
++	SUN60IW2_PLL_PERI0_REG,
++};
++
++static int sun60iw2_ccu_probe(struct platform_device *pdev)
++{
++	void __iomem *reg;
++	u32 val;
++	int i;
++
++	reg = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(reg))
++		return PTR_ERR(reg);
++
++	/*
++	 * ccu_nm_ops only toggles the output gate; force PLL Enable (31),
++	 * LDO Enable (30) and Lock Enable (29) on all PLLs, mirroring the A523
++	 * driver. These are normally already set by boot0/U-Boot.
++	 */
++	for (i = 0; i < ARRAY_SIZE(pll_regs); i++) {
++		val = readl(reg + pll_regs[i]);
++		val |= BIT(31) | BIT(30) | BIT(29);
++		writel(val, reg + pll_regs[i]);
++	}
++
++	/* PLL_PERI0 has three output gates (25..27); enable them all. */
++	val = readl(reg + SUN60IW2_PLL_PERI0_REG);
++	val |= BIT(27) | BIT(26) | BIT(25);
++	writel(val, reg + SUN60IW2_PLL_PERI0_REG);
++
++	return devm_sunxi_ccu_probe(&pdev->dev, reg, &sun60iw2_ccu_desc);
++}
++
++static const struct of_device_id sun60iw2_ccu_ids[] = {
++	{ .compatible = "allwinner,sun60i-a733-ccu" },
++	{ }
++};
++
++static struct platform_driver sun60iw2_ccu_driver = {
++	.probe	= sun60iw2_ccu_probe,
++	.driver	= {
++		.name			= "sun60i-a733-ccu",
++		.suppress_bind_attrs	= true,
++		.of_match_table		= sun60iw2_ccu_ids,
++	},
++};
++module_platform_driver(sun60iw2_ccu_driver);
++
++MODULE_IMPORT_NS("SUNXI_CCU");
++MODULE_DESCRIPTION("Support for the Allwinner A733 (sun60iw2) CCU");
++MODULE_LICENSE("GPL");
+--- a/drivers/clk/sunxi-ng/Makefile
++++ b/drivers/clk/sunxi-ng/Makefile
+@@ -33,6 +33,7 @@
+ obj-$(CONFIG_SUN50I_H6_CCU)	+= sun50i-h6-ccu.o
+ obj-$(CONFIG_SUN50I_H6_R_CCU)	+= sun50i-h6-r-ccu.o
+ obj-$(CONFIG_SUN50I_H616_CCU)	+= sun50i-h616-ccu.o
++obj-$(CONFIG_SUN60I_A733_CCU)	+= ccu-sun60iw2.o
+ obj-$(CONFIG_SUN55I_A523_CCU)	+= sun55i-a523-ccu.o
+ obj-$(CONFIG_SUN55I_A523_MCU_CCU)	+= sun55i-a523-mcu-ccu.o
+ obj-$(CONFIG_SUN55I_A523_R_CCU)	+= sun55i-a523-r-ccu.o
+--- a/drivers/clk/sunxi-ng/Kconfig
++++ b/drivers/clk/sunxi-ng/Kconfig
+@@ -52,6 +52,11 @@
+ 	default ARCH_SUNXI
+ 	depends on ARM64 || COMPILE_TEST
+ 
++config SUN60I_A733_CCU
++	tristate "Support for the Allwinner A733 CCU"
++	default ARCH_SUNXI
++	depends on ARM64 || COMPILE_TEST
++
+ config SUN55I_A523_CCU
+ 	tristate "Support for the Allwinner A523/T527 CCU"
+ 	default ARCH_SUNXI

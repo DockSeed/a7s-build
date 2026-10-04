@@ -1,0 +1,650 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] pwm: add a driver for the A733 (sun60iw2) PWM controllers
+
+Mainline 6.18.36 has exactly one Allwinner PWM driver, pwm-sun4i.c, and it
+cannot drive this block. Checked rather than assumed: drivers/pwm/ contains
+pwm-sun4i.c and pwm-sunplus.c and nothing else with an "allwinner," compatible,
+Documentation/devicetree/bindings/pwm/ has one Allwinner file, and there is no
+pwm-sun20i*.c anywhere in the tree.
+
+Register by register against A733 UM V0.92 chapter 18.7 (register list in 18.7.7):
+
+  A733 UM 18.7.7            offset   pwm-sun4i.c expects there
+  PIER, IRQ enable          0x0000   PWM_CTRL_REG
+  PISR, IRQ status          0x0004   channel 0 period
+  PCCR01..89, clock cfg     0x0020   channel 3 period
+  PCGR, clock gating        0x0040   -
+  PER, channel enable       0x0080   -            (sun4i: CTRL bit 4)
+  PCR(N), control           0x0100 + N * 0x0040   -
+  PPR(N), period            0x0104 + N * 0x0040   -
+
+pwm-sun4i's first write would land in an interrupt-enable register, so this is a
+new driver, not a compatible string.
+
+The value this patch exists to get right is the per-channel stride. The
+long-pending upstream series for this same second-generation block ("pwm: Add
+Allwinner's D1/T113-S3/R329 SoCs PWM support", v12 of 2025-04-27, still not
+merged as of 6.18.36) names the A733 in its own cover letter as one of the parts
+that carry it, and it matches this SoC exactly across the whole global register
+block: PCCR at 0x20 + pair * 4 with CLK_SRC in bits 8:7 and DIV_M in bits 3:0,
+PCGR at 0x40 with gating in bit N and bypass in bit N+16, PER at 0x80 with
+enable in bit N, PCR.ACT_STA at bit 8, PCR.PRESCAL_K in bits 7:0, PPR split
+31:16 / 15:0. Every one of those was re-derived here from the A733 UM and every
+one agrees.
+
+It then places the per-channel registers at 0x100 + N * 0x20, and on the A733
+the stride is 0x40. The UM says so twice and unambiguously: the register list
+and every per-channel register description
+both read "0x0100+0x00xx+N*0x0040 (N= 0~9)". The reason is visible in
+the register list -- this part carries three capture-cycle-counter registers per
+channel (CCCSR, CCCNR, CCCR at 0x1C, 0x20, 0x24) that the D1 does not, so a
+channel block reaches 0x24 and cannot fit in 0x20.
+
+Inherited unchecked, that value is the exact failure this tree has a name for: it
+compiles, channel 0 works, and every other channel writes into its neighbour.
+Channel 1's control register would go to 0x120, which on the A733 is channel 0's
+CCCNR. Channel 9 -- the one this board's fan hangs off -- would be written at
+0x220, inside channel 4. The fan would never turn and no register would report an
+error.
+
+What the driver does and does not model:
+
+- Cycle mode only. Pulse mode (PCR.PWM_MODE + PUL_NUM + PUL_START), the dead
+  zone generator, group mode and capture are all left at their reset values.
+- The clock bypass bit (PCGR bit N+16, which routes the divided source clock
+  straight to the pin instead of through the counter) is cleared on every apply
+  and never set. get_state warns once if it finds it set, rather than reporting a
+  duty cycle that is not what the pin is doing.
+- PCCR is per channel PAIR -- source and the /1../256 divider are shared between
+  channels 2n and 2n+1, only PRESCAL_K and the counters are per channel. A
+  request that would need a different PCCR while the paired channel is enabled
+  is refused with -EBUSY and a dev_err naming both channels, rather than served
+  by silently reprogramming somebody else's clock.
+- Both sources are offered to every request and the one leaving the most counter
+  steps in the period wins, because that count is the duty-cycle resolution the
+  consumer gets. Rates come from clk_get_rate(), never from a constant: the
+  driver has no opinion about 24 versus 26 MHz and the device tree is where that
+  has to be right.
+- Rounding is down at every step, as the PWM API requires. One corner is
+  documented in the code: ACT_CYCLE is 16 bit while ENTIRE_CYCLE counts to
+  65536, so a period using the very last counter step tops out at 65535/65536
+  rather than 100 %.
+
+Probe deliberately enables nothing. It maps the registers, takes the three
+clocks and de-asserts the reset, and writes no PER, PCGR or PCR bit. PER, PCGR
+and every PCR are 0 out of reset (UM 18.7.8), so a controller that no consumer
+has requested a channel from leaves its pins alone -- which is what lets the SoC
+device tree carry this node for every A733 board, including one that muxes a PWM
+pin to something else.
+
+Applies clean and builds (compile-check gate). NOT hardware-proven. What would
+prove it, in order: PWM0/PWM1 appear as pwmchips; a channel programmed to a
+known period shows that period on a scope or on the fan; and the value this
+patch is really about -- a channel other than 0 does something, i.e. channel 9
+moves and channels 4 and 8 do not.
+
+One thing this patch cannot answer and which the UM does not either: what level
+a channel's pin sits at while the channel is disabled. UM 18.7.8.18 defines
+PER.PWMn_EN as "0: PWM disable" and says nothing about the output. That matters
+for a board that muxes the pin before a consumer drives it, and it has to be
+measured, not deduced.
+
+Assisted-by: Claude
+---
+--- /dev/null
++++ b/drivers/pwm/pwm-sun60i-a733.c
+@@ -0,0 +1,523 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Allwinner A733 (sun60iw2) PWM controller driver.
++ *
++ * Copyright (c) 2026 DockSeed A733 Debian mainline track
++ *
++ * The part has three of these blocks -- PWM0 @ 0x02527000, PWM1 @ 0x02528000
++ * and S_PWM @ 0x07023000, ten channels each (A733 UM V0.92 18.7.7).
++ * This driver claims the first two. S_PWM is deliberately left
++ * out: its register file is documented as identical, but its clock sources are
++ * not (DCXO / RTC_32K / RC16M / SYS_CLK24M against SYS_CLK24M / APB0),
++ * so its PCCR source field is a different table that has not
++ * been read here. Claiming it would be a guess.
++ *
++ * Why this is not pwm-sun4i, and not the sun20i-d1 layout either. Every offset
++ * below is from A733 UM chapter 18.7, and the two divergences are the point of
++ * this file:
++ *
++ *   register              sun4i (pwm-sun4i.c)   A733 UM 18.7.7
++ *   0x0000                PWM_CTRL_REG          PIER, IRQ enable
++ *   0x0004                channel 0 period      PISR, IRQ status
++ *   channel enable        CTRL bit 4            PER 0x0080 bit N
++ *   channel registers     0x0004 + ch * 0x04    0x0100 + ch * 0x0040
++ *
++ * so pwm-sun4i cannot drive this block at all: its very first write would land
++ * in an interrupt-enable register.
++ *
++ * The second divergence is the one that looks harmless and is not. The
++ * long-pending upstream series for this same second-generation block
++ * ("pwm: Add Allwinner's D1/T113-S3/R329 SoCs PWM support", v12 2025-04-27, not
++ * in 6.18.36) matches this part register for register in the whole global
++ * block -- PCCR at 0x20 + pair * 4 with CLK_SRC in bits 8:7 and DIV_M in 3:0,
++ * PCGR at 0x40 with gating in bit N and bypass in bit N+16, PER at 0x80 -- and
++ * then places the per-channel block at 0x100 + ch * 0x20. On the A733 the
++ * stride is 0x40 (the A733 user manual's register list and descriptions both spell out
++ * "0x0100+0x0000+N*0x0040"), because this part carries three capture cycle
++ * counter registers per channel that the D1 does not, reaching 0x24 inside the
++ * channel block. At stride 0x20 channel 1's control register would be written
++ * at 0x120, which on the A733 is channel 0's CCCNR. Channel 0 would work,
++ * every other channel would silently write into a neighbour, and the fan on
++ * channel 9 would never turn.
++ *
++ * The pair sharing is real and is not modelled away: PCCR is one register per
++ * channel pair (PCCR01, PCCR23, ... PCCR89), so the clock source and the /1../256
++ * divider are shared between channels 2n and 2n+1. Only the pre-scaler
++ * (PCR.PRESCAL_K) and the counters are per channel. A request that would need a
++ * different PCCR while the paired channel is enabled is refused with -EBUSY
++ * rather than served by reprogramming somebody else's clock.
++ *
++ * Not modelled: pulse mode (PCR.PWM_MODE, always left at cycle mode), the dead
++ * zone generator, group mode, and capture. The clock bypass bit (PCGR bit
++ * N+16, which routes the divided source clock straight to the pin instead of
++ * the counter) is cleared on every apply and never set.
++ */
++
++#include <linux/bitfield.h>
++#include <linux/bitops.h>
++#include <linux/clk.h>
++#include <linux/err.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/math64.h>
++#include <linux/minmax.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/pwm.h>
++#include <linux/reset.h>
++#include <linux/time.h>
++
++/* UM 18.7.1: ten channels per controller. */
++#define A733_PWM_NPWM			10
++
++/* PCCR01..PCCR89, one register per channel pair (UM 18.7.8.7). */
++#define A733_PWM_PCCR(pair)		(0x0020 + (pair) * 0x4)
++#define A733_PWM_PCCR_CLK_SRC		GENMASK(8, 7)
++#define A733_PWM_PCCR_DIV_M		GENMASK(3, 0)
++/* DIV_M encodes 2^M: 0000 = /1 ... 1000 = /256, "others: /". */
++#define A733_PWM_DIV_M_MAX		8
++
++/* PCGR, whole-controller clock gating (UM 18.7.8.12). */
++#define A733_PWM_PCGR			0x0040
++#define A733_PWM_PCGR_BYPASS(ch)	BIT((ch) + 16)
++#define A733_PWM_PCGR_GATING(ch)	BIT(ch)
++
++/* PER, output enable (UM 18.7.8.18). */
++#define A733_PWM_PER			0x0080
++#define A733_PWM_PER_EN(ch)		BIT(ch)
++
++/*
++ * Per-channel block. The stride is the value this SoC differs on, so it is
++ * spelled out rather than folded into the register macros (UM 18.7.7 register
++ * list, and each per-channel register description from the PWM channel
++ * control register onwards: "0x0100+0x00xx+N*0x0040 (N= 0~9)").
++ */
++#define A733_PWM_CH_BASE		0x0100
++#define A733_PWM_CH_STRIDE		0x0040
++
++/* PCR, per-channel control (UM 18.7.8.25). */
++#define A733_PWM_PCR(ch)		(A733_PWM_CH_BASE + (ch) * A733_PWM_CH_STRIDE)
++#define A733_PWM_PCR_PERIOD_RDY		BIT(11)
++#define A733_PWM_PCR_MODE_PULSE		BIT(9)
++#define A733_PWM_PCR_ACT_STA		BIT(8)
++#define A733_PWM_PCR_PRESCAL_K		GENMASK(7, 0)
++/* The pre-scale divisor is K + 1 with K = PRESCAL_K = 0..255. */
++#define A733_PWM_PRESCAL_MAX		256
++
++/* PPR, per-channel period (UM 18.7.8.26). */
++#define A733_PWM_PPR(ch)		(A733_PWM_PCR(ch) + 0x4)
++#define A733_PWM_PPR_ENTIRE_CYCLE	GENMASK(31, 16)
++#define A733_PWM_PPR_ACT_CYCLE		GENMASK(15, 0)
++/* ENTIRE_CYCLE gives a period of N + 1 cycles; ACT_CYCLE gives N cycles. */
++#define A733_PWM_ENTIRE_MAX		65536
++#define A733_PWM_ACT_MAX		65535
++
++/*
++ * Bounds for the PWM_PERIOD_RDY handshake. The bit clears when the shadowed
++ * period register has been taken over, i.e. at the end of the period that is
++ * currently running, so the wait is bounded by that period and not by a
++ * constant. A stopped channel clears it at once (reset value 0 in the
++ * A733 user manual).
++ */
++#define A733_PWM_RDY_MIN_TIMEOUT_US	1000
++#define A733_PWM_RDY_MAX_TIMEOUT_US	2000000
++
++/* PCCR.CLK_SRC: 00 = SYS_CLK24M, 01 = APB0, "Others: /". */
++enum a733_pwm_clk_src {
++	A733_PWM_SRC_HOSC = 0,
++	A733_PWM_SRC_APB0 = 1,
++	A733_PWM_SRC_NUM
++};
++
++/*
++ * "hosc" is the SYS_CLK24M net -- PLL_REF, fixed at 24 MHz (A733 user manual
++ * V0.92), NOT the 26 MHz DCXO. The driver never assumes either number, it
++ * asks the clock framework; the device tree is where that distinction has to be
++ * got right.
++ */
++static const char *const a733_pwm_clk_names[A733_PWM_SRC_NUM] = {
++	[A733_PWM_SRC_HOSC] = "hosc",
++	[A733_PWM_SRC_APB0] = "apb",
++};
++
++struct a733_pwm {
++	void __iomem *base;
++	struct clk *src[A733_PWM_SRC_NUM];
++};
++
++/* One channel's programming, in hardware units. */
++struct a733_pwm_cfg {
++	unsigned int src;	/* enum a733_pwm_clk_src */
++	unsigned int div_m;	/* PCCR.DIV_M, divider is 1 << div_m */
++	unsigned int prescal;	/* PCR.PRESCAL_K + 1, i.e. 1..256 */
++	unsigned int entire;	/* PPR.ENTIRE_CYCLE + 1, i.e. 1..65536 */
++	unsigned int act;	/* PPR.ACT_CYCLE, i.e. 0..65535 */
++};
++
++static inline struct a733_pwm *to_a733_pwm(struct pwm_chip *chip)
++{
++	return pwmchip_get_drvdata(chip);
++}
++
++static unsigned long a733_pwm_src_rate(struct a733_pwm *pc,
++				       const struct a733_pwm_cfg *cfg)
++{
++	return clk_get_rate(pc->src[cfg->src]);
++}
++
++/* Total division from the source clock to one counter tick. */
++static u64 a733_pwm_cfg_div(const struct a733_pwm_cfg *cfg)
++{
++	return (u64)cfg->prescal << cfg->div_m;
++}
++
++/*
++ * Turn a requested period/duty into register values, rounding DOWN at every
++ * step: the PWM API requires that neither the applied period nor the applied
++ * duty cycle exceeds what the caller asked for.
++ */
++static int a733_pwm_calc(unsigned long rate, u64 period_ns, u64 duty_ns,
++			 struct a733_pwm_cfg *cfg)
++{
++	u64 cycles, div_needed, best_div = 0, act;
++	unsigned int m;
++
++	cycles = mul_u64_u64_div_u64(period_ns, rate, NSEC_PER_SEC);
++	if (!cycles)
++		return -EINVAL;		/* shorter than one source clock tick */
++
++	/* The counter is 16 bit, so anything above 65536 ticks needs dividing. */
++	div_needed = DIV64_U64_ROUND_UP(cycles, A733_PWM_ENTIRE_MAX);
++	if (div_needed > ((u64)A733_PWM_PRESCAL_MAX << A733_PWM_DIV_M_MAX))
++		return -EINVAL;		/* longer than the divider chain reaches */
++
++	/*
++	 * Two dividers in series: PCCR.DIV_M is a power of two up to 256,
++	 * PCR.PRESCAL_K is 1..256 and is the only one of the pair that is per
++	 * channel. Pick the smallest product that still fits the counter,
++	 * because a smaller product means more counter ticks per period and so
++	 * finer duty-cycle resolution.
++	 */
++	for (m = 0; m <= A733_PWM_DIV_M_MAX; m++) {
++		u64 k = DIV64_U64_ROUND_UP(div_needed, 1ULL << m);
++		u64 div;
++
++		if (k > A733_PWM_PRESCAL_MAX)
++			continue;
++
++		div = k << m;
++		if (!best_div || div < best_div) {
++			best_div = div;
++			cfg->div_m = m;
++			cfg->prescal = k;
++		}
++	}
++	if (!best_div)
++		return -EINVAL;
++
++	cycles = div64_u64(cycles, best_div);
++	if (!cycles || cycles > A733_PWM_ENTIRE_MAX)
++		return -EINVAL;
++	cfg->entire = cycles;
++
++	act = div64_u64(mul_u64_u64_div_u64(duty_ns, rate, NSEC_PER_SEC),
++			best_div);
++	act = min_t(u64, act, cfg->entire);
++	/*
++	 * ACT_CYCLE is 16 bit while ENTIRE_CYCLE counts to 65536, so a period
++	 * that uses the very last counter step cannot express 100 %. It gives
++	 * 65535/65536 instead, which is a round-down and therefore allowed.
++	 */
++	cfg->act = min_t(u64, act, A733_PWM_ACT_MAX);
++
++	return 0;
++}
++
++/* Read back what a channel is actually programmed to. */
++static int a733_pwm_read_cfg(struct a733_pwm *pc, unsigned int ch,
++			     struct a733_pwm_cfg *cfg)
++{
++	u32 pccr, pcr, ppr;
++
++	pccr = readl(pc->base + A733_PWM_PCCR(ch / 2));
++	pcr = readl(pc->base + A733_PWM_PCR(ch));
++	ppr = readl(pc->base + A733_PWM_PPR(ch));
++
++	cfg->src = FIELD_GET(A733_PWM_PCCR_CLK_SRC, pccr);
++	if (cfg->src >= A733_PWM_SRC_NUM)
++		return -EINVAL;		/* UM: "Others: /" -- undefined */
++
++	cfg->div_m = FIELD_GET(A733_PWM_PCCR_DIV_M, pccr);
++	if (cfg->div_m > A733_PWM_DIV_M_MAX)
++		return -EINVAL;		/* UM: "others: /" -- undefined */
++
++	cfg->prescal = FIELD_GET(A733_PWM_PCR_PRESCAL_K, pcr) + 1;
++	cfg->entire = FIELD_GET(A733_PWM_PPR_ENTIRE_CYCLE, ppr) + 1;
++	cfg->act = FIELD_GET(A733_PWM_PPR_ACT_CYCLE, ppr);
++
++	return 0;
++}
++
++static u64 a733_pwm_cycles_to_ns(unsigned long rate,
++				 const struct a733_pwm_cfg *cfg,
++				 unsigned int cycles)
++{
++	/*
++	 * Bounded: 65536 counter steps * 65536 division * 1e9 is 4.3e18, which
++	 * still fits an u64.
++	 */
++	return DIV_ROUND_UP_ULL((u64)cycles * a733_pwm_cfg_div(cfg) * NSEC_PER_SEC,
++				rate);
++}
++
++static bool a733_pwm_is_running(struct a733_pwm *pc, unsigned int ch)
++{
++	return (readl(pc->base + A733_PWM_PER) & A733_PWM_PER_EN(ch)) &&
++	       (readl(pc->base + A733_PWM_PCGR) & A733_PWM_PCGR_GATING(ch));
++}
++
++static int a733_pwm_wait_period_ready(struct pwm_chip *chip, unsigned int ch)
++{
++	struct a733_pwm *pc = to_a733_pwm(chip);
++	struct a733_pwm_cfg cur;
++	unsigned long rate;
++	u64 timeout_us = A733_PWM_RDY_MIN_TIMEOUT_US;
++	u32 pcr;
++	int ret;
++
++	if (!a733_pwm_read_cfg(pc, ch, &cur)) {
++		rate = a733_pwm_src_rate(pc, &cur);
++		if (rate) {
++			u64 period = a733_pwm_cycles_to_ns(rate, &cur, cur.entire);
++
++			timeout_us = clamp_t(u64,
++					     DIV_ROUND_UP_ULL(period * 2, NSEC_PER_USEC),
++					     A733_PWM_RDY_MIN_TIMEOUT_US,
++					     A733_PWM_RDY_MAX_TIMEOUT_US);
++		}
++	}
++
++	ret = readl_poll_timeout(pc->base + A733_PWM_PCR(ch), pcr,
++				 !(pcr & A733_PWM_PCR_PERIOD_RDY),
++				 10, timeout_us);
++	if (ret)
++		dev_err(pwmchip_parent(chip),
++			"ch%u: period register stayed busy for %lluus\n",
++			ch, timeout_us);
++
++	return ret;
++}
++
++static void a733_pwm_disable(struct a733_pwm *pc, unsigned int ch)
++{
++	u32 val;
++
++	val = readl(pc->base + A733_PWM_PER);
++	writel(val & ~A733_PWM_PER_EN(ch), pc->base + A733_PWM_PER);
++
++	val = readl(pc->base + A733_PWM_PCGR);
++	writel(val & ~A733_PWM_PCGR_GATING(ch), pc->base + A733_PWM_PCGR);
++}
++
++static int a733_pwm_apply(struct pwm_chip *chip, struct pwm_device *pwm,
++			  const struct pwm_state *state)
++{
++	struct a733_pwm *pc = to_a733_pwm(chip);
++	unsigned int ch = pwm->hwpwm, pair = ch / 2, src;
++	struct a733_pwm_cfg cfg = {}, cand;
++	bool found = false;
++	u32 pccr, val;
++	int ret;
++
++	if (!state->enabled) {
++		a733_pwm_disable(pc, ch);
++		return 0;
++	}
++
++	/*
++	 * Both sources can serve most requests; take whichever leaves the most
++	 * counter steps in the period, since that is the duty-cycle resolution
++	 * the consumer gets.
++	 */
++	for (src = 0; src < A733_PWM_SRC_NUM; src++) {
++		unsigned long rate = clk_get_rate(pc->src[src]);
++
++		if (!rate)
++			continue;
++		if (a733_pwm_calc(rate, state->period, state->duty_cycle, &cand))
++			continue;
++
++		cand.src = src;
++		if (!found || cand.entire > cfg.entire) {
++			cfg = cand;
++			found = true;
++		}
++	}
++	if (!found)
++		return -EINVAL;
++
++	/*
++	 * PCCR is per channel PAIR. Reprogramming it for this channel would
++	 * change the paired channel's clock underneath it, so refuse instead --
++	 * loudly, because "the fan is quiet" is not a diagnosis.
++	 */
++	pccr = FIELD_PREP(A733_PWM_PCCR_CLK_SRC, cfg.src) |
++	       FIELD_PREP(A733_PWM_PCCR_DIV_M, cfg.div_m);
++	val = readl(pc->base + A733_PWM_PCCR(pair));
++	if ((val & (A733_PWM_PCCR_CLK_SRC | A733_PWM_PCCR_DIV_M)) != pccr) {
++		if (readl(pc->base + A733_PWM_PER) & A733_PWM_PER_EN(ch ^ 1)) {
++			dev_err(pwmchip_parent(chip),
++				"ch%u needs PCCR%u%u changed while ch%u is running\n",
++				ch, pair * 2, pair * 2 + 1, ch ^ 1);
++			return -EBUSY;
++		}
++		writel(pccr, pc->base + A733_PWM_PCCR(pair));
++	}
++
++	/*
++	 * The counter needs its clock before the period handshake can complete,
++	 * and bypass (raw clock straight to the pin) is not a mode this driver
++	 * offers, so clear it whatever firmware left behind.
++	 */
++	val = readl(pc->base + A733_PWM_PCGR);
++	val &= ~A733_PWM_PCGR_BYPASS(ch);
++	val |= A733_PWM_PCGR_GATING(ch);
++	writel(val, pc->base + A733_PWM_PCGR);
++
++	/*
++	 * PWM_ACT_STA says which level the active cycles drive: 1 = high, so
++	 * that is PWM_POLARITY_NORMAL. Writing PCR also clears PWM_MODE, which
++	 * is what we want -- cycle mode, not a finite pulse train.
++	 */
++	val = FIELD_PREP(A733_PWM_PCR_PRESCAL_K, cfg.prescal - 1);
++	if (state->polarity == PWM_POLARITY_NORMAL)
++		val |= A733_PWM_PCR_ACT_STA;
++	writel(val, pc->base + A733_PWM_PCR(ch));
++
++	ret = a733_pwm_wait_period_ready(chip, ch);
++	if (ret)
++		return ret;
++
++	writel(FIELD_PREP(A733_PWM_PPR_ENTIRE_CYCLE, cfg.entire - 1) |
++	       FIELD_PREP(A733_PWM_PPR_ACT_CYCLE, cfg.act),
++	       pc->base + A733_PWM_PPR(ch));
++
++	val = readl(pc->base + A733_PWM_PER);
++	writel(val | A733_PWM_PER_EN(ch), pc->base + A733_PWM_PER);
++
++	return 0;
++}
++
++static int a733_pwm_get_state(struct pwm_chip *chip, struct pwm_device *pwm,
++			      struct pwm_state *state)
++{
++	struct a733_pwm *pc = to_a733_pwm(chip);
++	unsigned int ch = pwm->hwpwm;
++	struct a733_pwm_cfg cfg;
++	unsigned long rate;
++	u32 pcr;
++	int ret;
++
++	ret = a733_pwm_read_cfg(pc, ch, &cfg);
++	if (ret)
++		return ret;
++
++	rate = a733_pwm_src_rate(pc, &cfg);
++	if (!rate)
++		return -EINVAL;
++
++	if (readl(pc->base + A733_PWM_PCGR) & A733_PWM_PCGR_BYPASS(ch))
++		dev_warn_once(pwmchip_parent(chip),
++			      "ch%u: clock bypass is set, reported state ignores it\n",
++			      ch);
++
++	pcr = readl(pc->base + A733_PWM_PCR(ch));
++
++	state->period = a733_pwm_cycles_to_ns(rate, &cfg, cfg.entire);
++	state->duty_cycle = a733_pwm_cycles_to_ns(rate, &cfg, cfg.act);
++	state->polarity = (pcr & A733_PWM_PCR_ACT_STA) ? PWM_POLARITY_NORMAL
++						      : PWM_POLARITY_INVERSED;
++	state->enabled = a733_pwm_is_running(pc, ch);
++
++	return 0;
++}
++
++static const struct pwm_ops a733_pwm_ops = {
++	.apply = a733_pwm_apply,
++	.get_state = a733_pwm_get_state,
++};
++
++static int a733_pwm_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct reset_control *rst;
++	struct pwm_chip *chip;
++	struct a733_pwm *pc;
++	struct clk *bus;
++	unsigned int i;
++	int ret;
++
++	chip = devm_pwmchip_alloc(dev, A733_PWM_NPWM, sizeof(*pc));
++	if (IS_ERR(chip))
++		return PTR_ERR(chip);
++	pc = to_a733_pwm(chip);
++
++	pc->base = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(pc->base))
++		return PTR_ERR(pc->base);
++
++	/*
++	 * "bus" is PWMn_BGR bit 0. Its CCU reset default is 0 = masked, so
++	 * without it every register below reads back as nothing at all.
++	 */
++	bus = devm_clk_get_enabled(dev, "bus");
++	if (IS_ERR(bus))
++		return dev_err_probe(dev, PTR_ERR(bus), "no bus clock\n");
++
++	for (i = 0; i < A733_PWM_SRC_NUM; i++) {
++		pc->src[i] = devm_clk_get_enabled(dev, a733_pwm_clk_names[i]);
++		if (IS_ERR(pc->src[i]))
++			return dev_err_probe(dev, PTR_ERR(pc->src[i]),
++					     "no %s clock\n",
++					     a733_pwm_clk_names[i]);
++	}
++
++	/* PWMn_BGR bit 16, reset default 0 = asserted. */
++	rst = devm_reset_control_get_exclusive_deasserted(dev, NULL);
++	if (IS_ERR(rst))
++		return dev_err_probe(dev, PTR_ERR(rst), "cannot deassert reset\n");
++
++	chip->ops = &a733_pwm_ops;
++
++	/*
++	 * Nothing is enabled, gated on or written here on purpose. PER, PCGR
++	 * and every PCR come out of reset as 0 (UM 18.7.8), so a controller
++	 * that nobody has requested a channel from leaves its pins alone -- and
++	 * a board that muxes a PWM pin to something else is not disturbed by
++	 * this driver having probed.
++	 */
++	ret = devm_pwmchip_add(dev, chip);
++	if (ret)
++		return dev_err_probe(dev, ret, "cannot register PWM chip\n");
++
++	return 0;
++}
++
++static const struct of_device_id a733_pwm_dt_ids[] = {
++	{ .compatible = "allwinner,sun60i-a733-pwm" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, a733_pwm_dt_ids);
++
++static struct platform_driver a733_pwm_driver = {
++	.driver = {
++		.name = "sun60i-a733-pwm",
++		.of_match_table = a733_pwm_dt_ids,
++	},
++	.probe = a733_pwm_probe,
++};
++module_platform_driver(a733_pwm_driver);
++
++MODULE_DESCRIPTION("Allwinner A733 (sun60iw2) PWM driver");
++MODULE_LICENSE("GPL");
+--- a/drivers/pwm/Kconfig
++++ b/drivers/pwm/Kconfig
+@@ -726,6 +726,18 @@
+ 	  To compile this driver as a module, choose M here: the module
+ 	  will be called pwm-sun4i.
+ 
++config PWM_SUN60I_A733
++	tristate "Allwinner A733 PWM support"
++	depends on ARCH_SUNXI || COMPILE_TEST
++	depends on HAS_IOMEM && COMMON_CLK
++	help
++	  PWM framework driver for the ten-channel PWM controllers on the
++	  Allwinner A733 (sun60iw2). This is a different register file from the
++	  one PWM_SUN4I drives and the two are not interchangeable.
++
++	  To compile this driver as a module, choose M here: the module
++	  will be called pwm-sun60i-a733.
++
+ config PWM_SUNPLUS
+ 	tristate "Sunplus PWM support"
+ 	depends on ARCH_SUNPLUS || COMPILE_TEST
+--- a/drivers/pwm/Makefile
++++ b/drivers/pwm/Makefile
+@@ -66,6 +66,7 @@
+ obj-$(CONFIG_PWM_STM32_LP)	+= pwm-stm32-lp.o
+ obj-$(CONFIG_PWM_STMPE)		+= pwm-stmpe.o
+ obj-$(CONFIG_PWM_SUN4I)		+= pwm-sun4i.o
++obj-$(CONFIG_PWM_SUN60I_A733)	+= pwm-sun60i-a733.o
+ obj-$(CONFIG_PWM_SUNPLUS)	+= pwm-sunplus.o
+ obj-$(CONFIG_PWM_TEGRA)		+= pwm-tegra.o
+ obj-$(CONFIG_PWM_TIECAP)	+= pwm-tiecap.o

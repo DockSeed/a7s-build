@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Mon, 14 Sep 2026 13:30:00 +0200
+Subject: [PATCH] arm64: dts: a733: cubie-a7s: reserve a ramoops window
+
+A board that the watchdog resets, or that panics and reboots after 10 s,
+comes back with no trace of why: the kernel log was in RAM, and nobody
+was at the serial console. pstore keeps the panic, the oops and the
+console of the previous boot in a reserved DRAM window that survives the
+warm reset; the kernel side is PSTORE, PSTORE_CONSOLE and PSTORE_RAM in
+the kernel config (kernel/6.18/config). This patch gives ramoops its window.
+
+WHERE EACH VALUE COMES FROM
+
+  * The binding: Documentation/devicetree/bindings/reserved-memory/ramoops.yaml:
+    a reserved-memory child with compatible "ramoops".
+  * 0x60000000: inside the first GiB of DRAM (memory starts at
+    0x40000000), so it exists on every memory population; above U-Boot's
+    bootm_size window (SDRAM 0x40000000 + BOOTM_SIZE 0xa000000,
+    include/configs/sunxi-common.h in the boot chain), so booti does not
+    place the kernel, fdt or initrd there; and on the 8 GiB board on 2026-09-14 a
+    1 MiB pattern there was kept whole across a U-Boot `reset` (a WDT0
+    reset) and a WDT0 timeout, while 0x80000000 and 0x180000000 changed in
+    part.
+  * console-size 0x40000 and ecc-size 16: the most frequent values among
+    the ramoops nodes in arch/arm64/boot/dts (console-size 0x40000 in 19
+    nodes, ecc-size 16 in 18). ECC because other DRAM regions were
+    rewritten in part across a reset.
+  * record-size 0x20000 (10 upstream nodes; 0x1000 is more frequent, 13):
+    with PSTORE_COMPRESS, pstore_dump() fills a part with up to 100/60 of
+    the record's data area (bufsize: the record minus its header and ECC,
+    fs/pstore/platform.c and ram.c) of log before compressing, so a 128 KiB
+    record keeps a whole panic in one part.
+
+No A523 value: no sun55i DT carries a ramoops node. Not taken from the
+vendor BSP.
+
+WHAT THIS DOES NOT COVER
+
+  * A power cycle loses the window.
+  * A hang that stops the console before WDT0 fires leaves the console
+    record where the log stopped.
+
+VERIFIED HERE: applies with fuzz 0 on top of the full series; the board
+dts, preprocessed with cpp and built with dtc, reads back
+/reserved-memory/ramoops@60000000 with reg <0 0x60000000 0 0x100000> and
+compatible "ramoops".
+
+VERIFIED ON HARDWARE (2026-09-14, the 8 GiB board, test build of this series): after
+`systemctl reboot` -- by the source (TF-A plat/allwinner/common/
+sunxi_native_pm.c) BL31's PSCI SYSTEM_RESET, not the
+WDT0 resets the window was first measured across -- console-ramoops held the
+boot's last lines; after a sysrq panic dmesg-ramoops held Panic#1 with the
+panic line, in one part; after PID 1 froze and WDT0 reset the board,
+console-ramoops ended with `watchdog did not stop!`.
+
+Assisted-by: Claude
+---
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -625,6 +625,25 @@
+ 		scp@48100000 {
+ 			reg = <0x0 0x48100000 0x0 0x00100000>;
+ 		};
++
++		/*
++		 * pstore: the panic, oops and console log of the previous boot.
++		 * 0x60000000 is inside the first GiB, so every memory population
++		 * has it; above U-Boot's bootm_size window (0x40000000 + 0xa000000,
++		 * include/configs/sunxi-common.h), so booti does not load there; and
++		 * it was kept whole across a WDT0 reset and a WDT0 timeout on the
++		 * 8 GiB board, where
++		 * other DRAM regions changed in part. console-size and ecc-size are
++		 * the values most upstream arm64 ramoops nodes use; a 128 KiB record
++		 * holds a whole panic dump in one compressed part (fs/pstore/platform.c).
++		 */
++		ramoops@60000000 {
++			compatible = "ramoops";
++			reg = <0x0 0x60000000 0x0 0x00100000>;
++			record-size = <0x20000>;
++			console-size = <0x40000>;
++			ecc-size = <16>;
++		};
+ 	};
+ 
+ 	/*

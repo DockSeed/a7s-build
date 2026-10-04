@@ -1,0 +1,112 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Sat, 3 Oct 2026 17:08:44 +0200
+Subject: [PATCH] fix(allwinner): A733: security setup
+
+sunxi_security_setup() is common code. For the A733 it does three
+things differently, each as a platform setting so that every other SoC
+does what it did before:
+
+- PRCM_SEC_SWITCH_REG |= 0x7 (S_PRCM + 0x290, A733 UM V1.00 4.2.5.26,
+  reset 0): bit 0 CPUS bus clock registers, bit 1 PLL control registers
+  0/1, bit 2 power (VDD_SYS power domain reset, system domain power
+  control); 0 = secure, 1 = non-secure. Read-modify-write, so the
+  register's other bits stay as found. Mainline writes 0x1. The bits are
+  SUNXI_R_PRCM_SEC_SWITCH_NS; a platform that does not set it keeps the
+  plain write of 0x1.
+- S_TZMA + 0x0/0x4/0x8 = 0 and S_SPC + 0x04/0x14/0x24 = 0xffffffff, built
+  where the platform's map defines SUNXI_R_TZMA_BASE / SUNXI_R_SPC_BASE
+  (only the A733), as the dlan17 TF-A fork's A523 support writes them
+  (public, fork commit 87ecf4ef5).
+- Nothing is written to S_PRCM + 0x8, which is no register (UM 4.2.4: the
+  list goes 0x0000 AHBS_CLK_REG, 0x000C APBS0_CLK_REG). The A523 code
+  this is derived from wrote 7 there through a "DSP PRCM" base the A733
+  does not have.
+
+Effect: SID + 0xA0 reads 0 on the dies we have, so the Secure Enable
+Bit is not set and the security switch has no effect on them (note
+under UM 4.2.5.26). Measured on the
+8 GiB board (2026-09-26): S_PRCM + 0x290 reads 0x1 without this and
+0x7 with it.
+
+Co-developed-by: Jernej Skrabec <jernej.skrabec@gmail.com>
+Signed-off-by: Jernej Skrabec <jernej.skrabec@gmail.com>
+Link: https://github.com/dlan17/trusted-firmware-a/commit/87ecf4ef54db52ff4925baf3acfced569b8653f9
+Assisted-by: Claude
+---
+ plat/allwinner/common/allwinner-common.mk | 10 ++++++++++
+ plat/allwinner/common/sunxi_security.c    | 19 +++++++++++++++++++
+ plat/allwinner/sun60i_a733/platform.mk    |  6 ++++++
+ 3 files changed, 35 insertions(+)
+
+diff --git a/plat/allwinner/common/allwinner-common.mk b/plat/allwinner/common/allwinner-common.mk
+index 885fe245d..1ca26b6aa 100644
+--- a/plat/allwinner/common/allwinner-common.mk
++++ b/plat/allwinner/common/allwinner-common.mk
+@@ -92,6 +92,16 @@ BL31_SOURCES		+=	common/fdt_fixup.c			\
+ 				${AW_PLAT}/common/sunxi_prepare_dtb.c
+ endif
+ 
++# R_PRCM security switch (SUNXI_R_PRCM_SEC_SWITCH_REG). Unset, as for every
++# SoC before this was settable, sunxi_security_setup() writes 0x1 (the CPUS
++# bus clock registers non-secure, everything else secure). A platform that
++# sets it -- BEFORE including this file -- names the bits to make
++# non-secure, and they are set without touching the rest of the register.
++SUNXI_R_PRCM_SEC_SWITCH_NS	?=
++ifneq (${SUNXI_R_PRCM_SEC_SWITCH_NS},)
++$(eval $(call add_define,SUNXI_R_PRCM_SEC_SWITCH_NS))
++endif
++
+ # The bootloader is guaranteed to only run on CPU 0 by the boot ROM.
+ COLD_BOOT_SINGLE_CPU		:=	1
+ 
+diff --git a/plat/allwinner/common/sunxi_security.c b/plat/allwinner/common/sunxi_security.c
+index 98b91c39f..849620183 100644
+--- a/plat/allwinner/common/sunxi_security.c
++++ b/plat/allwinner/common/sunxi_security.c
+@@ -32,9 +32,28 @@ void sunxi_security_setup(void)
+ 	/* set MBUS clocks, bus clocks (AXI/AHB/APB) and PLLs to non-secure */
+ 	mmio_write_32(SUNXI_CCU_SEC_SWITCH_REG, 0x7);
+ 
++#ifdef SUNXI_R_PRCM_SEC_SWITCH_NS
++	/* Set the R_PRCM register groups the platform names to non-secure */
++	mmio_setbits_32(SUNXI_R_PRCM_SEC_SWITCH_REG, SUNXI_R_PRCM_SEC_SWITCH_NS);
++#else
+ 	/* Set R_PRCM bus clocks to non-secure */
+ 	mmio_write_32(SUNXI_R_PRCM_SEC_SWITCH_REG, 0x1);
++#endif
+ 
+ 	/* Set all DMA channels (16 max.) to non-secure */
+ 	mmio_write_32(SUNXI_DMA_BASE + DMA_SEC_REG, 0xffff);
++
++#ifdef SUNXI_R_TZMA_BASE
++	/* R_TZMA: no secure region in SRAM */
++	mmio_write_32(SUNXI_R_TZMA_BASE + 0x0, 0);
++	mmio_write_32(SUNXI_R_TZMA_BASE + 0x4, 0);
++	mmio_write_32(SUNXI_R_TZMA_BASE + 0x8, 0);
++#endif
++
++#ifdef SUNXI_R_SPC_BASE
++	/* R_SPC: the peripherals behind it to non-secure */
++	mmio_write_32(SUNXI_R_SPC_BASE + 0x04, 0xffffffff);
++	mmio_write_32(SUNXI_R_SPC_BASE + 0x14, 0xffffffff);
++	mmio_write_32(SUNXI_R_SPC_BASE + 0x24, 0xffffffff);
++#endif
+ }
+diff --git a/plat/allwinner/sun60i_a733/platform.mk b/plat/allwinner/sun60i_a733/platform.mk
+index dc0b2097d..277832e0f 100644
+--- a/plat/allwinner/sun60i_a733/platform.mk
++++ b/plat/allwinner/sun60i_a733/platform.mk
+@@ -10,6 +10,12 @@ ARM_ARCH_MINOR := 2
+ # There are 8 cores in 1 cluster
+ PLATFORM_MAX_CPUS_PER_CLUSTER := 8
+ 
++# PRCM_SEC_SWITCH_REG (S_PRCM + 0x290, UM V1.00 4.2.5.26): bit 0 CPUS bus
++# clock registers, bit 1 PLL control registers 0/1, bit 2 power (VDD_SYS
++# power domain reset, system domain power control); 1 = non-secure. All
++# three, set read-modify-write so the other bits stay as found (`|= 7`).
++SUNXI_R_PRCM_SEC_SWITCH_NS := 0x7
++
+ # DynamIQ MPIDR layout; the cores are powered through Arm PPUs
+ # (sunxi_cpu_new_ops.c).
+ SUNXI_NEW_MPIDR_FMT := 1

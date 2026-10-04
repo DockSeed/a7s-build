@@ -1,0 +1,229 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] usb: dwc3: program LCSR_TX_DEEMPH on the A733, or Gen2 writes fail
+
+With `usb-dwc3-a733-set-lluctl-bit30-for-gen2` an RTL9210 NVMe bridge links at Gen2. At that rate every write
+fails on this board. The kernel logs USB Transaction Error events on the
+bulk OUT endpoint from the first MiB on, and after 40-837 MiB one transfer
+fails for good, uas error handling runs, and the device goes offline.
+Measured on the 8 GiB board, 2026-09-17:
+
+  - The vendor 6.6 stack fails the same way.
+  - usb-storage (BOT) instead of uas: 1854 errors in 35 s, and a device
+    reset about every second.
+  - 8 MiB chunks with pauses: 7-22 errors per chunk from the first one,
+    flat over time.
+  - Gen2 reads and Gen1 writes: zero (one run each).
+
+The fault is therefore in the host-to-device direction at 10 Gbit/s, not
+in uas, not heat. The same enclosure wrote 32 GiB cleanly on an x86 host
+(2026-09-16).
+
+Where the value comes from
+--------------------------
+
+The register is not in the A733 user manual (UM 18.4.4.2 defers the dwc3
+registers to the Synopsys guide), so the evidence is silicon.
+
+In the capture on both stacks, the dwc3 link-layer word 0x06A0D060 reads
+0x34c2. A script sweeps it with the controller
+retrained after each write: xHCI unbind/bind, which leaves the dwc3 core
+alone. The metric is the number of trace-counted USB Transaction Error
+events during a 32 MiB write:
+
+  bits [1:0]  values tried                              errors / 32 MiB
+  10          0x34c2 (3x), 0x34c6, 0x34ca, 0x0582,       50-66 (*)
+              0x3502, 0x3482, 0x24c2, 0x44c2
+  00          0x34c0 (2x), 0x34c4 (2x), 0x34c8,          2-7
+              0x3540, 0x0600
+  01          0x34c1 (5x), 0x34c5, 0x34c9, 0x34cd,       0
+              0x0001
+  11          0x34c3 (2x), 0x34c7                        link up, device
+                                                          fails on the
+                                                          first write
+
+  (*) two of the three 0x34c2 runs (50, 66) were printed but not saved
+      raw; the logged range of this group is 52-59.
+
+Among the bits varied, only [1:0] had a measurable effect. Bits 2-3, 6-8
+and 12-14 were varied singly, bits 4-5, 9-11 and 15 only together, and
+bits 16-17 not at all. With 0x34c1 set by hand, 3x 2 GiB O_DIRECT writes
+(414-418 MB/s) and a 4 GiB read (646 MB/s) gave zero transaction errors in
+the trace; the journal count of uas/scsi error handling was 0.
+
+What the register is
+--------------------
+
+Two upstream submissions define DWC3_LCSR_TX_DEEMPH(n) = 0xd060 + n * 0x80
+as the 18-bit TxDeemph that the controller drives on the PIPE4 interface
+for Gen2:
+
+  - Joy Chakraborty <joychakr@google.com>, "usb: dwc3: Program USB Gen2
+    de-emphasis defined in PIPE4 spec" (2024-10-07, series in the first
+    Link: below).
+    Properties snps,tx_gen2_de_emphasis_quirk and
+    snps,tx_gen2_de_emphasis, written in dwc3_ss_phy_setup(). It documents
+    the split [5:0] C-1, [11:6] C0, [17:12] C+1. By that split 0x34c2 is
+    C-1 2, C0 19, C+1 3.
+  - Radhey Shyam Pandey <radhey.shyam.pandey@amd.com>, "usb: dwc3: xilinx:
+    Add support to program MMI USB TX deemphasis", v1 2025-11, v2 2026-03,
+    v3 2026-04 (the other Link: lines). v3 reads snps,lcsr-tx-deemph in
+    dwc3_get_software_properties(), supplied by its glue as a software-node
+    property with no DT binding. It writes the register in
+    dwc3_config_soc_bus() for every num_usb3_ports. Its Versal2 value
+    0x8c45 has bits [1:0] = 01 as well.
+
+Neither is merged. This patch follows Xilinx v3 in register name, mask,
+UNSPECIFIED default, write site and port loop: the three register
+definitions and the read-modify-write loop over the ports are taken from
+Radhey Shyam Pandey's v3 patch. It differs in two ways:
+
+  - It makes the value a DT property with a schema entry, read in
+    dwc3_get_properties(). A raw register value in DT is something DT
+    maintainers may question. It is done this way because the A733 is
+    described through the generic flat glue, which has no match data to
+    carry it.
+  - It gates the write to DWC_usb31, the only core measured.
+
+The upper 16 bits keep the reset value. The sweep does not fit the PIPE4
+meaning of [5:0] on this PHY: a C-1 of 1, 5, 9 or 13 is clean, while 2, 6
+or 10 fails and 3 or 7 loses the device. That is periodic in 4, not
+monotonic, so which bits the PHY actually uses is not known beyond [1:0].
+
+The vendor BSP never writes the register (in Alex Cao's 6.18 port of it,
+alexcaoys/allwinner-bsp branch linux-6.18.y at 656a550c8267,
+dwc3-sunxi-plat.c writes only LLUCTL(0)) and leaves the reset value that
+fails. That is why its stack fails too. This patch is
+where we go beyond it.
+
+dwc3_config_soc_bus() runs inside dwc3_core_init(), which covers probe, a
+dwc3 rebind and a host's system resume. Core soft resets outside it are not
+covered (DRD role switch, gadget soft connect), same as for `usb-dwc3-a733-set-lluctl-bit30-for-gen2`; this node
+is dr_mode = "host".
+
+Verified: the value's effect, on silicon (the 8 GiB board, 2026-09-17, set by hand).
+This patch: applies with --fuzz=0 on a fresh 6.18.36 tree carrying the
+whole series. Not built, not run.
+
+Pending on hardware, with a kernel carrying this patch and no register
+written by hand:
+  - LCSR_TX_DEEMPH(0) reads 0x34c1 after a cold boot and after a dwc3
+    unbind/bind.
+  - Gen2 writes and reads of several GiB complete with zero transaction
+    errors.
+  - Gen1 writes stay clean (bit30 cleared, retrained).
+
+Link: https://lore.kernel.org/r/20241007135508.3143756-1-joychakr@google.com
+Link: https://lore.kernel.org/r/20251119193036.2666877-4-radhey.shyam.pandey@amd.com
+Link: https://lore.kernel.org/r/20260330190304.1841593-5-radhey.shyam.pandey@amd.com
+Link: https://lore.kernel.org/r/20260429173050.1772377-5-radhey.shyam.pandey@amd.com
+Assisted-by: Claude
+
+--- a/drivers/usb/dwc3/core.h
++++ b/drivers/usb/dwc3/core.h
+@@ -180,6 +180,7 @@
+ #define DWC3_OSTS		0xcc10
+ 
+ #define DWC3_LLUCTL(n)		(0xd024 + ((n) * 0x80))
++#define DWC3_LCSR_TX_DEEMPH(n)	(0xd060 + ((n) * 0x80))
+ 
+ /* Bit fields */
+ 
+@@ -198,6 +199,10 @@
+ #define DWC3_GSBUSCFG0_REQINFO(n)	(((n) & 0xffff) << 16)
+ #define DWC3_GSBUSCFG0_REQINFO_UNSPECIFIED	0xffffffff
+ 
++/* LCSR_TX_DEEMPH: 18-bit TxDeemph driven on the PIPE for Gen2 */
++#define DWC3_LCSR_TX_DEEMPH_MASK(n)		((n) & 0x3ffff)
++#define DWC3_LCSR_TX_DEEMPH_UNSPECIFIED		0xffffffff
++
+ /* Global Debug LSP MUX Select */
+ #define DWC3_GDBGLSPMUX_ENDBC		BIT(15)	/* Host only */
+ #define DWC3_GDBGLSPMUX_HOSTSELECT(n)	((n) & 0x3fff)
+@@ -1184,6 +1189,8 @@
+  * @num_ep_resized: carries the current number endpoints which have had its tx
+  *		    fifo resized.
+  * @debug_root: root debugfs directory for this device to put its files in.
++ * @lcsr_tx_deemph: TxDeemph for Gen2 operation, written to LCSR_TX_DEEMPH(n)
++ *	of every SuperSpeed port, or DWC3_LCSR_TX_DEEMPH_UNSPECIFIED
+  * @gsbuscfg0_reqinfo: store GSBUSCFG0.DATRDREQINFO, DESRDREQINFO,
+  *		       DATWRREQINFO, and DESWRREQINFO value passed from
+  *		       glue driver.
+@@ -1428,6 +1435,7 @@
+ 	int			num_ep_resized;
+ 	struct dentry		*debug_root;
+ 	u32			gsbuscfg0_reqinfo;
++	u32			lcsr_tx_deemph;
+ 	u32			wakeup_pending_funcs;
+ };
+ 
+--- a/drivers/usb/dwc3/core.c
++++ b/drivers/usb/dwc3/core.c
+@@ -645,6 +645,20 @@
+ 		reg |= DWC3_GSBUSCFG0_REQINFO(dwc->gsbuscfg0_reqinfo);
+ 		dwc3_writel(dwc, DWC3_GSBUSCFG0, reg);
+ 	}
++
++	/* dwc3_core_init() calls this on probe and on resume */
++	if (dwc->lcsr_tx_deemph != DWC3_LCSR_TX_DEEMPH_UNSPECIFIED &&
++	    DWC3_IP_IS(DWC31)) {
++		u32 reg;
++		int i;
++
++		for (i = 0; i < dwc->num_usb3_ports; i++) {
++			reg = dwc3_readl(dwc, DWC3_LCSR_TX_DEEMPH(i));
++			reg &= ~DWC3_LCSR_TX_DEEMPH_MASK(~0);
++			reg |= DWC3_LCSR_TX_DEEMPH_MASK(dwc->lcsr_tx_deemph);
++			dwc3_writel(dwc, DWC3_LCSR_TX_DEEMPH(i), reg);
++		}
++	}
+ }
+ 
+ static int dwc3_core_ulpi_init(struct dwc3 *dwc)
+@@ -1887,6 +1901,10 @@
+ 	dwc->inv_sync_hdr_quirk = device_property_read_bool(dev,
+ 				"snps,inv-sync-hdr-quirk");
+ 
++	dwc->lcsr_tx_deemph = DWC3_LCSR_TX_DEEMPH_UNSPECIFIED;
++	device_property_read_u32(dev, "snps,lcsr-tx-deemph",
++				 &dwc->lcsr_tx_deemph);
++
+ 	dwc->lpm_nyet_threshold = lpm_nyet_threshold;
+ 	dwc->tx_de_emphasis = tx_de_emphasis;
+ 
+--- a/Documentation/devicetree/bindings/usb/snps,dwc3-common.yaml
++++ b/Documentation/devicetree/bindings/usb/snps,dwc3-common.yaml
+@@ -214,6 +214,14 @@
+       devices link at Gen1 on Allwinner A733.
+     type: boolean
+ 
++  snps,lcsr-tx-deemph:
++    description:
++      18-bit TxDeemph value the controller drives on the PIPE interface for
++      USB 3.2 Gen2 operation (LCSR_TX_DEEMPH). When absent, the register keeps
++      its reset value.
++    $ref: /schemas/types.yaml#/definitions/uint32
++    maximum: 0x3ffff
++
+   snps,gfladj-refclk-lpm-sel-quirk:
+     description:
+       When set, run the SOF/ITP counter based on ref_clk.
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -1222,6 +1222,17 @@
+ 			 * stack, which sets it (0x06A0D024 = 0x408b8080).
+ 			 */
+ 			snps,inv-sync-hdr-quirk;
++			/*
++			 * LCSR_TX_DEEMPH(0). The reset value 0x34c2, which the
++			 * vendor stack leaves in place too, gives USB transaction
++			 * errors on every Gen2 write to an RTL9210 bridge (50-66
++			 * per 32 MiB) and drops the device within a GiB. Only
++			 * bits [1:0] moved the error count on the 8 GiB board, 2026-09-17:
++			 * 10 -> 50-66, 00 -> 2-7, 01 -> 0, 11 -> the device
++			 * fails on the first write. 0x34c1
++			 * changes nothing but those two bits.
++			 */
++			snps,lcsr-tx-deemph = <0x34c1>;
+ 
+ 			/* Target for the connector's mandatory port@0 (HS). Inert:
+ 			 * dwc3 only builds a role switch when usb-role-switch is

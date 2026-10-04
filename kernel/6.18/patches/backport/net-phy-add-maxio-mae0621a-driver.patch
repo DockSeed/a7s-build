@@ -1,0 +1,317 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] net: phy: add a driver for the Maxio MAE0621A PHY
+
+The Radxa Cubie A7S (Allwinner A733) has a Maxio MAE0621A Gigabit PHY on
+its GMAC. Mainline has no Maxio PHY driver; with "Generic PHY" EEE stays
+enabled and the link flaps (Link is Down/Up every few minutes).
+
+Based on the patch Armbian carries for the Radxa Cubie A5E (sun55i-a527,
+same PHY): build commit 485a6d62cc3b by Juan Esf91, file
+patch/kernel/archive/sunxi-dev-6.14/1137-net-phy-add-Maxio-MAE0621A-phy-driver.patch.
+That patch file has a placeholder author ("John Doe"); the driver's file
+header names zhao yang <yang_zhao@maxio-tech.com> as its author, and that
+header and the Maxio copyright line are kept.
+
+Changes against that patch for Linux 6.18:
+- EEE: struct phy_device no longer has the u32 eee_broken_modes member,
+  so config_init calls phy_disable_eee() instead of the eee_broken_modes
+  memcpy (same intent; as in dp83867). The maxio_read_mmd() and
+  maxio_write_mmd() helpers that only served that path and the debug
+  printk() calls are dropped.
+- an exact phy_id entry for 0x7b744412, the MAE0621A-03C revision read
+  from the silicon (the existing entry targets ...4411).
+- config_init sets LED1 to show link at 1000/100/10 Mbit/s and activity;
+  the power-on default lights it only on a 100 Mbit/s link.
+- SPDX line added, maxio_mae0621a_suspend() made static, Kconfig and
+  Makefile lines indented with tabs.
+- left out: the phy_device.c PHY ID read quirk (meant for several PHYs
+  on one MDIO bus, compiled only with CONFIG_MAXIO_PHY=y) and the
+  stmmac_main.c resume hook (its 6.14 hunk does not apply to 6.18).
+
+Built as a module (CONFIG_MAXIO_PHY=m); if it does not bind, the PHY
+falls back to Generic PHY.
+
+Link: https://github.com/armbian/build/commit/485a6d62cc3b44a754ede5ad7c562dfdfe0c95a2
+Assisted-by: Claude
+---
+diff --git a/drivers/net/phy/Kconfig b/drivers/net/phy/Kconfig
+index 98700d0..ff13a8c 100644
+--- a/drivers/net/phy/Kconfig
++++ b/drivers/net/phy/Kconfig
+@@ -394,6 +394,11 @@ config ROCKCHIP_PHY
+ 	help
+ 	  Currently supports the integrated Ethernet PHY.
+ 
++config MAXIO_PHY
++	tristate "Maxio PHYs"
++	help
++	  Supports the Maxio MAExxxx PHY.
++
+ config SMSC_PHY
+ 	tristate "SMSC PHYs"
+ 	select CRC16
+diff --git a/drivers/net/phy/Makefile b/drivers/net/phy/Makefile
+index 76e0db4..1a08842 100644
+--- a/drivers/net/phy/Makefile
++++ b/drivers/net/phy/Makefile
+@@ -91,6 +91,7 @@ obj-$(CONFIG_NXP_TJA11XX_PHY)	+= nxp-tja11xx.o
+ obj-y				+= qcom/
+ obj-$(CONFIG_QSEMI_PHY)		+= qsemi.o
+ obj-$(CONFIG_REALTEK_PHY)	+= realtek/
++obj-$(CONFIG_MAXIO_PHY)		+= maxio.o
+ obj-$(CONFIG_RENESAS_PHY)	+= uPD60620.o
+ obj-$(CONFIG_ROCKCHIP_PHY)	+= rockchip.o
+ obj-$(CONFIG_SMSC_PHY)		+= smsc.o
+diff --git a/drivers/net/phy/maxio.c b/drivers/net/phy/maxio.c
+new file mode 100644
+index 0000000..129aef8
+--- /dev/null
++++ b/drivers/net/phy/maxio.c
+@@ -0,0 +1,247 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * drivers/net/phy/maxio.c
++ *
++ * Driver for maxio PHYs
++ *
++ * Author: zhao yang <yang_zhao@maxio-tech.com>
++ *
++ * Copyright (c) 2004 maxio technology, Inc.
++ */
++#include <linux/bitops.h>
++#include <linux/phy.h>
++#include <linux/module.h>
++#include <linux/delay.h>
++#include <linux/device.h>
++#include <linux/timer.h>
++#include <linux/netdevice.h>
++
++#define MAXIO_PAGE_SELECT			    0x1f
++#define MAXIO_MAE0621A_INER				0x12
++#define MAXIO_MAE0621A_INER_LINK_STATUS	BIT(4)
++#define MAXIO_MAE0621A_INSR				0x1d
++#define MAXIO_MAE0621A_TX_DELAY			(BIT(6)|BIT(7))
++#define MAXIO_MAE0621A_RX_DELAY			(BIT(4)|BIT(5))
++#define MAXIO_MAE0621A_LCR_PAGE			0xd04
++#define MAXIO_MAE0621A_LCR			0x10
++#define MAXIO_MAE0621A_LED1_LINK_1000		BIT(8)
++#define MAXIO_MAE0621A_LED1_LINK_10		BIT(5)
++#define MAXIO_MAE0621A_CLK_MODE_REG      0x02
++#define MAXIO_MAE0621A_WORK_STATUS_REG   0x1d
++
++
++static int maxio_read_paged(struct phy_device *phydev, int page, u32 regnum)
++{
++	int ret = 0, oldpage;
++
++	oldpage = phy_read(phydev, MAXIO_PAGE_SELECT);
++	if (oldpage >= 0) {
++		phy_write(phydev, MAXIO_PAGE_SELECT, page);
++		ret = phy_read(phydev, regnum);
++    }
++	phy_write(phydev, MAXIO_PAGE_SELECT, oldpage);
++
++	return ret;
++}
++
++static int maxio_write_paged(struct phy_device *phydev, int page, u32 regnum, u16 val)
++{
++	int ret = 0, oldpage;
++
++	oldpage = phy_read(phydev, MAXIO_PAGE_SELECT);
++	if (oldpage >= 0) {
++		phy_write(phydev, MAXIO_PAGE_SELECT, page);
++		ret = phy_write(phydev, regnum, val);
++	}
++	phy_write(phydev, MAXIO_PAGE_SELECT, oldpage);
++
++	return ret;
++}
++
++static int maxio_mae0621a_clk_init(struct phy_device *phydev)
++{
++	u32 workmode,clkmode,oldpage;
++
++	oldpage = phy_read(phydev, MAXIO_PAGE_SELECT);
++	if (oldpage == 0xFFFF)	{
++		oldpage = phy_read(phydev, MAXIO_PAGE_SELECT);
++	}
++
++	//soft reset
++	phy_write(phydev, MAXIO_PAGE_SELECT, 0x0);
++	phy_write(phydev, MII_BMCR, BMCR_RESET | phy_read(phydev, MII_BMCR));
++
++	//get workmode
++	phy_write(phydev, MAXIO_PAGE_SELECT, 0xa43);
++	workmode = phy_read(phydev, MAXIO_MAE0621A_WORK_STATUS_REG);
++
++	//get clkmode
++	phy_write( phydev,  MAXIO_PAGE_SELECT, 0xd92 );
++	clkmode = phy_read( phydev, MAXIO_MAE0621A_CLK_MODE_REG );
++
++	//abnormal
++	if (0 == (workmode&BIT(5))) {
++		if (0 == (clkmode&BIT(8))) {
++			//oscillator
++			phy_write(phydev, 0x02, clkmode | BIT(8));
++		} else {
++			//crystal
++			phy_write(phydev, 0x02, clkmode &(~ BIT(8)));
++		}
++	}
++	phy_write(phydev, MAXIO_PAGE_SELECT, 0x0);
++
++	phy_write(phydev, MAXIO_PAGE_SELECT, oldpage);
++
++	return 0;
++}
++
++static int maxio_mae0621a_config_aneg(struct phy_device *phydev)
++{
++	return genphy_config_aneg(phydev);
++}
++
++
++static int maxio_mae0621a_config_init(struct phy_device *phydev)
++{
++	struct device *dev = &phydev->mdio.dev;
++	u16 val;
++	int ret;
++
++	maxio_mae0621a_clk_init(phydev);
++
++	/* disable EEE: default-on EEE-LPI negotiation causes periodic link flaps on this PHY.
++	 * 6.18 API: struct phy_device dropped the u32 eee_broken_modes member
++	 * (replaced by the linkmode eee_disabled_modes bitmap). Use the phylib
++	 * helper phy_disable_eee() to disable EEE entirely -- same intent as the
++	 * upstream-6.14 eee_broken_modes memcpy, idiomatic for 6.18 (cf. dp83867).
++	 */
++	phy_disable_eee(phydev);
++
++	//enable auto_speed_down
++	ret = maxio_write_paged(phydev, 0xd8f, 0x0, 0x300 );
++ 
++	//adjust TX/RX delay
++	switch (phydev->interface) {
++	case PHY_INTERFACE_MODE_RGMII:
++		val = 0x0;
++		break;
++	case PHY_INTERFACE_MODE_RGMII_ID:
++		val = MAXIO_MAE0621A_TX_DELAY | MAXIO_MAE0621A_RX_DELAY;
++		break;
++	case PHY_INTERFACE_MODE_RGMII_RXID:
++		val = MAXIO_MAE0621A_RX_DELAY;
++		break;
++	case PHY_INTERFACE_MODE_RGMII_TXID:
++		val = MAXIO_MAE0621A_TX_DELAY;
++		break;
++	default: /* the rest of the modes imply leaving delays as is. */
++		goto delay_skip;
++	}
++
++	ret = maxio_read_paged(phydev, 0xd96, 0x0);
++	if (ret < 0) {
++		dev_err(dev, "Failed to update the TX delay register\n");
++		return ret;
++	}
++
++	ret =maxio_write_paged(phydev, 0xd96, 0x0, val|ret );
++	if (ret < 0) {
++		dev_err(dev, "Failed to update the TX delay register\n");
++		return ret;
++	} else if (ret == 0) {
++		dev_dbg(dev,
++			"2ns  delay was already %s (by pin-strapping RXD1 or bootloader configuration)\n",
++			val ? "enabled" : "disabled");
++	}
++delay_skip:
++
++	phy_write(phydev, MII_BMCR, BMCR_RESET | phy_read(phydev, MII_BMCR));
++	msleep(1);
++	phy_write(phydev, MAXIO_PAGE_SELECT, 0x0);
++
++	/*
++	 * LED: power-on default LCR (page 0xd04 reg 0x10) maps the green LED
++	 * (LED1 per board wiring) to 100Mbps-link only, so it is dark on a
++	 * gigabit link. Make LED1 track link at 1000/100/10Mbps + activity
++	 * (verified by live MDIO read: 0x6251 -> 0x6371).
++	 */
++	ret = maxio_read_paged(phydev, MAXIO_MAE0621A_LCR_PAGE, MAXIO_MAE0621A_LCR);
++	if (ret >= 0)
++		maxio_write_paged(phydev, MAXIO_MAE0621A_LCR_PAGE, MAXIO_MAE0621A_LCR,
++				  ret | MAXIO_MAE0621A_LED1_LINK_1000 |
++				  MAXIO_MAE0621A_LED1_LINK_10);
++
++	return 0;
++}
++
++
++static int maxio_mae0621a_resume(struct phy_device *phydev)
++{
++	int ret = genphy_resume(phydev);
++
++	ret |= phy_write(phydev, MII_BMCR, BMCR_RESET | phy_read(phydev, MII_BMCR));
++
++	msleep(20);
++
++	return ret;
++}
++
++static int maxio_mae0621a_suspend(struct phy_device *phydev)
++{
++	genphy_suspend(phydev);
++	phy_write(phydev, MAXIO_PAGE_SELECT ,0);
++
++	return 0;
++}
++
++static int maxio_mae0621a_status(struct phy_device *phydev)
++{
++	return genphy_read_status(phydev);
++}
++
++static int maxio_mae0621a_probe(struct phy_device *phydev)
++{
++	int ret = maxio_mae0621a_clk_init(phydev);
++	mdelay(100);
++	return ret;
++}
++
++static struct phy_driver maxio_nc_drvs[] = {
++	{
++		.phy_id			= 0x7b744411,
++		.phy_id_mask	= 0x7fffffff,
++		.name			= "MAE0621A Gigabit Ethernet",
++		.features		= PHY_GBIT_FEATURES,
++		.probe			= maxio_mae0621a_probe,
++		.config_init	= maxio_mae0621a_config_init,
++		.config_aneg	= maxio_mae0621a_config_aneg,
++		.read_status	= maxio_mae0621a_status,
++		.suspend		= maxio_mae0621a_suspend,
++		.resume			= maxio_mae0621a_resume,
++	},
++	{
++		/*
++		 * MAE0621A-03C silicon revision: reports PHY ID 0x7b744412
++		 * (the entry above targets rev ...4411). Same register map and
++		 * driver ops; only the low ID bit differs. Mask 0x7fffffff (bit31
++		 * don't-care) keeps bits 0..30 significant so each rev binds its own
++		 * entry — deterministic on the Radxa Cubie A7S (Allwinner A733).
++		 */
++		.phy_id			= 0x7b744412,
++		.phy_id_mask	= 0x7fffffff,
++		.name			= "MAE0621A-03C Gigabit Ethernet",
++		.features		= PHY_GBIT_FEATURES,
++		.probe			= maxio_mae0621a_probe,
++		.config_init	= maxio_mae0621a_config_init,
++		.config_aneg	= maxio_mae0621a_config_aneg,
++		.read_status	= maxio_mae0621a_status,
++		.suspend		= maxio_mae0621a_suspend,
++		.resume			= maxio_mae0621a_resume,
++	},
++};
++module_phy_driver(maxio_nc_drvs);
++
++MODULE_DESCRIPTION("Maxio PHY driver");
++MODULE_AUTHOR("Zhao Yang");
++MODULE_LICENSE("GPL");

@@ -1,0 +1,34 @@
+# TF-A (BL31) patches, one file name per line, in apply order.
+# Base: upstream TF-A master, commit 3d425f4f459820a44d24b23464dbc09d6baab7bb
+# (2026-10-02, VERSION 2.15.0; bootchain/overlay/apply.sh pins it).
+#
+# 1-4   Allwinner common code: more than four cores per cluster, the generic
+#       GIC driver, CPU_ON/CPU_OFF for DynamIQ cores (MPIDR Aff1/Aff2, PPU),
+#       the Cortex-A53 CVE/feature opt-outs moved to allwinner-common-a53.mk.
+# 5     The A733 platform (plat/allwinner/sun60i_a733).
+# 6-16  A733 behaviour: security setup, system reset, native CPU_SUSPEND,
+#       CPU_BACK_PLL, Cortex-A76 errata, DSU PMU access, DSU cluster power,
+#       a GICv3 driver accessor for the redistributor base, DSU cluster OFF,
+#       runtime console.
+# Patches 1, 3, 5 and parts of 6 and 7 come from the dlan17 TF-A fork (Jernej
+# Skrabec, Yixun Lan); each names its fork commit in its header. A523 support
+# is not carried.
+#
+# One file name per line; '#' lines and empty lines are ignored.
+# Format and what it refuses: scripts/lib/series.sh.
+allwinner-allow-max-cpus-per-cluster-to-be-overridden.patch
+allwinner-let-a-platform-use-the-generic-gic-driver.patch
+allwinner-cpu-on-off-for-the-new-mpidr-format.patch
+allwinner-cortex-a53-opt-outs-in-the-a53-makefile.patch
+allwinner-a733-add-initial-support.patch
+allwinner-a733-security-setup.patch
+allwinner-system-reset-through-a-standalone-watchdog.patch
+allwinner-a733-native-psci-cpu-suspend.patch
+allwinner-a733-enable-cpu-back-pll.patch
+allwinner-a733-apply-a76-errata.patch
+allwinner-a733-apply-a76-erratum-3888013.patch
+allwinner-a733-el2-access-to-the-dsu-cluster-pmu.patch
+allwinner-a733-dsu-cluster-power-required.patch
+gicv3-let-a-platform-read-a-cores-redistributor-base.patch
+allwinner-a733-dsu-cluster-off-state.patch
+allwinner-a733-runtime-console-at-error-level.patch

@@ -1,0 +1,257 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] mmc: sunxi: bound a data request whose completion never arrives
+
+What. Every request with data arms a delayed work, data_work, when it is
+issued. If the request is still open when it runs -- neither finalized nor
+in its busy wait -- the driver logs one dev_err with int_sum, SMHC_RINTSTS,
+SMHC_STATUS and SMHC_IDST, marks a data timeout and finalizes the request
+through the existing error path: the manual stop where
+sunxi_mmc_needs_manual_stop() asks for one, the controller reset when the
+stop does not take, the request completed with -ETIMEDOUT for the block
+layer to recover and retry. A transfer that takes no stop and still has
+SMHC_STATUS FSM_BUSY after finalize gets the same controller reset.
+finalize cancels the work; data_seq names the request it was armed for,
+and a deadline covers an expiry that was already waiting for host->lock
+while the software queue started the next request.
+
+The bound follows sdhci's software data timer (sdhci.c,
+sdhci_target_timeout() + sdhci_calc_sw_timeout()): data->timeout_ns plus
+data->timeout_clks at the card clock per block, times the block count,
+plus twice the bus time of one block, plus 10 ms (MMC_CMD_TRANSFER_TIME),
+with a floor of 1 s (SDXC_DATA_SW_TIMEOUT_MIN_MS) for a request that
+carries no access time. The per-block access time is the one
+mmc_set_data_timeout() derives from the card's CSD, the spec's worst case,
+so the bound ends a hang and does not judge a slow card. The busy wait
+after a write keeps its own bounds (busy_work, done_work), untouched.
+
+Why. on 2026-09-19 (8 GB board, 6.18.36) a read at an accepted
+data-strobe delay left the task in D state for over ten minutes; only a
+power cycle freed it. The trigger there was the stop path, fixed since
+(mmc-sunxi-stop-the-card-before-tearing-the-data-engine-down): the
+same read on 2026-09-25 recovers every failed transfer, 6/6 runs on
+HS400ES and plain HS400.
+What stays is that nothing bounds a data request the controller never
+completes. SMHC_TMOUT cannot (DTO_LMT covers the wait for a start bit),
+and the block layer does not: mmc_mq_timed_out() returns
+BLK_EH_RESET_TIMER for every host without CQE and for every host with the
+software queue -- both configurations of this tree.
+
+What the vendor does. The BSP driver (allwinner-bsp drivers/mmc/sunxi-mmc.c,
+sunxi_timerout_handle(), opt-in per controller through the DT property
+ctl-spec-caps) arms a fixed SUNXI_TRANS_TIMEOUT of 5 s for every request,
+whatever its size. It calls INIT_DELAYED_WORK() in the request path on a
+work that may still be queued, and the handler queues itself again every
+5 s, idle or not. With nothing latched it masks SMHC_INTMASK and re-runs
+its bottom half as a "timeout retry"; with a write still moving it sleeps
+in 1 s steps and then gates and ungates the bus clock. A fixed 5 s fails
+a transfer the card is allowed to take longer on (an SD write may take
+3 s per block, mmc_set_data_timeout()). Here: data requests only, a
+bound from the card's own access time, the work initialised once in
+probe, and the driver's existing error and recovery path instead of a
+second one.
+
+Not taken:
+- Generalising done_work: its two cases (a busy clear without DTC/ACD,
+  an R1b command without command done) have their own fixed bounds and
+  messages, and it only runs on controllers with can_wait_busy.
+- A bound on commands without data: the R1b case already has one, and a
+  response timeout is the controller's own (RTO).
+- Clearing the request with a controller reset in every case: the stop
+  path already resets when the stop does not take; a reset on top of a
+  stop that worked only costs a reprogram.
+
+Test stimulus: a test-only patch (mmc-sunxi-lose-the-completion-of-a-data-request, not carried)
+(test kernels only) masks DTC and ACD for the next N data requests on one
+controller.
+
+Falsifier, on the board, with that stimulus, on the eMMC (not the card
+that carries root):
+  echo 1 > /sys/bus/platform/drivers/sunxi-mmc/4022000.mmc/lose_completion
+  dd if=/dev/mmcblk2p4 of=/dev/null bs=64k count=1 iflag=direct
+Without this patch: dd stays in D state. With it: after the logged bound,
+"cmd 18 RD: no completion after N ms", the stop path's lines, and dd
+completes (the block layer's retry reads the data) or fails with EIO. A dd
+in D state with this patch refutes it.
+
+Assisted-by: Claude
+
+diff --git a/drivers/mmc/host/sunxi-mmc.c b/drivers/mmc/host/sunxi-mmc.c
+index 10fa85f..b49a564 100644
+--- a/drivers/mmc/host/sunxi-mmc.c
++++ b/drivers/mmc/host/sunxi-mmc.c
+@@ -156,6 +156,14 @@
+  * done never arrives.
+  */
+ #define SDXC_BUSY_CLEAR_DONE_MS		1000
++/*
++ * Floor of the software bound on a data request's bus phase. The bound
++ * itself is computed per request from the card's own access time, as sdhci
++ * computes its software data timer; the floor keeps a request that carries no
++ * access time (data->timeout_ns and timeout_clks both 0) from being failed
++ * while it is still being sent.
++ */
++#define SDXC_DATA_SW_TIMEOUT_MIN_MS	1000
+ /*
+  * Below this the DAT0 poll's first look legitimately beats an interrupt, so a
+  * missing R1b busy-clear interrupt cannot be concluded from it. Above it the
+@@ -554,6 +562,12 @@ struct sunxi_mmc_host {
+ 	u32		req_seq;
+ 	u32		done_seq;
+ 	struct delayed_work done_work;
++
++	/* bound on a data request whose completion never arrives */
++	u32		data_seq;
++	unsigned int	data_timeout_ms;
++	unsigned long	data_deadline;
++	struct delayed_work data_work;
+ };
+ 
+ /*
+@@ -1160,6 +1174,7 @@ static irqreturn_t sunxi_mmc_finalize_request(struct sunxi_mmc_host *host)
+ 	}
+ 	if (host->cfg->can_wait_busy)
+ 		cancel_delayed_work(&host->done_work);
++	cancel_delayed_work(&host->data_work);
+ 
+ 	host->mrq = NULL;
+ 	host->int_sum = 0;
+@@ -1431,6 +1446,106 @@ static void sunxi_mmc_done_work(struct work_struct *work)
+ 	sunxi_mmc_complete_deferred(host, mrq, ret);
+ }
+ 
++/*
++ * How long the bus phase of a data request may take: from the command to
++ * DTC/ACD and, on a read, the IDMAC receive interrupt. After the formula of
++ * sdhci's software data timer (sdhci.c, sdhci_target_timeout() and
++ * sdhci_calc_sw_timeout()): the card's access time per block, from
++ * data->timeout_ns and data->timeout_clks as mmc_set_data_timeout() set them,
++ * times the block count, plus twice the time one block takes on the bus, plus
++ * MMC_CMD_TRANSFER_TIME (10 ms). The access time is the spec's worst case per
++ * block, so the bound is generous by construction; it is meant to end a hang,
++ * not to judge a slow card.
++ */
++static unsigned int sunxi_mmc_data_timeout_ms(struct sunxi_mmc_host *host,
++					      struct mmc_data *data)
++{
++	struct mmc_ios *ios = &host->mmc->ios;
++	u64 clock = host->mmc->actual_clock ? : ios->clock;
++	u64 block_ns = data->timeout_ns;
++	u64 total_ns = 10 * NSEC_PER_MSEC;
++
++	if (clock) {
++		if (data->timeout_clks)
++			block_ns += DIV64_U64_ROUND_UP((u64)data->timeout_clks *
++						       NSEC_PER_SEC, clock);
++		/* one block on 1 << bus_width data lines, twice */
++		total_ns += 2 * DIV64_U64_ROUND_UP((u64)data->blksz * 8 *
++						   NSEC_PER_SEC,
++						   clock << ios->bus_width);
++	}
++	total_ns += (u64)data->blocks * block_ns;
++
++	return max_t(u64, DIV_ROUND_UP_ULL(total_ns, NSEC_PER_MSEC),
++		     SDXC_DATA_SW_TIMEOUT_MIN_MS);
++}
++
++/*
++ * A data request whose completion has not arrived within its bound.
++ * The block layer does not end it: with the software queue, and on a host
++ * without CQE, mmc_mq_timed_out() answers BLK_EH_RESET_TIMER, so the task
++ * waiting for it would sit in D state for as long as the controller stays
++ * silent. Fail it here, through the same error path as a data timeout the
++ * controller reports: the manual stop for a transfer that needs one, the
++ * controller reset if the stop does not take, the request completed with
++ * -ETIMEDOUT so the block layer recovers and retries.
++ *
++ * A request that has reached its busy wait is not ours: busy_work bounds that
++ * phase. Nor is one that has been finalized or replaced meanwhile; data_seq
++ * names the request the bound was armed for. The deadline covers the one case
++ * data_seq cannot: an expiry that was already running, waiting for the lock,
++ * while the software queue started the next request from the completion of
++ * the last one and armed data_seq for it.
++ */
++static void sunxi_mmc_data_work(struct work_struct *work)
++{
++	struct sunxi_mmc_host *host = container_of(to_delayed_work(work),
++						   struct sunxi_mmc_host,
++						   data_work);
++	struct mmc_request *mrq;
++	unsigned long iflags;
++	irqreturn_t ret;
++	bool fsm_busy;
++
++	spin_lock_irqsave(&host->lock, iflags);
++	mrq = host->mrq;
++	if (!mrq || !mrq->data || host->busy_wait ||
++	    host->req_seq != host->data_seq ||
++	    time_before(jiffies, host->data_deadline)) {
++		spin_unlock_irqrestore(&host->lock, iflags);
++		return;
++	}
++
++	dev_err(mmc_dev(host->mmc),
++		"cmd %d %s: no completion after %u ms, int_sum %08x rint %08x status %08x idst %08x%s\n",
++		mrq->cmd->opcode,
++		mrq->data->flags & MMC_DATA_WRITE ? "WR" : "RD",
++		host->data_timeout_ms, host->int_sum,
++		mmc_readl(host, REG_RINTR), mmc_readl(host, REG_STAS),
++		mmc_readl(host, REG_IDST),
++		host->wait_dma ? ", IDMAC not done" : "");
++
++	host->int_sum |= SDXC_DATA_TIMEOUT;
++	ret = sunxi_mmc_finalize_request(host);
++	/*
++	 * A transfer that takes no stop (a single block) has had its data
++	 * engine released by finalize; if the data state machine still runs,
++	 * the next command would wait behind it, the same hang an earlier bug report saw in another
++	 * place. Reset the controller as the failed-stop path does.
++	 */
++	fsm_busy = ret == IRQ_HANDLED &&
++		   (mmc_readl(host, REG_STAS) & SDXC_DATA_FSM_BUSY);
++	spin_unlock_irqrestore(&host->lock, iflags);
++
++	if (fsm_busy) {
++		dev_err(mmc_dev(host->mmc),
++			"data state machine still busy after the timeout, resetting the controller\n");
++		sunxi_mmc_reset_after_failed_stop(host);
++	}
++
++	sunxi_mmc_complete_deferred(host, mrq, ret);
++}
++
+ static irqreturn_t sunxi_mmc_irq(int irq, void *dev_id)
+ {
+ 	struct sunxi_mmc_host *host = dev_id;
+@@ -2511,6 +2626,16 @@ static void sunxi_mmc_request(struct mmc_host *mmc, struct mmc_request *mrq)
+ 	host->mrq = mrq;
+ 	host->req_seq++;
+ 
++	/* Bound the bus phase of every data request. */
++	if (data) {
++		host->data_seq = host->req_seq;
++		host->data_timeout_ms = sunxi_mmc_data_timeout_ms(host, data);
++		host->data_deadline = jiffies +
++				      msecs_to_jiffies(host->data_timeout_ms);
++		mod_delayed_work(system_long_wq, &host->data_work,
++				 msecs_to_jiffies(host->data_timeout_ms) + 1);
++	}
++
+ 	/*
+ 	 * Bound the case the UM leaves open: a command whose done bit never
+ 	 * arrives because the controller is holding it for the busy. The busy
+@@ -3204,6 +3329,7 @@ static int sunxi_mmc_probe(struct platform_device *pdev)
+ 	spin_lock_init(&host->lock);
+ 	INIT_DELAYED_WORK(&host->busy_work, sunxi_mmc_busy_work);
+ 	INIT_DELAYED_WORK(&host->done_work, sunxi_mmc_done_work);
++	INIT_DELAYED_WORK(&host->data_work, sunxi_mmc_data_work);
+ 
+ 	ret = sunxi_mmc_resource_request(host, pdev);
+ 	if (ret)
+@@ -3414,6 +3540,7 @@ static void sunxi_mmc_remove(struct platform_device *pdev)
+ 	mmc_remove_host(mmc);
+ 	cancel_delayed_work_sync(&host->busy_work);
+ 	cancel_delayed_work_sync(&host->done_work);
++	cancel_delayed_work_sync(&host->data_work);
+ 	pm_runtime_disable(&pdev->dev);
+ 	if (!pm_runtime_status_suspended(&pdev->dev)) {
+ 		disable_irq(host->irq);

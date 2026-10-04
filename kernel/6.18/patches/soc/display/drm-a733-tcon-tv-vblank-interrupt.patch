@@ -1,0 +1,894 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] drm/a733: tcon-tv, kms: service TCON_TV1's vblank interrupt
+
+[Recipe cut: regenerated: the hunks that touched the removed TCON debugfs
+knobs are gone.]
+
+MEASURED, 2026-09-26, the 6 GiB board, kernel 6.18.53 built from the series as it stood that day plus
+drm-a733-de-position-the-primary-plane-on-a-black-background, a monitor
+on DP-1 at 1920x1200@60, display manager and kmscon stopped so nothing
+else held the card. With the plane fix the plane check passes, and the
+documented pipeline
+
+  gst-launch-1.0 filesrc ! qtdemux ! h264parse ! omxh264dec \
+    ! videoconvert ! kmssink driver-name=sun60i-kms
+
+still stops at preroll:
+
+  gstkmssink.c:1872:gst_kms_sink_sync: drmWaitVBlank failed:
+  Operation not supported (95)
+
+EOPNOTSUPP is drm_wait_vblank_ioctl()'s answer on a device that never
+called drm_vblank_init() (drm_wait_vblank_supported(), drm_vblank.c).
+This tree did not, on purpose: TCON_TV1's interrupt had no handler, so
+every flip event was completed by drm_atomic_helper_fake_vblank().
+The same gap blocks drm_dp_start_crc(), whose sampler loops on
+drm_crtc_wait_one_vblank().
+
+WHAT CHANGES
+
+sun60i-tcon-tv.c requests the TCON's interrupt and services it;
+sun60i-kms.c initialises vblank for its one CRTC and sends flip events
+from it.
+
+  register              address       bit  field           access
+  TV_GINT0 (TCON_TV1)   0x05731004    30   TV_VB_INT_EN    R/W
+                                      14   TV_VB_INT_FLAG  R/W0C
+
+  - The line is requested at probe with IRQF_NO_AUTOEN and unmasked only
+    between the TCON's program sequence and its disable, i.e. while its
+    clocks run; the handler never reads a gated window. It is masked
+    (disable_irq(), which waits out a running handler) after TV_GINT0 is
+    written 0 and before the clocks go.
+  - The handler reads TV_GINT0. Without bit 14 it returns IRQ_NONE (with
+    a dev_dbg of the word). With it, it writes the word back with bit 14
+    = 0 -- the enables stay, other flags written 1 are untouched (W0C),
+    only the vblank flag clears -- and calls drm_crtc_handle_vblank() on
+    the CRTC the KMS enable handed it.
+  - .enable_vblank sets bit 30 and clears a stale bit 14 in the same write;
+    .disable_vblank clears bit 30. Both refuse while the raster is not
+    running. One spinlock covers enable, disable and the handler's ack,
+    because all three read-modify-write one register from different CPUs.
+  - sun60i_tcon_tv_program() still writes TV_GINT0 = 0 twice, unchanged:
+    the enable is DRM's vblank reference count's to set, not the modeset's.
+  - KMS: drm_vblank_init() before drm_mode_config_reset() when the TCON has
+    an interrupt; drm_crtc_vblank_on() at the end of .atomic_enable, only
+    once DE and TCON are both up; drm_crtc_vblank_off() at the start of
+    .atomic_disable, while the TCON still runs.
+
+THE EVENT PATH (sun60i-kms.c)
+
+  - .atomic_flush (new): takes the new state's event; drm_crtc_vblank_get()
+    == 0 -> drm_crtc_arm_vblank_event(), sent by drm_crtc_handle_vblank()
+    from the TCON interrupt at the next vblank, which also drops the
+    reference; otherwise drm_crtc_send_vblank_event() at once.
+  - .atomic_disable: a commit that switches the CRTC off gets no
+    .atomic_flush (DRM_PLANE_COMMIT_ACTIVE_ONLY), so its event is sent
+    there.
+  - drm_dev_has_vblank() is now true, so drm_atomic_helper_check_modeset()
+    clears every crtc_state->no_vblank and drm_atomic_helper_fake_vblank()
+    in the _rpm tail finds nothing to do.
+    drm_atomic_helper_wait_for_vblanks() now waits one real frame before
+    the old framebuffer is released.
+  - Fallback: a TCON node without `interrupts` gets a dev_warn at TCON
+    probe and a drm_warn at bind, no drm_vblank_init(), and .atomic_flush
+    sends each event at once -- the old behaviour, now only where there is
+    no interrupt.
+
+sun4i_tcon.c (sun4i_tcon_handler(), sun4i_tcon_enable_vblank()) and
+sun4i_crtc.c (.atomic_flush, .atomic_disable, .enable_vblank) are the
+model.
+
+What the page flip still is NOT: the layer write lands the moment it is
+committed, wherever the raster is (sun60i_de_kms_scanout()). The event now
+waits for a vblank; the write does not. That line-window guard stays stage
+3's. Comments in sun60i-de.c and sun60i-dp.c that said the interrupt had no
+handler are corrected.
+
+NO DEVICE-TREE CHANGE. The TCON_TV1 node has carried
+`interrupts = <GIC_SPI 58 IRQ_TYPE_LEVEL_HIGH>` since
+arm64-dts-a733-tcon-tv1-and-the-dp-phy-pad-window; nothing read it until
+now.
+
+WHERE THE VALUES COME FROM -- the A733 user manual V1.00, each read on the page:
+
+  - TV_GINT0 at TCON_TV + 0x0004, 15.2.10.2, printed page 722-723 (PDF
+    743-744): bit 30 TV_VB_INT_EN enables an interrupt as each field
+    finishes; bit 14 TV_VB_INT_FLAG is R/W0C, set during the vertical
+    blanking period of every frame and cleared by writing 0. Line enables [28:25] /
+    flags [12:9] and PSR bit 24 / bit 8 stay 0; 31, 29, [23:15], 13 and [7:0] are reserved.
+  - 15.2.7.2 Module Configuration, printed page 711 (PDF 732), step 5: setting
+    up the line/field interrupts in TV_GINT0_REG and TV_GINT1_REG is
+    listed there as an optional step.
+  - Interrupt number 90, source "TV1", vector 0x0168: GIC chapter table,
+    printed page 594 (PDF 615); that is intid 90, gic_spi 58.
+  - TCON_TV1 base 0x05731000: the node's reg, as every earlier TCON patch.
+
+WHAT THE VENDOR DOES DIFFERENTLY (allwinner-bsp, branch cubie-aiot-v1.4.8,
+drivers/drm/, read for this patch; no code taken). Its bit map agrees
+-- flags [15:0], enables [31:16], LCD_IRQ_TCON1_VBLK = 14
+(tcon_tv_reg.h:35-41, include.h:237-246) -- and so does its ack, a
+read-modify-write that clears only that flag (tcon_tv_irq_query(),
+tcon_tv_reg.c:65-76). Where it differs:
+
+  - tcon_tv_close() disables LCD_IRQ_TCON0_VBLK = bit 31, reserved on this
+    TCON, where tcon_tv_open() enabled bit 30 (tcon_tv_reg.c:98-111): the
+    enable survives the close.
+  - tcon_tv_open() enables the interrupt on every modeset
+    (tcon_tv_reg.c:101), and its CRTC takes a vblank reference per flip
+    that it never drops (sunxi_drm_crtc.c:2035): the interrupt never goes
+    off. Here the enable follows DRM's reference count.
+  - Its handler calls the CRTC's, and drm_crtc_handle_vblank() with it, on
+    every interrupt; the flag only feeds a counter (sunxi_tcon.c:437-470,
+    sunxi_drm_crtc.c:1600-1635). Here no flag, no vblank, IRQ_NONE.
+  - Enable, disable and ack are unlocked read-modify-writes of the same
+    register from two contexts (tcon_tv_reg.c:51-76 and :573-579,
+    sunxi_tcon.c:952-966). Here one spinlock.
+  - Enabling keeps a stale flag, so the first interrupt can fire mid-frame
+    and count as a vblank. Here the enabling write clears it. ⬜ That the
+    flag latches with the enable off is the UM's "every frame" read
+    literally, not a register reading.
+  - The handler is requested after the enable is set and freed before it
+    is cleared (sunxi_tcon.c:811-834). Here it exists for the device's
+    lifetime and is unmasked only while the TCON is clocked.
+
+VERIFIED BEFORE THE BOARD
+
+  - apply-patches: every series entry at --fuzz=0 on a freshly unpacked
+    6.18.53, including arm64-dts-a733-display-engine-behind-iommu1, which
+    edits comments in sun60i-de.c and sun60i-kms.c after this patch.
+  - compile-check green; drivers/gpu/drm/sun60i/ rebuilt with W=1: no
+    warning; checkpatch --strict: no error or check on the code.
+  - a full kernel build (localversion -t390), for the test boot below.
+  - a small test program (a733-vblank-rate), the instrument for item 1, built
+    freestanding for aarch64 and run under qemu-aarch64-static: no card
+    with a *kms driver -> exit 2; a non-DRM node -> ioctl errno 25, exit 4;
+    a missing node -> errno 2, exit 3. Its ioctl number and union layout
+    are static-asserted against include/uapi/drm/drm.h (0xc018643a, 24
+    bytes, reply sequence/tval_sec/tval_usec at 4/8/16).
+
+HARDWARE-PROVEN on the 6 GiB board, 2026-09-26 (6.18.53-t390),
+1920x1200 mode:
+  * a733-vblank-rate: 300 waits, sequence 691..990, steps != 1: 0,
+    59.946 Hz, gaps 16525..16847 us.
+  * 5731000.lcd-controller +300 over the run, +309 in the 7 s after it
+    (the core's 5 s vblank-off delay); TV_GINT0 0x40000000 while a waiter
+    holds vblank, 0x00004000 after -- the flag latches with the enable
+    off, which settles the open point above.
+  * drm_vblank_event tracepoints: seq counts up by one per event;
+    drm_vblank_event_delivered carries a real sequence, none with 0.
+  * kmssink's drmWaitVBlank, EOPNOTSUPP before this patch, now returns
+    and the pipeline runs to EOS (see the plane patch).
+  * X and kmscon unchanged, no vblank or flip_done timeout in the log.
+
+OWED BY THE BOARD (the plan before the run), with the falsifier of each
+(1920x1200 CVT-RB: 154 MHz /
+(2080 x 1235) = 59.950 Hz, 16.68 ms)
+
+  1. a733-vblank-rate prints rate 59.95 Hz, steps != 1: 0, gaps near
+     16680 us. Falsified by errno 95 (no drm_vblank_init(): look for the
+     "no interrupt in DT" warning), errno 16 (no interrupt within 3 s),
+     a rate that is a multiple of 59.95 or far above it (the flag
+     re-asserting within the blanking), or steps != 1.
+  2. /proc/interrupts, the 5731000.lcd-controller line: read, run item 1,
+     read again at once -- delta about 300 (more if X or kmscon also
+     wait), i.e. 60/s while a waiter holds vblank; about 5 s after the
+     last waiter it stops (vblank_offdelay).
+     TV_GINT0 (busybox devmem 0x05731004) holds bit 30 during the run and
+     has it clear some seconds after; whether bit 14 is set then answers
+     the open point above (the flag latching with the enable off).
+     Falsified by no line, a delta in the thousands, or "nobody cared" in
+     dmesg.
+  3. kmssink 1080p on the 1200 mode runs to EOS with no drmWaitVBlank
+     error, and the earlier plane checks still hold.
+  4. X (LightDM) and kmscon come up and behave as before; console proof
+     16/16.
+  5. Flips no longer complete by fake vblank: with the tracepoints
+     drm/drm_vblank_event and drm/drm_vblank_event_delivered enabled
+     (FTRACE is pinned), every delivery during X, kmscon or kmssink flips
+     carries the seq of the drm_vblank_event just before it, at the same
+     timestamp. A fake-vblank delivery carries seq 0 and has no
+     drm_vblank_event beside it.
+
+Assisted-by: Claude
+---
+
+diff --git a/drivers/gpu/drm/sun60i/sun60i-de.c b/drivers/gpu/drm/sun60i/sun60i-de.c
+--- a/drivers/gpu/drm/sun60i/sun60i-de.c
++++ b/drivers/gpu/drm/sun60i/sun60i-de.c
+@@ -1555,8 +1555,9 @@ EXPORT_SYMBOL_GPL(sun60i_de_kms_disable);
+ /*
+  * A new scanout address, staged through the same commit path as everything
+  * else. This is the page flip, and what it is NOT is a flip synchronised to
+- * anything: nothing here waits for vblank, because nothing in this tree
+- * services the TCON interrupt yet.
++ * anything: the write lands the moment it is made. The TCON's vblank
++ * interrupt is serviced now, but it only decides when the flip's event is
++ * sent (the next vblank, sun60i-kms.c), not when this write happens.
+  *
+  * ⚠ AND THE MISSING GUARD HAS A SHAPE, WHICH IS WORTH MORE THAN "expect
+  * tearing". The vendor does not write the datapath at an arbitrary point in the
+@@ -1567,8 +1568,8 @@ EXPORT_SYMBOL_GPL(sun60i_de_kms_disable);
+  * an update past it (sunxi_tcon_calc_judge_line(), sunxi_tcon.c:121-150). Two
+  * independent line-window guards on the same write this function does
+  * unguarded. So the risk here is not only a torn line: it is a write that lands
+- * on a frame boundary. Stage 3 owns it, it needs the TCON interrupt first, and
+- * the two functions above are what it should look like.
++ * on a frame boundary. Stage 3 owns it, the TCON interrupt it needed is
++ * wired, and the two functions above are what it should look like.
+  *
+  * A plane that MOVES is the same write plus pipe 0's window, and it carries the
+  * same missing guard: for the part of one frame between the layer's size words
+diff --git a/drivers/gpu/drm/sun60i/sun60i-kms.c b/drivers/gpu/drm/sun60i/sun60i-kms.c
+--- a/drivers/gpu/drm/sun60i/sun60i-kms.c
++++ b/drivers/gpu/drm/sun60i/sun60i-kms.c
+@@ -26,9 +26,10 @@
+  *      on the screen; the same pattern read back and compared with cmp matches.
+  *      Falsified by: no /dev/fb0; a cmp mismatch; or a screen that does not
+  *      change when the buffer changes.
+- *   ⬜ VBLANK IS NOT WIRED. TCON_TV1's interrupt (INTID 90 = GIC SPI 58) is in
+- *      the device tree and nothing requests it, so drm_vblank_init() is
+- *      deliberately NOT called -- see the block above sun60i_kms_bind().
++ *   ⬜ VBLANK IS WIRED AND NOT YET PROVEN. TCON_TV1's interrupt (INTID 90 =
++ *      GIC SPI 58) is requested by the TCON driver, which hands each vblank
++ *      to this CRTC; drm_vblank_init() is called when it has one, and flips
++ *      complete from that interrupt -- see the block above sun60i_kms_bind().
+  *
+  * ⚠ THE SINGLE LOAD-BEARING LINE IN THIS FILE IS `.fb_create =
+  * drm_gem_fb_create`, NOT drm_gem_fb_create_with_dirty. That choice IS the
+@@ -85,9 +86,11 @@
+  *     call it at all without a Makefile move and an export on top of the ops
+  *     refactor.
+  *   - What is mirrored is 60 lines, not 256: the parts of sun4i_crtc.c that are
+- *     vblank event handling for hardware whose vblank is wired, colour
+- *     correction for the composite TV encoder, and the of_graph port lookup for
+- *     a multi-pipe topology are all absent here on purpose.
++ *     colour correction for the composite TV encoder and the of_graph port
++ *     lookup for a multi-pipe topology are absent here on purpose. Its vblank
++ *     half -- .enable_vblank/.disable_vblank, vblank on/off around the
++ *     raster, the event armed in .atomic_flush -- came later, with the TCON
++ *     interrupt it needs.
+  *
+  *   So the refactor is the right long-term answer and it belongs in the same
+  *   patch as the mixer move, where it is one change instead of two.
+@@ -130,7 +133,7 @@
+  *   - THE VBLANK INTERRUPT IS THE TCON'S. devm_request_irq() on the TCON device
+  *     (sunxi_tcon.c:472-484), tail-calling the CRTC's handler; the DE's own
+  *     interrupt is CRC-only (sunxi_de.c:1125-1138). That is INTID 90 = GIC SPI
+- *     58 on our TCON_TV1 node, and it is stage 3's.
++ *     58 on our TCON_TV1 node, and sun60i-tcon-tv.c requests it the same way.
+  *
+  * TAUGHT -- three hardware rules that are in no register table, each with what
+  * it means here:
+@@ -188,11 +191,13 @@
+  *     take crtc_state->adjusted_mode |
+  *   | sunxi_de_enable()'s failure is logged and then ignored -- scrtc->enabled
+  *     = true and drm_crtc_vblank_on() run anyway (crtc.c:1955-1959) | the CRTC
+- *     enable stops, and the engine is put back down if the TCON then fails |
++ *     enable stops, and the engine is put back down if the TCON then fails;
++ *     vblank is switched on only for a raster that runs |
+  *   | drm_crtc_vblank_get() in .atomic_begin (crtc.c:2035) with no
+  *     drm_crtc_vblank_put() anywhere in the tree: after the first page flip the
+- *     vblank interrupt is pinned on and .disable_vblank is dead | no vblank
+- *     claimed at all until it is serviced -- see sun60i_kms_bind() |
++ *     vblank interrupt is pinned on and .disable_vblank is dead | one reference
++ *     per event, taken in .atomic_flush and dropped by the DRM core when it
++ *     sends the event (drm_crtc_arm_vblank_event()) -- mainline's pattern |
+  *   | no plane .atomic_check of any kind (crtc.c:1082-1092): no clipping, no
+  *     scaling bound, no visibility, and one of its two hooks needs an
+  *     out-of-tree change to struct drm_plane_helper_funcs | the plane refuses
+@@ -259,6 +264,7 @@
+ #include <drm/drm_plane.h>
+ #include <drm/drm_probe_helper.h>
+ #include <drm/drm_rect.h>
++#include <drm/drm_vblank.h>
+ 
+ #include "sun60i-kms.h"
+ 
+@@ -686,18 +692,36 @@ static void sun60i_kms_crtc_atomic_enable(struct drm_crtc *crtc,
+ 	}
+ 
+ 	ret = sun60i_tcon_tv_kms_enable(kms->tcon, &crtc_state->adjusted_mode,
+-					sun60i_kms_crtc_bpc(kms, state));
++					sun60i_kms_crtc_bpc(kms, state), crtc);
+ 	if (ret) {
+ 		drm_err(crtc->dev, "TCON_TV1: %d\n", ret);
+ 		sun60i_de_kms_disable(kms->de);
++		return;
+ 	}
++
++	/*
++	 * Only for a raster that runs. On either failure above vblank stays
++	 * off, drm_crtc_vblank_get() refuses, and .atomic_flush sends the event
++	 * at once instead of arming it for an interrupt that will not come.
++	 */
++	if (drm_dev_has_vblank(crtc->dev))
++		drm_crtc_vblank_on(crtc);
+ }
+ 
+ static void sun60i_kms_crtc_atomic_disable(struct drm_crtc *crtc,
+ 					   struct drm_atomic_state *state)
+ {
++	struct drm_crtc_state *crtc_state =
++		drm_atomic_get_new_crtc_state(state, crtc);
+ 	struct sun60i_kms *kms = crtc_to_kms(crtc);
+ 
++	/*
++	 * Vblank off while the TCON still runs, so .disable_vblank writes into
++	 * a clocked register; it also sends any event still armed.
++	 */
++	if (drm_dev_has_vblank(crtc->dev))
++		drm_crtc_vblank_off(crtc);
++
+ 	/*
+ 	 * Raster first, then the fetch. The engine must not be reading a buffer
+ 	 * the atomic helpers are about to hand back while a TCON is still
+@@ -706,25 +730,79 @@ static void sun60i_kms_crtc_atomic_disable(struct drm_crtc *crtc,
+ 	 */
+ 	sun60i_tcon_tv_kms_disable(kms->tcon);
+ 	sun60i_de_kms_disable(kms->de);
++
++	/*
++	 * A commit that switches the CRTC off gets no .atomic_flush
++	 * (DRM_PLANE_COMMIT_ACTIVE_ONLY), and no vblank will come to send its
++	 * event, so it goes here -- sun4i_crtc_atomic_disable() does the same.
++	 */
++	if (crtc_state->event && !crtc_state->active) {
++		spin_lock_irq(&crtc->dev->event_lock);
++		drm_crtc_send_vblank_event(crtc, crtc_state->event);
++		spin_unlock_irq(&crtc->dev->event_lock);
++		crtc_state->event = NULL;
++	}
++}
++
++/*
++ * The event of a commit on a running CRTC. The plane writes above have landed
++ * -- they are direct stores -- so the event is armed for the NEXT vblank and
++ * sent by drm_crtc_handle_vblank() from the TCON's interrupt, which also drops
++ * the reference taken here. Without a vblank (no interrupt in DT, or a raster
++ * that failed to start) the get refuses and the event goes out at once, which
++ * is what drm_atomic_helper_fake_vblank() used to do for every flip.
++ * sun4i_crtc_atomic_flush() is the model.
++ */
++static void sun60i_kms_crtc_atomic_flush(struct drm_crtc *crtc,
++					 struct drm_atomic_state *state)
++{
++	struct drm_crtc_state *crtc_state =
++		drm_atomic_get_new_crtc_state(state, crtc);
++	struct drm_pending_vblank_event *event = crtc_state->event;
++
++	if (!event)
++		return;
++
++	crtc_state->event = NULL;
++
++	spin_lock_irq(&crtc->dev->event_lock);
++	if (drm_crtc_vblank_get(crtc) == 0)
++		drm_crtc_arm_vblank_event(crtc, event);
++	else
++		drm_crtc_send_vblank_event(crtc, event);
++	spin_unlock_irq(&crtc->dev->event_lock);
+ }
+ 
+ static const struct drm_crtc_helper_funcs sun60i_kms_crtc_helper_funcs = {
+ 	.mode_valid	= sun60i_kms_crtc_mode_valid,
+ 	.atomic_check	= sun60i_kms_crtc_atomic_check,
++	.atomic_flush	= sun60i_kms_crtc_atomic_flush,
+ 	.atomic_enable	= sun60i_kms_crtc_atomic_enable,
+ 	.atomic_disable	= sun60i_kms_crtc_atomic_disable,
+ };
+ 
+ /*
+- * No .enable_vblank / .disable_vblank, and no drm_vblank_init() below. That is
+- * a stage boundary, not an oversight -- see the block above sun60i_kms_bind().
++ * The TCON's TV_VB_INT_EN, switched by DRM's vblank reference count: on for
++ * the first waiter, off vblank_offdelay (5 s by default) after the last.
+  */
++static int sun60i_kms_crtc_enable_vblank(struct drm_crtc *crtc)
++{
++	return sun60i_tcon_tv_kms_enable_vblank(crtc_to_kms(crtc)->tcon);
++}
++
++static void sun60i_kms_crtc_disable_vblank(struct drm_crtc *crtc)
++{
++	sun60i_tcon_tv_kms_disable_vblank(crtc_to_kms(crtc)->tcon);
++}
++
+ static const struct drm_crtc_funcs sun60i_kms_crtc_funcs = {
+ 	.reset			= drm_atomic_helper_crtc_reset,
+ 	.set_config		= drm_atomic_helper_set_config,
+ 	.page_flip		= drm_atomic_helper_page_flip,
+ 	.atomic_duplicate_state	= drm_atomic_helper_crtc_duplicate_state,
+ 	.atomic_destroy_state	= drm_atomic_helper_crtc_destroy_state,
++	.enable_vblank		= sun60i_kms_crtc_enable_vblank,
++	.disable_vblank		= sun60i_kms_crtc_disable_vblank,
+ };
+ 
+ /*
+@@ -751,8 +829,10 @@ static const struct drm_mode_config_helper_funcs sun60i_kms_mode_config_helpers
+ 	 * engine's channel and blender register windows do not accept a write
+ 	 * until three de_top words have been set, and those are written as part
+ 	 * of bringing the engine up. It also calls
+-	 * drm_atomic_helper_fake_vblank(), which is what completes a flip on a
+-	 * CRTC with no vblank interrupt wired.
++	 * drm_atomic_helper_fake_vblank(), which completed every flip before
++	 * the TCON interrupt was wired. It finds nothing to do now: with
++	 * drm_vblank_init() done crtc_state->no_vblank is false, and in every
++	 * case .atomic_flush or .atomic_disable has already taken the event.
+ 	 */
+ 	.atomic_commit_tail = drm_atomic_helper_commit_tail_rpm,
+ };
+@@ -976,24 +1056,33 @@ static int sun60i_kms_attach_components(struct sun60i_kms *kms,
+ }
+ 
+ /*
+- * ⬜ WHY drm_vblank_init() IS NOT CALLED, and it is a decision with an
+- * observable consequence rather than a missing line.
++ * ⬜ WHEN drm_vblank_init() IS CALLED, and what it changes -- wired, not yet
++ * proven on silicon.
++ *
++ * TCON_TV1's interrupt -- INTID 90 = GIC SPI 58, in the device tree since
++ * `arm64-dts-a733-tcon-tv1-and-the-dp-phy-pad-window` -- is requested by sun60i-tcon-tv.c, which acks TV_VB_INT_FLAG and hands
++ * each vblank to this CRTC through drm_crtc_handle_vblank(). When the TCON has
++ * it, drm_vblank_init() is called for the one CRTC, drm_dev_has_vblank() is
++ * true and every crtc_state->no_vblank false. Then: a flip's event is armed in
++ * .atomic_flush and sent from the interrupt at the next vblank;
++ * DRM_IOCTL_WAIT_VBLANK answers (kmssink's drmWaitVBlank got EOPNOTSUPP without
++ * it); drm_atomic_helper_wait_for_vblanks() waits a frame before the old
++ * framebuffer is released; and drm_crtc_wait_one_vblank(), the loop under
++ * drm_dp_start_crc(), has something to wait on.
+  *
+- * TCON_TV1 has an interrupt -- INTID 90 = GIC SPI 58, in the device tree since
+- * `arm64-dts-a733-tcon-tv1-and-the-dp-phy-pad-window` -- and nothing in this tree requests it. `drm-a733-tcon-tv1-timing-generator-and-video-source` deliberately writes
+- * TV_GINT0_REG to zero on the stated grounds that "an enabled interrupt with no
+- * handler is not a diagnostic, it is a latch nobody clears". Until that handler
+- * exists there is no vblank to count, and claiming one would be worse than
+- * having none: drm_atomic_helper_wait_for_vblanks() would wait on a counter
+- * that never moves.
++ * Until the handler existed this block explained why the call was absent: `drm-a733-tcon-tv1-timing-generator-and-video-source`
++ * writes TV_GINT0_REG to zero because "an enabled interrupt with no handler is
++ * not a diagnostic, it is a latch nobody clears", and a vblank claimed without
++ * a handler would make drm_atomic_helper_wait_for_vblanks() wait on a counter
++ * that never moves. That reasoning still decides the fallback: a TCON node
++ * without `interrupts` gets no drm_vblank_init(), and its flips complete at
++ * once, as all of them used to.
+  *
+- * Without drm_vblank_init(), drm_dev_has_vblank() is false, so
+- * drm_atomic_helper_check_modeset() sets every crtc_state->no_vblank and
+- * drm_atomic_helper_fake_vblank() -- called from the _rpm commit tail --
+- * completes each flip event immediately. A page flip therefore returns, and it
+- * returns without any guarantee about where in the frame it landed. That is
+- * exactly what stage 3 buys, and it is why stage 3 is where the tearing test
+- * lives.
++ * What it does not buy: a flip still writes the layer the moment it is
++ * committed, wherever the raster is (sun60i_de_kms_scanout()). The event now
++ * says the new buffer is being scanned; it does not say the write missed the
++ * visible part of a frame. That line-window guard is stage 3's and still open,
++ * and it is also why the tearing test lives there.
+  */
+ static int sun60i_kms_bind(struct device *dev)
+ {
+@@ -1063,6 +1152,18 @@ static int sun60i_kms_bind(struct device *dev)
+ 	if (ret)
+ 		goto unbind_all;
+ 
++	/*
++	 * Before drm_mode_config_reset(): the CRTC reset marks vblank off only
++	 * on a device that has it, and the CRTC is off until its first enable.
++	 */
++	if (sun60i_tcon_tv_kms_has_vblank(kms->tcon)) {
++		ret = drm_vblank_init(drm, drm->mode_config.num_crtc);
++		if (ret)
++			goto unbind_all;
++	} else {
++		drm_warn(drm, "TCON_TV1 has no interrupt: no vblank, flips complete by fake vblank\n");
++	}
++
+ 	drm_mode_config_reset(drm);
+ 
+ 	/*
+diff --git a/drivers/gpu/drm/sun60i/sun60i-kms.h b/drivers/gpu/drm/sun60i/sun60i-kms.h
+--- a/drivers/gpu/drm/sun60i/sun60i-kms.h
++++ b/drivers/gpu/drm/sun60i/sun60i-kms.h
+@@ -32,6 +32,7 @@
+ 
+ #include <linux/types.h>
+ 
++struct drm_crtc;
+ struct drm_display_mode;
+ struct drm_rect;
+ struct sun60i_de;
+@@ -63,11 +64,23 @@ int sun60i_de_kms_scanout(struct sun60i_de *de, const struct drm_rect *dst,
+ 			  dma_addr_t scanout, u32 pitch);
+ void sun60i_de_kms_layer_off(struct sun60i_de *de);
+ 
+-/* TCON_TV1 -- implemented in sun60i-tcon-tv.c, same ownership rule. */
++/*
++ * TCON_TV1 -- implemented in sun60i-tcon-tv.c, same ownership rule.
++ *
++ * The TCON owns the vblank interrupt and calls drm_crtc_handle_vblank() on
++ * @crtc for as long as the raster that sun60i_tcon_tv_kms_enable() started
++ * runs. That is a call into the DRM core, not into sun60i-kms.ko, so the
++ * dependency above still points one way. The two _vblank calls are the CRTC's
++ * .enable_vblank/.disable_vblank and are safe in atomic context.
++ */
+ int sun60i_tcon_tv_kms_check(struct sun60i_tcon_tv *tcon,
+ 			     const struct drm_display_mode *mode);
+ int sun60i_tcon_tv_kms_enable(struct sun60i_tcon_tv *tcon,
+-			      const struct drm_display_mode *mode, u8 bpc);
++			      const struct drm_display_mode *mode, u8 bpc,
++			      struct drm_crtc *crtc);
+ void sun60i_tcon_tv_kms_disable(struct sun60i_tcon_tv *tcon);
++bool sun60i_tcon_tv_kms_has_vblank(struct sun60i_tcon_tv *tcon);
++int sun60i_tcon_tv_kms_enable_vblank(struct sun60i_tcon_tv *tcon);
++void sun60i_tcon_tv_kms_disable_vblank(struct sun60i_tcon_tv *tcon);
+ 
+ #endif /* _SUN60I_KMS_H_ */
+diff --git a/drivers/gpu/drm/sun60i/sun60i-tcon-tv.c b/drivers/gpu/drm/sun60i/sun60i-tcon-tv.c
+--- a/drivers/gpu/drm/sun60i/sun60i-tcon-tv.c
++++ b/drivers/gpu/drm/sun60i/sun60i-tcon-tv.c
+@@ -39,6 +39,11 @@
+  * TV_DEBUG_REG's free-running line counter sweeping to exactly the programmed
+  * VTOTAL, sampled hundreds of times.
+  *
++ * It also owns the pipe's vblank interrupt, INTID 90 "TV1" (UM V1.00 printed
++ * page 594), and hands each one to the KMS CRTC -- the block above
++ * sun60i_tcon_tv_irq() has the register, the ack and what the vendor does
++ * differently.
++ *
+  * Copyright (c) 2026 DockSeed
+  */
+ 
+@@ -47,6 +52,7 @@
+ #include <linux/component.h>
+ #include <linux/debugfs.h>
+ #include <linux/delay.h>
++#include <linux/interrupt.h>
+ #include <linux/io.h>
+ #include <linux/ktime.h>
+ #include <linux/minmax.h>
+@@ -56,9 +62,11 @@
+ #include <linux/platform_device.h>
+ #include <linux/reset.h>
+ #include <linux/seq_file.h>
++#include <linux/spinlock.h>
+ 
+ #include <drm/drm_modes.h>
+ #include <drm/drm_print.h>
++#include <drm/drm_vblank.h>
+ 
+ #include "sun60i-display.h"
+ #include "sun60i-kms.h"
+@@ -80,7 +88,17 @@
+ #define  TV_GCTL_MODULE_EN		BIT(31)
+ #define  TV_GCTL_PIXEL_MODE		GENMASK(5, 4)	/* 00 = one pixel/clock */
+ #define  TV_GCTL_UNSTRICT_TIMING	BIT(0)
++/*
++ * UM V1.00 15.2.10.2, printed page 723 (PDF 744). Enables in the upper half,
++ * their flags in the lower: bit 30 TV_VB_INT_EN over bit 14 TV_VB_INT_FLAG,
++ * [28:25] TV_LINE_INT_EN over [12:9] TV_LINE_INT_FLAG, bit 24 PSR_FORCE_SR_EN
++ * over bit 8 Psr_Force_Sr_Flag; 31, 29, [23:15], 13 and [7:0] are reserved.
++ * Every flag is R/W0C: writing 0 clears it. Only the vblank pair is used
++ * here; the line and PSR enables stay 0.
++ */
+ #define TV_GINT0_REG			0x0004
++#define  TV_GINT0_VB_INT_EN		BIT(30)
++#define  TV_GINT0_VB_INT_FLAG		BIT(14)
+ #define TV_SRC_CTL_REG			0x0040		/* the A733 user manual */
+ #define  TV_SRC_CTL_SEL			GENMASK(2, 1)
+ #define  TV_SRC_CTL_VDBIST_MODE		BIT(0)
+@@ -246,6 +264,21 @@ struct sun60i_tcon_tv {
+ 	bool			kms_owned;
+ 	struct drm_display_mode	mode;
+ 	u8			bpc;
++
++	/*
++	 * The vblank interrupt. `irq` is 0 when the node carries none, and then
++	 * the KMS master calls no drm_vblank_init(). The line is requested at
++	 * probe but switched on only between sun60i_tcon_tv_irq_on() and
++	 * sun60i_tcon_tv_irq_off(), i.e. while this TCON's clocks run, so the
++	 * handler never reads a gated window. `irq_lock` serialises every
++	 * read-modify-write of TV_GINT0 -- the handler's ack against the
++	 * enable/disable that DRM issues from another CPU -- and guards
++	 * `irq_live`. `crtc` is written only while the line is off.
++	 */
++	int			irq;
++	spinlock_t		irq_lock;	/* TV_GINT0 RMW, irq_live */
++	bool			irq_live;
++	struct drm_crtc		*crtc;
+ };
+ 
+ static u32 sun60i_tcon_tv_depth(u8 bpc)
+@@ -491,10 +524,12 @@ static void sun60i_tcon_tv_set_source(struct sun60i_tcon_tv *tcon,
+  * discovered later:
+  *
+  *  1. TV_GINT0_REG is written ZERO, where the run writes 0x40000000
+- *     (TV_VB_INT_EN). Nothing in this tree services a TCON
+- *     interrupt, and an enabled interrupt with no handler is not a diagnostic,
+- *     it is a latch nobody clears. Falsified by: the scan stopping without it,
+- *     which would be a finding and would come back with a handler attached.
++ *     (TV_VB_INT_EN). The enable is not this sequence's to
++ *     set: sun60i_tcon_tv_kms_enable_vblank() sets it once the raster runs and
++ *     DRM holds a vblank reference, and clears it when the last one goes. An
++ *     enable with no handler behind it is a latch nobody clears, which is why
++ *     the run's value is not copied here. The scan does not need it: every
++ *     picture this driver produced before the handler existed ran with zero.
+  *  2. TV_DEBUG_REG is written ZERO, where the run writes back the 0x000002E5 it
+  *     read from a live link. Only bits 30 and 29 of this register are writable
+  *     and both are R/W0C, so zero is the clear; [15:0] is read-only and writing
+@@ -651,6 +686,120 @@ static int sun60i_tcon_tv_clocks_on(struct sun60i_tcon_tv *tcon)
+ 	return ret;
+ }
+ 
++/*
++ * THE VBLANK INTERRUPT. TV_GINT0 bit 30 TV_VB_INT_EN enables an interrupt when
++ * each field finishes, and bit 14
++ * TV_VB_INT_FLAG goes high in the vertical blanking period of every frame;
++ * writing 0 to it clears it (UM V1.00 15.2.10.2, printed page 723). The UM's own
++ * programming guide makes it step 5 of the module configuration, optional
++ * (15.2.7.2, printed page 711). It reaches the GIC as INTID 90 "TV1" (printed
++ * page 594), SPI 58 in the device tree.
++ *
++ * The ack is a read-modify-write that writes 0 to bit 14 and every other bit
++ * back as it was read: the enables stay, a W0C flag written with 1 stays, and
++ * nothing but the vblank flag is cleared. mainline's sun4i_tcon_handler() acks
++ * the same way (regmap_update_bits(..., flags, 0)). Because DRM switches the
++ * enable from another CPU in the same register, every such write holds
++ * irq_lock.
++ *
++ * WHAT THE VENDOR DOES DIFFERENTLY (allwinner-bsp, branch cubie-aiot-v1.4.8,
++ * drivers/drm/, read for this patch; no code taken). Its field map and ours
++ * agree -- flags [15:0], enables [31:16], LCD_IRQ_TCON1_VBLK = 14
++ * (tcon_tv_reg.h:35-41, include.h:237-246) -- and so does its ack
++ * (tcon_tv_irq_query(), tcon_tv_reg.c:65-76). Where it differs:
++ *
++ *  - tcon_tv_close() disables LCD_IRQ_TCON0_VBLK, bit 31, where
++ *    tcon_tv_open() enabled LCD_IRQ_TCON1_VBLK, bit 30 (tcon_tv_reg.c:98-111).
++ *    Bit 31 is reserved on this TCON, so closing it leaves the vblank enable
++ *    set. Here one pair of bits is named once and used both ways.
++ *  - tcon_tv_open() enables the interrupt on every modeset whether or not
++ *    anyone waits for a vblank (tcon_tv_reg.c:101), and its CRTC takes a
++ *    vblank reference per flip that it never drops (sunxi_drm_crtc.c:2035), so
++ *    the interrupt never goes off. Here the enable follows DRM's reference
++ *    count through .enable_vblank/.disable_vblank.
++ *  - Its handler calls the CRTC handler, and with it drm_crtc_handle_vblank(),
++ *    on every interrupt; whether the vblank flag was set only feeds a counter
++ *    (sunxi_tcon.c:437-470, sunxi_drm_crtc.c:1600-1635). Here an interrupt
++ *    without the flag counts nothing and returns IRQ_NONE, so genirq's
++ *    spurious-interrupt accounting sees it.
++ *  - Enable, disable and ack are three unlocked read-modify-writes of one
++ *    register (tcon_tv_reg.c:51-76 and :573-579, sunxi_tcon.c:952-966), from
++ *    DRM's vblank code on one CPU and the interrupt on another: an ack that
++ *    read the enable before a disable wrote it puts it back. Here one
++ *    spinlock covers all three.
++ *  - Enabling does not clear a flag left from a frame nobody listened to, so
++ *    the first interrupt after an enable fires at once, mid-frame, and is
++ *    counted as a vblank. Here the write that sets bit 30 clears bit 14.
++ *    ⬜ That the flag latches while the enable is off is the UM's "every
++ *    frame" read literally, not a register reading; clearing it costs nothing
++ *    either way.
++ *  - The handler is requested after tcon_tv_open() has set the enable and
++ *    freed before tcon_tv_close() (sunxi_tcon.c:811-834). Here the line is
++ *    requested once at probe and unmasked only while the TCON is clocked.
++ */
++static irqreturn_t sun60i_tcon_tv_irq(int irq, void *data)
++{
++	struct sun60i_tcon_tv *tcon = data;
++	u32 status;
++
++	spin_lock(&tcon->irq_lock);
++	status = readl(tcon->regs + TV_GINT0_REG);
++	if (status & TV_GINT0_VB_INT_FLAG)
++		writel(status & ~TV_GINT0_VB_INT_FLAG,
++		       tcon->regs + TV_GINT0_REG);
++	spin_unlock(&tcon->irq_lock);
++
++	if (!(status & TV_GINT0_VB_INT_FLAG)) {
++		dev_dbg(tcon->dev, "interrupt without the vblank flag, TV_GINT0 %#010x\n",
++			status);
++		return IRQ_NONE;
++	}
++
++	/*
++	 * No CRTC means the raster runs for the debugfs verb, which sets no
++	 * enable; the flag is acked above and nobody is told.
++	 */
++	if (tcon->crtc)
++		drm_crtc_handle_vblank(tcon->crtc);
++	else
++		dev_dbg(tcon->dev, "vblank with no CRTC attached, TV_GINT0 %#010x\n",
++			status);
++
++	return IRQ_HANDLED;
++}
++
++/*
++ * The line is unmasked at the GIC only while this TCON is clocked and
++ * programmed; sun60i_tcon_tv_program() has just written TV_GINT0 to zero, so
++ * nothing is pending when it is.
++ */
++static void sun60i_tcon_tv_irq_on(struct sun60i_tcon_tv *tcon)
++{
++	if (!tcon->irq)
++		return;
++
++	scoped_guard(spinlock_irq, &tcon->irq_lock)
++		tcon->irq_live = true;
++	enable_irq(tcon->irq);
++}
++
++/*
++ * Every enable and flag to zero, then mask the line and wait out a handler
++ * that is already running -- before the clocks go, and before `crtc` may be
++ * cleared.
++ */
++static void sun60i_tcon_tv_irq_off(struct sun60i_tcon_tv *tcon)
++{
++	if (!tcon->irq)
++		return;
++
++	scoped_guard(spinlock_irq, &tcon->irq_lock) {
++		tcon->irq_live = false;
++		writel(0, tcon->regs + TV_GINT0_REG);
++	}
++	disable_irq(tcon->irq);
++}
++
+ static int sun60i_tcon_tv_enable(struct sun60i_tcon_tv *tcon, bool vdbist)
+ {
+ 	int ret;
+@@ -683,6 +832,7 @@ static int sun60i_tcon_tv_enable(struct sun60i_tcon_tv *tcon, bool vdbist)
+ 
+ 	sun60i_tcon_tv_route(tcon);
+ 	sun60i_tcon_tv_program(tcon, vdbist);
++	sun60i_tcon_tv_irq_on(tcon);
+ 	tcon->enabled = true;
+ 
+ 	dev_info(tcon->dev, "scanning %dx%d, %d kHz, htotal %d vtotal %d\n",
+@@ -699,6 +849,8 @@ static int sun60i_tcon_tv_enable(struct sun60i_tcon_tv *tcon, bool vdbist)
+ 
+ static void sun60i_tcon_tv_disable(struct sun60i_tcon_tv *tcon)
+ {
++	sun60i_tcon_tv_irq_off(tcon);
++	tcon->crtc = NULL;
+ 	writel(0, tcon->regs + TV_CTL_REG);
+ 	writel(0, tcon->regs + TV_GCTL_REG);
+ 	/*
+@@ -747,11 +899,15 @@ EXPORT_SYMBOL_GPL(sun60i_tcon_tv_kms_check);
+ /*
+  * The raster, taking its source from the display engine rather than from the
+  * TCON's own pattern generator. That single argument is the whole difference
+- * between this and the debugfs verb.
++ * between this and the debugfs verb -- that, and the CRTC each vblank is
++ * handed to while this raster runs.
+  */
+ int sun60i_tcon_tv_kms_enable(struct sun60i_tcon_tv *tcon,
+-			      const struct drm_display_mode *mode, u8 bpc)
++			      const struct drm_display_mode *mode, u8 bpc,
++			      struct drm_crtc *crtc)
+ {
++	int ret;
++
+ 	guard(mutex)(&tcon->lock);
+ 
+ 	if (!tcon->kms_owned)
+@@ -762,11 +918,65 @@ int sun60i_tcon_tv_kms_enable(struct sun60i_tcon_tv *tcon,
+ 
+ 	drm_mode_copy(&tcon->mode, mode);
+ 	tcon->bpc = bpc;
++	/* Before the line is unmasked, so the handler never sees it change. */
++	tcon->crtc = crtc;
+ 
+-	return sun60i_tcon_tv_enable(tcon, false);
++	ret = sun60i_tcon_tv_enable(tcon, false);
++	if (ret)
++		tcon->crtc = NULL;
++
++	return ret;
+ }
+ EXPORT_SYMBOL_GPL(sun60i_tcon_tv_kms_enable);
+ 
++/* Whether the node gave this TCON an interrupt; without one, no vblank. */
++bool sun60i_tcon_tv_kms_has_vblank(struct sun60i_tcon_tv *tcon)
++{
++	return tcon->irq > 0;
++}
++EXPORT_SYMBOL_GPL(sun60i_tcon_tv_kms_has_vblank);
++
++/*
++ * DRM's .enable_vblank and .disable_vblank, called under its vblank spinlock
++ * with interrupts off, so they take no mutex. They act only while the raster
++ * runs: drm_crtc_vblank_on() comes after the TCON is up and
++ * drm_crtc_vblank_off() before it goes down, and outside that window the
++ * register may sit behind a shut gate.
++ */
++int sun60i_tcon_tv_kms_enable_vblank(struct sun60i_tcon_tv *tcon)
++{
++	u32 val;
++
++	guard(spinlock_irqsave)(&tcon->irq_lock);
++
++	if (!tcon->irq_live) {
++		dev_dbg(tcon->dev, "vblank enable refused: the raster is not running\n");
++		return -ENODEV;
++	}
++
++	/* Set the enable and clear a stale flag in one write. */
++	val = readl(tcon->regs + TV_GINT0_REG);
++	writel((val | TV_GINT0_VB_INT_EN) & ~TV_GINT0_VB_INT_FLAG,
++	       tcon->regs + TV_GINT0_REG);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(sun60i_tcon_tv_kms_enable_vblank);
++
++void sun60i_tcon_tv_kms_disable_vblank(struct sun60i_tcon_tv *tcon)
++{
++	u32 val;
++
++	guard(spinlock_irqsave)(&tcon->irq_lock);
++
++	if (!tcon->irq_live)
++		return;
++
++	val = readl(tcon->regs + TV_GINT0_REG);
++	writel(val & ~TV_GINT0_VB_INT_EN, tcon->regs + TV_GINT0_REG);
++}
++EXPORT_SYMBOL_GPL(sun60i_tcon_tv_kms_disable_vblank);
++
+ void sun60i_tcon_tv_kms_disable(struct sun60i_tcon_tv *tcon)
+ {
+ 	guard(mutex)(&tcon->lock);
+@@ -905,6 +1115,41 @@ static int sun60i_tcon_tv_resources(struct device *dev,
+ 	return 0;
+ }
+ 
++/*
++ * The vblank line, requested masked (IRQF_NO_AUTOEN): sun60i_tcon_tv_irq_on()
++ * unmasks it once the TCON is clocked. Requested here, before the teardown
++ * action, so devm frees it after that action has masked it again.
++ *
++ * Optional in the device-tree sense only. A node without `interrupts` still
++ * rasters, and the KMS master then falls back to completing flips by fake
++ * vblank -- said once here, loudly, because that is the state an earlier bug report described.
++ */
++static int sun60i_tcon_tv_request_irq(struct platform_device *pdev,
++				      struct sun60i_tcon_tv *tcon)
++{
++	struct device *dev = &pdev->dev;
++	int irq, ret;
++
++	spin_lock_init(&tcon->irq_lock);
++
++	irq = platform_get_irq_optional(pdev, 0);
++	if (irq == -ENXIO) {
++		dev_warn(dev, "no interrupt in DT: no vblank, a KMS master completes flips by fake vblank\n");
++		return 0;
++	}
++	if (irq < 0)
++		return dev_err_probe(dev, irq, "vblank interrupt\n");
++
++	ret = devm_request_irq(dev, irq, sun60i_tcon_tv_irq, IRQF_NO_AUTOEN,
++			       dev_name(dev), tcon);
++	if (ret)
++		return dev_err_probe(dev, ret, "vblank interrupt %d\n", irq);
++
++	tcon->irq = irq;
++
++	return 0;
++}
++
+ static int sun60i_tcon_tv_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -932,6 +1177,10 @@ static int sun60i_tcon_tv_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		return ret;
+ 
++	ret = sun60i_tcon_tv_request_irq(pdev, tcon);
++	if (ret)
++		return ret;
++
+ 	ret = devm_add_action_or_reset(dev, sun60i_tcon_tv_teardown, tcon);
+ 	if (ret)
+ 		return ret;

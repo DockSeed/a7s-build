@@ -1,0 +1,20 @@
+# a7s-build: the boot counter of the boot chain (U-Boot overlay
+# "bootcount-rtc-gpr") sits in RTC GP_DATA_REG7. U-Boot counts every boot and,
+# past its bootlimit, boots /boot/extlinux/extlinux-fallback.conf instead.
+# This clears the counter once multi-user.target is reached. The fallback entry
+# carries a7s.fallback on the kernel command line, so a board that came up in
+# safe mode stays there until somebody clears the counter by hand
+# (docs/image.md, "Safe mode").
+[Unit]
+Description=Mark this boot good: clear the boot chain's boot counter (RTC GP_DATA_REG7)
+ConditionKernelCommandLine=!a7s.fallback
+Requires=boot-complete.target
+After=boot-complete.target multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/busybox devmem 0x0709011C 32 0
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

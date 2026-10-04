@@ -1,0 +1,119 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] dt-bindings: pwm: add allwinner,sun60i-a733-pwm
+
+A new file rather than an enum entry in allwinner,because
+the block it describes is not that block. In pwm-sun4i's register file 0x00 is
+the control register and 0x04 is channel 0's period; on the A733 those two are
+the interrupt enable and interrupt status registers (A733 UM V0.92 18.7.7,
+A733 user manual). Nothing about the sun4i binding's shape carries over --
+not the offsets, not the one-or-two-clock model, not "#pwm-cells = 3" meaning
+the same fields against the same hardware.
+
+Three clocks, and the split is real hardware rather than a driver convenience.
+"bus" is the PWMn_BGR gate, needed to reach the registers at all. "hosc" and
+"apb" are the two sources the block's own clock mux selects between in
+PCCR.CLK_SRC (00 = SYS_CLK24M, 01 = APB0), so both have
+to be named phandles: the driver picks one per channel pair and needs to know
+each one's rate.
+
+⚠ "hosc" is the SYS_CLK24M net, fixed at 24 MHz, NOT the 26 MHz
+DCXO -- on this SoC those are two different nets and confusing them has produced
+three separate defects in this tree. The binding cannot enforce it; the SoC
+device tree is where it has to be right.
+
+"resets" is required. PWMn_BGR bit 16 comes out of reset asserted, so a node
+without it describes a controller that cannot run.
+
+Two things left out on purpose. The always-on S_PWM instance at 0x07023000 has
+the same register file but a different set of clock sources (DCXO / RTC_32K /
+RC16M / SYS_CLK24M), which means a different CLK_SRC
+encoding that has not been read here -- so it gets no compatible in this file
+rather than a guessed one. And "interrupts" is optional: the block has one
+(PWM0 = INTID 67 = GIC SPI 35, PWM1 = INTID 68 = GIC SPI 36, from
+the interrupt list of the A733 user manual), it is real, and the driver added
+alongside this binding does not use it -- capture is not implemented.
+
+Assisted-by: Claude
+---
+--- /dev/null
++++ b/Documentation/devicetree/bindings/pwm/allwinner,sun60i-a733-pwm.yaml
+@@ -0,0 +1,79 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/pwm/allwinner,sun60i-a733-pwm.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Allwinner A733 PWM
++
++maintainers:
++  - DockSeed <dockseed@proton.me>
++
++description: >
++  The A733 (sun60iw2) carries two of these controllers on the main bus, PWM0 at
++  0x02527000 and PWM1 at 0x02528000, with ten channels each. The register file
++  is not the one drivers/pwm/pwm-sun4i.c drives: offsets 0x00 and 0x04 are the
++  interrupt enable and status registers, channel output enable lives in PER at
++  0x80, and the per-channel registers start at 0x100 with a stride of 0x40.
++
++  The block also exists in the always-on domain as S_PWM at 0x07023000. That
++  instance takes a different set of clock sources and is not covered by this
++  binding.
++
++properties:
++  compatible:
++    const: allwinner,sun60i-a733-pwm
++
++  reg:
++    maxItems: 1
++
++  clocks:
++    items:
++      - description: Bus clock, the controller's PWMn_BGR gate
++      - description: SYS_CLK24M, the 24 MHz source selectable in PCCR
++      - description: APB0, the other source selectable in PCCR
++
++  clock-names:
++    items:
++      - const: bus
++      - const: hosc
++      - const: apb
++
++  resets:
++    maxItems: 1
++
++  interrupts:
++    maxItems: 1
++
++  "#pwm-cells":
++    const: 3
++
++required:
++  - compatible
++  - reg
++  - clocks
++  - clock-names
++  - resets
++
++allOf:
++  - $ref: pwm.yaml#
++
++additionalProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/clock/sun60i-a733-ccu.h>
++    #include <dt-bindings/reset/sun60i-a733-ccu.h>
++    #include <dt-bindings/interrupt-controller/arm-gic.h>
++
++    pwm@2528000 {
++        compatible = "allwinner,sun60i-a733-pwm";
++        reg = <0x02528000 0x400>;
++        interrupts = <GIC_SPI 36 IRQ_TYPE_LEVEL_HIGH>;
++        clocks = <&ccu CLK_BUS_PWM1>, <&osc24M>, <&ccu CLK_APB0>;
++        clock-names = "bus", "hosc", "apb";
++        resets = <&ccu RST_BUS_PWM1>;
++        #pwm-cells = <3>;
++    };
++
++...
