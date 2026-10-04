@@ -173,13 +173,13 @@ Other cards, drives and board revisions are not claimed.
 |---|---|---|
 | Boot from SD card | works | Boot chain with source-built BL31 |
 | Boot from eMMC | works | HS400, about 290 MB/s at 64 KiB requests |
-| NVMe root over PCIe | partial | Gen3 x1 proven; the SD card stays the default root, NVMe root is a script |
+| NVMe root over PCIe | works | Gen3 x1; U-Boot loads kernel and root from the drive after the card and eMMC; U-Boot itself stays on the card or eMMC |
 | USB 2 | works | Both ports |
 | USB 3 and Type-C | works | 10 Gbit/s, both plug orientations |
 | Gigabit Ethernet | works | Line rate both ways |
 | Wi-Fi | works | Vendor driver built out of tree; firmware fetched at build time |
 | Bluetooth | works | LE and classic, A2DP, PAN; classic HID and HFP not tested |
-| Display | partial | DisplayPort console and desktop; some link-rate recovery is open |
+| Display | partial | DisplayPort console and desktop up to 1920x1200 at 60 Hz (154 MHz pixel clock); higher modes need dual pixel mode, not done yet |
 | GPU | works | Mesa OpenGL (GLES 2 / GL via zink); about 4x slower than the vendor driver |
 | Desktop | opt-in | `A7S_DESKTOP=1`: Xfce with LightDM |
 | CPU: 8 cores, DVFS, idle | works | DVFS measured on two silicon bins; other bins use the vendor's table |
