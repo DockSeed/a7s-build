@@ -138,5 +138,6 @@ or serial console.
 Our own files are `GPL-2.0-only OR MIT`. Patches and bundled code keep the
 licence of the project they belong to (Linux GPL-2.0-only, U-Boot
 GPL-2.0-or-later, TF-A BSD-3-Clause, ORC BSD-2-Clause, xfwm4 GPL-2.0-or-later,
-aic8800 GPL-2.0). Full texts in [LICENSES/](LICENSES/),
+aic8800 GPL-2.0-only). The repository as a whole can be shared under
+GPL-2.0 ([LICENSE](LICENSE)). Full texts in [LICENSES/](LICENSES/),
 assignments in [REUSE.toml](REUSE.toml); `reuse lint` checks them.
