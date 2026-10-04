@@ -124,6 +124,7 @@ for your own use, **do not redistribute it**.
 - [docs/reproducibility.md](docs/reproducibility.md): what is pinned, moving a pin
 - [docs/kernel.md](docs/kernel.md), [docs/bootchain.md](docs/bootchain.md), [docs/image.md](docs/image.md), [docs/distro-interface.md](docs/distro-interface.md)
 - [docs/how-we-built-it.md](docs/how-we-built-it.md): how this came about
+- [docs/benchmarks.md](docs/benchmarks.md): sbc-bench on the board
 - [docs/help-wanted.md](docs/help-wanted.md): the A733 is landing in mainline right now, and help is welcome
 
 ## Found a problem?
