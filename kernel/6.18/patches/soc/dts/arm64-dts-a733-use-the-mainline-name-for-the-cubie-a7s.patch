@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Mon, 5 Oct 2026 06:45:00 +0200
+Subject: [PATCH] arm64: dts: a733: use the mainline name for the Cubie A7S
+
+Rename sun60i-a733-cubie-a7s-minimal.dts to sun60i-a733-cubie-a7s.dts and
+set model to "Radxa Cubie A7S", the names of the upstream board
+submission. "minimal" and "M1" were left over from the first bring-up.
+
+Assisted-by: Claude
+---
+diff --git a/arch/arm64/boot/dts/allwinner/Makefile b/arch/arm64/boot/dts/allwinner/Makefile
+index d73d19b2f..a37f8c309 100644
+--- a/arch/arm64/boot/dts/allwinner/Makefile
++++ b/arch/arm64/boot/dts/allwinner/Makefile
+@@ -1,5 +1,5 @@
+ # SPDX-License-Identifier: GPL-2.0
+-dtb-$(CONFIG_ARCH_SUNXI) += sun60i-a733-cubie-a7s-minimal.dtb
++dtb-$(CONFIG_ARCH_SUNXI) += sun60i-a733-cubie-a7s.dtb
+ dtb-$(CONFIG_ARCH_SUNXI) += sun50i-a64-amarula-relic.dtb
+ dtb-$(CONFIG_ARCH_SUNXI) += sun50i-a64-bananapi-m64.dtb
+ dtb-$(CONFIG_ARCH_SUNXI) += sun50i-a64-nanopi-a64.dtb
+diff --git a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s.dts
+similarity index 99%
+rename from arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+rename to arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s.dts
+index 10f371aad..497319cb3 100644
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s.dts
+@@ -29,7 +29,7 @@
+ #include <dt-bindings/usb/pd.h>
+ 
+ / {
+-	model = "Radxa Cubie A7S (A733 minimal M1)";
++	model = "Radxa Cubie A7S";
+ 	compatible = "radxa,cubie-a7s", "allwinner,sun60i-a733";
+ 	interrupt-parent = <&gic>;
+ 	#address-cells = <2>;

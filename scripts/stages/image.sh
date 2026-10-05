@@ -26,7 +26,7 @@ A7S_ROOT_UUID="${A7S_ROOT_UUID:-a7500000-7e57-4a7a-8a7a-000000000001}"
 IMAGE_ROOT_LABEL="a7s-root"
 # The device tree the kernel stage puts beside the Image in OUT_DIR (the file
 # name of its A7S_KERNEL_DTB).
-IMAGE_DTB="${A7S_KERNEL_DTB:-allwinner/sun60i-a733-cubie-a7s-minimal.dtb}"
+IMAGE_DTB="${A7S_KERNEL_DTB:-allwinner/sun60i-a733-cubie-a7s.dtb}"
 IMAGE_DTB="${IMAGE_DTB##*/}"
 # The GPU firmware the powervr driver asks for.
 IMAGE_GPU_FW="rogue_36.56.104.183_v1.fw"

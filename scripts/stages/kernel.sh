@@ -24,7 +24,7 @@ KERNEL_URL="https://cdn.kernel.org/pub/linux/kernel/v${KERNEL_VERSION%%.*}.x/${K
 KERNEL_SHA256="9df30b02dd8102bbd0be52556288ef6889ddbe7f1ddb96fbf847d0becf3eacac"
 KERNEL_ARCH="arm64"
 # The boot dtb built and shipped (relative to arch/arm64/boot/dts/).
-KERNEL_DTB="${A7S_KERNEL_DTB:-allwinner/sun60i-a733-cubie-a7s-minimal.dtb}"
+KERNEL_DTB="${A7S_KERNEL_DTB:-allwinner/sun60i-a733-cubie-a7s.dtb}"
 # What the build is read from. The defaults are the repository's own files; the
 # variables let a developer point the stage at another series or config without
 # editing the tree (the pinned tarball still decides the base).
