@@ -252,3 +252,4 @@ soc/display/drm-a733-dp-audio-through-the-bridge.patch
 soc/dts/arm64-dts-a733-dp-audio-card-disabled.patch
 soc/sound/asoc-sun4i-i2s-keep-the-fifo-across-a-pause.patch
 soc/dts/arm64-dts-a733-use-the-mainline-name-for-the-cubie-a7s.patch
+soc/dts/arm64-dts-a733-add-the-cubie-a7s-leds.patch
