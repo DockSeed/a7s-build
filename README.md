@@ -134,6 +134,14 @@ please open an issue on GitHub. Include the commit you built, your host
 (distribution, podman or docker) and the relevant part of the build log
 or serial console.
 
+## A note on earlier versions
+
+Earlier versions of this repository described other projects' code, including
+Radxa's and Allwinner's, in a tone that was not fair to the people who wrote
+it. Those texts were written with AI agents and published without the review
+they needed. They have been rewritten, and we apologise to everyone they
+concerned. Their work is what made this project possible.
+
 ## Licence
 
 Our own files are `GPL-2.0-only OR MIT`. Patches and bundled code keep the
