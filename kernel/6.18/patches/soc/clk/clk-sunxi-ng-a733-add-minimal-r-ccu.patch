@@ -1,0 +1,194 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] clk: sunxi-ng: A733 add a minimal R-CCU (CPUS/PRCM)
+
+The AON pin bank (S_GPIO / r_pio) needs an "apb" bus clock, which comes from
+the CPUS PRCM at 0x07010000 (A733 UM 4.2). Adds a small
+R-CCU driver exposing only the three AON bus clocks r-ahb / r-apb0 / r-apb1
+(offsets 0x000 / 0x00c / 0x010, src-mux [26:24], M [4:0] -- all from the A733
+UM; silicon: 0x07010000 reads 0x03000000 = AHBS src=011).
+
+Deliberately minimal, NOT a reuse of ccu-sun55i-a523-r: that driver drives ~27
+AON clocks (timers, uart, i2c, dma@0x1dc, ...) whose A733 offsets are only
+partly confirmed, so reusing it would touch unverified registers. This set
+touches only the three bus-clock registers we have verified. The bus clocks are
+ungated mux/dividers (the AON bus is always live) -- S_GPIO itself has no gate
+(the UM has no S_GPIO_BGR and silicon reads it live without any enable), so no
+gate or reset is modelled. More AON clocks (r_i2c for the PMIC, ...) are added
+as consumers land.
+
+Parent order follows the A733 AHBS/APBS src field: hosc / losc / iosc /
+pll-periph-200m / pll-periph-300m (the last two from the main CCU via DT).
+
+Based on drivers/clk/sunxi-ng/ccu-sun55i-a523-r.c, Copyright (C) 2024 Arm Ltd.
+
+Assisted-by: Claude
+---
+--- /dev/null
++++ b/include/dt-bindings/clock/sun60i-a733-r-ccu.h
+@@ -0,0 +1,17 @@
++/* SPDX-License-Identifier: (GPL-2.0-only OR MIT) */
++/*
++ * A733 (sun60iw2) R-CCU (CPUS / Secure PRCM) clock indices.
++ *
++ * The PRCM at 0x07010000 is the AON/CPUS clock+reset block (A733 UM 4.2,
++ * A733 user manual). This minimal set exposes only the AON bus clocks the
++ * r_pio (S_GPIO) needs; more AON clocks (r_i2c for the PMIC, r_uart, ...) are
++ * added as consumers land.
++ */
++#ifndef _DT_BINDINGS_CLK_SUN60I_A733_R_CCU_H_
++#define _DT_BINDINGS_CLK_SUN60I_A733_R_CCU_H_
++
++#define CLK_R_AHB		0
++#define CLK_R_APB0		1
++#define CLK_R_APB1		2
++
++#endif /* _DT_BINDINGS_CLK_SUN60I_A733_R_CCU_H_ */
+--- /dev/null
++++ b/drivers/clk/sunxi-ng/ccu-sun60iw2-r.h
+@@ -0,0 +1,12 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * A733 (sun60iw2) R-CCU (PRCM) driver private header.
++ */
++#ifndef _CCU_SUN60IW2_R_H
++#define _CCU_SUN60IW2_R_H
++
++#include <dt-bindings/clock/sun60i-a733-r-ccu.h>
++
++#define CLK_NUMBER	(CLK_R_APB1 + 1)
++
++#endif /* _CCU_SUN60IW2_R_H */
+--- /dev/null
++++ b/drivers/clk/sunxi-ng/ccu-sun60iw2-r.c
+@@ -0,0 +1,107 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * A733 (sun60iw2) R-CCU (CPUS / Secure PRCM) driver.
++ *
++ * The PRCM at 0x07010000 is the always-on CPUS clock+reset block (A733 UM 4.2,
++ * A733 user manual). Register offsets and the src-mux/M-divider layout are
++ * from the A733 UM and match the register-compatible
++ * parent sun55i-a523-r. This is a MINIMAL set: only the three AON bus clocks
++ * (r-ahb, r-apb0, r-apb1). They are ungated mux/dividers -- the AON bus is
++ * always live -- and exist so consumers (the r_pio / S_GPIO pinctrl, later the
++ * PMIC r_i2c, ...) have a valid "apb" clock to reference. S_GPIO itself has no
++ * gate (UM has no S_GPIO_BGR; silicon reads it live without any enable), so no
++ * gate/reset is modelled here.
++ *
++ * Parent order matches the A733 AHBS/APBS src-select field [26:24]:
++ *   000 = DCXO (hosc/24M), 001 = RTC_32K (losc), 010 = RC16M (iosc),
++ *   011 = PERIPLL-200M, 100 = PERI0-300M. The last two come from the main CCU
++ *   via DT (pll-periph-200m / pll-periph-300m). At reset AHBS reads src=011.
++ *
++ * Based on drivers/clk/sunxi-ng/ccu-sun55i-a523-r.c, Copyright (C) 2024 Arm Ltd.
++ */
++
++#include <linux/clk-provider.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++
++#include "ccu_common.h"
++#include "ccu_div.h"
++
++#include "ccu-sun60iw2-r.h"
++
++static const struct clk_parent_data r_ahb_apb_parents[] = {
++	{ .fw_name = "hosc" },			/* 000: DCXO 24M */
++	{ .fw_name = "losc" },			/* 001: RTC 32k */
++	{ .fw_name = "iosc" },			/* 010: RC 16M */
++	{ .fw_name = "pll-periph-200m" },	/* 011: PERIPLL-200M */
++	{ .fw_name = "pll-periph-300m" },	/* 100: PERI0-300M */
++};
++
++static SUNXI_CCU_M_DATA_WITH_MUX(r_ahb_clk, "r-ahb",
++				 r_ahb_apb_parents, 0x000,
++				 0, 5,	/* M */
++				 24, 3,	/* mux */
++				 0);
++static SUNXI_CCU_M_DATA_WITH_MUX(r_apb0_clk, "r-apb0",
++				 r_ahb_apb_parents, 0x00c,
++				 0, 5,	/* M */
++				 24, 3,	/* mux */
++				 0);
++static SUNXI_CCU_M_DATA_WITH_MUX(r_apb1_clk, "r-apb1",
++				 r_ahb_apb_parents, 0x010,
++				 0, 5,	/* M */
++				 24, 3,	/* mux */
++				 0);
++
++static struct ccu_common *sun60iw2_r_ccu_clks[] = {
++	&r_ahb_clk.common,
++	&r_apb0_clk.common,
++	&r_apb1_clk.common,
++};
++
++static struct clk_hw_onecell_data sun60iw2_r_hw_clks = {
++	.num	= CLK_NUMBER,
++	.hws	= {
++		[CLK_R_AHB]	= &r_ahb_clk.common.hw,
++		[CLK_R_APB0]	= &r_apb0_clk.common.hw,
++		[CLK_R_APB1]	= &r_apb1_clk.common.hw,
++	},
++};
++
++static const struct sunxi_ccu_desc sun60iw2_r_ccu_desc = {
++	.ccu_clks	= sun60iw2_r_ccu_clks,
++	.num_ccu_clks	= ARRAY_SIZE(sun60iw2_r_ccu_clks),
++
++	.hw_clks	= &sun60iw2_r_hw_clks,
++};
++
++static int sun60iw2_r_ccu_probe(struct platform_device *pdev)
++{
++	void __iomem *reg;
++
++	reg = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(reg))
++		return PTR_ERR(reg);
++
++	return devm_sunxi_ccu_probe(&pdev->dev, reg, &sun60iw2_r_ccu_desc);
++}
++
++static const struct of_device_id sun60iw2_r_ccu_ids[] = {
++	{ .compatible = "allwinner,sun60i-a733-r-ccu" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, sun60iw2_r_ccu_ids);
++
++static struct platform_driver sun60iw2_r_ccu_driver = {
++	.probe	= sun60iw2_r_ccu_probe,
++	.driver	= {
++		.name			= "sun60iw2-r-ccu",
++		.suppress_bind_attrs	= true,
++		.of_match_table		= sun60iw2_r_ccu_ids,
++	},
++};
++module_platform_driver(sun60iw2_r_ccu_driver);
++
++MODULE_IMPORT_NS("SUNXI_CCU");
++MODULE_DESCRIPTION("Support for the Allwinner A733 PRCM CCU");
++MODULE_LICENSE("GPL");
+--- a/drivers/clk/sunxi-ng/Kconfig
++++ b/drivers/clk/sunxi-ng/Kconfig
+@@ -57,6 +57,11 @@
+ 	default ARCH_SUNXI
+ 	depends on ARM64 || COMPILE_TEST
+ 
++config SUN60I_A733_R_CCU
++	tristate "Support for the Allwinner A733 PRCM CCU"
++	default ARCH_SUNXI
++	depends on ARM64 || COMPILE_TEST
++
+ config SUN55I_A523_CCU
+ 	tristate "Support for the Allwinner A523/T527 CCU"
+ 	default ARCH_SUNXI
+--- a/drivers/clk/sunxi-ng/Makefile
++++ b/drivers/clk/sunxi-ng/Makefile
+@@ -34,6 +34,7 @@
+ obj-$(CONFIG_SUN50I_H6_R_CCU)	+= sun50i-h6-r-ccu.o
+ obj-$(CONFIG_SUN50I_H616_CCU)	+= sun50i-h616-ccu.o
+ obj-$(CONFIG_SUN60I_A733_CCU)	+= ccu-sun60iw2.o
++obj-$(CONFIG_SUN60I_A733_R_CCU)	+= ccu-sun60iw2-r.o
+ obj-$(CONFIG_SUN55I_A523_CCU)	+= sun55i-a523-ccu.o
+ obj-$(CONFIG_SUN55I_A523_MCU_CCU)	+= sun55i-a523-mcu-ccu.o
+ obj-$(CONFIG_SUN55I_A523_R_CCU)	+= sun55i-a523-r-ccu.o

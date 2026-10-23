@@ -1,0 +1,17 @@
+# a7s-build: the image carries no ssl-cert snakeoil certificate and key (as in
+# Debian's live images: live-build hook 8090 removes them, live-config's
+# ssl-cert component makes new ones); every board makes its own on its first
+# boot. Images without ssl-cert skip this.
+[Unit]
+Description=Generate this board's own ssl-cert snakeoil certificate
+ConditionPathExists=/usr/sbin/make-ssl-cert
+ConditionPathExists=!/etc/ssl/certs/ssl-cert-snakeoil.pem
+ConditionPathExists=!/etc/ssl/private/ssl-cert-snakeoil.key
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/make-ssl-cert generate-default-snakeoil --force-overwrite
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

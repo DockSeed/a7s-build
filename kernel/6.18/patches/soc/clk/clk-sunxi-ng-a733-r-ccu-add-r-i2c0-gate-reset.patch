@@ -1,0 +1,145 @@
+From 11bb01e872fcc67c0f96fbff8b3c6ef2f16a0cab Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Mon, 20 Jul 2026 18:38:00 +0200
+Subject: [PATCH] clk: sunxi-ng: a733 r-ccu: add R_I2C0 bus gate + reset (PMIC
+ bus)
+
+The minimal A733 R-CCU (`clk-sunxi-ng-a733-add-minimal-r-ccu`) exposed only the three AON bus clocks. The
+AXP8191/AXP318W PMIC sits on S_TWI0 (r_i2c0), which needs its bus gate and
+reset. Add CLK_BUS_R_I2C0 (S_TWI_BGR 0x19c bit0) and RST_BUS_R_I2C0
+(0x19c bit16), parented on r-apb1 (S_TWI is on the APBS1 bus).
+
+Values from the A733 UM (S_TWI_BGR 0x19c, TWI0 gate bit0 /
+reset bit16) and cross-checked register-compatible against sun55i-a523-r.
+The controller base (S_TWI0 @ 0x07083000) and the axp8191 @ 0x36 were read
+back live on the 6 GiB board (of_node i2c@7083000).
+
+Assisted-by: Claude
+---
+ drivers/clk/sunxi-ng/ccu-sun60iw2-r.c         | 26 ++++++++++++++++---
+ drivers/clk/sunxi-ng/ccu-sun60iw2-r.h         |  3 ++-
+ include/dt-bindings/clock/sun60i-a733-r-ccu.h |  5 ++--
+ include/dt-bindings/reset/sun60i-a733-r-ccu.h | 14 ++++++++++
+ 4 files changed, 42 insertions(+), 6 deletions(-)
+ create mode 100644 include/dt-bindings/reset/sun60i-a733-r-ccu.h
+
+diff --git a/drivers/clk/sunxi-ng/ccu-sun60iw2-r.c b/drivers/clk/sunxi-ng/ccu-sun60iw2-r.c
+index 6841e4a..7db7ec2 100644
+--- a/drivers/clk/sunxi-ng/ccu-sun60iw2-r.c
++++ b/drivers/clk/sunxi-ng/ccu-sun60iw2-r.c
+@@ -26,6 +26,8 @@
+ 
+ #include "ccu_common.h"
+ #include "ccu_div.h"
++#include "ccu_gate.h"
++#include "ccu_reset.h"
+ 
+ #include "ccu-sun60iw2-r.h"
+ 
+@@ -71,26 +73,44 @@ static SUNXI_CCU_M_DATA_WITH_MUX(r_apb1_clk, "r-apb1",
+ 				 24, 3,	/* mux */
+ 				 0);
+ 
++/*
++ * S_TWI_BGR (PRCM 0x19c): TWI0 gate = bit0, TWI0 reset = bit16 (A733 UM,
++ * register table). S_TWI is on the APBS1 bus, so the parent is r-apb1. This
++ * is the bus clock the PMIC I2C (S_TWI0 @ 0x07083000, axp8191 @ 0x36 --
++ * both read back on the 6 GiB board) hangs off.
++ */
++static SUNXI_CCU_GATE_HW(bus_r_i2c0_clk, "bus-r-i2c0",
++			 &r_apb1_clk.common.hw, 0x19c, BIT(0), 0);
++
+ static struct ccu_common *sun60iw2_r_ccu_clks[] = {
+ 	&r_ahb_clk.common,
+ 	&r_apb0_clk.common,
+ 	&r_apb1_clk.common,
++	&bus_r_i2c0_clk.common,
+ };
+ 
+ static struct clk_hw_onecell_data sun60iw2_r_hw_clks = {
+ 	.num	= CLK_NUMBER,
+ 	.hws	= {
+-		[CLK_R_AHB]	= &r_ahb_clk.common.hw,
+-		[CLK_R_APB0]	= &r_apb0_clk.common.hw,
+-		[CLK_R_APB1]	= &r_apb1_clk.common.hw,
++		[CLK_R_AHB]		= &r_ahb_clk.common.hw,
++		[CLK_R_APB0]		= &r_apb0_clk.common.hw,
++		[CLK_R_APB1]		= &r_apb1_clk.common.hw,
++		[CLK_BUS_R_I2C0]	= &bus_r_i2c0_clk.common.hw,
+ 	},
+ };
+ 
++static struct ccu_reset_map sun60iw2_r_ccu_resets[] = {
++	[RST_BUS_R_I2C0]	= { 0x19c, BIT(16) },
++};
++
+ static const struct sunxi_ccu_desc sun60iw2_r_ccu_desc = {
+ 	.ccu_clks	= sun60iw2_r_ccu_clks,
+ 	.num_ccu_clks	= ARRAY_SIZE(sun60iw2_r_ccu_clks),
+ 
+ 	.hw_clks	= &sun60iw2_r_hw_clks,
++
++	.resets		= sun60iw2_r_ccu_resets,
++	.num_resets	= ARRAY_SIZE(sun60iw2_r_ccu_resets),
+ };
+ 
+ static int sun60iw2_r_ccu_probe(struct platform_device *pdev)
+diff --git a/drivers/clk/sunxi-ng/ccu-sun60iw2-r.h b/drivers/clk/sunxi-ng/ccu-sun60iw2-r.h
+index 816c0c7..b633fcb 100644
+--- a/drivers/clk/sunxi-ng/ccu-sun60iw2-r.h
++++ b/drivers/clk/sunxi-ng/ccu-sun60iw2-r.h
+@@ -6,7 +6,8 @@
+ #define _CCU_SUN60IW2_R_H
+ 
+ #include <dt-bindings/clock/sun60i-a733-r-ccu.h>
++#include <dt-bindings/reset/sun60i-a733-r-ccu.h>
+ 
+-#define CLK_NUMBER	(CLK_R_APB1 + 1)
++#define CLK_NUMBER	(CLK_BUS_R_I2C0 + 1)
+ 
+ #endif /* _CCU_SUN60IW2_R_H */
+diff --git a/include/dt-bindings/clock/sun60i-a733-r-ccu.h b/include/dt-bindings/clock/sun60i-a733-r-ccu.h
+index 68fbda3..a43cd84 100644
+--- a/include/dt-bindings/clock/sun60i-a733-r-ccu.h
++++ b/include/dt-bindings/clock/sun60i-a733-r-ccu.h
+@@ -4,8 +4,8 @@
+  *
+  * The PRCM at 0x07010000 is the AON/CPUS clock+reset block (A733 UM 4.2,
+  * A733 user manual). This minimal set exposes only the AON bus clocks the
+- * r_pio (S_GPIO) needs; more AON clocks (r_i2c for the PMIC, r_uart, ...) are
+- * added as consumers land.
++ * r_pio (S_GPIO) needs plus the r_i2c0 (S_TWI0) bus gate the PMIC hangs off;
++ * more AON clocks (r_uart, ...) are added as consumers land.
+  */
+ #ifndef _DT_BINDINGS_CLK_SUN60I_A733_R_CCU_H_
+ #define _DT_BINDINGS_CLK_SUN60I_A733_R_CCU_H_
+@@ -13,5 +13,6 @@
+ #define CLK_R_AHB		0
+ #define CLK_R_APB0		1
+ #define CLK_R_APB1		2
++#define CLK_BUS_R_I2C0		3
+ 
+ #endif /* _DT_BINDINGS_CLK_SUN60I_A733_R_CCU_H_ */
+diff --git a/include/dt-bindings/reset/sun60i-a733-r-ccu.h b/include/dt-bindings/reset/sun60i-a733-r-ccu.h
+new file mode 100644
+index 0000000..53c07b1
+--- /dev/null
++++ b/include/dt-bindings/reset/sun60i-a733-r-ccu.h
+@@ -0,0 +1,14 @@
++/* SPDX-License-Identifier: (GPL-2.0-only OR MIT) */
++/*
++ * A733 (sun60iw2) R-CCU (CPUS / Secure PRCM) reset indices.
++ *
++ * S_TWI_BGR at PRCM offset 0x19c gates and resets the S_TWI (r_i2c)
++ * controllers: TWI0/1/2 gate bit0/1/2, reset bit16/17/18 (A733 UM,
++ * register table). Only R_I2C0 (the PMIC bus) is modelled here for now.
++ */
++#ifndef _DT_BINDINGS_RST_SUN60I_A733_R_CCU_H_
++#define _DT_BINDINGS_RST_SUN60I_A733_R_CCU_H_
++
++#define RST_BUS_R_I2C0		0
++
++#endif /* _DT_BINDINGS_RST_SUN60I_A733_R_CCU_H_ */
+-- 
+2.55.0
+

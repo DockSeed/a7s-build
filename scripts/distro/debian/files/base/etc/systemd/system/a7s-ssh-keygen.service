@@ -1,0 +1,15 @@
+# a7s-build: the image carries no SSH host keys; every board makes its own on
+# its first boot, before sshd starts.
+[Unit]
+Description=Generate this board's own SSH host keys
+ConditionPathExistsGlob=!/etc/ssh/ssh_host_*_key
+Before=ssh.service
+Wants=ssh.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/ssh-keygen -A
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

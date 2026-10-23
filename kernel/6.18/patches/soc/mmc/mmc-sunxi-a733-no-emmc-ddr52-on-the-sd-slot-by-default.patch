@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Sat, 17 Oct 2026 11:12:53 +0200
+Subject: [PATCH] mmc: sunxi: a733: no eMMC DDR52 on the SD slot by default
+
+What. Add no_mmc_ddr to struct sunxi_mmc_cfg and set it in the A733 SD
+cfg (sun60i_a733_mmc_cfg, SMHC0). That host no longer offers
+MMC_CAP_1_8V_DDR and MMC_CAP_3_3V_DDR by default; the A733 eMMC cfg
+(SMHC2) is unchanged. Same shape as the H5 exception next to it, which
+drops the two caps for "allwinner,sun50i-h5-emmc".
+
+Why. An eMMC module on a microSD adapter in the SD slot attaches as
+"new high speed DDR MMC card" (timing MMC_DDR52, 4 bit, 50 MHz card
+clock), and every read ends in "data error, sending stop command"; the
+card is unusable. U-Boot reads the same module in the same slot at High
+Speed SDR, 52 MHz, 4 bit. The core selects DDR52 because the host offers
+the DDR caps (mmc_select_card_type()), and with MMC_CAP_1_8V_DDR
+mmc_select_hs_ddr() also switches the bus to 1.8 V signalling. On this
+slot that switch is the sdmmc-1v8 pad state alone (no vqmmc), while a
+microSD slot powers the device from one 3.3 V supply. Whether the DDR
+timing or the I/O level breaks the transfer is not known; both go with
+the caps, and the module then runs in the mode U-Boot uses.
+
+What it does not touch. SD and SDIO cards never use MMC_CAP_*_DDR: the
+caps are read only by the eMMC path (core/mmc.c) and set from
+mmc-ddr-* by mmc_of_parse() (core/host.c). SD cards keep their UHS
+modes (sd-uhs-sdr50, sd-uhs-sdr104 on this slot) and the full 4-bit
+bus. The soldered eMMC on SMHC2 keeps DDR52, HS200 and HS400. The caps
+are dropped before mmc_of_parse(), so a board whose slot carries a
+device that can do DDR52 can still say so with mmc-ddr-1_8v or
+mmc-ddr-3_3v; the Cubie A7S DT has neither on mmc0.
+
+Assisted-by: Claude
+---
+diff --git a/drivers/mmc/host/sunxi-mmc.c b/drivers/mmc/host/sunxi-mmc.c
+index 0685d2715..7416bea0e 100644
+--- a/drivers/mmc/host/sunxi-mmc.c
++++ b/drivers/mmc/host/sunxi-mmc.c
+@@ -474,6 +474,15 @@ struct sunxi_mmc_cfg {
+ 	 * that carries root from ever attaching.
+ 	 */
+ 	bool emmc_only;
++
++	/*
++	 * The controller instance is a removable card slot: do not offer
++	 * eMMC DDR52 (MMC_CAP_1_8V_DDR / MMC_CAP_3_3V_DDR) by default. SD
++	 * and SDIO cards never use these caps; an eMMC device in the slot
++	 * then runs at High Speed SDR. A DT can still ask for DDR52 with
++	 * mmc-ddr-1_8v or mmc-ddr-3_3v.
++	 */
++	bool no_mmc_ddr;
+ };
+ 
+ struct sunxi_mmc_host {
+@@ -3082,6 +3091,7 @@ static const struct sunxi_mmc_cfg sun60i_a733_mmc_cfg = {
+ 	 * except for SDUC cards. can_wait_busy above is what makes it safe.
+ 	 */
+ 	.can_hsq = true,
++	.no_mmc_ddr = true,
+ };
+ 
+ static const struct sunxi_mmc_cfg sun60i_a733_emmc_cfg = {
+@@ -3425,9 +3435,11 @@ static int sunxi_mmc_probe(struct platform_device *pdev)
+ 	 * use HS DDR mode for their eMMC chips.
+ 	 *
+ 	 * We still enable HS DDR modes for all the other controller
+-	 * variants that support them.
++	 * variants that support them, except on card slots that do not
++	 * offer them by default (cfg->no_mmc_ddr).
+ 	 */
+ 	if ((host->cfg->clk_delays || host->use_new_timings) &&
++	    !host->cfg->no_mmc_ddr &&
+ 	    !of_device_is_compatible(pdev->dev.of_node,
+ 				     "allwinner,sun50i-h5-emmc"))
+ 		mmc->caps      |= MMC_CAP_1_8V_DDR | MMC_CAP_3_3V_DDR;

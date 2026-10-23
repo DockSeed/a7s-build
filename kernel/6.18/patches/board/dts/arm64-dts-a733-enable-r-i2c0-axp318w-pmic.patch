@@ -1,0 +1,129 @@
+From 71f3e3202e287453e8ce4323054d15fb9c2e0453 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Mon, 20 Jul 2026 18:38:00 +0200
+Subject: [PATCH] arm64: dts: a733: enable r_i2c0 + AXP318W PMIC (swout1/2
+ rails)
+
+Enable the S_TWI0 PMU bus (r_i2c0 @ 0x07083000) and describe the
+AXP8191/AXP318W PMIC at 0x36 with its two DCDC1 switch outputs: SWOUT1
+(reg 0x11 bit3) = Maxio PHY 3v3 (net VCC33-LCD), SWOUT2 (bit4) = VCC-PH
+bank I/O. Both are boot-enabled (reg 0x11 = 0x1f, measured on the 6 GiB board) and
+kept always-on until the net patches wire swout1 as the gmac phy-supply.
+
+Base/IRQ/compatible verified on silicon (the 6 GiB board, 2026-07-20):
+of_node i2c@7083000, interrupts GIC_SPI 203 (0xcb), compatible
+sun8i-v536-i2c/sun6i-a31-i2c, axp8191 @ 1-0036. Note 0x07083000 is the
+A733 S_TWI0 base (SYSCPUS_APBS1) -- NOT the A523 r_i2c0 address 0x07081400,
+which on the A733 lands inside S_UART1 (0x07081000-0x07081FFF).
+
+Depends on the r-ccu R_I2C0 gate/reset patch.
+
+Assisted-by: Claude
+---
+ .../sun60i-a733-cubie-a7s-minimal.dts         | 67 +++++++++++++++++++
+ 1 file changed, 67 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+index 3b46119..412164a 100755
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -21,6 +21,7 @@
+ #include <dt-bindings/clock/sun60i-a733-serdes-ccu.h>
+ #include <dt-bindings/gpio/gpio.h>
+ #include <dt-bindings/reset/sun60i-a733-ccu.h>
++#include <dt-bindings/reset/sun60i-a733-r-ccu.h>
+ #include <dt-bindings/reset/sun60i-a733-serdes-ccu.h>
+ 
+ / {
+@@ -1558,12 +1559,13 @@
+ 			clocks = <&osc24M>, <&osc32k>, <&iosc>,
+ 				 <&ccu CLK_PLL_PERI0_200M>,
+ 				 <&ccu CLK_PLL_PERI0_300M>;
+ 			clock-names = "hosc", "losc", "iosc",
+ 				      "pll-periph-200m", "pll-periph-300m";
+ 			#clock-cells = <1>;
++			#reset-cells = <1>;
+ 		};
+ 
+ 		r_pio: pinctrl@7025000 {
+ 			compatible = "allwinner,sun60i-a733-r-pinctrl",
+ 				     "allwinner,sun55i-a523-r-pinctrl";
+ 			reg = <0x0 0x07025000 0x0 0x800>;
+@@ -1572,12 +1574,77 @@
+ 			clocks = <&r_ccu CLK_R_APB0>, <&osc24M>, <&osc32k>;
+ 			clock-names = "apb", "hosc", "losc";
+ 			gpio-controller;
+ 			#gpio-cells = <3>;
+ 			interrupt-controller;
+ 			#interrupt-cells = <3>;
++
++			/*
++			 * PMU I2C = S_TWI0 on PL0/PL1 (mux 2). Pin/mux from the
++			 * pin tables (PL0 = S-TWI0-SCK, PL1 = S-TWI0-SDA)
++			 * and confirmed on the 6 GiB board. The pinctrl function name is
++			 * the register-compatible a523-r-pinctrl's "r_i2c0".
++			 */
++			r_i2c_pins: r-i2c-pins {
++				pins = "PL0", "PL1";
++				allwinner,pinmux = <2>;
++				function = "r_i2c0";
++			};
++		};
++
++		/*
++		 * S_TWI0 @ 0x07083000 (A733 UM memory-map: SYSCPUS_APBS1,
++		 * 0x07083000-0x07083FFF). This is NOT 0x07081400 -- that is the
++		 * A523 r_i2c0 address, which on the A733 falls inside S_UART1
++		 * (0x07081000-0x07081FFF). Base, IRQ (GIC_SPI 203 = S_TWI0
++		 * intid 235) and the axp8191 @ 0x36 were all read back live on
++		 * the 6 GiB board (of_node i2c@7083000, interrupts 0xcb, reg 0x11 =
++		 * 0x1f). Register layout is mv64xxx-compatible, reused via the
++		 * sun8i-v536 / sun6i-a31 fallback (no A733-specific binding yet).
++		 */
++		r_i2c0: i2c@7083000 {
++			compatible = "allwinner,sun8i-v536-i2c",
++				     "allwinner,sun6i-a31-i2c";
++			reg = <0x0 0x07083000 0x0 0x400>;
++			interrupts = <GIC_SPI 203 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&r_ccu CLK_BUS_R_I2C0>;
++			resets = <&r_ccu RST_BUS_R_I2C0>;
++			pinctrl-names = "default";
++			pinctrl-0 = <&r_i2c_pins>;
++			status = "okay";
++
++			#address-cells = <1>;
++			#size-cells = <0>;
++
++			pmic@36 {
++				compatible = "x-powers,axp318w";
++				reg = <0x36>;
++
++				regulators {
++					/*
++					 * SWOUT1 = reg 0x11 BIT(3) = Maxio PHY
++					 * 3v3 (board net VCC33-LCD). SWOUT2 =
++					 * reg 0x11 BIT(4) = VCC-PH bank I/O.
++					 * Both are switch outputs of DCDC1
++					 * (<= 3.6 V). Boot default reg 0x11 =
++					 * 0x1f (both enabled) measured on the 6 GiB board
++					 * 2026-07-20; kept always-on to preserve
++					 * that state until the net patches wire
++					 * swout1 as the gmac phy-supply.
++					 */
++					reg_swout1: swout1 {
++						regulator-name = "vcc33-phy";
++						regulator-always-on;
++					};
++
++					reg_swout2: swout2 {
++						regulator-name = "vcc-ph";
++						regulator-always-on;
++					};
++				};
++			};
+ 		};
+ 
+ 		/*
+ 		 * RTC-CCU (PRCM @0x07090000, AON domain). Provides the two SERDES
+ 		 * DCXO gates (XO_CTRL1 @0x16c bit4/5); the COMB0 combo-PHY consumes
+ 		 * dcxo-serdes0. Parent = r-ahb (from the R-CCU). Driver = patch `clk-sunxi-ng-a733-add-minimal-rtc-ccu`.

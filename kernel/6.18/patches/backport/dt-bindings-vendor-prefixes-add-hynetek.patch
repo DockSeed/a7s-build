@@ -1,0 +1,33 @@
+From 5bda9c0261bce6a70bd7cb9afa0551c2fdf4ebc1 Mon Sep 17 00:00:00 2001
+From: Alexey Charkov <alchark@flipper.net>
+Date: Wed, 18 Mar 2026 18:32:53 +0400
+Subject: dt-bindings: vendor-prefixes: Add Hynetek Semiconductor Co., Ltd.
+
+[ Upstream commit 5bda9c0261bce6a70bd7cb9afa0551c2fdf4ebc1 ]
+
+Hynetek Semiconductor Co., Ltd. focuses on intelligent energy control
+technology, mainly for the intelligent fast charging and digital energy
+fields.
+
+Link: https://en.hynetek.com/
+Acked-by: Conor Dooley <conor.dooley@microchip.com>
+Signed-off-by: Alexey Charkov <alchark@flipper.net>
+Link: https://patch.msgid.link/20260318-husb311-v4-1-69e029255430@flipper.net
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+[ adapted: code unchanged; only hunk offsets differ on Linux 6.18 ]
+Assisted-by: Claude
+---
+diff --git a/Documentation/devicetree/bindings/vendor-prefixes.yaml b/Documentation/devicetree/bindings/vendor-prefixes.yaml
+index 5a806faf7170..3ffb1a8e24af 100644
+--- a/Documentation/devicetree/bindings/vendor-prefixes.yaml
++++ b/Documentation/devicetree/bindings/vendor-prefixes.yaml
+@@ -727,6 +727,8 @@ patternProperties:
+     description: Hycon Technology Corp.
+   "^hydis,.*":
+     description: Hydis Technologies
++  "^hynetek,.*":
++    description: Hynetek Semiconductor Co., Ltd.
+   "^hynitron,.*":
+     description: Shanghai Hynitron Microelectronics Co. Ltd.
+   "^hynix,.*":
+

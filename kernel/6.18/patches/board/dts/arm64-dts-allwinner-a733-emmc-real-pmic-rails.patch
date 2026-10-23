@@ -1,0 +1,116 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: allwinner: A733 eMMC on the real PMIC rails
+
+The eMMC node was wired to two regulator-fixed placeholders (reg_vcc3v3 /
+reg_vcc1v8). Those satisfy the binding and build green, but they are not the
+rail: the driver cannot see or reason about the actual supply through them.
+That is a known -110 (timeout) trap for exactly this node.
+
+Wire the real ones instead:
+
+  vmmc-supply  -> SWOUT2 (fed from DCDC1, 3.3 V), which carries VCC-eMMC
+                  along with VCC-CARD, VCC-PH, VCC-IO and VCC33-USB-2
+  vqmmc-supply -> CLDO5 (1.8 V), the eMMC VCCq, which also supplies VCC-PC -- the IO
+                  rail of bank PC, i.e. the eMMC pins themselves
+
+CLDO5 had no DT node yet (`arm64-dts-a733-enable-r-i2c0-axp318w-pmic` only declared swout1/swout2), so add it. The
+regulator driver already supports it (`regulator-axp20x-add-support-for-the-AXP318W`: AXP_DESC_DO(AXP318, CLDO5, "cldo5",
+..., AXP318_CLDO5_CONTROL) with control register 0x33).
+
+Confirmed on silicon on the vendor stack driving this eMMC at
+HS400: CLDO5 reg
+0x33 = 0x0d = 1800 mV, DCDC1 reg 0x12 = 0x17 = 3300 mV, and the switch enables
+reg 0x11 = 0x1f, i.e. both SWOUTs on. All three match the voltages above.
+
+Neither node carries regulator-min/max-microvolt, and that is deliberate. A DT
+window is enforcement, not a check: with both bounds present the kernel writes
+the rail into the window at registration, which is how ELDO1 got pulled from
+1.1 V to 0.95 V against trained, running DRAM. For cldo5 only a derived nominal
+value is known, and a nominal value is not a documented floor, so no window
+is written. The boot chain sets these
+rails; Linux consumes them, and any deviation is for a userspace check to
+report, which can only read and say so.
+
+Leaving the window out does not break the eMMC's 1.8 V signalling. Without
+regulator-min/max-microvolt the constraints keep min_uV == max_uV == 0, so
+REGULATOR_CHANGE_VOLTAGE is never set (of_regulator.c:106). regulator_is_
+supported_voltage() then takes its "if we can't change voltage check the current
+voltage" path and compares the live rail against the requested range
+(core.c:3492); mmc_regulator_set_vqmmc() asks for 1700000-1950000 for
+MMC_SIGNAL_VOLTAGE_180, the rail sits at 1.8 V, and the helper returns 1 = "no
+switch happened" rather than an error (regulator.c:156). Read, accept, do not
+regulate -- which is the intent.
+
+Both rails stay regulator-always-on. For SWOUT2 that is not cosmetic: it is a
+shared switch feeding VCC-CARD, VCC-PH, VCC-IO and VCC33-USB-2 besides the
+eMMC, so an mmc-core attempt to power the card down must not be able to take
+half the board with it.
+
+reg_vcc1v8 loses its last consumer here and is removed. reg_vcc3v3 stays: the
+SD node (mmc0) still uses it, and moving SD to real rails is a separate change
+-- bank PF is selectable between CLDO5 and SWOUT2 for UHS signalling, which
+needs its own analysis and its own board test. SD works today and is not
+touched here.
+
+Not hardware-proven: this changes which regulator the eMMC node points at. The
+rails themselves are already at these voltages from the boot chain, so no
+voltage should move -- but that expectation is exactly what the next board test
+has to confirm.
+
+Assisted-by: Claude
+---
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -524,14 +524,6 @@
+ 		regulator-always-on;
+ 	};
+ 
+-	reg_vcc1v8: regulator-vcc1v8 {
+-		compatible = "regulator-fixed";
+-		regulator-name = "vcc1v8";
+-		regulator-min-microvolt = <1800000>;
+-		regulator-max-microvolt = <1800000>;
+-		regulator-always-on;
+-	};
+-
+ 	/*
+ 	 * VCC5V0_USB20 -> the CH334F hub (USB-A J8 + on-board WiFi/BT), switched by
+ 	 * SGM2576 U10 whose enable is USB_HOST_EN = PM5 (schematic p7:172 / p13:92).
+@@ -1014,8 +1006,8 @@
+ 			pinctrl-names = "default";
+ 			pinctrl-0 = <&mmc2_pins>, <&mmc2_clk_pins>,
+ 				    <&mmc2_ds_pins>;
+-			vmmc-supply = <&reg_vcc3v3>;
+-			vqmmc-supply = <&reg_vcc1v8>;
++			vmmc-supply = <&reg_swout2>;
++			vqmmc-supply = <&reg_cldo5>;
+ 			bus-width = <8>;
+ 			max-frequency = <200000000>;
+ 			non-removable;
+@@ -1772,6 +1764,26 @@
+ 					 * that state until the net patches wire
+ 					 * swout1 as the gmac phy-supply.
+ 					 */
++					/*
++					 * eMMC VCCq and the IO supply of bank
++					 * PC, which carries the eMMC pins.
++					 * Deliberately carries NO
++					 * regulator-min/max-microvolt: a DT
++					 * window is enforcement, not a check
++					 * (the kernel writes the rail into it
++					 * at registration), and this rail has
++					 * no documented floor -- a nominal
++					 * value is not a floor, so none is
++					 * written.
++					 * Measured 1.8 V on the 6 GiB board and the 8 GiB board; the
++					 * boot chain sets it,
++					 * Linux only consumes it.
++					 */
++					reg_cldo5: cldo5 {
++						regulator-name = "vcc-pc";
++						regulator-always-on;
++					};
++
+ 					reg_swout1: swout1 {
+ 						regulator-name = "vcc33-phy";
+ 						regulator-always-on;

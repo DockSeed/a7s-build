@@ -1,0 +1,154 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] clk: sunxi-ng: A733 add a minimal RTC-CCU (SERDES DCXO gates)
+
+The COMB0 combo-PHY (USB3-SS) needs the SERDES DCXO clock, which lives in the
+RTC-CCU at 0x07090000 (A733 UM, XO_CTRL1 @0x16c). Adds a minimal RTC-CCU driver
+exposing only the two SERDES DCXO gates dcxo-serdes0/1 (0x16c bit4/bit5, parent
+r-ahb from the R-CCU). Verified on silicon (the 8 GiB board, vendor 6.6, a USB 3.2 Gen2
+device linked at 10 Gbps): both read 200 MHz (= r-ahb).
+
+Deliberately minimal, NOT a full RTC-CCU: the vendor ccu-sun60iw2-rtc.c models
+~11 clocks (iosc/losc/rtc-1k/...) with key-field-protected registers. Those are
+not needed for USB3/SERDES and use vendor-only primitives; the dcxo-serdes gates
+are plain gates and need none. Register values referenced from that BSP driver;
+implementation uses solely mainline ccu-sunxi-ng primitives.
+
+Assisted-by: Claude
+
+diff --git a/drivers/clk/sunxi-ng/Kconfig b/drivers/clk/sunxi-ng/Kconfig
+index 5de79a290..b8da63c7d 100644
+--- a/drivers/clk/sunxi-ng/Kconfig
++++ b/drivers/clk/sunxi-ng/Kconfig
+@@ -62,6 +62,11 @@ config SUN60I_A733_R_CCU
+ 	default ARCH_SUNXI
+ 	depends on ARM64 || COMPILE_TEST
+ 
++config SUN60I_A733_RTC_CCU
++	tristate "Support for the Allwinner A733 RTC CCU"
++	default ARCH_SUNXI
++	depends on ARM64 || COMPILE_TEST
++
+ config SUN55I_A523_CCU
+ 	tristate "Support for the Allwinner A523/T527 CCU"
+ 	default ARCH_SUNXI
+diff --git a/drivers/clk/sunxi-ng/Makefile b/drivers/clk/sunxi-ng/Makefile
+index 4e857c2e0..a3bced004 100644
+--- a/drivers/clk/sunxi-ng/Makefile
++++ b/drivers/clk/sunxi-ng/Makefile
+@@ -35,6 +35,7 @@ obj-$(CONFIG_SUN50I_H6_R_CCU)	+= sun50i-h6-r-ccu.o
+ obj-$(CONFIG_SUN50I_H616_CCU)	+= sun50i-h616-ccu.o
+ obj-$(CONFIG_SUN60I_A733_CCU)	+= ccu-sun60iw2.o
+ obj-$(CONFIG_SUN60I_A733_R_CCU)	+= ccu-sun60iw2-r.o
++obj-$(CONFIG_SUN60I_A733_RTC_CCU)	+= ccu-sun60i-a733-rtc.o
+ obj-$(CONFIG_SUN55I_A523_CCU)	+= sun55i-a523-ccu.o
+ obj-$(CONFIG_SUN55I_A523_MCU_CCU)	+= sun55i-a523-mcu-ccu.o
+ obj-$(CONFIG_SUN55I_A523_R_CCU)	+= sun55i-a523-r-ccu.o
+diff --git a/drivers/clk/sunxi-ng/ccu-sun60i-a733-rtc.c b/drivers/clk/sunxi-ng/ccu-sun60i-a733-rtc.c
+new file mode 100644
+index 000000000..2904a8ac4
+--- /dev/null
++++ b/drivers/clk/sunxi-ng/ccu-sun60i-a733-rtc.c
+@@ -0,0 +1,84 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Allwinner A733 (sun60iw2) RTC clock control unit — minimal.
++ *
++ * Models only the two SERDES DCXO gates the COMB0 combo-PHY consumes
++ * (dcxo-serdes0/1). Both are plain gates on XO_CTRL1 (offset 0x16c) whose parent
++ * is the R-CCU r-ahb clock. Verified on silicon (the 8 GiB board, vendor 6.6, USB 3.2 Gen2
++ * device linked at 10 Gbps): both read 200 MHz (= r-ahb) with gate bits 4/5 in
++ * 0x16c. The full RTC clock tree (iosc/losc/rtc-1k, some key-field protected) is
++ * intentionally out of scope; it is not needed for USB3/SERDES and can be added
++ * later.
++ *
++ * Register offsets + gate bits from BSP ccu-sun60iw2-rtc.c (the radxa/allwinner-bsp tree)
++ * as a reference for values only; this uses solely mainline ccu-sunxi-ng
++ * primitives (no vendor key-field machinery — the dcxo-serdes gates need none).
++ */
++
++#include <linux/clk-provider.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++
++#include "ccu_common.h"
++#include "ccu_gate.h"
++
++#include <dt-bindings/clock/sun60i-a733-rtc-ccu.h>
++
++#define SUN60I_A733_RTC_XO_CTRL1_REG	0x16c
++
++static const struct clk_parent_data r_ahb_parent[] = {
++	{ .fw_name = "r-ahb" },
++};
++
++static SUNXI_CCU_GATE_DATA(dcxo_serdes1_clk, "dcxo-serdes1", r_ahb_parent,
++			   SUN60I_A733_RTC_XO_CTRL1_REG, BIT(5), 0);
++static SUNXI_CCU_GATE_DATA(dcxo_serdes0_clk, "dcxo-serdes0", r_ahb_parent,
++			   SUN60I_A733_RTC_XO_CTRL1_REG, BIT(4), 0);
++
++static struct ccu_common *sun60i_a733_rtc_ccu_clks[] = {
++	&dcxo_serdes1_clk.common,
++	&dcxo_serdes0_clk.common,
++};
++
++static struct clk_hw_onecell_data sun60i_a733_rtc_ccu_hw_clks = {
++	.hws	= {
++		[CLK_RTC_DCXO_SERDES1]	= &dcxo_serdes1_clk.common.hw,
++		[CLK_RTC_DCXO_SERDES0]	= &dcxo_serdes0_clk.common.hw,
++	},
++	.num	= 2,
++};
++
++static const struct sunxi_ccu_desc sun60i_a733_rtc_ccu_desc = {
++	.ccu_clks	= sun60i_a733_rtc_ccu_clks,
++	.num_ccu_clks	= ARRAY_SIZE(sun60i_a733_rtc_ccu_clks),
++	.hw_clks	= &sun60i_a733_rtc_ccu_hw_clks,
++};
++
++static int sun60i_a733_rtc_ccu_probe(struct platform_device *pdev)
++{
++	void __iomem *reg;
++
++	reg = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(reg))
++		return PTR_ERR(reg);
++
++	return devm_sunxi_ccu_probe(&pdev->dev, reg, &sun60i_a733_rtc_ccu_desc);
++}
++
++static const struct of_device_id sun60i_a733_rtc_ccu_ids[] = {
++	{ .compatible = "allwinner,sun60i-a733-rtc-ccu" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, sun60i_a733_rtc_ccu_ids);
++
++static struct platform_driver sun60i_a733_rtc_ccu_driver = {
++	.probe	= sun60i_a733_rtc_ccu_probe,
++	.driver	= {
++		.name			= "sun60i-a733-rtc-ccu",
++		.of_match_table		= sun60i_a733_rtc_ccu_ids,
++	},
++};
++module_platform_driver(sun60i_a733_rtc_ccu_driver);
++
++MODULE_DESCRIPTION("Allwinner A733 RTC CCU (minimal, SERDES DCXO gates)");
++MODULE_LICENSE("GPL");
+diff --git a/include/dt-bindings/clock/sun60i-a733-rtc-ccu.h b/include/dt-bindings/clock/sun60i-a733-rtc-ccu.h
+new file mode 100644
+index 000000000..0017c0743
+--- /dev/null
++++ b/include/dt-bindings/clock/sun60i-a733-rtc-ccu.h
+@@ -0,0 +1,13 @@
++/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
++/*
++ * A733 (sun60iw2) RTC-CCU clock indices — minimal set.
++ * Only the SERDES DCXO gates are modelled (needed by the COMB0 combo-PHY); the
++ * full vendor RTC clock tree (iosc/osc32k/rtc-1k/...) is not required here.
++ */
++#ifndef _DT_BINDINGS_CLK_SUN60I_A733_RTC_CCU_H_
++#define _DT_BINDINGS_CLK_SUN60I_A733_RTC_CCU_H_
++
++#define CLK_RTC_DCXO_SERDES1	0
++#define CLK_RTC_DCXO_SERDES0	1
++
++#endif

@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Fri, 2 Oct 2026 06:00:00 +0200
+Subject: [PATCH] arm64: dts: a733: add the DMA controller
+
+Describe DMAC0, the CPUX-domain controller: 0x04601000, 8 KiB (UM V1.00
+ch13), SPI 111 = INTID 143 DMA0_CPUX_NS,
+16 channels, DRQ ports up to 63 (Table 13-2, SMHC3), the clocks and reset
+from clk-sunxi-ng-a733-dma-gates-and-resets.
+
+DMAC1 (0x04024000, SPI 113) is not described: the UM gives one DRQ table
+for both and does not say which of them is the CPUS-domain one, and
+nothing on this board needs a second controller.
+
+Verified: applies, builds, the dtb carries the node. Silicon effect owed:
+the controller probes and dmatest memcpy passes.
+
+Assisted-by: Claude
+---
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -2508,6 +2508,34 @@ pwm1: pwm@2528000 {
+ 			status = "disabled";
+ 		};
+ 
++		/*
++		 * DMAC0, the CPUX-domain DMA controller (UM chapter 13,
++		 * SPI 111 = INTID 143 DMA0_CPUX_NS, interrupt list). 16
++		 * channels; DRQ ports up to 63 (SMHC3, ch13 Table 13-2). Audio
++		 * DRQs: 2 OWA, 3-7 I2S0-4, 9 DMIC, one port per block for both
++		 * directions.
++		 *
++		 * DMAC1 (0x04024000, SPI 113) is not described: the UM gives one
++		 * DRQ table for both controllers and does not say which of them is
++		 * the CPUS-domain one, and nothing on this board needs a second.
++		 *
++		 * Silicon the 8 GiB board, 2026-10-02, bus gate and reset opened by hand:
++		 * writes to 0x00 and 0x10 (the global IRQ registers of older
++		 * sun6i parts) read back 0, per-channel IRQ_EN at 0x134/0x174
++		 * holds what is written, DMA_PAU takes bit 0 and not bit 1.
++		 */
++		dma: dma-controller@4601000 {
++			compatible = "allwinner,sun60i-a733-dma";
++			reg = <0x0 0x04601000 0x0 0x2000>;
++			interrupts = <GIC_SPI 111 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&ccu CLK_BUS_DMA0>, <&ccu CLK_MBUS_DMA0>;
++			clock-names = "bus", "mbus";
++			resets = <&ccu RST_BUS_DMA0>;
++			dma-channels = <16>;
++			dma-requests = <63>;
++			#dma-cells = <1>;
++		};
++
+ 		gmac0: ethernet@4500000 {
+ 			compatible = "allwinner,sun60iw2-gmac200",
+ 				     "snps,dwmac-5.30a";

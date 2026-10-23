@@ -1,0 +1,19 @@
+# a7s-build: the image's Xfce defaults -- Greybird, the elementary-xfce icons,
+# the Whisker menu -- live in /etc/xdg/xdg-a7s, which this puts ahead of
+# /etc/xdg for an Xfce session. Modelled on Debian's 55xfce4-session
+# (xfce4-session), which does the same for XDG_DATA_DIRS. A user's own
+# settings in ~/.config still win.
+BASESTARTUP=$(basename "$STARTUP" | cut -d\  -f1)
+if [ "$BASESTARTUP" = x-session-manager ]; then
+    BASESTARTUP=$(basename "$(readlink /etc/alternatives/x-session-manager)")
+fi
+case "$BASESTARTUP" in
+  xfce4-session|startxfce4)
+    XDG_CONFIG_DIRS=/etc/xdg/xdg-a7s:${XDG_CONFIG_DIRS:-/etc/xdg}
+    export XDG_CONFIG_DIRS
+    if [ -n "$DBUS_SESSION_BUS_ADDRESS" ] && \
+      command -v dbus-update-activation-environment >/dev/null; then
+        dbus-update-activation-environment --systemd XDG_CONFIG_DIRS
+    fi
+    ;;
+esac

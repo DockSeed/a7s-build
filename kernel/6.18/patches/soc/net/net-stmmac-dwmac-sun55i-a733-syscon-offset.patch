@@ -1,0 +1,97 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] net: stmmac: dwmac-sun55i: add A733 (sun60iw2) GMAC200 via per-SoC syscon offset
+
+The A733 (sun60iw2) fits the same Synopsys DWC_ether_qos "GMAC200" core the
+dwmac-sun55i glue already drives on the A523/T527, and its Allwinner "EMAC
+clock" syscon register has the identical field layout (ETXDC/ERXDC delays,
+EPIT, ETCS, RMII_EN). Only one thing differs: where that register lives.
+
+On the A523/T527 the register sits in the shared system-control block at
+offset 0x34 (the historical EMAC1 slot, same as dwmac-sun8i). On the A733 the
+equivalent register is GMAC_CFG, the first register of the GMAC's own glue
+block (0x04508000 + 0x00) -- system-control has no ethernet syscon on this SoC.
+This was confirmed from the A733 User Manual (GMAC register list: GMAC_CFG at
+glue-base offset 0x0000) and a live silicon read (0x04508000 = 0x00011146 =
+external-PHY RGMII config), not from any vendor DT or driver.
+
+The driver hard-coded the 0x34 offset. Turn it into per-compatible match data
+(a small sun55i_gmac_variant) so the A733 can reuse the entire glue with its
+own 0x00 offset. The existing A523 compatible keeps 0x34, so its behaviour is
+unchanged. No field masks change: the A733 GMAC_CFG low bits are bit-identical
+to the A523 syscon register.
+
+(A733 GMAC_CFG also has a 2-bit ETXDC high field at [17:16] that the A523
+register lacks, extending TX delay from 3 to 5 bits. This patch does not use
+it -- the existing 3-bit tx-internal-delay-ps range (0..700ps) is enough to
+bring the link up; wider TX delay, if a board needs it, is a separate change.)
+
+Assisted-by: Claude
+---
+--- a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun55i.c
++++ b/drivers/net/ethernet/stmicro/stmmac/dwmac-sun55i.c
+@@ -16,6 +16,7 @@
+ #include <linux/of.h>
+ #include <linux/phy.h>
+ #include <linux/platform_device.h>
++#include <linux/property.h>
+ #include <linux/regmap.h>
+ #include <linux/regulator/consumer.h>
+ #include <linux/stmmac.h>
+@@ -23,7 +24,27 @@
+ #include "stmmac.h"
+ #include "stmmac_platform.h"
+ 
+-#define SYSCON_REG		0x34
++/*
++ * The syscon "EMAC clock" register carries the same field layout on every
++ * sun55i-family GMAC200 (delays, EPIT, ETCS, RMII_EN below), but its offset
++ * inside the phandle-referenced regmap differs per SoC:
++ *  - A523/T527: the register lives in the shared system-control block at
++ *    offset 0x34 (the EMAC1 slot), same idiom as dwmac-sun8i.
++ *  - A733 (sun60iw2): the equivalent register is GMAC_CFG, the first register
++ *    of the GMAC's own glue block (base + 0x00), not in system-control.
++ * The offset therefore comes from per-compatible match data.
++ */
++struct sun55i_gmac_variant {
++	u32 syscon_offset;
++};
++
++static const struct sun55i_gmac_variant sun55i_a523_gmac200 = {
++	.syscon_offset = 0x34,
++};
++
++static const struct sun55i_gmac_variant sun60iw2_gmac200 = {
++	.syscon_offset = 0x00,
++};
+ 
+ /* RMII specific bits */
+ #define SYSCON_RMII_EN		BIT(13) /* 1: enable RMII (overrides EPIT) */
+@@ -40,6 +61,7 @@
+ static int sun55i_gmac200_set_syscon(struct device *dev,
+ 				     struct plat_stmmacenet_data *plat)
+ {
++	const struct sun55i_gmac_variant *variant = device_get_match_data(dev);
+ 	struct device_node *node = dev->of_node;
+ 	struct regmap *regmap;
+ 	u32 val, reg = 0;
+@@ -95,7 +117,7 @@
+ 				     phy_modes(plat->phy_interface));
+ 	}
+ 
+-	ret = regmap_write(regmap, SYSCON_REG, reg);
++	ret = regmap_write(regmap, variant->syscon_offset, reg);
+ 	if (ret < 0)
+ 		return dev_err_probe(dev, ret, "Failed to write to syscon\n");
+ 
+@@ -139,7 +161,10 @@
+ }
+ 
+ static const struct of_device_id sun55i_gmac200_match[] = {
+-	{ .compatible = "allwinner,sun55i-a523-gmac200" },
++	{ .compatible = "allwinner,sun55i-a523-gmac200",
++	  .data = &sun55i_a523_gmac200 },
++	{ .compatible = "allwinner,sun60iw2-gmac200",
++	  .data = &sun60iw2_gmac200 },
+ 	{ }
+ };
+ MODULE_DEVICE_TABLE(of, sun55i_gmac200_match);

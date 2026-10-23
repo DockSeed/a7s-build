@@ -1,0 +1,125 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only OR MIT
+#
+# a7s-growroot -- grow the root partition and its filesystem to fill the card
+# the image was written to. Started by a7s-growroot.service on every boot.
+#
+# The image is written at the size of its content plus headroom, so without
+# this a board on a 32 GB card would run with about 2 GiB of root.
+#
+# It asks nothing and writes no state file, and it is safe on every boot: the
+# work is decided by measuring the card, not by remembering whether it ran. A
+# partition that grew while resize2fs was cut short is finished on the next
+# boot, and a card swapped for a larger one is picked up without a marker.
+#
+# The partition is only ever extended into free space that follows it. If any
+# partition starts after ours, the script refuses rather than grow over it.
+#
+# Tools: sfdisk + partx (fdisk, util-linux) and resize2fs + dumpe2fs
+# (e2fsprogs); the image build asserts all of them. sfdisk -N rewrites only the
+# size of one entry -- start sector, type and boot flag are kept.
+#
+# Usage: a7s-growroot [DEVICE]
+#   DEVICE  the partition to grow; default is whatever is mounted on /.
+set -eu
+
+# Below this much free space at the end of the card, there is nothing worth
+# doing: an image written to a card of its own size has a few spare sectors from
+# rounding, and rewriting a partition table to gain them is all risk, no gain.
+SLACK_MIN_MIB=16
+SECTOR_BYTES=512
+MIB=1048576
+
+log()  { printf 'a7s-growroot: %s\n' "$*"; }
+die()  { printf 'a7s-growroot: %s\n' "$*" >&2; exit 1; }
+skip() { printf 'a7s-growroot: %s\n' "$*"; exit 0; }
+
+[ "$(id -u)" = 0 ] || die "needs root (sfdisk writes the partition table)"
+
+dev="${1:-}"
+if [ -z "${dev}" ]; then
+	dev="$(findmnt -no SOURCE / 2>/dev/null || true)"
+	[ -n "${dev}" ] || die "cannot resolve the device mounted on /"
+fi
+[ -b "${dev}" ] || die "${dev} is not a block device"
+
+part="$(basename "${dev}")"
+[ -f "/sys/class/block/${part}/partition" ] \
+	|| skip "${dev} is a whole disk, not a partition -- nothing to grow into"
+partno="$(cat "/sys/class/block/${part}/partition")"
+disk="$(lsblk -no PKNAME "${dev}" | head -1)"
+[ -n "${disk}" ] && [ -b "/dev/${disk}" ] \
+	|| die "cannot resolve the parent disk of ${dev}"
+
+# Everything below is in 512-byte sectors, which is what /sys/class/block
+# reports regardless of the device's own logical block size.
+disk_sectors="$(cat "/sys/class/block/${disk}/size")"
+our_start="$(cat "/sys/class/block/${part}/start")"
+our_sectors="$(cat "/sys/class/block/${part}/size")"
+our_end=$((our_start + our_sectors))
+
+# Refuse to grow into a neighbour. Read every partition of this disk out of
+# sysfs rather than parsing a table: sysfs is what the kernel actually acts on.
+for p in "/sys/class/block/${disk}"/*/partition; do
+	[ -f "${p}" ] || continue
+	pdir="$(dirname "${p}")"
+	[ "$(basename "${pdir}")" = "${part}" ] && continue
+	pstart="$(cat "${pdir}/start")"
+	[ "${pstart}" -lt "${our_end}" ] \
+		|| die "$(basename "${pdir}") starts at sector ${pstart}, after ${part} ends at ${our_end} -- refusing to grow over it"
+done
+
+slack_sectors=$((disk_sectors - our_end))
+slack_mib=$((slack_sectors * SECTOR_BYTES / MIB))
+log "${dev}: partition ${partno} of /dev/${disk}, ${slack_mib} MiB free after it"
+
+if [ "${slack_mib}" -ge "${SLACK_MIN_MIB}" ]; then
+	# ", +" keeps the start sector and takes every sector available. --force
+	# because sfdisk warns on a table it did not write itself; --no-reread
+	# because BLKRRPART cannot succeed on a disk whose partition is mounted,
+	# and failing there would abort before the table is written.
+	#
+	# --no-tell-kernel is not cosmetic: without it sfdisk still fires BLKRRPART
+	# after writing, which cannot succeed on a mounted disk, and prints
+	# "Re-reading the partition table failed.: Device or resource busy" into
+	# the boot log of a run that worked (measured on a loop device,
+	# 2026-08-17). partx -u below is what tells the kernel, and it can do it
+	# while the filesystem is mounted.
+	printf ', +\n' | sfdisk --no-reread --no-tell-kernel --force -N"${partno}" "/dev/${disk}" \
+		|| die "sfdisk failed to extend partition ${partno} of /dev/${disk}"
+	# The table on the card is now correct and the kernel's idea of it is not.
+	# partx -u resizes the in-use partition through BLKPG, which -- unlike
+	# BLKRRPART -- works while the filesystem is mounted.
+	partx -u "/dev/${disk}" || die "partx could not update the kernel's view of /dev/${disk}"
+	udevadm settle 2>/dev/null || true
+	new_sectors="$(cat "/sys/class/block/${part}/size")"
+	[ "${new_sectors}" -gt "${our_sectors}" ] \
+		|| die "partition ${partno} still reads ${new_sectors} sectors after sfdisk+partx -- the kernel did not take the new size"
+	log "partition grown: ${our_sectors} -> ${new_sectors} sectors ($((new_sectors * SECTOR_BYTES / MIB)) MiB)"
+	our_sectors="${new_sectors}"
+else
+	log "less than ${SLACK_MIN_MIB} MiB free after the partition -- leaving the table alone"
+fi
+
+# The filesystem is a separate question from the partition: it can lag behind
+# after a partial run, and on a card that was already grown it is the only half
+# left to do.
+fs_blocks="$(dumpe2fs -h "${dev}" 2>/dev/null | sed -n 's/^Block count: *//p')"
+fs_bsize="$(dumpe2fs -h "${dev}" 2>/dev/null | sed -n 's/^Block size: *//p')"
+[ -n "${fs_blocks}" ] && [ -n "${fs_bsize}" ] \
+	|| die "cannot read the ext4 superblock of ${dev} -- is it ext4?"
+fs_sectors=$((fs_blocks * fs_bsize / SECTOR_BYTES))
+gap_mib=$(( (our_sectors - fs_sectors) * SECTOR_BYTES / MIB ))
+
+if [ "${gap_mib}" -lt "${SLACK_MIN_MIB}" ]; then
+	skip "filesystem already covers the partition (${gap_mib} MiB unused) -- nothing to do"
+fi
+
+log "filesystem is ${gap_mib} MiB smaller than its partition -- resizing"
+resize2fs "${dev}" || die "resize2fs failed on ${dev}"
+
+fs_blocks="$(dumpe2fs -h "${dev}" 2>/dev/null | sed -n 's/^Block count: *//p')"
+new_fs_sectors=$((fs_blocks * fs_bsize / SECTOR_BYTES))
+[ "${new_fs_sectors}" -gt "${fs_sectors}" ] \
+	|| die "resize2fs reported success but the block count did not change"
+log "filesystem grown to $((new_fs_sectors * SECTOR_BYTES / MIB)) MiB -- done"

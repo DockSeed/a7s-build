@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only OR MIT
+#
+# mmdebstrap --customize-hook for the Debian root filesystem. mmdebstrap runs it
+# with the root filesystem's path as $1 (scripts/distro/debian/distro.sh,
+# distro_rootfs_build); the environment carries SRC, WORK_DIR, OUT_DIR,
+# SOURCE_DATE_EPOCH and the A7S_* switches.
+set -euo pipefail
+log() { printf '=== %s\n' "$*"; }
+warn() { printf '::warning:: %s\n' "$*" >&2; }
+die() { printf '::error:: %s\n' "$*" >&2; exit 1; }
+: "${SRC:?}" "${1:?usage: $0 <root>}"
+# shellcheck source=distro.sh
+. "${SRC}/scripts/distro/debian/distro.sh"
+debian_customize "$1"

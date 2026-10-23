@@ -1,0 +1,2 @@
+# Applied in this order by the build-orc stage (scripts/stages/orc.sh), at --fuzz=0.
+neon-fix-loadupdb-reading-past-the-end-of-the-source-on-aarch64.patch

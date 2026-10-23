@@ -1,0 +1,4 @@
+# a7s-build: the kernel has no NVMe over Fabrics; these units would fail and
+# leave the system degraded.
+disable nvmf-autoconnect.service
+disable nvmefc-boot-connections.service

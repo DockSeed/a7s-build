@@ -1,0 +1,19 @@
+# Applied in this order; file names carry no numbers.
+compat-build-against-linux-6.18.patch
+aic_load_fw-set-cache-bit-before-firmware-upload.patch
+aic_load_fw-match-only-the-vendor-interface.patch
+aic_load_fw-track-firmware-upload-per-part.patch
+aic8800-lower-the-default-log-level.patch
+regulatory-let-cfg80211-govern-the-radio.patch
+aic8800_fdrv-keep-draining-rx-after-a-bad-aggregate.patch
+aic8800_fdrv-drop-the-disconnect-handshake-from-rx-completion.patch
+aic_load_fw-bound-the-rx-parser-to-the-buffer.patch
+aic8800_fdrv-do-not-advertise-monitor-mode.patch
+aic8800_fdrv-print-the-mgmt-tx-status-through-dynamic-debug.patch
+aic8800-give-the-boot-path-prints-a-log-level.patch
+aic_load_fw-no-rx-refill-after-the-bus-has-stopped.patch
+aic8800-init-the-rx-refill-work-before-the-first-error-path.patch
+aic_load_fw-no-rx-urb-in-flight-after-the-bus-stop.patch
+aic_load_fw-return-an-errno-from-a-failed-configuration-or-upload.patch
+aic_load_fw-a-timed-out-firmware-message-fails-and-is-freed.patch
+aic8800_fdrv-count-received-data-frames-in-the-interface-statistics.patch

@@ -1,0 +1,6 @@
+# a7s-build: the on-board radio is wl0 (a fixed name for the one WLAN device).
+[Match]
+Type=wlan
+
+[Link]
+Name=wl0

@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DockSeed <dockseed@proton.me>
+Date: Wed, 30 Sep 2026 12:40:00 +0200
+Subject: [PATCH] arm64: dts: a733: describe the DSU cluster PMU
+
+Add an arm,dsu-pmu node, so the in-tree arm_dsu_pmu driver binds and
+perf gets the DSU's L3, snoop-filter and bus event counters
+(arm_dsu_0/...). Without them the DSU devfreq policy has no counter
+source: its effect can be seen only as a switch count, and nothing
+separates L3 starvation of the A76 from core frequency.
+
+- interrupts: nCLUSTERPMUIRQ is INTID 274 = SPI 242 (A733 UM V1.00,
+  chapter 12, interrupt sources table, vector 0x0448). Level: the DSU
+  holds nCLUSTERPMUIRQ asserted while an overflow flag is set (DSU TRM
+  100453 B3); GIC SPIs take level-high or rising edge only, and the
+  SoC-side inversion is not documented, so level-high is the one
+  setting a stimulus can prove -- an overflow that is counted exactly
+  once per period in /proc/interrupts.
+- cpus: all eight cores; CLUSTERCFR reads 8 cores in one DSU on silicon
+  (read on the board, 2026-09-29).
+
+The vendor device tree has no such node, so this is not a port.
+
+Depends on the BL31 change allwinner-a733-el2-access-to-the-dsu-cluster-pmu:
+the kernel runs at EL2 (VHE) and the cluster PMU registers trap to EL3
+unless ACTLR_EL3[12] is set (DSU TRM B3.4 "Traps and enables"). On a
+chain without it, the driver's first register access traps.
+
+Assisted-by: Claude
+---
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -463,6 +463,21 @@
+ 	};
+ 
+ 	/*
++	 * DSU cluster PMU (L3, snoop filter, bus), one instance for all
++	 * eight cores. nCLUSTERPMUIRQ is INTID 274 = SPI 242 (UM
++	 * V1.00 chapter 12, interrupt sources table).
++	 * The counters are reachable from EL2 only
++	 * because BL31 sets ACTLR_EL3[12] on every core
++	 * (allwinner-a733-el2-access-to-the-dsu-cluster-pmu).
++	 */
++	dsu-pmu {
++		compatible = "arm,dsu-pmu";
++		interrupts = <GIC_SPI 242 IRQ_TYPE_LEVEL_HIGH>;
++		cpus = <&cpu0>, <&cpu1>, <&cpu2>, <&cpu3>,
++		       <&cpu4>, <&cpu5>, <&cpu6>, <&cpu7>;
++	};
++
++	/*
+ 	 * SYS_CLK24M -- the SoC-internal 24 MHz that every peripheral block
+ 	 * calls "hosc". It is NOT the crystal on this board and it does not
+ 	 * follow it:

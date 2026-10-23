@@ -1,0 +1,77 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: allwinner: A733: reserve the SCP DRAM window
+
+The boot chain leaves one firmware image resident in DRAM after the kernel
+starts, and nothing currently stops the kernel from allocating over it:
+
+    [    0.000000] OF: reserved mem: Reserved memory: No reserved-memory node in the DT
+    [    0.000000]   node   0: [mem 0x0000000040000000-0x000000023fffffff]
+
+The boot chain is:
+
+  vendor boot0 (libdram blob)  ->  BL31 (source, SRAM @0x62000)  ->  U-Boot  ->  kernel
+
+BL31 lives in SRAM (the source-built v2.12 binary fits the 56 KiB slot
+that the 115 KiB vendor blob did not, which is what forced the DRAM relocation
+in the first place). SCP — the vendor ar100s RISC-V firmware, ~117 KiB, built
+from the allwinner-arisc submodule and linking the closed libar100s.a — still
+does not fit SRAM and stays in DRAM at 0x48100000 (set by the SCP-only version
+of Radxa's U-Boot package patch sunxi-a733-relocate-SCP-base-to-DRAM).
+
+The address comes from the U-Boot package:
+
+  sunxi-a733-relocate-SCP-base-to-DRAM
+      +default 0x48100000 if MACH_SUN60I_A733      /* CONFIG_SUNXI_SCP_BASE */
+
+Window sized for SCP only (117 480 B measured on the 6 GiB board), rounded to 1 MiB.
+BL31 built from source runs entirely in SRAM (TF-A's
+default SUNXI_BL31_IN_DRAM=0; the A733 platform does not override it), so
+the reservation covers just the SCP footprint.
+
+No `no-map`: a 16 MiB reservation without it was HW-proven on the 6 GiB board,
+and SCP does not require it for its current use. Adding `no-map` would
+additionally drop the window from the linear map — useful hardening for
+firmware regions in general, but untested here. Keep the proven shape; harden
+later if a SCP shared-memory transport turns out to need it.
+
+Variant-agnostic: the absolute address 0x48100000 + 1 MiB works for every A7S
+board (4 / 6 / 8 GiB DRAM, eMMC or not) — the carve-out sits near the start of
+DRAM, far from any size ceiling.
+
+License: GPL-2.0-only OR MIT (DT + bindings).
+
+For this size, /proc/iomem is expected to show
+`48100000-481fffff : reserved` under System RAM.
+
+Assisted-by: Claude
+
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -85,6 +85,27 @@
+ 		reg = <0x0 0x40000000 0x0 0x40000000>;
+ 	};
+ 
++	/*
++	 * Firmware that stays resident while Linux runs. The boot chain builds
++	 * BL31 from source; it fits SRAM and does not live in
++	 * DRAM. SCP (vendor ar100s, ~117 KiB) does not fit SRAM and stays
++	 * at 0x48100000 (CONFIG_SUNXI_SCP_BASE, relocated to DRAM by a Radxa
++	 * U-Boot package patch). The kernel must never allocate over it:
++	 * SCP handles ARISC services (DVFS, suspend-to-RAM via the PMIC); once
++	 * those are wired, a clobbered SCP = a dead PMIC path.
++	 *
++	 * Window = 1 MiB, sized for SCP's measured footprint with headroom.
++	 */
++	reserved-memory {
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++
++		scp@48100000 {
++			reg = <0x0 0x48100000 0x0 0x00100000>;
++		};
++	};
++
+ 	soc {
+ 		compatible = "simple-bus";
+ 		#address-cells = <2>;

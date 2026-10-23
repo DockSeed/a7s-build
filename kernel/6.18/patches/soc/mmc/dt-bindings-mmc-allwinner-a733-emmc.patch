@@ -1,0 +1,23 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] dt-bindings: mmc: allwinner: add the A733 eMMC (HS400) compatible
+
+The A733 eMMC controller (SMHC2) gets its own compatible + driver cfg so only
+that instance enables HS400 (the SD controller stays on sun20i-d1-mmc). Add
+allwinner,sun60i-a733-emmc to the binding, with allwinner,sun20i-d1-mmc as the
+fallback the driver also matches, so a kernel without the A733 entry still binds
+(without HS400). Needed for dtbs_check once the eMMC DT node is armed.
+
+Assisted-by: Claude
+---
+--- a/Documentation/devicetree/bindings/mmc/allwinner,sun4i-a10-mmc.yaml
++++ b/Documentation/devicetree/bindings/mmc/allwinner,sun4i-a10-mmc.yaml
+@@ -58,6 +58,9 @@
+       - items:
+           - const: allwinner,sun55i-a523-mmc
+           - const: allwinner,sun20i-d1-mmc
++      - items:
++          - const: allwinner,sun60i-a733-emmc
++          - const: allwinner,sun20i-d1-mmc
+ 
+   reg:
+     maxItems: 1

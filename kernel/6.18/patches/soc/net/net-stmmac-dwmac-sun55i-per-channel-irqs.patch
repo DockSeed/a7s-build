@@ -1,0 +1,128 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] net: stmmac: dwmac-sun55i: use the A733's per-channel TX and RX interrupts
+
+The A733's GMAC0 has three interrupt lines, not one (A733 User Manual,
+Table 12-1):
+
+  GMAC0_TOP          INTID 204  GIC SPI 172
+  GMAC0_PERCH_TX_0   INTID 205  GIC SPI 173
+  GMAC0_PERCH_RX_0   INTID 206  GIC SPI 174
+
+The UM names per-channel lines for channel 0 only. The DMA channel count
+(MAC_HW_FEATURE2 at 0x04500124, TXCHCNT/RXCHCNT) is still to be read back
+on the board: the register description used here places the HW_FEATURE
+words one register off against dwmac4.h (GMAC_HW_FEATURE0 = 0x11c). This
+patch does not depend on the count. It enables multi-IRQ mode only when
+the DT names a line for every queue stmmac uses (one of each by default).
+
+The glue ran stmmac on GMAC0_TOP alone, and stmmac_request_irq_single()
+then serves RX and TX completion from one handler on one CPU. With the two
+backports before this patch, stmmac_get_platform_resources() reads
+"tx-queue-N" and "rx-queue-N" lines from the DT (a31bbe5ca2f8). Their data
+is kept only in multi-IRQ mode (dab177cbea34). This patch lets the glue
+choose between the two modes:
+
+- stmmac's multi-IRQ mode (STMMAC_FLAG_MULTI_MSI_EN) when the DT names both
+  lines for every queue in use;
+- the single-IRQ mode otherwise, so a DT with only "macirq" runs exactly as
+  before.
+
+In multi-IRQ mode stmmac also sets DMA_Mode.INTM = 1 in dwmac4_dma_init(),
+the DMA init of every core from 5.10 up (hwif.c; this one is 0x53).
+
+The selection is the one dwmac-s32 makes upstream, commit 66ccb4f1d205
+("stmmac: s32: enable support for Multi-IRQ mode"): the same checks and the
+same two log lines. A comment in the code names it.
+
+What this does not change. stmmac_request_irq_multi_msi() hints rx-0 and
+tx-0 to cpumask_of(i % num_online_cpus()), which is CPU0 for queue 0, and
+re-applies that on every open. That is mainline behaviour -- 6.18.53, and
+mainline, net-next and linux-next as of 2026-09-27 -- and it stays. So both
+lines start on CPU0, as the single line did. What this buys is RX and TX as
+separate interrupts that a user can place apart.
+
+Vendor: the vendor 6.6 kernel requests the same two lines
+(eth0:tx-0 on 173, eth0:rx-0 on 174, both at smp_affinity 0) and in
+addition SPI 178, GMAC0_PWS_CLK_CTRL, as "eth0:lpi". Nothing here is taken
+from its code. 6.18.53's platform code reads no LPI line, so SPI 178 stays
+undescribed. Whether it is the LPI interrupt is open.
+
+A523: the new function does not look at the compatible. The binding keeps
+the A523's gmac200 at one "macirq", so an A523 stays in single-IRQ mode; the
+one visible change there is the "MAC IRQ mode selected" line. That is a code
+review item, not tested on an A523.
+
+Open until the board shows it:
+- that INTM = 1 routes channel 0's completion to SPI 173 and 174 on this
+  integration;
+- that those lines are level-high like GMAC0_TOP. The A733 documentation
+  available gives no trigger types; the vendor kernel and dwmac-s32's DT use level.
+
+What to observe: end0:tx-0 and end0:rx-0 in /proc/interrupts counting under
+one-directional traffic while end0:mac stays near zero, with throughput equal
+to single-IRQ mode.
+
+Assisted-by: Claude
+---
+diff --git a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun55i.c b/drivers/net/ethernet/stmicro/stmmac/dwmac-sun55i.c
+index 9cc635805..1dea9d116 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun55i.c
++++ b/drivers/net/ethernet/stmicro/stmmac/dwmac-sun55i.c
+@@ -131,6 +131,48 @@ static int sun55i_gmac200_set_syscon(struct device *dev,
+ 	return 0;
+ }
+ 
++/*
++ * Per-channel interrupts. The A733's GMAC0 has a line of its own for DMA
++ * channel 0's transmit and for its receive completion, GMAC0_PERCH_TX_0 and
++ * GMAC0_PERCH_RX_0 (SPI 173 and 174, A733 User Manual Table 12-1), next to
++ * GMAC0_TOP (SPI 172, "macirq"). When the DT names a "tx-queue-N" and an
++ * "rx-queue-N" line for every queue in use, run stmmac in its multi-IRQ mode:
++ * RX and TX then get separate handlers and separate interrupts, and stmmac
++ * sets DMA_Mode.INTM = 1 so the core signals completion on those lines. A DT
++ * that names only "macirq" keeps the single-IRQ mode it has always had.
++ *
++ * The selection is the one dwmac-s32 makes upstream, commit 66ccb4f1d205
++ * ("stmmac: s32: enable support for Multi-IRQ mode").
++ */
++static void sun55i_gmac200_setup_multi_irq(struct device *dev,
++					   struct plat_stmmacenet_data *plat,
++					   struct stmmac_resources *res)
++{
++	u32 i;
++
++	for (i = 0; i < plat->rx_queues_to_use; i++) {
++		if (res->rx_irq[i] <= 0) {
++			dev_dbg(dev, "no rx-queue-%u interrupt\n", i);
++			goto mac_irq_mode;
++		}
++	}
++
++	for (i = 0; i < plat->tx_queues_to_use; i++) {
++		if (res->tx_irq[i] <= 0) {
++			dev_dbg(dev, "no tx-queue-%u interrupt\n", i);
++			goto mac_irq_mode;
++		}
++	}
++
++	plat->flags |= STMMAC_FLAG_MULTI_MSI_EN;
++	dev_info(dev, "Multi-IRQ mode (per queue IRQs) selected\n");
++	return;
++
++mac_irq_mode:
++	plat->flags &= ~STMMAC_FLAG_MULTI_MSI_EN;
++	dev_info(dev, "MAC IRQ mode selected\n");
++}
++
+ static int sun55i_gmac200_probe(struct platform_device *pdev)
+ {
+ 	const struct sun55i_gmac_variant *variant;
+@@ -156,6 +198,8 @@ static int sun55i_gmac200_probe(struct platform_device *pdev)
+ 	plat_dat->flags |= STMMAC_FLAG_SPH_DISABLE;
+ 	plat_dat->host_dma_width = 32;
+ 
++	sun55i_gmac200_setup_multi_irq(dev, plat_dat, &stmmac_res);
++
+ 	/*
+ 	 * On the A733 the syscon register is GMAC_CFG, the first register of
+ 	 * the GMAC's own glue block, so it shares the MAC's reset domain: the

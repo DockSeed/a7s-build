@@ -1,0 +1,42 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: allwinner: A733 add the PCK-600 power controller
+
+Adds the pck600 power-controller node so DT consumers can reference
+power-domains = <&pck600 PD_...>. The immediate need is the USB3/dwc3 node
+(PD_USB2), which is wired by a later USB3 patch (arm64-dts-a733-usb3-power-domain), not here.
+
+reg 0x07060000 size 0xb000 = 11 domains * 0x1000, matching silicon
+(/proc/iomem: 07060000-0706afff : power-controller@7060000) and the ARM-view
+memory map (PPU @0x07060000). No clock or reset is wired: the A733 driver
+variant (patch `pmdomain-sunxi-pck600-add-a733-support`) is attach-only and holds the boot power state; the block
+is already clocked and out of reset by boot firmware (its USB2 domain is
+boot-on).
+
+Placed next to the GIC in the minimal DT (the r-domain nodes r_ccu /
+rtc_ccu are only added later, with USB). Node only, no consumer
+references.
+
+Assisted-by: Claude
+
+diff --git a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -157,6 +157,18 @@
+ 			interrupts = <GIC_PPI 9 IRQ_TYPE_LEVEL_HIGH>;
+ 		};
+ 
++		/*
++		 * PCK-600 power controller (Arm CoreLink PCK-600 / PPU). Provides
++		 * the SoC power domains; PD_USB2 (index 8) is boot-on (on silicon,
++		 * the 8 GiB board: status @0x07068008 = 0x8). Attach-only driver variant
++		 * (patch `pmdomain-sunxi-pck600-add-a733-support`): no clock/reset wired, block is boot-clocked.
++		 */
++		pck600: power-controller@7060000 {
++			compatible = "allwinner,sun60i-a733-pck-600";
++			reg = <0x0 0x07060000 0x0 0xb000>;
++			#power-domain-cells = <1>;
++		};
++
+ 		uart0: serial@2500000 {
+ 			compatible = "snps,dw-apb-uart";
+ 			reg = <0x0 0x02500000 0x0 0x400>;

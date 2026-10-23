@@ -1,0 +1,66 @@
+From: DockSeed <dockseed@proton.me>
+Subject: [PATCH] arm64: dts: allwinner: a733: THS calibration nvmem cell
+
+An nvmem cell over SID 0x44..0x4f, the THS factory calibration (ft_temp
+and one raw code per sensor, packed 12-bit), handed to the THS node as
+"calibration". The consumer is sun60i_a733_ths_calibrate()
+(thermal-sun8i-a733-factory-calibration-from-the-sid).
+
+The cell shares the word at 0x4c with cpu_speed_grade: sensor 4's top
+bits sit in [7:0], the speed bin in [15:8]. nvmem allows overlapping
+cells; both are read-only.
+
+The THS node comment said "No nvmem-cells: the driver does not implement
+the fuse-to-CDATA transform"; it now says what the cell is for.
+
+Verified: the dtb builds and carries nvmem-cell-names = "calibration" on
+thermal-sensor@2522000. Pending on silicon: as the driver patch.
+
+Assisted-by: Claude
+---
+diff -uNr a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s-minimal.dts
+@@ -1050,6 +1050,19 @@
+ 			cpu_speed_grade: cpu-speed-grade@4c {
+ 				reg = <0x4c 4>;
+ 			};
++
++			/*
++			 * THS factory calibration, fuse offsets 0x44..0x4f =
++			 * ARM 0x03006244..0x0300624f: ft_temp and one raw
++			 * code per sensor, packed 12-bit (the unpacking is in
++			 * sun60i_a733_ths_calibrate()). Shares 0x4c with the
++			 * DVFS word: sensor 4's top bits sit in [7:0], the
++			 * speed bin in [15:8]. Read back 2026-09-25 on the
++			 * 6 GiB board: 0x729770f6 0xd98197c9 0x00000496.
++			 */
++			ths_calibration: thermal-sensor-calibration@44 {
++				reg = <0x44 0xc>;
++			};
+ 		};
+ 
+ 		/*
+@@ -2376,11 +2389,8 @@
+ 		 * meaningless. It must be the 24 MHz SYS_CLK24M net, never the 26 MHz
+ 		 * DCXO.
+ 		 *
+-		 * No nvmem-cells: the driver does not implement the fuse-to-CDATA
+-		 * transform (known from the vendor driver, not from the UM; see
+-		 * `thermal-sun8i-add-a733-support`), and shipping on the 0x800 reset default costs
+-		 * -0.74..+0.43 C measured across five sensors on two dies -- well
+-		 * inside the part's own +-3 C.
++		 * nvmem-cells: the per-die factory calibration from the SID, written
++		 * into THSn_CDATA before the sensors are enabled (UM 7.1.6.1 step 8).
+ 		 * No allwinner,sram either; that is an H616 erratum, not this part.
+ 		 */
+ 		ths: thermal-sensor@2522000 {
+@@ -2390,6 +2400,8 @@
+ 			clocks = <&ccu CLK_BUS_THS>, <&ccu CLK_GPADC0_24M>;
+ 			clock-names = "bus", "mod";
+ 			resets = <&ccu RST_BUS_THS>;
++			nvmem-cells = <&ths_calibration>;
++			nvmem-cell-names = "calibration";
+ 			#thermal-sensor-cells = <1>;
+ 		};
+ 

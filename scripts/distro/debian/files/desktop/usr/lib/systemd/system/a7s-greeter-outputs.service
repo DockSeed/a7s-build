@@ -1,0 +1,9 @@
+# a7s-build: started by 70-a7s-greeter-outputs.rules on a DRM hotplug.
+[Unit]
+Description=Light display outputs hotplugged while the LightDM greeter is shown
+Documentation=file:/usr/libexec/a7s-greeter-outputs
+After=lightdm.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/a7s-greeter-outputs

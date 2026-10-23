@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: GPL-2.0-only OR MIT
+#
+# The build environment of a7s-build. ../build.sh builds it from this directory
+# and tags it with a hash of the directory's contents, so any change here gives
+# a new image and an unchanged tree reuses the old one.
+#
+# Pinned twice:
+#  - the base image by the digest of its multi-arch index (Debian trixie,
+#    created 2026-09-18; amd64 and arm64 hosts each get their own platform
+#    image from the same index),
+#  - every package by packages.lock: the snapshot.debian.org timestamp APT
+#    uses, and the exact version of every package the image ends up with.
+# builder-packages.sh refuses to finish when the installed set differs from the
+# lock.
+FROM docker.io/library/debian:trixie@sha256:9cc080028c43b27d2074d63a5f9caf7166d731494965616c1a6d2827a004585c
+
+COPY builder-packages.sh packages.lock /etc/a7s-builder/
+COPY packages.d/ /etc/a7s-builder/packages.d/
+
+RUN bash /etc/a7s-builder/builder-packages.sh install /etc/a7s-builder \
+ && git config --system safe.directory '*' \
+ && git config --system advice.detachedHead false \
+ && git config --system init.defaultBranch main \
+ && git config --system user.name 'a7s-build' \
+ && git config --system user.email 'a7s-build@build.invalid'
+
+ENV LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    TZ=UTC \
+    DEBIAN_FRONTEND=noninteractive
+
+WORKDIR /src

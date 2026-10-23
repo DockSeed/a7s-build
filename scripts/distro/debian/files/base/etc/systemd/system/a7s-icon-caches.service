@@ -1,0 +1,17 @@
+# a7s-build: the image carries no icon-theme.cache files (as in Debian's live
+# images, live-build hook 9000; two builds would differ in them); the board
+# builds them on its first boot, before the display manager starts. Images
+# without GTK skip this.
+[Unit]
+Description=Build the icon theme caches
+ConditionPathExists=/usr/sbin/update-icon-caches
+ConditionPathExists=!/usr/share/icons/hicolor/icon-theme.cache
+Before=display-manager.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'exec /usr/sbin/update-icon-caches /usr/share/icons/*'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

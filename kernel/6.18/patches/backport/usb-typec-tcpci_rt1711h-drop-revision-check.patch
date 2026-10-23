@@ -1,0 +1,116 @@
+From b41470c6b4d4177adf8968015514cf240e37d226 Mon Sep 17 00:00:00 2001
+From: Alexey Charkov <alchark@flipper.net>
+Date: Wed, 18 Mar 2026 18:32:56 +0400
+Subject: usb: typec: tcpci_rt1711h: Drop unnecessary VID/PID/DID checks
+
+[ Upstream commit b41470c6b4d4177adf8968015514cf240e37d226 ]
+
+Existing checks for VID/PID/DID in the driver are redundant since the
+driver is already matched to the device via I2C device ID and OF
+compatible strings, and they preclude the use of fallback compatibles.
+
+Remove them to make the driver slimmer and adding new clones easier.
+
+Reviewed-by: Heikki Krogerus <heikki.krogerus@linux.intel.com>
+Signed-off-by: Alexey Charkov <alchark@flipper.net>
+Link: https://patch.msgid.link/20260318-husb311-v4-4-69e029255430@flipper.net
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+[ adapted: Linux 6.18 has no ETEK ET7304 support in this driver, so the
+  ET7304 defines, the et7304 chip_info, the `vid` field and the et7304
+  table entries that upstream removes or repoints do not exist here, and
+  rt1711h_check_revision() compares against RT1711H_VID directly. This
+  backport removes what 6.18 has: the four RT1711H/RT1715 defines,
+  rt1711h_check_revision() and its call, the `did` field and its two
+  initialisers. 6.18.39 added a forward declaration of
+  rt1711h_unregister_tcpci_port() right after the removed helper
+  (e5406c8fb71c, "usb: typec: tcpci_rt1711h: unregister TCPCI port with
+  devres"); it stays. Carried because the check rejects the HUSB311 on
+  the Radxa Cubie A7S ("vid is not correct, 0x2e99"; 0x2e99 is Hynetek). ]
+Assisted-by: Claude
+---
+diff --git a/drivers/usb/typec/tcpm/tcpci_rt1711h.c b/drivers/usb/typec/tcpm/tcpci_rt1711h.c
+index cd74cb9..84728e4 100644
+--- a/drivers/usb/typec/tcpm/tcpci_rt1711h.c
++++ b/drivers/usb/typec/tcpm/tcpci_rt1711h.c
+@@ -18,11 +18,6 @@
+ #include <linux/regmap.h>
+ #include <linux/regulator/consumer.h>
+ 
+-#define RT1711H_VID		0x29CF
+-#define RT1711H_PID		0x1711
+-#define RT1711H_DID		0x2171
+-#define RT1715_DID		0x2173
+-
+ #define RT1711H_PHYCTRL1	0x80
+ #define RT1711H_PHYCTRL2	0x81
+ 
+@@ -55,7 +50,6 @@
+ 
+ struct rt1711h_chip_info {
+ 	u32 rxdz_sel;
+-	u16 did;
+ 	bool enable_pd30_extended_message;
+ };
+ 
+@@ -301,35 +295,6 @@ static int rt1711h_sw_reset(struct rt1711h_chip *chip)
+ 	return 0;
+ }
+ 
+-static int rt1711h_check_revision(struct i2c_client *i2c, struct rt1711h_chip *chip)
+-{
+-	int ret;
+-
+-	ret = i2c_smbus_read_word_data(i2c, TCPC_VENDOR_ID);
+-	if (ret < 0)
+-		return ret;
+-	if (ret != RT1711H_VID) {
+-		dev_err(&i2c->dev, "vid is not correct, 0x%04x\n", ret);
+-		return -ENODEV;
+-	}
+-	ret = i2c_smbus_read_word_data(i2c, TCPC_PRODUCT_ID);
+-	if (ret < 0)
+-		return ret;
+-	if (ret != RT1711H_PID) {
+-		dev_err(&i2c->dev, "pid is not correct, 0x%04x\n", ret);
+-		return -ENODEV;
+-	}
+-	ret = i2c_smbus_read_word_data(i2c, TCPC_BCD_DEV);
+-	if (ret < 0)
+-		return ret;
+-	if (ret != chip->info->did) {
+-		dev_err(&i2c->dev, "did is not correct, 0x%04x\n", ret);
+-		return -ENODEV;
+-	}
+-	dev_dbg(&i2c->dev, "did is 0x%04x\n", ret);
+-	return ret;
+-}
+-
+ static void rt1711h_unregister_tcpci_port(void *tcpci);
+ 
+ static int rt1711h_probe(struct i2c_client *client)
+@@ -348,12 +313,6 @@ static int rt1711h_probe(struct i2c_client *client)
+ 
+ 	chip->info = i2c_get_match_data(client);
+ 
+-	ret = rt1711h_check_revision(client, chip);
+-	if (ret < 0) {
+-		dev_err(&client->dev, "check vid/pid fail\n");
+-		return ret;
+-	}
+-
+ 	chip->data.regmap = devm_regmap_init_i2c(client,
+ 						 &rt1711h_regmap_config);
+ 	if (IS_ERR(chip->data.regmap))
+@@ -410,12 +369,10 @@ static void rt1711h_unregister_tcpci_port(void *tcpci)
+ }
+ 
+ static const struct rt1711h_chip_info rt1711h = {
+-	.did = RT1711H_DID,
+ };
+ 
+ static const struct rt1711h_chip_info rt1715 = {
+ 	.rxdz_sel = RT1711H_BMCIO_RXDZSEL,
+-	.did = RT1715_DID,
+ 	.enable_pd30_extended_message = true,
+ };
+ 

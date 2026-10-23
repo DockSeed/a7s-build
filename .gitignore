@@ -1,0 +1,29 @@
+# Build directories (./build.sh defaults; A7S_WORK, A7S_OUT, A7S_CACHE move them).
+/work/
+/out/
+/cache/
+
+# Second lock against committing build products or vendor binaries. The tree
+# carries no blobs by policy: everything binary is fetched at build time, pinned
+# by sha256, into the cache. One `git add -A` in the wrong place is all it takes.
+*.img
+*.img.xz
+*.deb
+*.so
+*.so.[0-9]*
+*.ko
+*.o
+*.fex
+*.fw
+*.tar
+*.tar.gz
+*.tar.xz
+*.tar.bz2
+*.tar.zst
+*.tgz
+*.zst
+
+# Editor and tool leftovers
+*~
+*.swp
+__pycache__/

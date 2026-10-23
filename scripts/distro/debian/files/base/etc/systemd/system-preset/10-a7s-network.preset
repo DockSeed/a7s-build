@@ -1,0 +1,5 @@
+# a7s-build: NetworkManager owns the links; a preset run must not enable
+# systemd-networkd beside it.
+disable systemd-networkd.service
+disable systemd-networkd.socket
+disable systemd-networkd-wait-online.service

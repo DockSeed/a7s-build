@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-2.0-only OR MIT
+# Builder packages for the image stages: rootfs, image, compress
+# (scripts/stages/image.sh, scripts/distro/debian/).
+
+mmdebstrap              # the Debian root filesystem, rootless (root mode in the user namespace)
+arch-test               # mmdebstrap and distro.sh check that arm64 code runs
+debian-archive-keyring  # apt checks the archive's signatures against it
+e2fsprogs               # mke2fs -d: the ext4 root filesystem from a directory, no mount
+libarchive13t64         # mke2fs -d - reads the tree as a tar stream through libarchive
+fdisk                   # sfdisk writes the partition table into the image file
+kmod                    # depmod for the module set
+xz-utils                # compress
