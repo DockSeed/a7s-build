@@ -185,6 +185,8 @@ distro_rootfs_build() {  # <dir>
   # --mode=root: uid 0 of the container's user namespace; mmdebstrap finds it
   #   has no mknod and bind-mounts /dev's nodes instead.
   # --setup-hook: the backports pins must exist before apt resolves --include.
+  #   The cached .debs keep the owner they have in the cache (after a rootful
+  #   build, the invoking user); the chown makes the copy root's again.
   # --customize-hook: everything after the packages (customize-hook), then the
   #   downloaded .debs back into the cache.
   TMPDIR="${WORK_DIR}" mmdebstrap \
@@ -196,6 +198,7 @@ distro_rootfs_build() {  # <dir>
       --skip=download/empty --skip=essential/unlink \
       --setup-hook='mkdir -p "$1"/var/cache/apt/archives/' \
       --setup-hook="sync-in ${debs} /var/cache/apt/archives/" \
+      --setup-hook='chown -R 0:0 "$1"/var/cache/apt/archives' \
       --setup-hook="${DEBIAN_DIR}/setup-hook" \
       --customize-hook="${DEBIAN_DIR}/customize-hook" \
       --customize-hook="sync-out /var/cache/apt/archives ${debs}" \
