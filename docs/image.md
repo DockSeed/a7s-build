@@ -63,9 +63,9 @@ non-free-firmware`, as a Debian 13 install writes them), so
 `sudo apt update && sudo apt upgrade` brings normal Debian updates. Only
 kmscon, libtsm4 and Mesa come from trixie-backports (pinned).
 
-Kernel side: the kernel, device tree and modules of the kernel stage, the GPU
-firmware, and the WLAN/BT driver and firmware (aic8800) when the wifi stage
-built them.
+Kernel side: the kernel, device tree and modules of the kernel stage (with the
+WLAN/BT driver aic8800), the GPU firmware, and the WLAN/BT firmware when the
+wifi stage built it.
 
 ## Switches
 

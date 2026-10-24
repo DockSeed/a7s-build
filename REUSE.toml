@@ -6,12 +6,6 @@ SPDX-PackageDownloadLocation = "https://github.com/DockSeed/a7s-build"
 # files they add carry inside the diff; hence "override".
 
 [[annotations]]
-path = "kernel/**"
-precedence = "override"
-SPDX-FileCopyrightText = "The Linux kernel contributors and the a7s-build contributors"
-SPDX-License-Identifier = "GPL-2.0-only"
-
-[[annotations]]
 path = "userspace/orc/patches/**"
 precedence = "override"
 SPDX-FileCopyrightText = "David A. Schleef and the ORC contributors"
@@ -23,16 +17,10 @@ precedence = "override"
 SPDX-FileCopyrightText = "The Xfce contributors"
 SPDX-License-Identifier = "GPL-2.0-or-later"
 
-[[annotations]]
-path = "out-of-tree/aic8800/patches/**"
-precedence = "override"
-SPDX-FileCopyrightText = "AICSemi and the a7s-build contributors"
-SPDX-License-Identifier = "GPL-2.0-only"
-
 # Everything else without an inline header: our own scripts, docs, pins and
 # build data.
 [[annotations]]
-path = ["README.md", "docs/**", "pins/**", "container/**", ".gitignore", "**/series", "out-of-tree/**/*.sha256", "out-of-tree/**/*.md"]
+path = ["README.md", "docs/**", "container/**", ".gitignore", "**/series", "out-of-tree/**/*.sha256", "out-of-tree/**/*.md"]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "the a7s-build contributors"
 SPDX-License-Identifier = "GPL-2.0-only OR MIT"

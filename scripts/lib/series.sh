@@ -2,8 +2,8 @@
 # shellcheck shell=bash
 #
 # The one reader of a patch `series` file. Sourced, never run. Every place that
-# applies or checks a patch set goes through it: the kernel (apply-patches),
-# aic8800 (fetch-wifi), ORC (build-orc) and xfwm4 (fetch-xfwm4).
+# applies or checks a patch set goes through it: ORC (build-orc) and xfwm4
+# (fetch-xfwm4).
 #
 # Why one reader: with a series file, "the file is there" does not mean "the
 # file is applied". A line lost in a merge, a misspelt path or a new file
@@ -32,12 +32,6 @@
 #       default series file: <patch-dir>/series. Fills the global arrays
 #       SERIES (entries, in order) and SERIES_TEST (`#test:` paths). On any
 #       refusal: one `::error::` line per problem on stderr, return 1.
-#   series_resolve_skip <comma-separated tokens>
-#       after series_load. A token is a series path (with or without `.patch`)
-#       or a basename (with or without `.patch`) that exactly one entry has.
-#       Compared as fixed strings. Fills the global associative array
-#       SERIES_SKIP[<entry>]=<token>. Every token must hit exactly one entry and
-#       no two tokens the same one; otherwise `::error::` and return 1.
 
 series_load() {
   local dir="${1:?series_load: patch directory}" file="${2:-${1}/series}"
@@ -99,44 +93,4 @@ series_path_ok() {
     return 1
   fi
   return 0
-}
-
-series_resolve_skip() {
-  local tokens="$1" tok e hit bad=0
-  local -a hits list
-  declare -gA SERIES_SKIP=()
-  IFS=, read -r -a list <<< "${tokens}"
-  for tok in "${list[@]}"; do
-    # Surrounding blanks are separators, not part of a name: no name has one.
-    tok="${tok#"${tok%%[![:space:]]*}"}"; tok="${tok%"${tok##*[![:space:]]}"}"
-    if [ -z "${tok}" ]; then
-      echo "::error:: A7S_SKIP_PATCHES: empty token in '${tokens}'" >&2
-      bad=1; continue
-    fi
-    hits=()
-    for e in "${SERIES[@]}"; do
-      if [ "${e}" = "${tok}" ] || [ "${e}" = "${tok}.patch" ] \
-         || [ "${e##*/}" = "${tok}" ] || [ "${e##*/}" = "${tok}.patch" ]; then
-        hits+=("${e}")
-      fi
-    done
-    case "${#hits[@]}" in
-      1) hit="${hits[0]}"
-         if [ -n "${SERIES_SKIP[${hit}]:-}" ]; then
-           echo "::error:: A7S_SKIP_PATCHES: '${tok}' and '${SERIES_SKIP[${hit}]}' both name ${hit}" >&2
-           bad=1; continue
-         fi
-         SERIES_SKIP[${hit}]="${tok}" ;;
-      0) case "${tok}" in
-           [0-9][0-9][0-9][0-9])
-             echo "::error:: A7S_SKIP_PATCHES: '${tok}' looks like a patch number; patches are named, pass the name" >&2 ;;
-           *)
-             echo "::error:: A7S_SKIP_PATCHES: '${tok}' names no series entry" >&2 ;;
-         esac
-         bad=1 ;;
-      *) echo "::error:: A7S_SKIP_PATCHES: '${tok}' is ambiguous, it names ${#hits[@]} entries: ${hits[*]} -- pass the path" >&2
-         bad=1 ;;
-    esac
-  done
-  [ "${bad}" = 0 ]
 }

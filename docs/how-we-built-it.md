@@ -152,7 +152,7 @@ Measured in the lab repository, up to the freeze (3 Oct 2026):
 | Issues | 374 (303 closed, 71 open at the freeze) |
 | CI runs | 4,195: 3,727 passed, 234 failed, 234 cancelled |
 | CI time | about 320 runner-hours (sum of run durations) |
-| Kernel patches | 273 in the lab; recipe: 256 |
+| Kernel patches | 273 in the lab; recipe: 256, now in a7s-linux-lts |
 | Hardware proof and measurement logs | about 800 files |
 | Boards | 2 |
 

@@ -1,8 +1,8 @@
 # a7s-build
 
 Build your own Debian 13 (trixie, arm64) image for the Radxa Cubie A7S
-(Allwinner A733): boot chain, Linux 6.18 with the A733 patch series, root
-filesystem and a flashable image, all from one `./build.sh`, inside a container.
+(Allwinner A733): boot chain and Linux 6.18 with the A733 patch series (each a separate recipe,
+pinned to a commit), root filesystem and a flashable image, all from one `./build.sh`, inside a container.
 **You build your own image. We ship no image and no blob**: every vendor binary
 is downloaded at build time from its public origin and checked against a
 sha256 committed here.
@@ -145,9 +145,10 @@ concerned. Their work is what made this project possible.
 ## Licence
 
 Our own files are `GPL-2.0-only OR MIT`. Patches and bundled code keep the
-licence of the project they belong to (Linux GPL-2.0-only, ORC BSD-2-Clause,
-xfwm4 GPL-2.0-or-later, aic8800 GPL-2.0-only). The boot chain is not part of
-this repository: [a733-bootchain](https://github.com/DockSeed/a733-bootchain),
-pinned to a commit, has its own licences. The repository as a whole can be shared under
+licence of the project they belong to (ORC BSD-2-Clause, xfwm4
+GPL-2.0-or-later). The boot chain and the kernel are not
+part of this repository: [a733-bootchain](https://github.com/DockSeed/a733-bootchain)
+and [a7s-linux-lts](https://github.com/DockSeed/a7s-linux-lts), each pinned to a
+commit, have their own licences. The repository as a whole can be shared under
 GPL-2.0 ([LICENSE](LICENSE)). Full texts in [LICENSES/](LICENSES/),
 assignments in [REUSE.toml](REUSE.toml); `reuse lint` checks them.

@@ -6,6 +6,8 @@ ca-certificates
 make
 build-essential
 gcc-aarch64-linux-gnu
+# the arm64 libc headers: with them the kernel sets CONFIG_CC_CAN_LINK
+libc6-dev-arm64-cross
 binutils-aarch64-linux-gnu
 bc
 bison

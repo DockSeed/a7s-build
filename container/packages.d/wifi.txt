@@ -1,7 +1,0 @@
-# SPDX-License-Identifier: GPL-2.0-only OR MIT
-# Debian packages the wifi stages need (out-of-tree module build against the kernel tree, depmod/modprobe resolution).
-git
-kmod
-patch
-tar
-gzip

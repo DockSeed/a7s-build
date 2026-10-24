@@ -1,62 +1,39 @@
-# Kernel: Linux 6.18.57
+<!-- SPDX-License-Identifier: GPL-2.0-only OR MIT -->
+# Kernel: Linux 6.18 LTS
 
-`kernel/6.18/` is the kernel input of the build:
+The kernel is not built from source in this repository. It is the stand-alone
+recipe [a7s-linux-lts](https://github.com/DockSeed/a7s-linux-lts), pinned here
+to one commit (`KERNEL_RECIPE_COMMIT` in `scripts/stages/kernel.sh`):
 
-- `series`: 256 patch paths, applied in this order to the pristine
-  `linux-6.18.57.tar.xz` from cdn.kernel.org (sha256 in `scripts/stages/kernel.sh`).
-- `patches/`: `backport/` (other people's patches, to drop once 6.18.y has
-  them), `soc/<subsystem>/` (A733 support, any A733 board) and `board/dts/`
-  (Cubie A7S wiring). File names carry no numbers; the order lives in `series`.
-- `config`: a defconfig (output of `make savedefconfig`). Install it as
-  `arch/arm64/configs/a7s_defconfig` and run `make a7s_defconfig`.
+| | |
+|---|---|
+| Repository | `https://github.com/DockSeed/a7s-linux-lts` |
+| Pinned commit | `9715c609b022` |
+| Result | `Image`, `sun60i-a733-cubie-a7s.dtb`, `config`, `System.map`, `modules/` (with aic8800), `KERNEL-ID` |
 
-Apply with `patch -p1 --fuzz=0` and treat any `offset` or `fuzz` line as a
-failure: a moved hunk means the base changed, and the patch has to be
-regenerated, not nudged (the device tree has many identical OPP blocks). The
-`kernel` stage does exactly this.
+`./build.sh kernel` fetches the recipe at the pin and runs its
+`scripts/build.sh all` in the builder, with the kernel tree in the work
+directory (`work/linux-<version>`), and writes the result to `out/`. What the
+kernel is made of (the pinned tarball, the patch series, the config, the checks
+after the build) is described there (`docs/kernel.md`). Changes to the series
+are made there only; here the pin moves.
 
-## Changing the series
+Stages: `fetch-kernel` (the recipe at the pin), `build-kernel` (its `all`),
+`kernel` (both), `compile-check` (the recipe's fast compile gate, after a
+build), `kernel-key` (the recipe's key).
 
-1. Apply the series to a pristine tree (`./build.sh shell`, then `patch` as above, or a git tree).
-2. Edit, commit, regenerate the patch with `git format-patch`.
-3. Put it into `kernel/6.18/patches/…` and list it in `series` at the right place.
-4. Rebuild: `./build.sh kernel`.
+The recipe also builds the AIC8800 WLAN/BT driver against its kernel tree; the
+two modules are in `out/modules/`, and `KERNEL-ID` names the driver's upstream
+commit (`aic8800=`). The firmware the driver loads is the `wifi` stage's:
+`out/aic8800/`, from the same commit and verified against
+`out-of-tree/aic8800/firmware.sha256`.
 
-Patches of ours carry `From: DockSeed <dockseed@proton.me>`, one
-`Assisted-by: Claude` and no `Signed-off-by`. Third-party patches keep their
-authorship and trailers and name their source (`[ Upstream commit <sha> ]` or
-`Link:`); if we changed one, it also says `[ adapted: … ]`. Code ported from
-Allwinner's BSP says so in its header.
+The image stage takes `Image`, the dtb and `modules/` as they are. Before it
+does, it checks that the `key=` field of `KERNEL-ID` is the key
+(`scripts/build.sh key`) of the pinned checkout, that `Image` and the dtb match
+the hashes in `KERNEL-ID`, that the kernel is not a variant build (developer
+switches of the recipe set) and, when the firmware is present, that the driver
+was built from the commit the firmware comes from.
 
-## Good to know
-
-- **MAC address.** The kernel carries none. U-Boot writes `local-mac-address`
-  into `ethernet0` from its `ethaddr`; without one the boot chain's
-  `CONFIG_NET_RANDOM_ETHADDR=y` gives a random address per boot, so DHCP sees a
-  new machine after every reboot.
-- **Config.** `MEMTEST=y` stays (`memtest=1` on the kernel command line
-  excludes a bad DRAM window); `KPROBES`, `DEBUG_FS` and the default tracers
-  stay as debugging support. `SECURITY_DMESG_RESTRICT=y`
-  as in Debian's kernel: only root reads the kernel log. ISO9660, UDF, exFAT and
-  NTFS (ntfs3) are modules, as in Debian's kernel, for sticks, cards and DVDs;
-  so are Btrfs, XFS, F2FS and the NFS and SMB clients, for disks and network
-  shares (the tools come from Debian: `btrfs-progs`, `xfsprogs`, `f2fs-tools`,
-  `nfs-common`, `cifs-utils`).
-
-## Not carried
-
-- Fault-injection test instruments (IOMMU, MMC, GPU scheduler, stmmac,
-  thermal, cpufreq, display RCQ) and debug instrumentation (combo PHY DP,
-  AUX/HPD PHY, COMB1 PCIe PMA).
-- Writing to hardware: the debugfs knobs and module parameters DP `link`,
-  `train`, `video`, `edid`, `sink_crc`; TCON_TV1 and display engine;
-  `stop_after_link`, `rcq`. The code they drove stays, the default path is
-  unchanged, and read-only status files remain (for example the display engine
-  `state`).
-
-## Checked
-
-Against the pristine tree in a `debian:trixie` container: all 256 patches
-apply at fuzz 0 without offsets; `make a7s_defconfig && make savedefconfig`
-reproduces `config`; `make dtbs` and `make W=1` over the display, PHY, PCIe and
-CCU code are warning-free.
+The recipe takes its build time from its own commit, not from this repository:
+the kernel does not change when only this repository does.

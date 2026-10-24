@@ -90,6 +90,7 @@ stage_image() {
   local spl="${OUT_DIR}/bootchain/u-boot-sunxi-with-spl.bin" bcid="${OUT_DIR}/bootchain/BOOTCHAIN-ID"
   [ -s "${kimg}" ] || die "no kernel Image in ${OUT_DIR} -- run the kernel stage"
   [ -s "${dtb}" ] || die "no ${IMAGE_DTB} in ${OUT_DIR} -- run the kernel stage"
+  kernel_verify_output
   bootchain_verify_output
 
   # A copy of the root filesystem to add the kernel side to; the rootfs stays
@@ -135,38 +136,21 @@ image_add_modules() {  # <root> -- prints the kernel version
   printf '%s' "${d##*/}"
 }
 
-# A module pack (the wifi stage) into the image's module tree. The pack's own
-# depmod output stays out: depmod runs over the whole set afterwards, and the
-# kernel's modules.order and modules.builtin must not be replaced.
-image_copy_modpack() {  # <pack dir lib/modules/<kver>> <root> <kver>
-  tar -C "$1" --exclude='./modules.*' -cf - . | tar -C "$2/usr/lib/modules/$3" --no-same-owner -xf - \
-    || die "copying the module pack $1 failed"
-}
-
 image_depmod() {  # <root> <kver>
   depmod -b "$1" "$2" || die "depmod failed for $2"
   [ -s "$1/usr/lib/modules/$2/modules.dep" ] || die "depmod wrote no modules.dep"
 }
 
-# WLAN/BT (aic8800, out of tree) and the GPU firmware.
+# WLAN/BT (aic8800: firmware here, modules from the kernel stage) and the GPU
+# firmware.
 image_add_firmware() {  # <root> <kver>
   local r="$1" kver="$2" aic d fw="" lic="" mods=""
-  for d in "${OUT_DIR}/aic8800/usr/lib" "${OUT_DIR}/aic8800/lib"; do
-    [ -d "${d}/firmware/aic8800D80" ] && aic="${d}" && break
+  aic="${OUT_DIR}/aic8800/usr/lib"
+  for d in aic_load_fw.ko aic8800_fdrv.ko; do
+    find "${r}/usr/lib/modules/${kver}" -name "${d}" -print -quit | grep -q . || mods+=" ${d}"
   done
-  if [ -n "${aic:-}" ]; then
-    [ -d "${aic}/modules/${kver}" ] || die "the aic8800 pack has firmware but no modules for ${kver}"
-    image_copy_modpack "${aic}/modules/${kver}" "${r}" "${kver}"
-    install -d -m0755 "${r}/usr/lib/firmware/aic8800D80"
-    cp -a --no-preserve=ownership "${aic}/firmware/aic8800D80/." "${r}/usr/lib/firmware/aic8800D80/"
-    if [ -f "${SRC}/out-of-tree/aic8800/firmware.sha256" ]; then
-      ( cd "${r}/usr/lib/firmware/aic8800D80" && grep -v '^#' "${SRC}/out-of-tree/aic8800/firmware.sha256" | sha256sum -c --quiet - ) \
-        || die "the aic8800 firmware does not match out-of-tree/aic8800/firmware.sha256"
-    fi
-    for d in aic_load_fw.ko aic8800_fdrv.ko; do
-      find "${r}/usr/lib/modules/${kver}" -name "${d}" -print -quit | grep -q . || mods+=" ${d}"
-    done
-    [ -z "${mods}" ] || die "the aic8800 firmware is in the image but not its modules:${mods}"
+  # The driver modules come with the kernel; the keep-cfg80211 rule goes with them.
+  if [ -z "${mods}" ]; then
     install -d -m0755 "${r}/etc/modprobe.d"
     cat > "${r}/etc/modprobe.d/aic8800-keep-cfg80211.conf" <<'EOF'
 # a7s-build: `modprobe -r aic8800_fdrv` would take cfg80211 with it (nothing
@@ -174,10 +158,21 @@ image_add_firmware() {  # <root> <kver>
 # this kernel does not have. Remove the driver alone.
 remove aic8800_fdrv /sbin/rmmod aic8800_fdrv
 EOF
+  fi
+  if [ -d "${aic}/firmware/aic8800D80" ]; then
+    wifi_verify_output
+    [ -z "${mods}" ] || die "the aic8800 firmware is in the image but not its modules:${mods}"
+    install -d -m0755 "${r}/usr/lib/firmware/aic8800D80"
+    cp -a --no-preserve=ownership "${aic}/firmware/aic8800D80/." "${r}/usr/lib/firmware/aic8800D80/"
+    if [ -f "${SRC}/out-of-tree/aic8800/firmware.sha256" ]; then
+      ( cd "${r}/usr/lib/firmware/aic8800D80" && grep -v '^#' "${SRC}/out-of-tree/aic8800/firmware.sha256" | sha256sum -c --quiet - ) \
+        || die "the aic8800 firmware does not match out-of-tree/aic8800/firmware.sha256"
+    fi
     log "wifi/bt: aic8800 firmware (hashes checked) + aic_load_fw.ko + aic8800_fdrv.ko"
   else
-    warn "wifi/bt: no aic8800 pack in ${OUT_DIR}/aic8800 -- the image has NO WLAN and NO Bluetooth (run the wifi stage)"
+    warn "wifi/bt: no aic8800 firmware in ${OUT_DIR}/aic8800 -- the image has NO working WLAN and NO Bluetooth (run the wifi stage)"
   fi
+  mods=""
 
   for d in "${OUT_DIR}/gpu-firmware" "${OUT_DIR}/firmware/powervr"; do
     [ -f "${d}/${IMAGE_GPU_FW}" ] && fw="${d}/${IMAGE_GPU_FW}" && lic="${d}/LICENSE.powervr" && break
