@@ -9,7 +9,7 @@ one commit (`BOOTCHAIN_COMMIT` in `scripts/stages/bootchain.sh`):
 | | |
 |---|---|
 | Repository | `https://github.com/DockSeed/a733-bootchain` |
-| Pinned commit | `e5531aa47214d21328e21a57b4da5d1efd991eda` |
+| Pinned commit | `3e392496a399bdf428bc2225261ba82a64d476d7` |
 | Result | `u-boot-sunxi-with-spl.bin`, sha256 `eafbda165c42ec47db60ec06d87324417f7959ee8ffd4539b4a0e46625efbf97` |
 
 `./build.sh bootchain` fetches the recipe at the pin and runs its

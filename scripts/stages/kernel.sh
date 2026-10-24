@@ -16,7 +16,7 @@
 # The recipe, pinned to a COMMIT (main moves). To bump it: build, compare the
 # result, test on a board, then change it here.
 KERNEL_RECIPE_URL="https://github.com/DockSeed/a7s-linux-lts.git"
-KERNEL_RECIPE_COMMIT="9715c609b0228befe0601ba07e2c5729ff159d2b"
+KERNEL_RECIPE_COMMIT="e6592369d766ab44352dc99d2b4027047e4b9e60"
 
 # Where the pinned recipe is checked out.
 kernel_dir() { printf '%s\n' "${WORK_DIR}/a7s-linux-lts"; }

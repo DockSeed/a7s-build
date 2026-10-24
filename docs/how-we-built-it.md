@@ -16,7 +16,7 @@ history shown here. Two earlier tracks came first:
 - **An Armbian track** (mid-June): the vendor's 6.6 kernel overlaid on
   Armbian, with a small set of validated patches. It produced a bootable
   system quickly and taught us what the board needs: which drivers exist
-  only in the vendor tree, and where mainline falls short.
+  only in the vendor tree and are not yet in mainline.
 - **A Fedora track** (late June): a from-scratch image recipe on a 6.18
   kernel with the vendor tree as a pinned source. It reached a login prompt
   and gave us the recipe architecture this build still follows.
@@ -121,7 +121,7 @@ combined, and over four times their CI runs.
 | 21 Sep | PCIe / NVMe root drive |
 | 25 Sep | Xfce desktop with hardware GL |
 | 2 Oct | Audio and Bluetooth audio proven |
-| 3 Oct | Freeze; recipe extracted |
+| 3 Oct | Recipe extracted |
 
 ## Who did what
 
@@ -142,14 +142,14 @@ One human and several AI coding agents (Claude and a few other assistants).
 
 ## What it cost
 
-Measured in the lab repository, up to the freeze (3 Oct 2026):
+Measured in the lab repository, up to 3 Oct 2026:
 
 | What | Amount |
 |---|---|
 | Calendar time | 77 days (16 Jul - 3 Oct), commits on 61 of them; 136 days since the first experiments (20 May) |
 | Commits (main) | 2,970; about 270 more in the earlier tracks |
 | Pull requests | 745, all closed |
-| Issues | 374 (303 closed, 71 open at the freeze) |
+| Issues | 374 (303 closed, 71 open) |
 | CI runs | 4,195: 3,727 passed, 234 failed, 234 cancelled |
 | CI time | about 320 runner-hours (sum of run durations) |
 | Kernel patches | 273 in the lab; recipe: 256, now in a7s-linux-lts |
