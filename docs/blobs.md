@@ -10,7 +10,7 @@ may not be redistributed. "Unknown" means no licence text came with the file.
 |---|---|---|---|---|
 | Kernel recipe `a7s-linux-lts` (Linux 6.18.57 and the patch series; fetches the row below itself) | github.com/DockSeed/a7s-linux-lts | commit `e6592369d766`, `scripts/stages/kernel.sh` | GPL-2.0 | yes |
 | Linux 6.18.57 | cdn.kernel.org | by `a7s-linux-lts`: sha256 | GPL-2.0 | yes |
-| Boot-chain recipe `a733-bootchain` (U-Boot, TF-A and the patches on both; fetches the rows below itself) | github.com/DockSeed/a733-bootchain | commit `3e392496a399`, `scripts/stages/bootchain.sh` | GPL / BSD-3-Clause, per file | yes |
+| Boot-chain recipe `a733-bootchain` (U-Boot, TF-A and the patches on both; fetches the rows below itself) | github.com/DockSeed/a733-bootchain | commit `03418865bde9`, `scripts/stages/bootchain.sh` | GPL / BSD-3-Clause, per file | yes |
 | Boot-chain package `u-boot-dlan17` (build glue, with the DRAM blob `awbin/a733/ddr.bin`) | github.com/radxa-pkg/u-boot-dlan17 | by `a733-bootchain`: commit, `ddr.bin` sha256 | glue GPL; `ddr.bin` closed vendor code, no licence text | `ddr.bin`: no |
 | U-Boot source | github.com/radxa/u-boot | by `a733-bootchain`: commit, by hash only | GPL-2.0+ | yes |
 | TF-A | git.trustedfirmware.org/TF-A/trusted-firmware-a master | by `a733-bootchain`: commit | BSD-3-Clause | yes |
