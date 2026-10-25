@@ -134,6 +134,21 @@ please open an issue on GitHub. Include the commit you built, your host
 (distribution, podman or docker) and the relevant part of the build log
 or serial console.
 
+## Who wrote this
+
+One human and AI coding agents (Claude). The scripts, the container recipe and
+the documentation were written by the agents. The decisions were the human's:
+
+- to build a plain Debian on a mainline-based kernel;
+- to follow the 6.18 LTS line and take stable releases as separate commits;
+- to keep the boot chain, the kernel and the image recipe in three repositories,
+  with this one pinning the other two to commits and checking the sha256 of the
+  result, no copies;
+- to ship Debian as Debian: no project name, logo or login banner in the
+  image, nothing that presents Debian's work as ours;
+- what counts as proven: a statement about the hardware is made only after it
+  was measured on a board, and an image is released only after it has booted.
+
 ## A note on earlier versions
 
 Earlier versions of this repository described other projects' code, including
