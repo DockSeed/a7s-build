@@ -10,12 +10,13 @@ The result lands in `out/`. `./build.sh --help` lists every stage and switch.
 
 ## What the host needs
 
-- x86_64 Linux (tested; an aarch64 host has not been tried); bash, coreutils,
-  git.
-- **podman >= 4 or docker >= 24.** Tested: rootless podman 5.8; docker 29.8
-  running inside a podman container (not yet on a real docker host).
-- **Linux >= 6.7**, or a `qemu-aarch64` binfmt handler already
+- x86_64 or aarch64 Linux (both tested); bash, coreutils, git.
+- **podman >= 4 or docker >= 24.** Tested: rootless podman 5.8 (x86_64) and
+  5.4 (aarch64); docker 29.8 running inside a podman container (not yet on a
+  real docker host).
+- x86_64 only: **Linux >= 6.7**, or a `qemu-aarch64` binfmt handler already
   registered on the host with the `F` flag (see [arm64 emulation](#arm64-emulation)).
+  An aarch64 host runs the arm64 programs natively.
 - Network access to the public origins of the inputs (docker.io, snapshot.debian.org,
   cdn.kernel.org, github.com, ...). Everything is checked against a committed
   sha256 or commit id.

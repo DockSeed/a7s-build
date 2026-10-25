@@ -9,8 +9,8 @@ sha256 committed here.
 
 ## Requirements
 
-- x86_64 Linux host (tested; an aarch64 host has not been tried).
-- Linux kernel >= 6.7 on the host, or a `qemu-aarch64` binfmt handler
+- x86_64 or aarch64 Linux host (both tested).
+- On an x86_64 host: Linux kernel >= 6.7, or a `qemu-aarch64` binfmt handler
   registered on the host with the `F` flag (the root filesystem is arm64).
 - `git`, and **podman >= 4 or docker >= 24**. Tested: rootless podman 5.8,
   docker 29.8 (inside a podman container).
