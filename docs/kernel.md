@@ -8,7 +8,7 @@ to one commit (`KERNEL_RECIPE_COMMIT` in `scripts/stages/kernel.sh`):
 | | |
 |---|---|
 | Repository | `https://github.com/DockSeed/a7s-linux-lts` |
-| Pinned commit | `e6592369d766` |
+| Pinned commit | `adfccdd38cac` |
 | Result | `Image`, `sun60i-a733-cubie-a7s.dtb`, `config`, `System.map`, `modules/` (with aic8800), `KERNEL-ID` |
 
 `./build.sh kernel` fetches the recipe at the pin and runs its
