@@ -68,6 +68,11 @@ a7s_env_setup() {
   fi
   [ -n "${sde}" ] || die "no SOURCE_DATE_EPOCH: no git metadata and A7S_SNAPSHOT is empty -- set A7S_SOURCE_DATE_EPOCH"
   case "${sde}" in *[!0-9]*) die "SOURCE_DATE_EPOCH must be a number, not '${sde}'" ;; esac
+  # The image stage clamps file times to SOURCE_DATE_EPOCH, which only lowers
+  # them: with a time in the future, every file this build writes keeps the
+  # wall-clock time, and two builds of the same commit differ.
+  [ "${sde}" -le "$(date -u +%s)" ] \
+    || die "SOURCE_DATE_EPOCH ${sde} ($(date -u -d "@${sde}" '+%Y-%m-%d %H:%M:%S') UTC) lies in the future; two builds would not match -- set A7S_SOURCE_DATE_EPOCH to a time in the past"
   export SOURCE_DATE_EPOCH="${sde}"
 
   if [ -z "${A7S_BUILD_COMMIT}" ]; then

@@ -17,7 +17,7 @@ x86_64, rootless podman 5.8 and 5.5), came out the same to the byte.
 | Root filesystem packages | `A7S_SNAPSHOT` (APT sources point at that snapshot) | APT, against the signed `InRelease` |
 | Downloaded files | sha256 in the repository, `fetch_verified` | before entering the cache and on every use |
 | Git sources | full commit id, `git_fetch_pinned` | git checks every object; `HEAD` is compared with the pin |
-| Time stamps | `SOURCE_DATE_EPOCH` = commit time of `HEAD` (`A7S_SOURCE_DATE_EPOCH` overrides) | exported to every stage (the kernel takes the commit time of its own recipe) |
+| Time stamps | `SOURCE_DATE_EPOCH` = commit time of `HEAD` (`A7S_SOURCE_DATE_EPOCH` overrides) | exported to every stage (the kernel takes the commit time of its own recipe); a time in the future is refused, because file times are only clamped downwards |
 | Build identity | `A7S_BUILD_COMMIT` = `HEAD` id, `-dirty` if modified | stamped into the image |
 
 A mirror (`A7S_DOWNLOAD_MIRROR`) and the cache are only places to look; a
