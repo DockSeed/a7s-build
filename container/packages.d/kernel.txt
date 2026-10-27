@@ -22,3 +22,5 @@ rsync
 patch
 python3
 device-tree-compiler
+# BTF for the kernel's CONFIG_DEBUG_INFO_BTF
+pahole
