@@ -265,6 +265,7 @@ debian_customize() {  # <root>
   log "customize: packages of the base are in ($(in_root "${r}" dpkg-query -W -f='${db:Status-Status}\n' | grep -cx installed) installed)"
 
   debian_regulatory_db "${r}"
+  debian_kernel_package "${r}"
   debian_assert_kmscon "${r}"
   debian_assert_mesa "${r}"
 
@@ -292,6 +293,42 @@ debian_customize() {  # <root>
 debian_regulatory_db() {  # <root>
   in_root "$1" update-alternatives --set regulatory.db /lib/firmware/regulatory.db-upstream >/dev/null \
     || die "could not select the upstream regulatory.db"
+}
+
+# KERNEL_PACKAGE (packages.sh): built here with dpkg-deb, installed with apt
+# like any local package. Afterwards apt must meet wireguard's dependency with
+# it, Recommends included, and plan no Debian kernel and no initramfs-tools.
+debian_kernel_package() {  # <root>
+  local r="$1" d="${WORK_DIR}/kernel-package" provides sim bad
+  provides="$(printf '%s, ' "${KERNEL_PROVIDES[@]}")"; provides="${provides%, }"
+  rm -rf "${d}" "${d}.deb"
+  install -d -m0755 "${d}/DEBIAN"
+  cat > "${d}/DEBIAN/control" <<EOF
+Package: ${KERNEL_PACKAGE}
+Version: 1
+Architecture: all
+Multi-Arch: foreign
+Maintainer: a7s-build
+Section: kernel
+Priority: optional
+Provides: ${provides}
+Description: the kernel of this image (not installed by a package)
+ The kernel, its device tree and its modules in /boot and /usr/lib/modules
+ were written when the image was built; no package owns them. This package
+ holds no files. It declares the virtual packages that kernel provides, so
+ apt does not install a Debian kernel to satisfy a dependency on one of them.
+EOF
+  chmod 0644 "${d}/DEBIAN/control"
+  dpkg-deb --root-owner-group -Zxz --build "${d}" "${d}.deb" >/dev/null || die "building ${KERNEL_PACKAGE} failed"
+  install -d -m0755 "${r}/tmp/a7s-kernel"
+  install -m0644 "${d}.deb" "${r}/tmp/a7s-kernel/${KERNEL_PACKAGE}.deb"
+  debian_apt_install "${r}" "/tmp/a7s-kernel/${KERNEL_PACKAGE}.deb" || die "installing ${KERNEL_PACKAGE} failed"
+  rm -rf "${r:?}/tmp/a7s-kernel" "${d}" "${d}.deb"
+  sim="$(in_root "${r}" apt-get -s -q --install-recommends install wireguard)" \
+    || die "apt cannot install wireguard with ${KERNEL_PACKAGE} in place: ${sim}"
+  bad="$(awk '/^Inst (linux-image|linux-headers|initramfs-tools)/ {printf "%s ", $2}' <<<"${sim}")"
+  [ -z "${bad}" ] || die "apt still plans a Debian kernel for wireguard: ${bad}"
+  log "${KERNEL_PACKAGE} provides ${provides}"
 }
 
 debian_assert_kmscon() {  # <root>
@@ -851,6 +888,17 @@ distro_rootfs_assert() {  # <dir>
   [ "$(stat -c %Y "${r}/usr/lib/clock-epoch" 2>/dev/null)" = "${SOURCE_DATE_EPOCH}" ] \
     || die "/usr/lib/clock-epoch is missing or its mtime is not SOURCE_DATE_EPOCH"
   [ "$(cat "${r}/etc/hostname")" = "${A7S_HOSTNAME}" ] || die "/etc/hostname is not ${A7S_HOSTNAME}"
+  # KERNEL_PACKAGE stands in for the kernel; once the image stage has added the
+  # modules, every one its Provides rest on must be there.
+  assert_installed "${r}" "apt would install a Debian kernel for wireguard" "${KERNEL_PACKAGE}"
+  local kd i
+  for kd in "${r}"/usr/lib/modules/*/; do
+    [ -d "${kd}" ] || continue
+    for i in "${!KERNEL_PROVIDES_MODULES[@]}"; do
+      [ -n "$(find "${kd}" -name "${KERNEL_PROVIDES_MODULES[i]}.ko*" -print -quit)" ] \
+        || die "${KERNEL_PACKAGE} provides ${KERNEL_PROVIDES[i]}, but ${kd#"${r}"} has no ${KERNEL_PROVIDES_MODULES[i]}.ko"
+    done
+  done
   # Residue of the build.
   ! compgen -G "${r}/var/cache/apt/archives/*.deb" >/dev/null || die "cached .deb files in the rootfs"
   [ -z "$(find "${r}/var/lib/apt/lists" -maxdepth 1 -type f ! -name lock -print -quit 2>/dev/null)" ] || die "apt package lists in the rootfs"

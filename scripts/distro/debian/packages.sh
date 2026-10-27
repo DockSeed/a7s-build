@@ -41,6 +41,19 @@ DEBIAN_BASE_PACKAGES=(
   linux-sysctl-defaults nftables iptables systemd-zram-generator kmscon
 )
 
+# The image's kernel is no Debian package: the image stage writes it to /boot
+# and /usr/lib/modules. KERNEL_PACKAGE holds no files; it declares to dpkg the
+# virtual packages that kernel provides, as Debian's linux-image-arm64 does, so
+# apt meets a dependency on one of them with it instead of installing a Debian
+# kernel (and initramfs-tools with it). Each entry of KERNEL_PROVIDES is backed
+# by the module of the same index in KERNEL_PROVIDES_MODULES, which the
+# finished image must carry (distro_rootfs_assert):
+#   wireguard-modules   wireguard-tools recommends it, wireguard depends on it;
+#                       1.0.0 is the version Debian's kernel packages provide
+KERNEL_PACKAGE="a7s-kernel"
+KERNEL_PROVIDES=("wireguard-modules (= 1.0.0)")
+KERNEL_PROVIDES_MODULES=(wireguard)
+
 # Debian's standard parts that minbase leaves out, each for what it does:
 #   logrotate        logs under /var/log are rotated instead of filling the card
 #   bash-completion  Tab completes commands and options

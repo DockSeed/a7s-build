@@ -67,6 +67,14 @@ Kernel side: the kernel, device tree and modules of the kernel stage (with the
 WLAN/BT driver aic8800), the GPU firmware, and the WLAN/BT firmware when the
 wifi stage built it.
 
+The kernel is not a Debian package, and U-Boot boots it without an initrd. The
+package `a7s-kernel` holds no files; it tells apt what that kernel provides
+(`wireguard-modules`, as Debian's kernel packages do), so installing
+`wireguard-tools` or `wireguard` brings no Debian kernel and no
+`initramfs-tools`. A Debian kernel installed by name (`linux-image-arm64`)
+lands in `/boot` but is not booted: `extlinux.conf` names only the image's
+kernel.
+
 ## Switches
 
 `A7S_DESKTOP`, `A7S_USER`, `A7S_HOSTNAME`, `A7S_SNAPSHOT`, `A7S_ROOTFS_REBUILD`: see [building](building.md#switches). `A7S_DESKTOP=1` adds Xfce with LightDM (no LibreOffice) and the patched xfwm4.
