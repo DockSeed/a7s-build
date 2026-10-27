@@ -8,7 +8,7 @@ may not be redistributed. "Unknown" means no licence text came with the file.
 
 | What | Origin | Pin | Licence | Redistribute? |
 |---|---|---|---|---|
-| Kernel recipe `a7s-linux-lts` (Linux 6.18.59 and the patch series; fetches the row below itself) | github.com/DockSeed/a7s-linux-lts | commit `a9de602dc4b0`, `scripts/stages/kernel.sh` | GPL-2.0 | yes |
+| Kernel recipe `a7s-linux-lts` (Linux 6.18.59 and the patch series; fetches the row below itself) | github.com/DockSeed/a7s-linux-lts | commit `c8adfd07b3eb`, `scripts/stages/kernel.sh` | GPL-2.0 | yes |
 | Linux 6.18.59 | cdn.kernel.org | by `a7s-linux-lts`: sha256 | GPL-2.0 | yes |
 | Boot-chain recipe `a733-bootchain` (U-Boot, TF-A and the patches on both; fetches the rows below itself) | github.com/DockSeed/a733-bootchain | commit `03418865bde9`, `scripts/stages/bootchain.sh` | GPL / BSD-3-Clause, per file | yes |
 | Boot-chain package `u-boot-dlan17` (build glue, with the DRAM blob `awbin/a733/ddr.bin`) | github.com/radxa-pkg/u-boot-dlan17 | by `a733-bootchain`: commit, `ddr.bin` sha256 | glue GPL; `ddr.bin` closed vendor code, no licence text | `ddr.bin`: no |
