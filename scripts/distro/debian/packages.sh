@@ -31,14 +31,23 @@ DEBIAN_ARCH="arm64"
 #                               console needs to say what it sees
 #   linux-sysctl-defaults       ping_group_range (unprivileged ping)
 #   nftables iptables           netfilter userspace (iptables-nft), no ruleset
-#   systemd-zram-generator      swap in compressed RAM
+#   systemd-zram-generator      swap in compressed RAM, with the package's own
+#                               default (no swap partition on the card)
+#   apparmor                    AppArmor's parser and profiles; Debian's kernel
+#                               packages recommend it, so every Debian install
+#                               has it. Loads nothing on a kernel without
+#                               AppArmor (ConditionSecurity=apparmor)
+#   unattended-upgrades         Debian's security updates installed daily, as
+#                               in Debian's cloud images; its debconf default
+#                               writes apt.conf.d/20auto-upgrades
 #   kmscon                      the console on the screen (tty1); from backports
 DEBIAN_BASE_PACKAGES=(
   systemd-sysv udev dbus libpam-systemd sudo ca-certificates procps iproute2 kmod
   openssh-server systemd-timesyncd network-manager
   wpasupplicant iw rfkill wireless-regdb bluez busybox e2fsprogs fdisk
   ethtool iputils-ping wget curl xz-utils pciutils usbutils nvme-cli nano less
-  linux-sysctl-defaults nftables iptables systemd-zram-generator kmscon
+  linux-sysctl-defaults nftables iptables systemd-zram-generator apparmor
+  unattended-upgrades kmscon
 )
 
 # The image's kernel is no Debian package: the image stage writes it to /boot

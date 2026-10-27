@@ -733,6 +733,20 @@ EOF
   [ ! -e "${r}/usr/lib/systemd/systemd-resolved" ] || die "systemd-resolved is in the rootfs -- NetworkManager does DNS, as on Debian"
   in_rootfs "${r}" /etc/systemd/system/sysinit.target.wants/systemd-timesyncd.service || die "systemd-timesyncd is not enabled"
   in_rootfs "${r}" /etc/systemd/system/bluetooth.target.wants/bluetooth.service || die "bluetooth.service is not enabled"
+  # AppArmor as on a Debian install: the package enables apparmor.service, which
+  # is skipped (not failed) on a kernel without AppArmor.
+  in_rootfs "${r}" /etc/systemd/system/sysinit.target.wants/apparmor.service || die "apparmor.service is not enabled"
+  grep -qx 'ConditionSecurity=apparmor' "${r}/usr/lib/systemd/system/apparmor.service" \
+    || die "apparmor.service lost ConditionSecurity=apparmor -- it would fail on a kernel without AppArmor"
+  # Security updates as in Debian's cloud images: the package's debconf default
+  # switches on the daily run.
+  grep -q 'Unattended-Upgrade "1"' "${r}/etc/apt/apt.conf.d/20auto-upgrades" 2>/dev/null \
+    || die "unattended-upgrades is not switched on (apt.conf.d/20auto-upgrades)"
+  # Swap: zram0 as systemd-zram-generator ships it; /etc stays the admin's.
+  grep -qx '\[zram0\]' "${r}/usr/lib/systemd/zram-generator.conf" \
+    || die "systemd-zram-generator's own configuration no longer sets up zram0"
+  [ ! -e "${r}/etc/systemd/zram-generator.conf" ] && [ ! -e "${r}/etc/systemd/zram-generator.conf.d" ] \
+    || die "the rootfs overrides systemd-zram-generator's configuration in /etc"
 
   # Consoles: kmscon on tty1 only, agetty on tty2..6 (autovt@ back to getty@,
   # or logind would start a kmscon on every VT), and the UART.

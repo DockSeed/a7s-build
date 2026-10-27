@@ -54,9 +54,32 @@ image also makes its own ssl-cert snakeoil certificate and its icon caches
 
 Debian 13 minbase plus: systemd, NetworkManager (Ethernet, WLAN), Bluetooth,
 OpenSSH, systemd-timesyncd, kmscon on tty1, Debian's Mesa from
-trixie-backports (PowerVR Vulkan driver), zram swap, nftables, and the usual
-tools (`ip`, `iw`, `ethtool`, `lspci`, `lsusb`, `nvme`, `curl`, `nano`, …).
-The full list with reasons: `scripts/distro/debian/packages.sh`.
+trixie-backports (PowerVR Vulkan driver), zram swap, AppArmor, nftables, and
+the usual tools (`ip`, `iw`, `ethtool`, `lspci`, `lsusb`, `nvme`, `curl`,
+`nano`, …). The full list with reasons: `scripts/distro/debian/packages.sh`.
+
+AppArmor is the `apparmor` package every Debian install has (Debian's kernel
+packages recommend it). `apparmor.service` loads its profiles when the kernel
+has AppArmor and is skipped otherwise.
+
+Security updates from Debian install themselves once a day
+(`unattended-upgrades`, as in Debian's cloud images; origins Debian and
+Debian-Security). This covers Debian's packages, not the kernel: the kernel
+is not a Debian package.
+
+## Swap
+
+The image has no swap partition. Swap is `/dev/zram0`, compressed in RAM, as
+`systemd-zram-generator` sets it up by default: half of the RAM, at most
+4 GiB. To change it, write `/etc/systemd/zram-generator.conf`
+(`zram-generator.conf(5)`); to switch it off, link that file to `/dev/null`
+or boot with `systemd.zram=0`.
+
+Kubernetes: the kubelet refuses to start with swap unless `failSwapOn: false`;
+k3s sets that itself, so `curl -sfL https://get.k3s.io | sh -` installs as
+on any Debian system with swap. Pods do not swap (the kubelet's default
+`memorySwap.swapBehavior: NoSwap`); other kubelets need `failSwapOn: false`
+or swap switched off.
 
 apt points at `deb.debian.org` and `security.debian.org` (`main
 non-free-firmware`, as a Debian 13 install writes them), so
