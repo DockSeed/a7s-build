@@ -24,23 +24,23 @@
 # The recipe, pinned to a COMMIT (main moves). To bump it: build, compare the
 # result, test on a board, then change it here.
 KERNEL_RECIPE_URL="https://github.com/DockSeed/a7s-linux-lts.git"
-KERNEL_RECIPE_COMMIT="8b8606bebe630d8b925ffc553874aeca2b69a0df"
+KERNEL_RECIPE_COMMIT="5ec2b93afbae87d1644647315c2c1b54b9eb075c"
 
 # The release of that recipe the image can install instead of building the
 # kernel (A7S_KERNEL=release). The packages are pinned by sha256; the release
 # was built by the recipe's release workflow from KERNEL_RELEASE_COMMIT, which
 # must be the recipe commit pinned above (the driver's patches come from it).
 # The asset names are the ones GitHub serves: it turns the "~" of the package
-# version (6.18.59~t2-1) into ".".
-KERNEL_RELEASE_TAG="v6.18.59-T2"
-KERNEL_RELEASE_COMMIT="8b8606bebe630d8b925ffc553874aeca2b69a0df"
-KERNEL_RELEASE_NAME="6.18.59-t2"
+# version (6.18.59~t3-1) into ".".
+KERNEL_RELEASE_TAG="v6.18.59-T3"
+KERNEL_RELEASE_COMMIT="5ec2b93afbae87d1644647315c2c1b54b9eb075c"
+KERNEL_RELEASE_NAME="6.18.59-t3"
 KERNEL_RELEASE_DTB="allwinner/sun60i-a733-cubie-a7s.dtb"
 KERNEL_RELEASE_BASE_URL="https://github.com/DockSeed/a7s-linux-lts/releases/download/${KERNEL_RELEASE_TAG}"
-KERNEL_RELEASE_IMAGE_DEB="linux-image-${KERNEL_RELEASE_NAME}_6.18.59.t2-1_arm64.deb"
-KERNEL_RELEASE_IMAGE_SHA256="8cdefe96d6760a854d84c83076cb63cb6182ae91572015039b938eb2ba32478c"
-KERNEL_RELEASE_HEADERS_DEB="linux-headers-${KERNEL_RELEASE_NAME}_6.18.59.t2-1_arm64.deb"
-KERNEL_RELEASE_HEADERS_SHA256="76585fd4e3c61c44868aaa260adbc1157b2e17e627f7ee81d24213238c72b58f"
+KERNEL_RELEASE_IMAGE_DEB="linux-image-${KERNEL_RELEASE_NAME}_6.18.59.t3-1_arm64.deb"
+KERNEL_RELEASE_IMAGE_SHA256="2fc3324915740496ad066d88b906fb40fddba906151a6dbb7a03cb472c322d06"
+KERNEL_RELEASE_HEADERS_DEB="linux-headers-${KERNEL_RELEASE_NAME}_6.18.59.t3-1_arm64.deb"
+KERNEL_RELEASE_HEADERS_SHA256="0d52b6d42cdd006c75c99929d63a41d0db94fe2c186e06522d4eec57deca354a"
 
 # Where the pinned recipe is checked out.
 kernel_dir() { printf '%s\n' "${WORK_DIR}/a7s-linux-lts"; }
