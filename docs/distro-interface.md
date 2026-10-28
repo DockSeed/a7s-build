@@ -61,7 +61,10 @@ Available: everything `scripts/lib/common.sh` exports (`SRC` read-only,
 
 `/boot/`, `/usr/lib/modules/`, `/usr/lib/firmware/{aic8800D80,powervr}/`,
 `/etc/modprobe.d/aic8800-keep-cfg80211.conf`, `/etc/fstab`. The image stage
-writes these. `/lib` may be a link to `usr/lib`.
+writes these. With `A7S_KERNEL=release` the kernel arrives as packages
+(`OUT_DIR/kernel-release/`, and the aic8800 DKMS package in
+`OUT_DIR/aic8800/dkms/`): the distro installs them, and the image stage adds
+the boot files around the kernel it finds installed. `/lib` may be a link to `usr/lib`.
 
 ## Adding a distro
 

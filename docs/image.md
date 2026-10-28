@@ -90,13 +90,25 @@ Kernel side: the kernel, device tree and modules of the kernel stage (with the
 WLAN/BT driver aic8800), the GPU firmware, and the WLAN/BT firmware when the
 wifi stage built it.
 
-The kernel is not a Debian package, and U-Boot boots it without an initrd. The
-package `a7s-kernel` holds no files; it tells apt what that kernel provides
-(`wireguard-modules`, as Debian's kernel packages do), so installing
-`wireguard-tools` or `wireguard` brings no Debian kernel and no
+With the default `A7S_KERNEL=build` the kernel is not a Debian package: the image
+stage copies it to `/boot/Image` and `/usr/lib/modules`, and U-Boot boots it
+without an initrd. The package `a7s-kernel` holds no files; it tells apt what
+that kernel provides (`wireguard-modules`, as Debian's kernel packages do), so
+installing `wireguard-tools` or `wireguard` brings no Debian kernel and no
 `initramfs-tools`. A Debian kernel installed by name (`linux-image-arm64`)
 lands in `/boot` but is not booted: `extlinux.conf` names only the image's
 kernel.
+
+With `A7S_KERNEL=release` the kernel is the pair of packages
+`linux-image-<release>` and `linux-headers-<release>` of a release of the
+kernel recipe ([kernel](kernel.md)), installed with dpkg: `dpkg -l | grep linux-`
+lists them. `extlinux.conf` boots `/boot/vmlinuz-<release>` with the device tree
+from `/usr/lib/linux-image-<release>/allwinner/`. `a7s-kernel` stays, with
+the same job. The WLAN/BT driver is the DKMS package `a7s-aic8800-dkms`, built
+for the kernel when the image is made; `dkms`, `gcc`, `make` and `dpkg-dev` (with perl and binutils, 40 packages)
+are in the image for it: about 230 MiB installed, plus the headers (56 MiB).
+The raw image grows from 1.5 GiB to 1.8 GiB, the `.xz` from 154 MB to 207 MB
+(measured with the minimal image). There is no initrd in either case.
 
 ## Switches
 

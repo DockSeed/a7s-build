@@ -105,6 +105,7 @@ Environment variables, defaults in [config/defaults.conf](config/defaults.conf).
 | `A7S_DESKTOP` | `0` | `1`: Xfce desktop (LightDM) and patched xfwm4 |
 | `A7S_USER` | `a7s` | login user |
 | `A7S_HOSTNAME` | `a7s` | host name |
+| `A7S_KERNEL` | `build` | `build`: compile the kernel here; `release`: install the Debian packages of a pinned release of the kernel recipe and build the WLAN driver with DKMS ([docs/kernel.md](docs/kernel.md)) |
 | `A7S_SNAPSHOT` | fixed timestamp | snapshot.debian.org time of the packages; empty = live archive (not reproducible) |
 | `A7S_ENGINE` | podman, else docker | container engine |
 | `A7S_WORK`, `A7S_OUT`, `A7S_CACHE` | `work`, `out`, `cache` | scratch, output and download-cache directories |
