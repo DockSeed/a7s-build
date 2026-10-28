@@ -7,7 +7,9 @@
 #   rootfs    the distro's root filesystem in WORK_DIR/rootfs
 #             (scripts/distro/${A7S_DISTRO}/, docs/distro-interface.md)
 #   image     kernel, modules, firmware and the boot chain around it, written
-#             into a partitioned raw image in OUT_DIR -- distro-agnostic
+#             into a partitioned raw image in OUT_DIR -- distro-agnostic. The
+#             kernel is either copied in (A7S_KERNEL=build) or already installed
+#             by the distro's packages (A7S_KERNEL=release, docs/kernel.md).
 #   compress  xz of the raw image, plus its sha256
 #
 # Rootless throughout: no loop device, no mount. The root filesystem is built
@@ -59,6 +61,9 @@ image_rootfs_key() {
 
 stage_rootfs() {
   image_load_distro
+  # The distro installs the release packages: they are the pinned bytes, and the
+  # DKMS package is the one made from the pinned patches, before dpkg sees them.
+  if [ "$(kernel_source)" = release ]; then kernel_verify_output; wifi_verify_output; fi
   local r="${WORK_DIR}/rootfs" key
   key="$(image_rootfs_key)"
   if [ -d "${r}" ] && [ "$(cat "${WORK_DIR}/rootfs.key" 2>/dev/null)" = "${key}" ] && [ "${A7S_ROOTFS_REBUILD:-0}" != 1 ]; then
@@ -88,8 +93,11 @@ stage_image() {
   # The inputs other stages left in OUT_DIR.
   local kimg="${OUT_DIR}/Image" dtb="${OUT_DIR}/${IMAGE_DTB}"
   local spl="${OUT_DIR}/bootchain/u-boot-sunxi-with-spl.bin" bcid="${OUT_DIR}/bootchain/BOOTCHAIN-ID"
-  [ -s "${kimg}" ] || die "no kernel Image in ${OUT_DIR} -- run the kernel stage"
-  [ -s "${dtb}" ] || die "no ${IMAGE_DTB} in ${OUT_DIR} -- run the kernel stage"
+  local source; source="$(kernel_source)"
+  if [ "${source}" = build ]; then
+    [ -s "${kimg}" ] || die "no kernel Image in ${OUT_DIR} -- run the kernel stage"
+    [ -s "${dtb}" ] || die "no ${IMAGE_DTB} in ${OUT_DIR} -- run the kernel stage"
+  fi
   kernel_verify_output
   bootchain_verify_output
 
@@ -99,15 +107,27 @@ stage_image() {
   rm -rf "${stage}"
   cp -a --reflink=auto "${rootfs}" "${stage}"
 
-  local kver
-  kver="$(image_add_modules "${stage}")"
+  # The kernel's files in the tree and the paths U-Boot reads them from.
+  local kver kpath fpath
+  if [ "${source}" = release ]; then
+    kver="$(image_release_kernel "${stage}")"
+    kpath="/boot/vmlinuz-${kver}"
+    fpath="/usr/lib/linux-image-${kver}/${KERNEL_RELEASE_DTB}"
+  else
+    kver="$(image_add_modules "${stage}")"
+    install -d -m0755 "${stage}/boot"
+    install -m0644 "${kimg}" "${stage}/boot/Image"
+    install -m0644 "${dtb}" "${stage}/boot/${IMAGE_DTB}"
+    kpath="/boot/Image"
+    fpath="/boot/${IMAGE_DTB}"
+  fi
   image_add_firmware "${stage}" "${kver}"
   image_depmod "${stage}" "${kver}"
-  image_add_boot "${stage}" "${kimg}" "${dtb}" "${bcid}" "${kver}"
+  image_add_boot "${stage}" "${bcid}" "${kver}" "${kpath}" "${fpath}"
 
   # The rules hold for the finished tree, not only for the rootfs.
   distro_rootfs_assert "${stage}"
-  image_assert_kernel_side "${stage}" "${kver}"
+  image_assert_kernel_side "${stage}" "${kver}" "${kpath}"
 
   img="$(image_file)"
   fs="${WORK_DIR}/rootfs.ext4"
@@ -136,6 +156,20 @@ image_add_modules() {  # <root> -- prints the kernel version
   printf '%s' "${d##*/}"
 }
 
+# The release kernel is in the tree as its packages left it (the distro installed
+# them): prints its version after checking that it is the only kernel and that
+# its image, device tree and headers are in place.
+image_release_kernel() {  # <root>
+  local r="$1" kver="${KERNEL_RELEASE_NAME}" n
+  n="$(find "${r}/usr/lib/modules" -mindepth 1 -maxdepth 1 -type d | wc -l)"
+  [ "${n}" = 1 ] && [ -d "${r}/usr/lib/modules/${kver}" ] \
+    || die "${r}/usr/lib/modules holds ${n} kernel version(s), expected only ${kver} -- the distro did not install the release kernel"
+  [ -s "${r}/boot/vmlinuz-${kver}" ] && [ -s "${r}/usr/lib/linux-image-${kver}/${KERNEL_RELEASE_DTB}" ] \
+    || die "the release kernel's image or device tree is missing in the tree"
+  [ -d "${r}/usr/src/linux-headers-${kver}" ] || die "the release kernel's headers are missing in the tree"
+  printf '%s' "${kver}"
+}
+
 image_depmod() {  # <root> <kver>
   depmod -b "$1" "$2" || die "depmod failed for $2"
   [ -s "$1/usr/lib/modules/$2/modules.dep" ] || die "depmod wrote no modules.dep"
@@ -147,9 +181,10 @@ image_add_firmware() {  # <root> <kver>
   local r="$1" kver="$2" aic d fw="" lic="" mods=""
   aic="${OUT_DIR}/aic8800/usr/lib"
   for d in aic_load_fw.ko aic8800_fdrv.ko; do
-    find "${r}/usr/lib/modules/${kver}" -name "${d}" -print -quit | grep -q . || mods+=" ${d}"
+    find "${r}/usr/lib/modules/${kver}" -name "${d}*" -print -quit | grep -q . || mods+=" ${d}"
   done
-  # The driver modules come with the kernel; the keep-cfg80211 rule goes with them.
+  # The driver modules come with the kernel (A7S_KERNEL=build) or from DKMS
+  # (release; they are .ko files unless the kernel compresses modules); the keep-cfg80211 rule goes with them.
   if [ -z "${mods}" ]; then
     install -d -m0755 "${r}/etc/modprobe.d"
     cat > "${r}/etc/modprobe.d/aic8800-keep-cfg80211.conf" <<'EOF'
@@ -193,14 +228,14 @@ EOF
   log "gpu: ${IMAGE_GPU_FW} + LICENSE.powervr"
 }
 
-# Kernel, device tree, extlinux and the identity of the build, plus fstab.
-image_add_boot() {  # <root> <Image> <dtb> <BOOTCHAIN-ID> <kver>
-  local r="$1" kimg="$2" dtb="$3" bcid="$4" kver="$5" dtbn console="" root
-  dtbn="${dtb##*/}"
+# extlinux and the identity of the build, plus fstab. The kernel and the device
+# tree are in the tree already, at <kernel path> and <fdt path> (as U-Boot reads
+# them from the root filesystem).
+image_add_boot() {  # <root> <BOOTCHAIN-ID> <kver> <kernel path> <fdt path>
+  local r="$1" bcid="$2" kver="$3" kpath="$4" fpath="$5" console="" root
+  [ -s "${r}${kpath}" ] && [ -s "${r}${fpath}" ] || die "the kernel (${kpath}) or the device tree (${fpath}) is not in the tree"
   root="root=PARTUUID=${A7S_DISK_ID,,}-01 rootwait rw"
   install -d -m0755 "${r}/boot/extlinux"
-  install -m0644 "${kimg}" "${r}/boot/Image"
-  install -m0644 "${dtb}" "${r}/boot/${dtbn}"
   # The boot chain's identity, minus a build time stamp if it carries one
   # (the image is reproducible; the chain's bytes and pins identify it).
   grep -v '^built=' "${bcid}" > "${r}/boot/bootchain-id"
@@ -222,8 +257,8 @@ image_add_boot() {  # <root> <Image> <dtb> <BOOTCHAIN-ID> <kver>
 # the default label.
 default a7s
 label a7s
-    kernel /boot/Image
-    fdt /boot/${dtbn}
+    kernel ${kpath}
+    fdt ${fpath}
     append ${root} ${console}console=ttyS0,115200 earlycon consoleblank=0 watchdog.open_timeout=60
 EOF
   # Safe mode. U-Boot counts boots in RTC GP_DATA_REG7 and, past its bootlimit
@@ -236,8 +271,8 @@ EOF
 # a7s.fallback keeps the boot counter set: the board stays here until it is cleared.
 default a7s-fallback
 label a7s-fallback
-    kernel /boot/Image
-    fdt /boot/${dtbn}
+    kernel ${kpath}
+    fdt ${fpath}
     append ${root} ${console}console=ttyS0,115200 earlycon consoleblank=0 watchdog.open_timeout=60 systemd.unit=multi-user.target module_blacklist=powervr,aic8800_fdrv,aic_load_fw a7s.fallback
 EOF
   chmod 0644 "${r}"/boot/extlinux/*.conf
@@ -252,16 +287,16 @@ EOF
     echo "desktop=$(image_switch A7S_DESKTOP)"
     echo "rootfs_key=$(cat "${WORK_DIR}/rootfs.key")"
     echo "kernel=${kver}"
-    echo "kernel_sha256=$(sha256sum "${kimg}" | cut -d' ' -f1)"
-    echo "dtb=${dtbn} $(sha256sum "${dtb}" | cut -d' ' -f1)"
+    echo "kernel_sha256=$(sha256sum "${r}${kpath}" | cut -d' ' -f1)"
+    echo "dtb=${fpath##*/} $(sha256sum "${r}${fpath}" | cut -d' ' -f1)"
     sed 's/^/bootchain_/' "${r}/boot/bootchain-id"
   } > "${r}/boot/BUILD-ID"
   chmod 0644 "${r}/boot/BUILD-ID"
 }
 
-image_assert_kernel_side() {  # <root> <kver>
-  local r="$1" kver="$2"
-  [ -s "${r}/boot/Image" ] && [ -s "${r}/boot/extlinux/extlinux.conf" ] && [ -s "${r}/boot/extlinux/extlinux-fallback.conf" ] \
+image_assert_kernel_side() {  # <root> <kver> <kernel path>
+  local r="$1" kver="$2" kpath="$3"
+  [ -s "${r}${kpath}" ] && [ -s "${r}/boot/extlinux/extlinux.conf" ] && [ -s "${r}/boot/extlinux/extlinux-fallback.conf" ] \
     || die "the boot files are incomplete"
   grep -q "root=PARTUUID=${A7S_DISK_ID,,}-01 " "${r}/boot/extlinux/extlinux.conf" || die "extlinux.conf does not name the root partition"
   [ -s "${r}/usr/lib/modules/${kver}/modules.dep" ] || die "no modules.dep for ${kver}"

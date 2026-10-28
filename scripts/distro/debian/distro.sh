@@ -49,6 +49,9 @@ A7S_RENDER_GID="${A7S_RENDER_GID:-991}"
 DEBIAN_ORC_DIR="${OUT_DIR}/orc"
 DEBIAN_ORC_SONAME="liborc-0.4.so.0"
 DEBIAN_XFWM4_DIR="${OUT_DIR}/xfwm4"
+# The release kernel's packages and the DKMS package of the aic8800 driver.
+DEBIAN_KERNEL_DIR="${OUT_DIR}/kernel-release"
+DEBIAN_DKMS_DIR="${OUT_DIR}/aic8800/dkms"
 DEBIAN_XFWM4_APT_PIN="etc/apt/preferences.d/xfwm4-a7s"
 DEBIAN_XFWM4_DOC_DIR="usr/local/share/doc/xfwm4-a7s"
 
@@ -112,6 +115,7 @@ distro_rootfs_inputs() {
   printf 'user=%s\nuid=%s\nhostname=%s\nrender_gid=%s\n' \
     "${A7S_USER}" "${A7S_USER_UID}" "${A7S_HOSTNAME}" "${A7S_RENDER_GID}"
   printf 'desktop=%s\n' "$(debian_switch A7S_DESKTOP)"
+  printf 'kernel=%s\n' "$(debian_kernel_source)"
   printf 'source_date_epoch=%s\n' "${SOURCE_DATE_EPOCH}"
   # The recipe itself: every file of this distro directory, by content.
   (cd "${DEBIAN_DIR}" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum) \
@@ -127,6 +131,7 @@ distro_rootfs_inputs() {
 debian_out_inputs() {
   local -a dirs=()
   if [ "$(debian_switch A7S_DESKTOP)" = 1 ]; then dirs+=("${DEBIAN_XFWM4_DIR}" "${DEBIAN_ORC_DIR}"); fi
+  if [ "$(debian_kernel_source)" = release ]; then dirs+=("${DEBIAN_KERNEL_DIR}" "${DEBIAN_DKMS_DIR}"); fi
   [ "${#dirs[@]}" -gt 0 ] || return 0
   find "${dirs[@]}" -type f 2>/dev/null | LC_ALL=C sort
 }
@@ -153,6 +158,7 @@ distro_rootfs_build() {  # <dir>
       || die "this builder cannot run ${DEBIAN_ARCH} code (arch-test ${DEBIAN_ARCH} failed) -- the qemu-aarch64 binfmt_misc handler is not registered in the container"
   fi
   debian_check_out_inputs
+  debian_kernel_source >/dev/null
 
   local opt="[signed-by=${DEBIAN_KEYRING}]"
   if [ -n "${A7S_SNAPSHOT:-}" ]; then opt="[signed-by=${DEBIAN_KEYRING} check-valid-until=no]"; fi
@@ -225,6 +231,11 @@ debian_check_out_inputs() {
     [ -f "${DEBIAN_ORC_DIR}/ORC-ID" ] && compgen -G "${DEBIAN_ORC_DIR}/${DEBIAN_ORC_SONAME}.*" >/dev/null \
       || die "A7S_DESKTOP=1 needs the patched liborc in ${DEBIAN_ORC_DIR} (the build-orc stage)"
   fi
+  if [ "$(debian_kernel_source)" = release ]; then
+    [ -f "${DEBIAN_KERNEL_DIR}/RELEASE-ID" ] && compgen -G "${DEBIAN_KERNEL_DIR}/linux-image-*_arm64.deb" >/dev/null \
+      && compgen -G "${DEBIAN_DKMS_DIR}/a7s-aic8800-dkms_*_all.deb" >/dev/null && [ -f "${DEBIAN_DKMS_DIR}/DKMS-ID" ] \
+      || die "A7S_KERNEL=release needs the release packages in ${DEBIAN_KERNEL_DIR} (the kernel stage) and the DKMS package in ${DEBIAN_DKMS_DIR} (the wifi stage)"
+  fi
   return 0
 }
 
@@ -266,6 +277,7 @@ debian_customize() {  # <root>
 
   debian_regulatory_db "${r}"
   debian_kernel_package "${r}"
+  if [ "$(debian_kernel_source)" = release ]; then debian_kernel_release "${r}"; fi
   debian_assert_kmscon "${r}"
   debian_assert_mesa "${r}"
 
@@ -299,7 +311,20 @@ debian_regulatory_db() {  # <root>
 # like any local package. Afterwards apt must meet wireguard's dependency with
 # it, Recommends included, and plan no Debian kernel and no initramfs-tools.
 debian_kernel_package() {  # <root>
-  local r="$1" d="${WORK_DIR}/kernel-package" provides sim bad
+  local r="$1" d="${WORK_DIR}/kernel-package" provides sim bad desc
+  if [ "$(debian_kernel_source)" = release ]; then
+    desc="Description: virtual packages the kernel of this image provides
+ The kernel is the linux-image package. Its modules do not declare the virtual
+ packages that Debian's kernels provide; this package holds no files and
+ declares them, so apt does not install a Debian kernel to satisfy a
+ dependency on one of them."
+  else
+    desc="Description: the kernel of this image (not installed by a package)
+ The kernel, its device tree and its modules in /boot and /usr/lib/modules
+ were written when the image was built; no package owns them. This package
+ holds no files. It declares the virtual packages that kernel provides, so
+ apt does not install a Debian kernel to satisfy a dependency on one of them."
+  fi
   provides="$(printf '%s, ' "${KERNEL_PROVIDES[@]}")"; provides="${provides%, }"
   rm -rf "${d}" "${d}.deb"
   install -d -m0755 "${d}/DEBIAN"
@@ -312,11 +337,7 @@ Maintainer: a7s-build
 Section: kernel
 Priority: optional
 Provides: ${provides}
-Description: the kernel of this image (not installed by a package)
- The kernel, its device tree and its modules in /boot and /usr/lib/modules
- were written when the image was built; no package owns them. This package
- holds no files. It declares the virtual packages that kernel provides, so
- apt does not install a Debian kernel to satisfy a dependency on one of them.
+${desc}
 EOF
   chmod 0644 "${d}/DEBIAN/control"
   dpkg-deb --root-owner-group -Zxz --build "${d}" "${d}.deb" >/dev/null || die "building ${KERNEL_PACKAGE} failed"
@@ -329,6 +350,77 @@ EOF
   bad="$(awk '/^Inst (linux-image|linux-headers|initramfs-tools)/ {printf "%s ", $2}' <<<"${sim}")"
   [ -z "${bad}" ] || die "apt still plans a Debian kernel for wireguard: ${bad}"
   log "${KERNEL_PACKAGE} provides ${provides}"
+}
+
+# --- the release kernel (A7S_KERNEL=release) -----------------------------------
+# The kernel stage leaves linux-image and linux-headers in DEBIAN_KERNEL_DIR
+# (RELEASE-ID names the kernel release), the wifi stage the DKMS package of the
+# aic8800 driver in DEBIAN_DKMS_DIR. The image's kernel then is a dpkg
+# package like on any Debian system; the image stage adds the boot files around it.
+
+debian_kernel_source() {
+  case "${A7S_KERNEL:-build}" in
+    build|release) printf '%s' "${A7S_KERNEL:-build}" ;;
+    *) die "A7S_KERNEL must be build or release, not '${A7S_KERNEL}'" ;;
+  esac
+}
+
+# The kernel release the packages carry (6.18.59-t2), from RELEASE-ID.
+debian_kernel_release_name() {
+  local rel; rel="$(sed -n 's/^release=//p' "${DEBIAN_KERNEL_DIR}/RELEASE-ID" 2>/dev/null)"
+  [ -n "${rel}" ] || die "no release kernel in ${DEBIAN_KERNEL_DIR} (A7S_KERNEL=release needs the kernel stage)"
+  printf '%s' "${rel}"
+}
+
+# The DKMS package first (it brings dkms and the compiler and registers the
+# source), then the kernel pair: the headers package's postinst runs dkms' hook,
+# which builds the driver for exactly that kernel. Installed the other way
+# round, the DKMS package's postinst builds it for the kernels that are there.
+debian_kernel_release() {  # <root>
+  local r="$1" rel d dkms_deb image_deb headers_deb f
+  rel="$(debian_kernel_release_name)"
+  d="${r}/tmp/a7s-kernel-release"
+  install -d -m0755 "${d}"
+  for f in "${DEBIAN_DKMS_DIR}"/a7s-aic8800-dkms_*_all.deb "${DEBIAN_KERNEL_DIR}/linux-image-${rel}_"*_arm64.deb "${DEBIAN_KERNEL_DIR}/linux-headers-${rel}_"*_arm64.deb; do
+    [ -f "${f}" ] || die "release kernel: no package matches ${f} (the kernel and wifi stages with A7S_KERNEL=release)"
+    install -m0644 "${f}" "${d}/"
+  done
+  # Names inside the root filesystem (a glob would be expanded by this shell).
+  dkms_deb="$(cd "${d}" && ls a7s-aic8800-dkms_*_all.deb)"
+  image_deb="$(cd "${d}" && ls "linux-image-${rel}_"*_arm64.deb)"
+  headers_deb="$(cd "${d}" && ls "linux-headers-${rel}_"*_arm64.deb)"
+  [ "$(wc -w <<<"${dkms_deb} ${image_deb} ${headers_deb}")" = 3 ] || die "release kernel: more than one package of a kind: ${dkms_deb} ${image_deb} ${headers_deb}"
+  debian_apt_install "${r}" "/tmp/a7s-kernel-release/${dkms_deb}" || die "installing the aic8800 DKMS package failed"
+  debian_apt_install "${r}" "/tmp/a7s-kernel-release/${image_deb}" "/tmp/a7s-kernel-release/${headers_deb}" \
+    || die "installing the release kernel failed"
+  rm -rf "${d}"
+  debian_assert_kernel_release "${r}"
+  log "release kernel ${rel} installed with dpkg; aic8800 built by DKMS"
+}
+
+# The release kernel is a dpkg package with its headers, and the driver DKMS
+# built for it is in the module tree with the vermagic of the kernel's own.
+debian_assert_kernel_release() {  # <root>
+  [ "$(debian_kernel_source)" = release ] || return 0
+  local r="$1" rel dv m want got
+  rel="$(debian_kernel_release_name)"
+  assert_installed "${r}" "A7S_KERNEL=release installs the kernel with dpkg" \
+    "linux-image-${rel}" "linux-headers-${rel}" a7s-aic8800-dkms
+  dv="$(sed -n 's/^version=//p' "${DEBIAN_DKMS_DIR}/DKMS-ID")"
+  [ "$(in_root "${r}" dpkg-query -W -f='${Version}' a7s-aic8800-dkms)" = "${dv}" ] \
+    || die "the installed a7s-aic8800-dkms is not version ${dv} of DKMS-ID"
+  # dkms' own record: the build for this kernel is in its tree (`dkms status`
+  # needs /proc, which this assert does not have on the finished tree).
+  [ -d "${r}/var/lib/dkms/aic8800/kernel-${rel}-aarch64/module" ] \
+    || die "dkms has no build of aic8800/${dv} for ${rel} in /var/lib/dkms"
+  want="$(modinfo -F vermagic "$(find "${r}/usr/lib/modules/${rel}/kernel" -name "wireguard.ko*" -print -quit)")" \
+    || die "no vermagic of the kernel's own modules"
+  for m in aic_load_fw aic8800_fdrv; do
+    got="$(find "${r}/usr/lib/modules/${rel}/updates/dkms" -name "${m}.ko" -print -quit 2>/dev/null)"
+    [ -n "${got}" ] || die "DKMS built no ${m}.ko for ${rel}"
+    [ "$(modinfo -F vermagic "${got}")" = "${want}" ] \
+      || die "${m}.ko has the vermagic '$(modinfo -F vermagic "${got}")', the kernel's modules have '${want}'"
+  done
 }
 
 debian_assert_kmscon() {  # <root>
@@ -829,6 +921,9 @@ debian_dpkg_verify() {  # <root>
     [ -n "${line}" ] || continue
     vattr="${line:10:1}" vpath="${line:12}"
     if [ "${vattr}" != c ] && [[ "${vpath}" == /var/* ]]; then continue; fi
+    # DKMS runs depmod after it installs the driver: the index files of the
+    # release kernel's package change by design.
+    if [ "$(debian_kernel_source)" = release ] && [[ "${vpath}" == /lib/modules/*/modules.* ]]; then continue; fi
     bad+="    ${line}"$'\n'
   done <<<"${out}"
   [ -z "${bad}" ] || die "the rootfs changes files that Debian packages own (dpkg --verify):"$'\n'"${bad}"
@@ -861,6 +956,8 @@ debian_cleanup() {  # <root>
   find "${r}/var/lib/apt/lists" -mindepth 1 -maxdepth 1 ! -name partial ! -name lock -exec rm -rf {} +
   rm -f "${r}"/var/cache/apt/*.bin
   find "${r}/usr" -name '__pycache__' -type d -prune -exec rm -rf {} +
+  # DKMS' build logs carry the time of the build.
+  find "${r}/var/lib/dkms" -type d -name log -prune -exec rm -rf {} + 2>/dev/null || true
   # The resolver last: apt in the hooks used the builder's, which mmdebstrap
   # copied in. On the board NetworkManager writes /etc/resolv.conf.
   rm -f "${r}/etc/resolv.conf"
@@ -913,6 +1010,7 @@ distro_rootfs_assert() {  # <dir>
         || die "${KERNEL_PACKAGE} provides ${KERNEL_PROVIDES[i]}, but ${kd#"${r}"} has no ${KERNEL_PROVIDES_MODULES[i]}.ko"
     done
   done
+  debian_assert_kernel_release "${r}"
   # Residue of the build.
   ! compgen -G "${r}/var/cache/apt/archives/*.deb" >/dev/null || die "cached .deb files in the rootfs"
   [ -z "$(find "${r}/var/lib/apt/lists" -maxdepth 1 -type f ! -name lock -print -quit 2>/dev/null)" ] || die "apt package lists in the rootfs"
