@@ -1,0 +1,198 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only OR MIT
+#
+# a7s-root-identity -- give the disk and the filesystem the system runs from
+# their own IDs. Started by a7s-root-identity.service until it has done so.
+#
+# Every image carries the same MBR disk ID (so the root partition's PARTUUID,
+# which root= in extlinux.conf and /etc/fstab name) and the same ext4 UUID.
+# With the same image on two disks of one board, root= matches both. This
+# replaces the build's values, as Raspberry Pi OS does with the disk ID
+# (init_resize.sh) and Fedora CoreOS with the filesystem UUID: only while the
+# build's value is still set, so a disk that was given an ID is never touched
+# again. The build's values are in /boot/BUILD-ID (disk_id=, root_uuid=).
+#
+# The order keeps the board bootable if the power fails at any point:
+#   1. the new ID is chosen and kept in a state file, so a run that was cut
+#      short goes on with the same ID;
+#   2. the new extlinux.conf and fstab are written beside the old ones;
+#   3. extlinux-fallback.conf (safe mode) is switched to the new ID;
+#   4. the disk ID is written;
+#   5. the new fstab, then the new extlinux.conf replace the old ones (rename).
+# Before 4, the disk and extlinux.conf still agree. Between 4 and 5,
+# extlinux.conf names an ID the disk no longer has: the kernel waits for its
+# root, the watchdog resets it, and after the boot limit U-Boot boots
+# extlinux-fallback.conf, which already names the new ID. That boot runs this
+# script again, which finishes step 5. A step that fails without a power cut
+# is undone (3) or never reached. root= cannot name both IDs, and the kernel
+# finds a PARTUUID only in the partition table, so there is no order without
+# such a window; this one leaves safe mode as the way out of it. fstab goes
+# first so that it is only ever stale in that safe-mode boot: `mount -o
+# remount /` (systemd-remount-fs) fails on an fstab source it cannot find, and
+# the boot goes on without the fstab options.
+#
+# The ext4 UUID is not named anywhere the boot needs it. It is changed on the
+# mounted filesystem with tune2fs -U, which does this through the kernel
+# (EXT4_IOC_SETFSUUID); the kernel allows that because the image's ext4 has
+# metadata_csum_seed, so no checksum has to be rewritten.
+#
+# Tools: sfdisk (fdisk), tune2fs + dumpe2fs (e2fsprogs), od (coreutils).
+#
+# Usage: a7s-root-identity [DISK PARTITION]
+#   DISK, PARTITION  default: the disk and partition mounted on /. For a test
+#   against a disk image and an unpacked tree, A7S_ROOT_DIR names the tree.
+set -eu
+
+ROOT="${A7S_ROOT_DIR:-}"
+BUILD_ID="${ROOT}/boot/BUILD-ID"
+EXTLINUX="${ROOT}/boot/extlinux/extlinux.conf"
+FALLBACK="${ROOT}/boot/extlinux/extlinux-fallback.conf"
+FSTAB="${ROOT}/etc/fstab"
+STATE_DIR="${ROOT}/var/lib/a7s"
+PENDING="${STATE_DIR}/root-identity.pending"
+DONE="${STATE_DIR}/root-identity.done"
+NEW=".a7s-new"
+DISK_ID_BYTES=4
+
+log() { printf 'a7s-root-identity: %s\n' "$*"; }
+die() { printf 'a7s-root-identity: %s\n' "$*" >&2; exit 1; }
+
+is_disk_id() {  # <value> -- eight lower-case hex digits, not all zero
+	case "$1" in
+		00000000) return 1 ;;
+		[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+build_value() {  # <key> -- from /boot/BUILD-ID
+	v="$(sed -n "s/^$1=//p" "${BUILD_ID}" 2>/dev/null | head -1)"
+	[ -n "${v}" ] || die "no $1= in ${BUILD_ID}"
+	printf '%s' "${v}"
+}
+
+# Write <file>'s content with the build's ID replaced by <id> to <file>.a7s-new,
+# same mode and owner, and flush it.
+prepare() {  # <file> <old id> <new id>
+	sed "s/PARTUUID=$2-/PARTUUID=$3-/g" "$1" > "$1${NEW}" || die "cannot write $1${NEW}"
+	chmod --reference="$1" "$1${NEW}" && chown --reference="$1" "$1${NEW}" \
+		|| die "cannot copy the mode and owner of $1"
+	sync
+}
+
+commit() {  # <file> -- the prepared copy replaces it
+	mv -f "$1${NEW}" "$1" || die "cannot replace $1"
+	sync
+}
+
+names() {  # <file> <id> -- does the file name PARTUUID=<id>-?
+	grep -q "PARTUUID=$2-" "$1"
+}
+
+disk_id_of() {  # <disk>
+	id="$(sfdisk --disk-id "$1")" || die "sfdisk cannot read the disk ID of $1"
+	id="$(printf '%s' "${id#0x}" | tr 'A-F' 'a-f')"
+	printf '%s' "${id}"
+}
+
+# The ID a cut-short run chose, or a new random one, kept before anything else
+# changes.
+pending_id() {  # <build id>
+	p="$(cat "${PENDING}" 2>/dev/null || true)"
+	if is_disk_id "${p}" && [ "${p}" != "$1" ]; then printf '%s' "${p}"; return 0; fi
+	p=""
+	while ! is_disk_id "${p}" || [ "${p}" = "$1" ]; do
+		p="$(od -An -N"${DISK_ID_BYTES}" -tx1 /dev/urandom | tr -d ' \n')"
+	done
+	mkdir -p "${STATE_DIR}"
+	printf '%s\n' "${p}" > "${PENDING}${NEW}" && sync && commit "${PENDING}"
+	printf '%s' "${p}"
+}
+
+# The disk still has the build's ID: steps 1 to 5 above.
+new_disk_id() {  # <disk> <build id>
+	new="$(pending_id "$2")"
+	log "$1: disk ID ${2} is the build's -- replacing it with ${new}"
+	prepare "${EXTLINUX}" "$2" "${new}"
+	prepare "${FSTAB}" "$2" "${new}"
+	prepare "${FALLBACK}" "$2" "${new}"
+	commit "${FALLBACK}"
+	if ! sfdisk --no-reread --no-tell-kernel --disk-id "$1" "0x${new}"; then
+		prepare "${FALLBACK}" "${new}" "$2"
+		commit "${FALLBACK}"
+		rm -f "${EXTLINUX}${NEW}" "${FSTAB}${NEW}"
+		die "sfdisk could not set the disk ID of $1 -- nothing changed"
+	fi
+	# --no-tell-kernel also skips sfdisk's own fsync.
+	sync
+	[ "$(disk_id_of "$1")" = "${new}" ] || die "the disk ID of $1 did not take"
+	commit "${FSTAB}"
+	commit "${EXTLINUX}"
+}
+
+# The disk has its own ID: make every file that still names the build's ID
+# name this one (the second half of a run that was cut short, or nothing).
+follow_disk_id() {  # <disk id> <build id>
+	for f in "${EXTLINUX}" "${FALLBACK}" "${FSTAB}"; do
+		names "${f}" "$2" || continue
+		log "${f#"${ROOT}"}: still names ${2} -- now ${1}"
+		prepare "${f}" "$2" "$1"
+		commit "${f}"
+	done
+}
+
+disk_identity() {  # <disk>
+	build="$(build_value disk_id)"
+	is_disk_id "${build}" || die "disk_id=${build} in ${BUILD_ID} is not an MBR disk ID"
+	label="$(sfdisk --dump "$1" 2>/dev/null | sed -n 's/^label: //p')"
+	[ "${label}" = dos ] || { log "$1 has no MBR (label '${label}') -- leaving its ID alone"; return 0; }
+	rm -f "${EXTLINUX}${NEW}" "${FALLBACK}${NEW}" "${FSTAB}${NEW}"
+	cur="$(disk_id_of "$1")"
+	if [ "${cur}" = "${build}" ]; then
+		new_disk_id "$1" "${build}"
+		cur="$(disk_id_of "$1")"
+	fi
+	follow_disk_id "${cur}" "${build}"
+	for f in "${EXTLINUX}" "${FALLBACK}" "${FSTAB}"; do
+		! names "${f}" "${build}" || die "${f} still names the build's disk ID ${build}"
+	done
+	log "disk ID ${cur}; extlinux.conf, extlinux-fallback.conf and fstab name it"
+}
+
+fs_uuid_of() {  # <partition>
+	dumpe2fs -h "$1" 2>/dev/null | sed -n 's/^Filesystem UUID: *//p'
+}
+
+fs_identity() {  # <partition>
+	build="$(build_value root_uuid)"
+	cur="$(fs_uuid_of "$1")"
+	[ -n "${cur}" ] || die "cannot read the ext4 superblock of $1"
+	if [ "${cur}" = "${build}" ]; then
+		log "$1: ext4 UUID ${cur} is the build's -- replacing it"
+		tune2fs -U random "$1" || die "tune2fs could not set a new UUID on $1"
+		cur="$(fs_uuid_of "$1")"
+		[ -n "${cur}" ] && [ "${cur}" != "${build}" ] || die "the ext4 UUID of $1 did not change"
+	fi
+	log "ext4 UUID ${cur}"
+}
+
+[ "$(id -u)" = 0 ] || die "needs root (sfdisk and tune2fs write the disk)"
+
+if [ "$#" -eq 2 ]; then
+	disk="$1"; part="$2"
+else
+	part="$(findmnt -no SOURCE / 2>/dev/null || true)"
+	[ -b "${part}" ] || die "cannot resolve the device mounted on /"
+	[ -f "/sys/class/block/${part##*/}/partition" ] || die "${part} is a whole disk, not a partition"
+	disk="$(lsblk -no PKNAME "${part}" | head -1)"
+	[ -n "${disk}" ] && [ -b "/dev/${disk}" ] || die "cannot resolve the parent disk of ${part}"
+	disk="/dev/${disk}"
+fi
+
+disk_identity "${disk}"
+fs_identity "${part}"
+rm -f "${PENDING}"
+mkdir -p "${STATE_DIR}"
+: > "${DONE}"
+sync
+log "done"

@@ -25,7 +25,8 @@ DEBIAN_ARCH="arm64"
 #   bluez                       Bluetooth userspace
 #   busybox                     its devmem applet clears the boot chain's boot
 #                               counter (a7s-boot-good.service)
-#   e2fsprogs fdisk             fsck.ext4, resize2fs, sfdisk: a7s-growroot
+#   e2fsprogs fdisk             fsck.ext4, resize2fs, tune2fs, sfdisk:
+#                               a7s-growroot, a7s-root-identity
 #   ethtool iputils-ping wget curl xz-utils pciutils usbutils nvme-cli nano less
 #                               the tools a board reached only through a
 #                               console needs to say what it sees
@@ -155,6 +156,7 @@ DESKTOP_ADDITIONS_MAY_ACTIVATE=(
 # the build (debian_check_unit_links).
 DEBIAN_OWN_LINKS=(
   "+ system/multi-user.target.wants/a7s-growroot.service a7s-growroot.service"
+  "+ system/multi-user.target.wants/a7s-root-identity.service a7s-root-identity.service"
   "+ system/multi-user.target.wants/a7s-boot-good.service a7s-boot-good.service"
   "+ system/boot-complete.target.requires/a7s-boot-check-no-oops.service a7s-boot-check-no-oops.service"
   "+ system/multi-user.target.wants/a7s-ssh-keygen.service a7s-ssh-keygen.service"

@@ -1,0 +1,18 @@
+# a7s-build: every image carries the same MBR disk ID (root=PARTUUID= and
+# fstab name it) and the same ext4 UUID. On the first boot the board gives its
+# root disk and filesystem their own; the unit runs until that is done.
+[Unit]
+Description=Give the root disk and filesystem this board's own IDs
+Documentation=file:/usr/local/sbin/a7s-root-identity
+After=local-fs.target
+Before=a7s-growroot.service
+ConditionPathIsReadWrite=/
+ConditionPathExists=!/var/lib/a7s/root-identity.done
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/a7s-root-identity
+
+[Install]
+WantedBy=multi-user.target

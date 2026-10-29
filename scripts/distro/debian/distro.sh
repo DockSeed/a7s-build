@@ -782,7 +782,7 @@ debian_accounts() {  # <root>
 debian_system() {  # <root>
   local r="$1" u
   cp -a --no-preserve=ownership "${DEBIAN_DIR}/files/base/." "${r}/"
-  chmod 0755 "${r}/usr/local/sbin/a7s-growroot"
+  chmod 0755 "${r}/usr/local/sbin/a7s-growroot" "${r}/usr/local/sbin/a7s-root-identity"
 
   printf '%s\n' "${A7S_HOSTNAME}" > "${r}/etc/hostname"
   cat > "${r}/etc/hosts" <<EOF
@@ -850,8 +850,8 @@ EOF
     || die "getty@tty1 is not enabled -- kmsconvt@'s OnFailure would have nothing to hand tty1 back to"
 
   # Our units.
-  for u in a7s-growroot.service a7s-boot-good.service a7s-ssh-keygen.service a7s-nvme-hostid.service \
-           a7s-ssl-cert.service a7s-icon-caches.service; do
+  for u in a7s-growroot.service a7s-root-identity.service a7s-boot-good.service a7s-ssh-keygen.service \
+           a7s-nvme-hostid.service a7s-ssl-cert.service a7s-icon-caches.service; do
     ln -sfn "/etc/systemd/system/${u}" "${r}/etc/systemd/system/multi-user.target.wants/${u}"
   done
   ln -sfn /dev/null "${r}/etc/systemd/system/systemd-firstboot.service"
@@ -870,7 +870,7 @@ EOF
   [ -x "${r}/usr/bin/busybox" ] || die "no busybox -- a7s-boot-good.service could not clear the boot counter"
   { in_root "${r}" /usr/bin/busybox 2>&1 || true; } | grep -qw devmem || die "busybox has no devmem applet"
   local t
-  for t in usr/sbin/nvme usr/bin/uuidgen usr/sbin/sfdisk usr/bin/partx usr/sbin/dumpe2fs usr/sbin/resize2fs usr/sbin/fsck.ext4 usr/sbin/modprobe usr/bin/ssh-keygen usr/sbin/sshd; do
+  for t in usr/sbin/nvme usr/bin/uuidgen usr/sbin/sfdisk usr/bin/partx usr/sbin/dumpe2fs usr/sbin/resize2fs usr/sbin/tune2fs usr/bin/od usr/sbin/fsck.ext4 usr/sbin/modprobe usr/bin/ssh-keygen usr/sbin/sshd; do
     [ -x "${r}/${t}" ] || die "no /${t} in the rootfs"
   done
   [ -f "${r}/usr/lib/aarch64-linux-gnu/security/pam_systemd.so" ] || die "no pam_systemd.so"
@@ -1001,6 +1001,8 @@ distro_rootfs_assert() {  # <dir>
   ! compgen -G "${r}/usr/share/icons/*/icon-theme.cache" >/dev/null || die "icon caches in the rootfs -- two builds would differ"
   [ ! -e "${r}/etc/nvme/hostnqn" ] && [ ! -e "${r}/etc/nvme/hostid" ] || die "an NVMe host NQN or host ID in the rootfs -- every board would share it"
   [ ! -s "${r}/etc/machine-id" ] || die "/etc/machine-id holds an ID"
+  [ ! -e "${r}/var/lib/a7s/root-identity.done" ] && [ ! -e "${r}/var/lib/a7s/root-identity.pending" ] \
+    || die "a7s-root-identity's state is in the rootfs -- the board would keep the build's disk ID"
   [ ! -e "${r}/var/lib/systemd/random-seed" ] || die "a random seed from the build is in the rootfs"
   [ ! -e "${r}/var/lib/dbus/machine-id" ] || [ "$(readlink "${r}/var/lib/dbus/machine-id")" = /etc/machine-id ] \
     || die "/var/lib/dbus/machine-id is a copy of the build's machine ID"

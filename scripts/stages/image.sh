@@ -18,9 +18,11 @@
 # has the layout and what makes two builds bit-identical.
 
 # MBR disk signature: fixed, so the root partition's PARTUUID (<id>-01), which
-# extlinux.conf and fstab name, is the same in every build.
+# extlinux.conf and fstab name, is the same in every build. Each board replaces
+# it on its first boot (a7s-root-identity, which reads it from BUILD-ID).
 A7S_DISK_ID="${A7S_DISK_ID:-a7530001}"
-# The ext4 UUID and directory hash seed: fixed, for the same reason.
+# The ext4 UUID and directory hash seed: fixed, for the same reason. The UUID
+# is replaced on the first boot, too.
 A7S_ROOT_UUID="${A7S_ROOT_UUID:-a7500000-7e57-4a7a-8a7a-000000000001}"
 IMAGE_ROOT_LABEL="a7s-root"
 # The device tree the kernel stage puts beside the Image in OUT_DIR (the file
@@ -88,7 +90,7 @@ stage_image() {
   [ -d "${rootfs}" ] && [ -f "${WORK_DIR}/rootfs.key" ] || die "no root filesystem in ${rootfs} -- run the rootfs stage first"
   [ "$(cat "${WORK_DIR}/rootfs.key")" = "$(image_rootfs_key)" ] \
     || die "${rootfs} was built from other inputs than this configuration -- run the rootfs stage again"
-  for t in mke2fs sfdisk depmod tar dd; do command -v "${t}" >/dev/null || die "the image stage needs ${t} (container/packages.d/image.txt)"; done
+  for t in mke2fs dumpe2fs sfdisk depmod tar dd; do command -v "${t}" >/dev/null || die "the image stage needs ${t} (container/packages.d/image.txt)"; done
 
   # The inputs other stages left in OUT_DIR.
   local kimg="${OUT_DIR}/Image" dtb="${OUT_DIR}/${IMAGE_DTB}"
@@ -287,6 +289,8 @@ EOF
     echo "desktop=$(image_switch A7S_DESKTOP)"
     echo "rootfs_key=$(cat "${WORK_DIR}/rootfs.key")"
     echo "kernel=${kver}"
+    echo "disk_id=${A7S_DISK_ID,,}"
+    echo "root_uuid=${A7S_ROOT_UUID}"
     echo "kernel_sha256=$(sha256sum "${r}${kpath}" | cut -d' ' -f1)"
     echo "dtb=${fpath##*/} $(sha256sum "${r}${fpath}" | cut -d' ' -f1)"
     sed 's/^/bootchain_/' "${r}/boot/bootchain-id"
@@ -299,6 +303,8 @@ image_assert_kernel_side() {  # <root> <kver> <kernel path>
   [ -s "${r}${kpath}" ] && [ -s "${r}/boot/extlinux/extlinux.conf" ] && [ -s "${r}/boot/extlinux/extlinux-fallback.conf" ] \
     || die "the boot files are incomplete"
   grep -q "root=PARTUUID=${A7S_DISK_ID,,}-01 " "${r}/boot/extlinux/extlinux.conf" || die "extlinux.conf does not name the root partition"
+  grep -qx "disk_id=${A7S_DISK_ID,,}" "${r}/boot/BUILD-ID" && grep -qx "root_uuid=${A7S_ROOT_UUID}" "${r}/boot/BUILD-ID" \
+    || die "BUILD-ID does not name the build's disk ID and ext4 UUID (a7s-root-identity reads them)"
   [ -s "${r}/usr/lib/modules/${kver}/modules.dep" ] || die "no modules.dep for ${kver}"
   [ -f "${r}/etc/fstab" ] || die "no /etc/fstab"
 }
@@ -315,7 +321,7 @@ image_tree_mib() {  # <dir>
 
 # Root filesystem from the staged tree, partition table, boot chain.
 image_assemble() {  # <tree> <fs file> <image> <u-boot-sunxi-with-spl.bin>
-  local tree="$1" fs="$2" img="$3" spl="$4" used head size fsmib m0 pt
+  local tree="$1" fs="$2" img="$3" spl="$4" used head size fsmib m0 pt feat
   used="$(image_tree_mib "${tree}")"
   size="${A7S_IMAGE_SIZE_MB:-}"
   if [ -z "${size}" ]; then
@@ -335,15 +341,20 @@ image_assemble() {  # <tree> <fs file> <image> <u-boot-sunxi-with-spl.bin>
   # mtime clamped to SOURCE_DATE_EPOCH, no atime/ctime, and of the extended
   # attributes only file capabilities (never the builder's SELinux labels).
   # mke2fs takes its own timestamps (superblock, root, lost+found, journal)
-  # from SOURCE_DATE_EPOCH; UUID and hash seed are fixed.
+  # from SOURCE_DATE_EPOCH; UUID and hash seed are fixed. metadata_csum_seed
+  # (Debian's mke2fs default, named here so it does not rest on the builder's
+  # mke2fs.conf) keeps the checksums independent of the UUID: the board can
+  # change the UUID of its mounted root on the first boot.
   tar -C "${tree}" --create --file=- --format=posix --sort=name --numeric-owner \
       --mtime="@${SOURCE_DATE_EPOCH}" --clamp-mtime \
       --pax-option='exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime' \
       --xattrs --xattrs-include='security.capability' --no-acls --no-selinux \
       . \
-    | mke2fs -q -F -t ext4 -b 4096 -L "${IMAGE_ROOT_LABEL}" -U "${A7S_ROOT_UUID}" \
+    | mke2fs -q -F -t ext4 -b 4096 -O metadata_csum_seed -L "${IMAGE_ROOT_LABEL}" -U "${A7S_ROOT_UUID}" \
         -E "hash_seed=${A7S_ROOT_UUID},root_owner=0:0" -d - "${fs}" "$(( fsmib * 256 ))" \
     || die "mke2fs -d failed"
+  feat="$(dumpe2fs -h "${fs}" 2>/dev/null | sed -n 's/^Filesystem features://p')"
+  [[ " ${feat} " == *" metadata_csum_seed "* ]] || die "the root filesystem has no metadata_csum_seed: ${feat}"
 
   truncate -s "${size}M" "${img}"
   printf 'label: dos\nlabel-id: 0x%s\nunit: sectors\n\nstart=%s, type=83\n' \

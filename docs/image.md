@@ -46,7 +46,9 @@ Then use `sudo` as usual.
   field of the user in `/etc/shadow`.
 
 On first boot the board also creates its own SSH host keys, machine ID and
-NVMe host ID, and grows the root partition to the end of the card. The desktop
+NVMe host ID, gives its disk and root filesystem their own IDs
+([Disk and filesystem IDs](#disk-and-filesystem-ids)), and grows the root
+partition to the end of the card. The desktop
 image also makes its own ssl-cert snakeoil certificate and its icon caches
 (none of them ship in the image, as in Debian's live images).
 
@@ -118,13 +120,40 @@ The raw image grows from 1.5 GiB to 1.8 GiB, the `.xz` from 154 MB to 207 MB
 
 | Offset | Content |
 |---|---|
-| 0 | MBR, disk id `0xa7530001` |
+| 0 | MBR, disk id `0xa7530001` (replaced on first boot) |
 | 128 KiB | `u-boot-sunxi-with-spl.bin` (boot chain: SPL, BL31, U-Boot) |
 | 16 MiB → end | partition 1: ext4 `a7s-root`, `PARTUUID=a7530001-01` |
 
 No boot partition, no initrd: U-Boot reads `/boot/extlinux/extlinux.conf`
 from the root filesystem. `/boot/BUILD-ID` and `/boot/bootchain-id` say which
 build and which boot chain the card carries.
+
+## Disk and filesystem IDs
+
+Every image is written with the same MBR disk ID (`0xa7530001`, so the root
+partition is `PARTUUID=a7530001-01`) and the same ext4 UUID; `/boot/BUILD-ID`
+records both (`disk_id=`, `root_uuid=`). The kernel finds its root by
+`root=PARTUUID=` in `extlinux.conf`, so with the same image on two disks of
+one board (an SD card and an NVMe drive, say) the root would be ambiguous.
+
+On the first boot `a7s-root-identity.service` replaces both, as Raspberry Pi OS
+does with the disk ID and Fedora CoreOS with the filesystem UUID: a random disk
+ID, written with `sfdisk --disk-id`, and the new partition ID in `root=` of
+`extlinux.conf` and `extlinux-fallback.conf` and in `/etc/fstab`; a random ext4
+UUID, set on the mounted root with `tune2fs -U random`. Each is replaced only
+while it is still the build's value. The unit stops running once
+`/var/lib/a7s/root-identity.done` exists.
+
+The files are switched in an order that keeps the board bootable if the power
+fails halfway: `extlinux-fallback.conf` (safe mode) gets the new ID before the
+disk does, `fstab` and `extlinux.conf` right after it. If the power fails after
+the disk has its new ID and before `extlinux.conf` names it, the normal boot
+cannot find its root, the watchdog resets it, and after three such boots
+U-Boot boots safe mode, which finishes the change; the board then stays in
+safe mode until the counter is cleared ([Safe mode](#safe-mode)).
+
+A copy of a disk made after its first boot (with `dd`, for instance) has that
+disk's IDs again; give the copy new ones before both are in one board.
 
 ## Safe mode
 
