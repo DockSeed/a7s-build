@@ -26,10 +26,21 @@
 # script again, which finishes step 5. A step that fails without a power cut
 # is undone (3) or never reached. root= cannot name both IDs, and the kernel
 # finds a PARTUUID only in the partition table, so there is no order without
-# such a window; this one leaves safe mode as the way out of it. fstab goes
-# first so that it is only ever stale in that safe-mode boot: `mount -o
-# remount /` (systemd-remount-fs) fails on an fstab source it cannot find, and
-# the boot goes on without the fstab options.
+# such a window; this one leaves safe mode as the way out of it.
+#
+# That way out must stay open, so a safe-mode boot (a7s.fallback on the kernel
+# command line) never starts a change: step 3 would switch the one file that
+# boots, and a power cut before step 4 would leave it naming an ID the disk
+# does not have. U-Boot keeps booting safe mode until the counter is cleared,
+# so that boot would never find its root. A safe-mode boot only finishes the
+# second half of a cut-short run (step 5). If the disk still has the build's
+# ID, it logs that and exits 0 without the done file: nothing failed, the
+# board is in the state it is meant to be in, and the next normal boot
+# (which starts this unit again) gives the IDs.
+#
+# fstab goes first in step 5 so that it is only ever stale in that safe-mode
+# boot: `mount -o remount /` (systemd-remount-fs) fails on an fstab source it
+# cannot find, and the boot goes on without the fstab options.
 #
 # The ext4 UUID is not named anywhere the boot needs it. It is changed on the
 # mounted filesystem with tune2fs -U, which does this through the kernel
@@ -51,6 +62,7 @@ FSTAB="${ROOT}/etc/fstab"
 STATE_DIR="${ROOT}/var/lib/a7s"
 PENDING="${STATE_DIR}/root-identity.pending"
 DONE="${STATE_DIR}/root-identity.done"
+CMDLINE="${ROOT}/proc/cmdline"
 NEW=".a7s-new"
 DISK_ID_BYTES=4
 
@@ -141,6 +153,17 @@ follow_disk_id() {  # <disk id> <build id>
 	done
 }
 
+safe_mode() {  # a7s.fallback on the kernel command line, as extlinux-fallback.conf sets it
+	[ -r "${CMDLINE}" ] || return 1
+	case " $(tr '\n' ' ' < "${CMDLINE}") " in
+		*" a7s.fallback "*|*" a7s.fallback="*) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+# Set when a safe-mode boot found the build's disk ID and left it alone.
+DEFERRED=0
+
 disk_identity() {  # <disk>
 	build="$(build_value disk_id)"
 	is_disk_id "${build}" || die "disk_id=${build} in ${BUILD_ID} is not an MBR disk ID"
@@ -148,6 +171,11 @@ disk_identity() {  # <disk>
 	[ "${label}" = dos ] || { log "$1 has no MBR (label '${label}') -- leaving its ID alone"; return 0; }
 	rm -f "${EXTLINUX}${NEW}" "${FALLBACK}${NEW}" "${FSTAB}${NEW}"
 	cur="$(disk_id_of "$1")"
+	if [ "${cur}" = "${build}" ] && safe_mode; then
+		log "$1: safe-mode boot -- the build's disk ID ${build} stays; the next normal boot replaces it"
+		DEFERRED=1
+		return 0
+	fi
 	if [ "${cur}" = "${build}" ]; then
 		new_disk_id "$1" "${build}"
 		cur="$(disk_id_of "$1")"
@@ -190,6 +218,10 @@ else
 fi
 
 disk_identity "${disk}"
+if [ "${DEFERRED}" = 1 ]; then
+	log "not done -- the unit runs again at the next boot"
+	exit 0
+fi
 fs_identity "${part}"
 rm -f "${PENDING}"
 mkdir -p "${STATE_DIR}"

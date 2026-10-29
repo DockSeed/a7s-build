@@ -152,6 +152,27 @@ cannot find its root, the watchdog resets it, and after three such boots
 U-Boot boots safe mode, which finishes the change; the board then stays in
 safe mode until the counter is cleared ([Safe mode](#safe-mode)).
 
+This holds in a safe-mode boot as well, because that boot never starts a
+change: with `a7s.fallback` on the kernel command line the script only
+finishes the second half of a run that was cut short. If the disk still has
+the build's ID (a first boot that already comes up in safe mode, for instance
+a disk flashed from a system that stood in safe mode), the script logs that and
+exits 0 without writing `root-identity.done`. The unit is not failed and runs
+again at the next normal boot, which gives the IDs. Starting the change in safe
+mode would not be safe: U-Boot keeps booting `extlinux-fallback.conf` until the
+counter is cleared, and a power cut after that file got the new ID and before
+the disk did would leave the only file that boots naming an ID the disk does
+not have.
+
+The very first boot is ambiguous when the same image sits unbooted on two
+disks of one board. U-Boot takes the kernel and the device tree from the first
+disk in its boot order (an SD card or eMMC before NVMe), and the kernel mounts
+the partition it finds first with that `PARTUUID`; these need not be the same
+disk, and which one the kernel finds is the kernel's behaviour, not something
+this image controls or that was measured here. The script gives only the
+mounted disk its own ID. After at most two boots each disk has an ID of its
+own. Do not put the same image, unbooted, on two disks of one board.
+
 A copy of a disk made after its first boot (with `dd`, for instance) has that
 disk's IDs again; give the copy new ones before both are in one board.
 
