@@ -15,7 +15,7 @@
 # The recipe, pinned to a COMMIT (main moves). To bump it: build,
 # compare the sha256 in docs/bootchain.md, test on a board, then change it here.
 BOOTCHAIN_URL="https://github.com/DockSeed/a733-bootchain.git"
-BOOTCHAIN_COMMIT="03418865bde96de2640a2910724c5a93106950fc"
+BOOTCHAIN_COMMIT="bd0f37556b82b780fdf4ed6471dfcd4fbc391e11"
 
 # Where the pinned recipe is checked out; its own work tree (the U-Boot package
 # clone) lives beside it in WORK_DIR.

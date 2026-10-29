@@ -179,8 +179,9 @@ disk's IDs again; give the copy new ones before both are in one board.
 ## Safe mode
 
 U-Boot counts boots; after three that were not marked good it boots
-`/boot/extlinux/extlinux-fallback.conf`: same kernel, no desktop, without the
-GPU and WLAN drivers (Ethernet and SSH work). The board stays in safe mode
+`/boot/extlinux/extlinux-fallback.conf` from the disk it would boot normally
+(card, eMMC or NVMe): same kernel, no desktop, without the GPU and WLAN
+drivers (Ethernet and SSH work). The board stays in safe mode
 until you clear the counter and reboot:
 
     sudo busybox devmem 0x0709011C 32 0
