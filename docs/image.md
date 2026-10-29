@@ -17,13 +17,24 @@ SD card (on your computer):
 
     xzcat out/a7s-debian-trixie-minimal.img.xz | sudo dd of=/dev/<card> bs=4M conv=fsync status=progress
 
-eMMC (boot is proven): boot the board from an SD card written as above, copy
+NVMe drive: the boot ROM does not read NVMe, so the card stays in and carries
+the boot chain. Boot the board from an SD card written as above, copy the image
+to the board, write it to the drive (`/dev/nvme0n1`) with the same `dd`
+command, then remove the card's partition table so that U-Boot no longer finds
+a system on the card; the boot chain at 128 KiB stays:
+
+    sudo dd if=/dev/zero of=/dev/mmcblk0 bs=512 count=1 conv=fsync
+
+Check with `lsblk` that `mmcblk0` is the card you booted from. U-Boot boots
+the card or eMMC before NVMe, so a card that still carries a system wins.
+
+eMMC (not yet tried with this boot chain): boot the board from an SD card written as above, copy
 the image (or its `.xz`) to the board, find the eMMC with `lsblk` (the
 `mmcblk*` device that is not the card you booted from), write it with the same `dd` command, power off, remove
 the card.
 
 The image is 1.5 GiB; on the first boot the root partition grows to the end of
-the card or eMMC.
+its disk.
 
 ## First login
 
@@ -48,7 +59,7 @@ Then use `sudo` as usual.
 On first boot the board also creates its own SSH host keys, machine ID and
 NVMe host ID, gives its disk and root filesystem their own IDs
 ([Disk and filesystem IDs](#disk-and-filesystem-ids)), and grows the root
-partition to the end of the card. The desktop
+partition to the end of its disk. The desktop
 image also makes its own ssl-cert snakeoil certificate and its icon caches
 (none of them ship in the image, as in Debian's live images).
 

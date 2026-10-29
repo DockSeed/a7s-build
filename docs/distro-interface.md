@@ -45,7 +45,7 @@ Available: everything `scripts/lib/common.sh` exports (`SRC` read-only,
 3. clear the boot counter once a boot is good: write `0` to physical address
    `0x0709011C` (RTC `GP_DATA_REG7`), unless `a7s.fallback` is on the kernel
    command line — otherwise every board ends in safe mode after three boots;
-4. grow the root partition to the end of the card on first boot, and replace
+4. grow the root partition to the end of its disk on first boot, and replace
    the build's disk ID and ext4 UUID (`disk_id=`, `root_uuid=` in
    `/boot/BUILD-ID`) with its own, rewriting `root=PARTUUID=` in both
    extlinux files and in `/etc/fstab` ([image](image.md#disk-and-filesystem-ids));

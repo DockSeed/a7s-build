@@ -26,7 +26,7 @@ cd a7s-build
 ./build.sh
 ```
 
-The image lands in `out/`: `a7s-debian-trixie-minimal.img.xz` (about 130 MB;
+The image lands in `out/`: `a7s-debian-trixie-minimal.img.xz` (about 155 MB;
 1.5 GiB unpacked) and its `.sha256`. For the Xfce desktop, build with
 `A7S_DESKTOP=1 ./build.sh`; the image is then `a7s-debian-trixie-desktop.img.xz`.
 `./build.sh --help` lists stages and switches; details in
@@ -44,12 +44,24 @@ xzcat out/a7s-debian-trixie-minimal.img.xz | sudo dd of=/dev/<card> bs=4M conv=f
 
 For the desktop image, use its file name instead.
 
-**eMMC** (boot from eMMC is proven): boot the board from an SD card as above,
-copy the image to the board, find the eMMC with `lsblk` (the `mmcblk*` device
-that is not your boot card), write it with the same `dd` command, power off and
-remove the card.
+**NVMe drive**: the boot ROM does not read NVMe, so the card stays in and
+carries the boot chain. Boot the board from an SD card as above, copy the image
+to the board, write it to the drive (`/dev/nvme0n1`) with the same `dd`
+command, then remove the card's partition table so that U-Boot no longer finds
+a system on the card (the boot chain at 128 KiB stays):
 
-On first boot the root partition grows to the end of the card or eMMC.
+```sh
+sudo dd if=/dev/zero of=/dev/mmcblk0 bs=512 count=1 conv=fsync
+```
+
+Check with `lsblk` that `mmcblk0` is the card you booted from, then reboot.
+
+**eMMC** (not yet tried with this boot chain): boot the board from an SD card
+as above, copy the image to the board, find the eMMC with `lsblk` (the
+`mmcblk*` device that is not your boot card), write it with the same `dd`
+command, power off and remove the card.
+
+On first boot the root partition grows to the end of its disk.
 Image layout, safe mode: [docs/image.md](docs/image.md).
 
 ## First login
