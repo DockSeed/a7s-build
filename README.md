@@ -96,6 +96,15 @@ After power-on the kernel may log a few `uncorrectable error in header` lines
 from ramoops: its crash-log area in RAM holds random data while the board is
 off. They are harmless.
 
+## Updates
+
+Debian's packages update as on any Debian install: security updates install
+themselves once a day (`unattended-upgrades`), and `sudo apt update && sudo
+apt upgrade` brings the rest. The kernel, its device tree and the WLAN/BT
+driver do not update: there is no package repository for them, and none is
+promised. A newer kernel comes as a new image; flashing it replaces
+everything on the card.
+
 ## Switches
 
 Environment variables, defaults in [config/defaults.conf](config/defaults.conf).
