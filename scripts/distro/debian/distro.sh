@@ -365,7 +365,7 @@ debian_kernel_source() {
   esac
 }
 
-# The kernel release the packages carry (6.18.59-t3), from RELEASE-ID.
+# The kernel release the packages carry (6.18.59-t4), from RELEASE-ID.
 debian_kernel_release_name() {
   local rel; rel="$(sed -n 's/^release=//p' "${DEBIAN_KERNEL_DIR}/RELEASE-ID" 2>/dev/null)"
   [ -n "${rel}" ] || die "no release kernel in ${DEBIAN_KERNEL_DIR} (A7S_KERNEL=release needs the kernel stage)"
