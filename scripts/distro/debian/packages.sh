@@ -156,6 +156,7 @@ DESKTOP_ADDITIONS_MAY_ACTIVATE=(
 DEBIAN_OWN_LINKS=(
   "+ system/multi-user.target.wants/a7s-growroot.service a7s-growroot.service"
   "+ system/multi-user.target.wants/a7s-boot-good.service a7s-boot-good.service"
+  "+ system/boot-complete.target.requires/a7s-boot-check-no-oops.service a7s-boot-check-no-oops.service"
   "+ system/multi-user.target.wants/a7s-ssh-keygen.service a7s-ssh-keygen.service"
   "+ system/multi-user.target.wants/a7s-nvme-hostid.service a7s-nvme-hostid.service"
   "+ system/multi-user.target.wants/a7s-ssl-cert.service a7s-ssl-cert.service"

@@ -1,10 +1,16 @@
 # a7s-build: the boot counter of the boot chain (U-Boot overlay
 # "bootcount-rtc-gpr") sits in RTC GP_DATA_REG7. U-Boot counts every boot and,
 # past its bootlimit, boots /boot/extlinux/extlinux-fallback.conf instead.
-# This clears the counter once multi-user.target is reached. The fallback entry
-# carries a7s.fallback on the kernel command line, so a board that came up in
-# safe mode stays there until somebody clears the counter by hand
-# (docs/image.md, "Safe mode").
+# This clears the counter once boot-complete.target is reached, in the role
+# systemd-bless-boot.service has with systemd-boot (systemd's Automatic Boot
+# Assessment, man:systemd.special(7)). boot-complete.target is reached only if
+# all of its checks passed; the image has one, a7s-boot-check-no-oops.service
+# (no kernel oops), after default.target. If a check fails, this unit does not
+# run and the boot keeps running, but is not marked good: the counter stays set
+# and U-Boot counts the next boot on top of it. The fallback entry carries
+# a7s.fallback on the kernel command line, so a board that came up in safe mode
+# stays there until somebody clears the counter by hand (docs/image.md,
+# "Safe mode").
 [Unit]
 Description=Mark this boot good: clear the boot chain's boot counter (RTC GP_DATA_REG7)
 ConditionKernelCommandLine=!a7s.fallback

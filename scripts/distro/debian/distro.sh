@@ -855,6 +855,16 @@ EOF
     ln -sfn "/etc/systemd/system/${u}" "${r}/etc/systemd/system/multi-user.target.wants/${u}"
   done
   ln -sfn /dev/null "${r}/etc/systemd/system/systemd-firstboot.service"
+  # The check of boot-complete.target (systemd's Automatic Boot Assessment):
+  # a7s-boot-good.service clears the boot counter only after it passed.
+  install -d -m0755 "${r}/etc/systemd/system/boot-complete.target.requires"
+  ln -sfn /etc/systemd/system/a7s-boot-check-no-oops.service \
+    "${r}/etc/systemd/system/boot-complete.target.requires/a7s-boot-check-no-oops.service"
+  # An oops panics, and the panic reboots: only our sysctl.d file sets it.
+  local oops
+  oops="$(cd "${r}" && grep -lsE '^[[:space:]]*-?kernel\.panic_on_oops' etc/sysctl.conf {etc,run,usr/local/lib,usr/lib}/sysctl.d/*.conf || true)"
+  [ "${oops}" = etc/sysctl.d/60-a7s-panic-on-oops.conf ] \
+    || die "kernel.panic_on_oops is set elsewhere than etc/sysctl.d/60-a7s-panic-on-oops.conf: ${oops:-nowhere}"
 
   # Tools our units and scripts need.
   [ -x "${r}/usr/bin/busybox" ] || die "no busybox -- a7s-boot-good.service could not clear the boot counter"

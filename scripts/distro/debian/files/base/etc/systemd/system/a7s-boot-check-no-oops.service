@@ -1,0 +1,23 @@
+# a7s-build: one of the checks of boot-complete.target (systemd's Automatic
+# Boot Assessment, man:systemd.special(7)). It fails if the kernel has died
+# since it booted: an oops or BUG sets taint bit 7, TAINT_DIE ("D", 128), and
+# that bit stays set until the next boot (Documentation/admin-guide/
+# tainted-kernels.rst). Other taint bits are left alone: an out-of-tree module
+# (O) taints a boot that is fine, and a warning (W) does not mean the kernel
+# died. A failed check keeps boot-complete.target from being
+# reached, so a7s-boot-good.service leaves the boot counter set.
+# Ordered as systemd-boot-check-no-failures.service.
+[Unit]
+Description=Check that the kernel has not oopsed during this boot
+After=default.target graphical.target multi-user.target
+Before=boot-complete.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# cat, not the shell's read: dash reads byte by byte, and a sysctl file ends at
+# the first read past offset 0, so read would never see the newline.
+ExecStart=/bin/sh -c 't="$$(cat /proc/sys/kernel/tainted)" && [ "$$((t & 128))" -eq 0 ] || { echo "kernel oopsed during this boot (tainted=$$t)" >&2; exit 1; }'
+
+[Install]
+RequiredBy=boot-complete.target

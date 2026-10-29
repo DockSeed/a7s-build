@@ -128,11 +128,31 @@ build and which boot chain the card carries.
 
 ## Safe mode
 
-U-Boot counts boots; after three that never reached `multi-user.target` it
-boots `/boot/extlinux/extlinux-fallback.conf`: same kernel, no desktop, without
-the GPU and WLAN drivers (Ethernet and SSH work). The board stays in safe
-mode until you clear the counter and reboot:
+U-Boot counts boots; after three that were not marked good it boots
+`/boot/extlinux/extlinux-fallback.conf`: same kernel, no desktop, without the
+GPU and WLAN drivers (Ethernet and SSH work). The board stays in safe mode
+until you clear the counter and reboot:
 
     sudo busybox devmem 0x0709011C 32 0
+
+A boot is marked good as in systemd's
+[Automatic Boot Assessment](https://systemd.io/AUTOMATIC_BOOT_ASSESSMENT/):
+`a7s-boot-good.service` clears the counter only once `boot-complete.target`
+is reached, and that target waits for its checks. The image ships one,
+`a7s-boot-check-no-oops.service`, which runs after `default.target` and fails
+if the kernel has oopsed since it booted (taint flag `D`). To add your own
+check, give its unit `Before=boot-complete.target` and
+`RequiredBy=boot-complete.target` (`man systemd.special`).
+
+A boot that fails a check keeps running; it is only not marked good, and
+`systemctl --failed` lists the check that failed. Nothing reboots the board
+for it: the counter counts on at the next boot, whatever starts that boot
+(reboot, watchdog reset, power cut).
+
+A kernel oops does reboot the board: `/etc/sysctl.d/60-a7s-panic-on-oops.conf`
+sets `kernel.panic_on_oops = 1`, so the oops ends in a panic and the panic
+reboots after the kernel's panic timeout. That boot was not marked good, so
+U-Boot counts it. A file that sorts after it, such as
+`/etc/sysctl.d/90-local.conf`, can set `kernel.panic_on_oops = 0` instead.
 
 Reproducibility: [reproducibility](reproducibility.md). A rootless build needs no loop device and no mount: the ext4 comes from a directory (`mke2fs -d`), the partition table from `sfdisk`, the pieces are placed with `dd`.
