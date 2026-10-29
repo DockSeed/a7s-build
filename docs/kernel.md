@@ -8,7 +8,7 @@ to one commit (`KERNEL_RECIPE_COMMIT` in `scripts/stages/kernel.sh`):
 | | |
 |---|---|
 | Repository | `https://github.com/DockSeed/a7s-linux-lts` |
-| Pinned commit | `b98ac7101e0d` |
+| Pinned commit | `c8c6568f583c` |
 | Result | `Image`, `sun60i-a733-cubie-a7s.dtb`, `config`, `System.map`, `modules/` (with aic8800), `KERNEL-ID` |
 
 Changes to the series are made there only; here the pin moves. What the kernel
@@ -36,7 +36,7 @@ directory (`work/linux-<version>`), and writes the result to `out/`. The recipe
 also builds the AIC8800 WLAN/BT driver against its kernel tree; the two modules
 are in `out/modules/`, and `KERNEL-ID` names the driver's upstream commit
 (`aic8800=`). `A7S_KERNEL_REVISION` (`r1`, `t2`, ...) gives the kernel a
-revision as the recipe's release workflow does (kernel release `6.18.59-t4`);
+revision as the recipe's release workflow does (kernel release `6.18.59-r1`);
 empty, the kernel release is `6.18.59`.
 
 The image stage takes `Image`, the dtb and `modules/` as they are. Before it
@@ -57,12 +57,13 @@ result to a release. `scripts/stages/kernel.sh` pins one release:
 
 | | |
 |---|---|
-| Release | `v6.18.59-T4` (kernel release `6.18.59-t4`), built from the pinned commit |
-| Files | `linux-image-6.18.59-t4_6.18.59.t4-1_arm64.deb`, `linux-headers-6.18.59-t4_6.18.59.t4-1_arm64.deb` |
+| Release | `v6.18.59-R1` (kernel release `6.18.59-r1`), built from the pinned commit |
+| Files | `linux-image-6.18.59-r1_6.18.59-1_arm64.deb`, `linux-headers-6.18.59-r1_6.18.59-1_arm64.deb` |
 | Pin | the sha256 of each file, `KERNEL_RELEASE_*_SHA256` |
-| URL | `https://github.com/DockSeed/a7s-linux-lts/releases/download/v6.18.59-T4/<file>` |
+| URL | `https://github.com/DockSeed/a7s-linux-lts/releases/download/v6.18.59-R1/<file>` |
 
-(GitHub serves the `~` of the package version, `6.18.59~t4-1`, as `.`.) The
+(GitHub serves a `~` in the package version, as in a test build's
+`6.18.59~t4-1`, as `.`; a release's `6.18.59-1` has none.) The
 download goes through `fetch_verified` like every other: the sha256 is checked
 before a file enters the cache and again on every use; a mismatch stops the
 build. A release that is not published yet cannot be downloaded anonymously. If
