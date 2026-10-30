@@ -56,10 +56,9 @@ sudo dd if=/dev/zero of=/dev/mmcblk0 bs=512 count=1 conv=fsync
 
 Check with `lsblk` that `mmcblk0` is the card you booted from, then reboot.
 
-**eMMC** (not yet tried with this boot chain): boot the board from an SD card
-as above, copy the image to the board, find the eMMC with `lsblk` (the
-`mmcblk*` device that is not your boot card), write it with the same `dd`
-command, power off and remove the card.
+**eMMC**: boot the board from an SD card as above, copy the image to the board,
+find the eMMC with `lsblk` (the `mmcblk*` device that is not your boot card),
+write it with the same `dd` command, power off and remove the card.
 
 On first boot the root partition grows to the end of its disk.
 Image layout, safe mode: [docs/image.md](docs/image.md).

@@ -28,10 +28,10 @@ a system on the card; the boot chain at 128 KiB stays:
 Check with `lsblk` that `mmcblk0` is the card you booted from. U-Boot boots
 the card or eMMC before NVMe, so a card that still carries a system wins.
 
-eMMC (not yet tried with this boot chain): boot the board from an SD card written as above, copy
-the image (or its `.xz`) to the board, find the eMMC with `lsblk` (the
-`mmcblk*` device that is not the card you booted from), write it with the same `dd` command, power off, remove
-the card.
+eMMC: boot the board from an SD card written as above, copy the image (or its
+`.xz`) to the board, find the eMMC with `lsblk` (the `mmcblk*` device that is
+not the card you booted from), write it with the same `dd` command, power off,
+remove the card.
 
 The image is 1.5 GiB; on the first boot the root partition grows to the end of
 its disk.
