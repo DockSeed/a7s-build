@@ -112,9 +112,9 @@ installing `wireguard-tools` or `wireguard` brings no Debian kernel and no
 lands in `/boot` but is not booted: `extlinux.conf` names only the image's
 kernel, and the hook below never makes a Debian kernel the default.
 
-With the default `A7S_KERNEL=release` the kernel is the pair of packages
-`linux-image-<release>` and `linux-headers-<release>` of a release of the
-kernel recipe ([kernel](kernel.md)), installed with dpkg: `dpkg -l | grep linux-`
+With the default `A7S_KERNEL=release` the kernel is the packages
+`linux-image-<release>` and `linux-headers-<release>` (with the hook package
+`a7s-kernel-hook`) of a release of the kernel recipe ([kernel](kernel.md)), installed with dpkg: `dpkg -l | grep linux-`
 lists them. `extlinux.conf` boots `/boot/vmlinuz-<release>` with the device tree
 from `/usr/lib/linux-image-<release>/allwinner/`. `a7s-kernel` stays, with
 the same job. The WLAN/BT driver is the DKMS package `a7s-aic8800-dkms`, built

@@ -8,7 +8,7 @@ to one commit (`KERNEL_RECIPE_COMMIT` in `scripts/stages/kernel.sh`):
 | | |
 |---|---|
 | Repository | `https://github.com/DockSeed/a7s-linux-lts` |
-| Pinned commit | `2925c2d5ae1f` |
+| Pinned commit | `757873369f77` |
 | Result | `Image`, `sun60i-a733-cubie-a7s.dtb`, `config`, `System.map`, `modules/` (with aic8800), `KERNEL-ID` |
 
 Changes to the series are made there only; here the pin moves. What the kernel
@@ -68,7 +68,7 @@ result to a release. `scripts/stages/kernel.sh` pins one release:
 | URL | `https://github.com/DockSeed/a7s-linux-lts/releases/download/<tag>/<file>` |
 
 (The files of a test build are named without `~`: the package version
-`6.18.59~t4-1` is `6.18.59.t4-1` in the file name; a release's `6.18.59-1` has
+`6.18.59~t4-1` is `6.18.59.t4-1` in the file name; a release's `6.18.59-2` has
 none.) The
 download goes through `fetch_verified` like every other: the sha256 is checked
 before a file enters the cache and again on every use; a mismatch stops the
