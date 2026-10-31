@@ -10,28 +10,32 @@
 # a commit. docs/kernel.md says what it builds.
 #
 # Two sources for the image's kernel, A7S_KERNEL:
-#   build    (default) the recipe builds the kernel here.
+#   build    the recipe builds the kernel here.
 #            Output: OUT_DIR/{Image,<dtb>,config,System.map,modules/,KERNEL-ID}.
 #            The modules include the AIC8800 WLAN/BT driver, which the recipe
 #            builds with the kernel; the wifi stage supplies its firmware.
-#   release  the Debian packages (linux-image, linux-headers) of a release of the
+#   release  (default) the Debian packages (linux-image, linux-headers) of a release of the
 #            recipe, downloaded from its public URL against a pinned sha256.
 #            Output: OUT_DIR/kernel-release/{*.deb,RELEASE-ID}. The AIC8800
 #            driver is not in them: the wifi stage packages its source for DKMS.
 #            Both modes fetch the recipe (fetch-kernel): the driver's patches
 #            are in it.
+# Both modes put the package a7s-kernel-hook (the recipe's hooks that give a
+# kernel installed on the board its extlinux entry) in OUT_DIR/kernel-hook/: in
+# `release` the one of the pinned release, in `build` one the recipe builds here.
 
 # The recipe, pinned to a COMMIT (main moves). To bump it: build, compare the
 # result, test on a board, then change it here.
 KERNEL_RECIPE_URL="https://github.com/DockSeed/a7s-linux-lts.git"
-KERNEL_RECIPE_COMMIT="c8c6568f583ce9a95819d46867252d2cad3536ab"
+KERNEL_RECIPE_COMMIT="2925c2d5ae1f085d37b90fdb75b7f04a86a3fef8"
 
 # The release of that recipe the image can install instead of building the
 # kernel (A7S_KERNEL=release). The packages are pinned by sha256; the release
 # was built by the recipe's release workflow from KERNEL_RELEASE_COMMIT, which
 # must be the recipe commit pinned above (the driver's patches come from it).
-# The asset names are the ones GitHub serves: it turns a "~" in the package
-# version (a test build's 6.18.59~t4-1) into "."; a release's 6.18.59-1 has none.
+# The asset names are the ones of the release's SHA256SUMS: the recipe names
+# the files of a test build without "~" (6.18.59~t4-1 is 6.18.59.t4-1); a
+# release's 6.18.59-1 has none.
 KERNEL_RELEASE_TAG="v6.18.59-R1"
 KERNEL_RELEASE_COMMIT="c8c6568f583ce9a95819d46867252d2cad3536ab"
 KERNEL_RELEASE_NAME="6.18.59-r1"
@@ -41,6 +45,13 @@ KERNEL_RELEASE_IMAGE_DEB="linux-image-${KERNEL_RELEASE_NAME}_6.18.59-1_arm64.deb
 KERNEL_RELEASE_IMAGE_SHA256="a604b829fe9170eb0b0353db86e70dbd0801b67b77e790c35229748653c9f385"
 KERNEL_RELEASE_HEADERS_DEB="linux-headers-${KERNEL_RELEASE_NAME}_6.18.59-1_arm64.deb"
 KERNEL_RELEASE_HEADERS_SHA256="8c5e449eda58439c9e8477ee076c2a6c4eaedbe8a213191a68d134aac0365b3f"
+# TODO(release pin): v6.18.59-R1 has no a7s-kernel-hook; the first release of the
+# recipe that has it is not published yet. When it is, set the tag, commit, name,
+# the three packages' names and sha256 here, together with KERNEL_RECIPE_COMMIT
+# (which must be that release's commit). Until then the default A7S_KERNEL=release
+# stops in fetch-kernel (kernel_release_hook_pinned); A7S_KERNEL=build works.
+KERNEL_RELEASE_HOOK_DEB="a7s-kernel-hook_TODO_all.deb"
+KERNEL_RELEASE_HOOK_SHA256="TODO"
 
 # Where the pinned recipe is checked out.
 kernel_dir() { printf '%s\n' "${WORK_DIR}/a7s-linux-lts"; }
@@ -56,8 +67,8 @@ kernel_recipe() {
 
 # The kernel source of this build: build or release (A7S_KERNEL).
 kernel_source() {
-  case "${A7S_KERNEL:-build}" in
-    build|release) printf '%s\n' "${A7S_KERNEL:-build}" ;;
+  case "${A7S_KERNEL:-release}" in
+    build|release) printf '%s\n' "${A7S_KERNEL:-release}" ;;
     *) die "A7S_KERNEL must be build or release, not '${A7S_KERNEL}'" ;;
   esac
 }
@@ -65,9 +76,15 @@ kernel_source() {
 # Where the downloaded release packages are kept for the image stages.
 kernel_release_dir() { printf '%s\n' "${OUT_DIR}/kernel-release"; }
 
+# Where the a7s-kernel-hook package is kept for the image stages.
+kernel_hook_dir() { printf '%s\n' "${OUT_DIR}/kernel-hook"; }
+
+# Has the pinned release a hook package (is the pin filled in)?
+kernel_release_hook_pinned() { [ "${KERNEL_RELEASE_HOOK_SHA256}" != TODO ]; }
+
 pins_kernel() {
   log "kernel   : ${KERNEL_RECIPE_URL} @ ${KERNEL_RECIPE_COMMIT} (its own pins: build.sh pins in that checkout)"
-  log "           release ${KERNEL_RELEASE_TAG} (A7S_KERNEL=release): ${KERNEL_RELEASE_IMAGE_DEB} sha256 ${KERNEL_RELEASE_IMAGE_SHA256:0:16}..., ${KERNEL_RELEASE_HEADERS_DEB} sha256 ${KERNEL_RELEASE_HEADERS_SHA256:0:16}..."
+  log "           release ${KERNEL_RELEASE_TAG} (A7S_KERNEL=release): ${KERNEL_RELEASE_IMAGE_DEB} sha256 ${KERNEL_RELEASE_IMAGE_SHA256:0:16}..., ${KERNEL_RELEASE_HEADERS_DEB} sha256 ${KERNEL_RELEASE_HEADERS_SHA256:0:16}..., ${KERNEL_RELEASE_HOOK_DEB} sha256 ${KERNEL_RELEASE_HOOK_SHA256:0:16}..."
 }
 
 # Fetch the recipe at the pinned commit (git_fetch_pinned proves HEAD). With
@@ -76,6 +93,8 @@ pins_kernel() {
 stage_fetch_kernel() {
   git_fetch_pinned "${KERNEL_RECIPE_URL}" "${KERNEL_RECIPE_COMMIT}" "$(kernel_dir)"
   [ "$(kernel_source)" = release ] || return 0
+  kernel_release_hook_pinned \
+    || die "the pinned release ${KERNEL_RELEASE_TAG} has no a7s-kernel-hook package (KERNEL_RELEASE_HOOK_* in scripts/stages/kernel.sh are placeholders) -- pin a release of the recipe that has it, or build the kernel here with A7S_KERNEL=build"
   [ "${KERNEL_RELEASE_COMMIT}" = "${KERNEL_RECIPE_COMMIT}" ] \
     || die "the pinned release ${KERNEL_RELEASE_TAG} was built from ${KERNEL_RELEASE_COMMIT}, the recipe pin is ${KERNEL_RECIPE_COMMIT} -- move the pins together"
   local d; d="$(kernel_release_dir)"
@@ -84,6 +103,10 @@ stage_fetch_kernel() {
     "${KERNEL_RELEASE_BASE_URL}/${KERNEL_RELEASE_IMAGE_DEB}"
   fetch_verified "${KERNEL_RELEASE_HEADERS_SHA256}" "${d}/${KERNEL_RELEASE_HEADERS_DEB}" \
     "${KERNEL_RELEASE_BASE_URL}/${KERNEL_RELEASE_HEADERS_DEB}"
+  mkdir -p "$(kernel_hook_dir)"
+  rm -f "$(kernel_hook_dir)"/a7s-kernel-hook_*_all.deb
+  fetch_verified "${KERNEL_RELEASE_HOOK_SHA256}" "$(kernel_hook_dir)/${KERNEL_RELEASE_HOOK_DEB}" \
+    "${KERNEL_RELEASE_BASE_URL}/${KERNEL_RELEASE_HOOK_DEB}"
 }
 
 # The recipe's own key (version, tarball sha256 and inputs hash), a function of
@@ -107,6 +130,33 @@ stage_build_kernel() {
   local recipe; recipe="$(kernel_recipe)"
   WORK_DIR="${WORK_DIR}" OUT_DIR="${OUT_DIR}" CACHE_DIR="${CACHE_DIR}" "${recipe}" all \
     || die "build-kernel failed (reason above)"
+  kernel_hook_build
+}
+
+# A7S_KERNEL=build: the recipe's step hook makes the a7s-kernel-hook package from
+# the pinned checkout. Its version needs a revision; t0 is what the recipe's own
+# manual run uses. It is set for this step only: the kernel above has none.
+kernel_hook_build() {
+  local recipe d out; recipe="$(kernel_recipe)"; d="$(kernel_hook_dir)"; out="${WORK_DIR}/kernel-hook-out"
+  rm -rf "${d}" "${out}"
+  mkdir -p "${d}"
+  A7S_KERNEL_REVISION=t0 WORK_DIR="${WORK_DIR}" OUT_DIR="${out}" CACHE_DIR="${CACHE_DIR}" "${recipe}" hook \
+    || die "the recipe's hook step failed (reason above)"
+  [ "$(find "${out}/deb" -name 'a7s-kernel-hook_*_all.deb' | wc -l)" = 1 ] || die "the recipe's hook step left not exactly one package in ${out}/deb"
+  mv "${out}"/deb/a7s-kernel-hook_*_all.deb "${d}/"
+  rm -rf "${out}"
+  kernel_hook_check "$(kernel_hook_dir)"/a7s-kernel-hook_*_all.deb
+}
+
+# The hook package: ours, for every architecture, with both hooks.
+kernel_hook_check() {  # <hook.deb>
+  local deb="$1" l
+  command -v dpkg-deb >/dev/null || die "dpkg-deb is missing in the builder"
+  [ "$(dpkg-deb -f "${deb}" Package)" = a7s-kernel-hook ] || die "${deb##*/} is not the package a7s-kernel-hook"
+  [ "$(dpkg-deb -f "${deb}" Architecture)" = all ] || die "${deb##*/} is not an architecture independent package"
+  l="$(dpkg-deb -c "${deb}")" || die "cannot list ${deb##*/}"
+  grep -q ' \./usr/share/kernel/postinst.d/zz-a7s-extlinux$' <<<"${l}" && grep -q ' \./usr/share/kernel/prerm.d/a7s-extlinux$' <<<"${l}" \
+    || die "${deb##*/} lacks one of its two hooks"
 }
 
 # The release packages in kernel_release_dir: the pinned bytes, the package
@@ -122,7 +172,12 @@ kernel_release_check() {
     [ "$(dpkg-deb -f "${n%%:*}" Package)" = "${n##*:}" ] || die "${n%%:*} is not the package ${n##*:}"
     [ "$(dpkg-deb -f "${n%%:*}" Architecture)" = arm64 ] || die "${n%%:*} is not an arm64 package"
   done
+  kernel_hook_check "$(kernel_hook_dir)/${KERNEL_RELEASE_HOOK_DEB}"
   v="$(dpkg-deb -f "${img}" Version)"
+  [ "$(dpkg-deb -f "$(kernel_hook_dir)/${KERNEL_RELEASE_HOOK_DEB}" Version)" = "${v}" ] \
+    || die "the hook package and the kernel packages have different versions"
+  [ "$(dpkg-deb -f "$(kernel_hook_dir)/${KERNEL_RELEASE_HOOK_DEB}" Maintainer)" = "$(dpkg-deb -f "${img}" Maintainer)" ] \
+    || die "the hook package and the kernel packages have different maintainers (the hook acts on its maintainer's kernels only)"
   [ "$(dpkg-deb -f "${hdr}" Version)" = "${v}" ] || die "the image and the headers package have different versions"
   # The listings go into variables first: `dpkg-deb -c | grep -q` fails at
   # random under pipefail when grep leaves at its first match.
@@ -142,8 +197,9 @@ kernel_release_check() {
     echo "version=${v}"
     echo "image=${KERNEL_RELEASE_IMAGE_DEB} ${KERNEL_RELEASE_IMAGE_SHA256}"
     echo "headers=${KERNEL_RELEASE_HEADERS_DEB} ${KERNEL_RELEASE_HEADERS_SHA256}"
+    echo "hook=${KERNEL_RELEASE_HOOK_DEB} ${KERNEL_RELEASE_HOOK_SHA256}"
   } > "${d}/RELEASE-ID"
-  log "kernel release ${KERNEL_RELEASE_TAG}: ${KERNEL_RELEASE_IMAGE_DEB}, ${KERNEL_RELEASE_HEADERS_DEB} (version ${v}, sha256 verified)"
+  log "kernel release ${KERNEL_RELEASE_TAG}: ${KERNEL_RELEASE_IMAGE_DEB}, ${KERNEL_RELEASE_HEADERS_DEB}, ${KERNEL_RELEASE_HOOK_DEB} (version ${v}, sha256 verified)"
 }
 
 # Both packages in kernel_release_dir are the pinned bytes.
@@ -153,6 +209,9 @@ kernel_release_verify_bytes() {
     _sha256_ok "${f##*:}" "${d}/${f%%:*}" \
       || die "${d}/${f%%:*} is missing or does not match its pinned sha256 -- run the kernel stage (A7S_KERNEL=release)"
   done
+  kernel_release_hook_pinned || die "the pinned release ${KERNEL_RELEASE_TAG} has no a7s-kernel-hook package (KERNEL_RELEASE_HOOK_* are placeholders) -- A7S_KERNEL=build builds the kernel here instead"
+  _sha256_ok "${KERNEL_RELEASE_HOOK_SHA256}" "$(kernel_hook_dir)/${KERNEL_RELEASE_HOOK_DEB}" \
+    || die "$(kernel_hook_dir)/${KERNEL_RELEASE_HOOK_DEB} is missing or does not match its pinned sha256 -- run the kernel stage (A7S_KERNEL=release)"
 }
 
 # The recipe's fast compile gate (the A733 driver directories only). Needs the

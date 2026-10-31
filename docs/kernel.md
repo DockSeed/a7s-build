@@ -8,7 +8,7 @@ to one commit (`KERNEL_RECIPE_COMMIT` in `scripts/stages/kernel.sh`):
 | | |
 |---|---|
 | Repository | `https://github.com/DockSeed/a7s-linux-lts` |
-| Pinned commit | `c8c6568f583c` |
+| Pinned commit | `2925c2d5ae1f` |
 | Result | `Image`, `sun60i-a733-cubie-a7s.dtb`, `config`, `System.map`, `modules/` (with aic8800), `KERNEL-ID` |
 
 Changes to the series are made there only; here the pin moves. What the kernel
@@ -19,8 +19,8 @@ the build) is described there (`docs/kernel.md`).
 
 | `A7S_KERNEL` | The image's kernel | The aic8800 driver |
 |---|---|---|
-| `build` (default) | built here from source by the recipe (`./build.sh kernel`), copied into the image | built by the recipe with the kernel, copied into the image |
-| `release` | the Debian packages `linux-image` and `linux-headers` of a release of the recipe, downloaded and installed with dpkg | built by DKMS in the image, against the installed headers |
+| `release` (default) | the Debian packages `linux-image` and `linux-headers` of a release of the recipe, downloaded and installed with dpkg | built by DKMS in the image, against the installed headers |
+| `build` | built here from source by the recipe (`./build.sh kernel`), copied into the image | built by the recipe with the kernel, copied into the image |
 
 Stages: `fetch-kernel` (the recipe at the pin; with `release` also the
 packages), `build-kernel` (the recipe's `all`; with `release` it checks the
@@ -50,6 +50,11 @@ was built from the commit the firmware comes from. `/boot/Image` and
 The recipe takes its build time from its own commit, not from this repository:
 the kernel does not change when only this repository does.
 
+The recipe's step `hook` also builds the package `a7s-kernel-hook` from the
+pinned checkout (no kernel build is needed for it); the kernel stage keeps it in
+`out/kernel-hook/`. Its version has the revision `t0` (`6.18.59~t0-1`), which
+only this step sets.
+
 ### `A7S_KERNEL=release`
 
 The recipe's release workflow builds a tagged commit on GitHub and attaches the
@@ -57,13 +62,14 @@ result to a release. `scripts/stages/kernel.sh` pins one release:
 
 | | |
 |---|---|
-| Release | `v6.18.59-R1` (kernel release `6.18.59-r1`), built from the pinned commit |
-| Files | `linux-image-6.18.59-r1_6.18.59-1_arm64.deb`, `linux-headers-6.18.59-r1_6.18.59-1_arm64.deb` |
+| Release | `KERNEL_RELEASE_TAG` (the kernel release is `KERNEL_RELEASE_NAME`), built from the pinned commit |
+| Files | `linux-image-<release>_<version>_arm64.deb`, `linux-headers-<release>_<version>_arm64.deb`, `a7s-kernel-hook_<version>_all.deb` |
 | Pin | the sha256 of each file, `KERNEL_RELEASE_*_SHA256` |
-| URL | `https://github.com/DockSeed/a7s-linux-lts/releases/download/v6.18.59-R1/<file>` |
+| URL | `https://github.com/DockSeed/a7s-linux-lts/releases/download/<tag>/<file>` |
 
-(GitHub serves a `~` in the package version, as in a test build's
-`6.18.59~t4-1`, as `.`; a release's `6.18.59-1` has none.) The
+(The files of a test build are named without `~`: the package version
+`6.18.59~t4-1` is `6.18.59.t4-1` in the file name; a release's `6.18.59-1` has
+none.) The
 download goes through `fetch_verified` like every other: the sha256 is checked
 before a file enters the cache and again on every use; a mismatch stops the
 build. A release that is not published yet cannot be downloaded anonymously. If
@@ -80,6 +86,7 @@ What the image gets:
   `/usr/lib/modules/<release>`, the device trees in
   `/usr/lib/linux-image-<release>/allwinner/`, the build environment in
   `/usr/src/linux-headers-<release>`.
+- `a7s-kernel-hook`, installed before the kernel packages ([below](#updating-the-kernel-on-the-board)).
 - `extlinux.conf` names those files directly (`kernel /boot/vmlinuz-<release>`,
   `fdt /usr/lib/linux-image-<release>/allwinner/sun60i-a733-cubie-a7s.dtb`), the
   paths Debian's tools use, instead of the copies `build` writes to `/boot`.
@@ -98,13 +105,40 @@ both packages before dpkg sees them (and the image stage again), and the rootfs 
 and that the DKMS modules have the vermagic of the kernel's own modules.
 
 What this gives: dpkg knows the kernel, its headers and the driver package.
-It gives no update path, and none is promised: there is no apt repository and
-no signing key. `extlinux.conf` and the safe-mode file name this release's
-files, and nothing changes them, so booting another kernel needs an edit of
-`extlinux.conf`, and removing these packages removes what the board boots. The
-driver does not follow a new kernel by itself either: DKMS would build the
-driver source that is in the image, without any later patches. Updating the
-kernel on a board is not part of this recipe.
+A newer kernel is installed with `a7s-kernel-update`, see the next section. DKMS builds the driver
+source that is in the image for a newer kernel too, without any later patches.
+
+## Updating the kernel on the board
+
+Both images carry the package `a7s-kernel-hook` of the kernel recipe: the
+command `a7s-kernel-update` and hooks that give an installed kernel its boot
+entry. The steps for the user (update, check, way back, remove, by hand) are in
+the "Updates" section of the [README](../README.md#updates); the recipe's
+`docs/kernel.md` ("Installing a kernel on the board") has the details of the
+command and the hooks.
+
+The hooks rewrite the `kernel` and `fdt` lines of `extlinux.conf` and
+`extlinux-fallback.conf` and nothing else: the new kernel becomes the normal
+boot, the kernel that booted well becomes the safe-mode entry. The hook leaves the
+files alone, and prints why and what to do, when the kernel is not from the
+recipe's maintainer, when this boot was not assessed as good (safe mode, or
+`boot-complete.target` not reached; in safe mode it only makes the safe-mode
+kernel the default again), when `/boot` cannot be shown to be the one the board
+booted from, or when the new kernel would have no WLAN driver. It does nothing
+while the image is built (no systemd runs in the root filesystem then); the
+image stage writes the files itself. A kernel that either file boots cannot be
+removed with `apt` or `dpkg`.
+
+What does not follow the kernel:
+
+- **The WLAN/BT driver** is in no kernel package. An image built with
+  `A7S_KERNEL=release` has the DKMS package `a7s-aic8800-dkms`, and installing
+  the new headers builds the driver for the new kernel (`dkms status`). An image
+  built with `A7S_KERNEL=build` has the driver in its own kernel tree only, and
+  nothing builds it for another kernel: the hook does not make a kernel installed
+  on it the default (it would boot without WLAN and Bluetooth), and says so.
+  A newer kernel needs a newly built image.
+- **The boot chain** (U-Boot, TF-A) is not touched.
 
 To move the release pin: tag in the recipe, build there, publish, then change
 `KERNEL_RELEASE_*` here together with `KERNEL_RECIPE_COMMIT` (the build refuses

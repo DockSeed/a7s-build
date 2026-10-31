@@ -33,7 +33,7 @@ eMMC: boot the board from an SD card written as above, copy the image (or its
 not the card you booted from), write it with the same `dd` command, power off,
 remove the card.
 
-The image is 1.5 GiB; on the first boot the root partition grows to the end of
+The image is 1.8 GiB (1.5 GiB with `A7S_KERNEL=build`); on the first boot the root partition grows to the end of
 its disk.
 
 ## First login
@@ -103,16 +103,16 @@ Kernel side: the kernel, device tree and modules of the kernel stage (with the
 WLAN/BT driver aic8800), the GPU firmware, and the WLAN/BT firmware when the
 wifi stage built it.
 
-With the default `A7S_KERNEL=build` the kernel is not a Debian package: the image
+With `A7S_KERNEL=build` the kernel is not a Debian package: the image
 stage copies it to `/boot/Image` and `/usr/lib/modules`, and U-Boot boots it
 without an initrd. The package `a7s-kernel` holds no files; it tells apt what
 that kernel provides (`wireguard-modules`, as Debian's kernel packages do), so
 installing `wireguard-tools` or `wireguard` brings no Debian kernel and no
 `initramfs-tools`. A Debian kernel installed by name (`linux-image-arm64`)
 lands in `/boot` but is not booted: `extlinux.conf` names only the image's
-kernel.
+kernel, and the hook below never makes a Debian kernel the default.
 
-With `A7S_KERNEL=release` the kernel is the pair of packages
+With the default `A7S_KERNEL=release` the kernel is the pair of packages
 `linux-image-<release>` and `linux-headers-<release>` of a release of the
 kernel recipe ([kernel](kernel.md)), installed with dpkg: `dpkg -l | grep linux-`
 lists them. `extlinux.conf` boots `/boot/vmlinuz-<release>` with the device tree
@@ -120,8 +120,16 @@ from `/usr/lib/linux-image-<release>/allwinner/`. `a7s-kernel` stays, with
 the same job. The WLAN/BT driver is the DKMS package `a7s-aic8800-dkms`, built
 for the kernel when the image is made; `dkms`, `gcc`, `make` and `dpkg-dev` (with perl and binutils, 40 packages)
 are in the image for it: about 230 MiB installed, plus the headers (56 MiB).
-The raw image grows from 1.5 GiB to 1.8 GiB, the `.xz` from 154 MB to 207 MB
-(measured with the minimal image). There is no initrd in either case.
+Against `A7S_KERNEL=build`, the raw image grows from 1.5 GiB to 1.8 GiB, the
+`.xz` from 155 MB to 207 MB (measured with the minimal image). There is no initrd in either case.
+
+Both images carry the package `a7s-kernel-hook`: hooks in `/usr/share/kernel` (with
+wrappers for the headers package in `/etc/kernel`) that
+make a kernel package of the kernel recipe, installed later with `apt install
+./linux-image-….deb`, the default entry of `extlinux.conf`, and keep the kernel
+that booted well in `extlinux-fallback.conf`. They are described in
+[kernel](kernel.md#updating-the-kernel-on-the-board). They change nothing while
+the image is built.
 
 ## Switches
 
@@ -191,9 +199,13 @@ disk's IDs again; give the copy new ones before both are in one board.
 
 U-Boot counts boots; after three that were not marked good it boots
 `/boot/extlinux/extlinux-fallback.conf` from the disk it would boot normally
-(card, eMMC or NVMe): same kernel, no desktop, without the GPU and WLAN
-drivers (Ethernet and SSH work). The board stays in safe mode
-until you clear the counter and reboot:
+(card, eMMC or NVMe): the kernel that last booted well (the normal one until
+a kernel is installed, see [kernel](kernel.md#updating-the-kernel-on-the-board)),
+no desktop, without the GPU and WLAN drivers (Ethernet and SSH work). The board
+stays in safe mode until the counter is cleared. After a kernel installed on the
+board failed to start, `sudo dpkg-reconfigure linux-image-$(uname -r)` and `sudo
+reboot` do that (README, "Updates"). For any other cause, clear the counter and
+reboot:
 
     sudo busybox devmem 0x0709011C 32 0
 

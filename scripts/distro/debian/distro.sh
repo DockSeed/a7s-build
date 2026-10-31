@@ -51,6 +51,8 @@ DEBIAN_ORC_SONAME="liborc-0.4.so.0"
 DEBIAN_XFWM4_DIR="${OUT_DIR}/xfwm4"
 # The release kernel's packages and the DKMS package of the aic8800 driver.
 DEBIAN_KERNEL_DIR="${OUT_DIR}/kernel-release"
+# The a7s-kernel-hook package, in both kernel modes (the kernel stage).
+DEBIAN_HOOK_DIR="${OUT_DIR}/kernel-hook"
 DEBIAN_DKMS_DIR="${OUT_DIR}/aic8800/dkms"
 DEBIAN_XFWM4_APT_PIN="etc/apt/preferences.d/xfwm4-a7s"
 DEBIAN_XFWM4_DOC_DIR="usr/local/share/doc/xfwm4-a7s"
@@ -129,7 +131,7 @@ distro_rootfs_inputs() {
 # The OUT_DIR files this configuration installs, sorted. Missing ones are
 # reported by distro_rootfs_build, not here.
 debian_out_inputs() {
-  local -a dirs=()
+  local -a dirs=("${DEBIAN_HOOK_DIR}")
   if [ "$(debian_switch A7S_DESKTOP)" = 1 ]; then dirs+=("${DEBIAN_XFWM4_DIR}" "${DEBIAN_ORC_DIR}"); fi
   if [ "$(debian_kernel_source)" = release ]; then dirs+=("${DEBIAN_KERNEL_DIR}" "${DEBIAN_DKMS_DIR}"); fi
   [ "${#dirs[@]}" -gt 0 ] || return 0
@@ -231,6 +233,8 @@ debian_check_out_inputs() {
     [ -f "${DEBIAN_ORC_DIR}/ORC-ID" ] && compgen -G "${DEBIAN_ORC_DIR}/${DEBIAN_ORC_SONAME}.*" >/dev/null \
       || die "A7S_DESKTOP=1 needs the patched liborc in ${DEBIAN_ORC_DIR} (the build-orc stage)"
   fi
+  compgen -G "${DEBIAN_HOOK_DIR}/a7s-kernel-hook_*_all.deb" >/dev/null \
+    || die "the image needs the a7s-kernel-hook package in ${DEBIAN_HOOK_DIR} (the kernel stage)"
   if [ "$(debian_kernel_source)" = release ]; then
     [ -f "${DEBIAN_KERNEL_DIR}/RELEASE-ID" ] && compgen -G "${DEBIAN_KERNEL_DIR}/linux-image-*_arm64.deb" >/dev/null \
       && compgen -G "${DEBIAN_DKMS_DIR}/a7s-aic8800-dkms_*_all.deb" >/dev/null && [ -f "${DEBIAN_DKMS_DIR}/DKMS-ID" ] \
@@ -277,6 +281,7 @@ debian_customize() {  # <root>
 
   debian_regulatory_db "${r}"
   debian_kernel_package "${r}"
+  debian_kernel_hook "${r}"
   if [ "$(debian_kernel_source)" = release ]; then debian_kernel_release "${r}"; fi
   debian_assert_kmscon "${r}"
   debian_assert_mesa "${r}"
@@ -352,6 +357,25 @@ EOF
   log "${KERNEL_PACKAGE} provides ${provides}"
 }
 
+# --- the kernel hook (both modes) ------------------------------------------------
+# a7s-kernel-hook (the kernel recipe): /usr/share/kernel hooks that give a kernel
+# installed on the board later its extlinux entry. Installed before the release
+# kernel's packages, so that their postinst runs it. Here, with no systemd
+# running, it changes nothing: image_add_boot writes the extlinux files.
+debian_kernel_hook() {  # <root>
+  local r="$1" f
+  f="$(cd "${DEBIAN_HOOK_DIR}" && ls a7s-kernel-hook_*_all.deb)"
+  [ "$(wc -w <<<"${f}")" = 1 ] || die "kernel hook: expected one package in ${DEBIAN_HOOK_DIR}, found: ${f}"
+  install -d -m0755 "${r}/tmp/a7s-kernel-hook"
+  install -m0644 "${DEBIAN_HOOK_DIR}/${f}" "${r}/tmp/a7s-kernel-hook/"
+  debian_apt_install "${r}" "/tmp/a7s-kernel-hook/${f}" || die "installing ${f} failed"
+  rm -rf "${r:?}/tmp/a7s-kernel-hook"
+  assert_installed "${r}" "the image carries the kernel hook" a7s-kernel-hook
+  [ -x "${r}/usr/share/kernel/postinst.d/zz-a7s-extlinux" ] && [ -x "${r}/usr/share/kernel/prerm.d/a7s-extlinux" ] \
+    || die "a7s-kernel-hook did not install its two hooks"
+  log "kernel hook: ${f}"
+}
+
 # --- the release kernel (A7S_KERNEL=release) -----------------------------------
 # The kernel stage leaves linux-image and linux-headers in DEBIAN_KERNEL_DIR
 # (RELEASE-ID names the kernel release), the wifi stage the DKMS package of the
@@ -359,8 +383,8 @@ EOF
 # package like on any Debian system; the image stage adds the boot files around it.
 
 debian_kernel_source() {
-  case "${A7S_KERNEL:-build}" in
-    build|release) printf '%s' "${A7S_KERNEL:-build}" ;;
+  case "${A7S_KERNEL:-release}" in
+    build|release) printf '%s' "${A7S_KERNEL:-release}" ;;
     *) die "A7S_KERNEL must be build or release, not '${A7S_KERNEL}'" ;;
   esac
 }

@@ -67,7 +67,9 @@ Available: everything `scripts/lib/common.sh` exports (`SRC` read-only,
 writes these. With `A7S_KERNEL=release` the kernel arrives as packages
 (`OUT_DIR/kernel-release/`, and the aic8800 DKMS package in
 `OUT_DIR/aic8800/dkms/`): the distro installs them, and the image stage adds
-the boot files around the kernel it finds installed. `/lib` may be a link to `usr/lib`.
+the boot files around the kernel it finds installed. In both modes the package
+`a7s-kernel-hook` (`OUT_DIR/kernel-hook/`) is installed; with no systemd running
+it leaves `/boot` alone. `/lib` may be a link to `usr/lib`.
 
 ## Adding a distro
 

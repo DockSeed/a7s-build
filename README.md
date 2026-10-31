@@ -16,7 +16,8 @@ sha256 committed here.
   docker 29.8 (inside a podman container).
 - About 20 GB free disk, 8 GB RAM (lower `A7S_JOBS` if tight).
 - Internet access during the build.
-- Time: about an hour for the first build on 4 cores; later builds reuse the cache.
+- Time: about an hour for the first build on 4 cores with `A7S_KERNEL=build` (the kernel is
+  compiled; [docs/building.md](docs/building.md) has the time of the default); later builds reuse the cache.
 
 ## Quick start
 
@@ -26,8 +27,8 @@ cd a7s-build
 ./build.sh
 ```
 
-The image lands in `out/`: `a7s-debian-trixie-minimal.img.xz` (about 155 MB;
-1.5 GiB unpacked) and its `.sha256`. For the Xfce desktop, build with
+The image lands in `out/`: `a7s-debian-trixie-minimal.img.xz` (about 207 MB;
+1.8 GiB unpacked; with `A7S_KERNEL=build`, 155 MB and 1.5 GiB) and its `.sha256`. For the Xfce desktop, build with
 `A7S_DESKTOP=1 ./build.sh`; the image is then `a7s-debian-trixie-desktop.img.xz`.
 `./build.sh --help` lists stages and switches; details in
 [docs/building.md](docs/building.md).
@@ -111,10 +112,91 @@ off. They are harmless.
 
 Debian's packages update as on any Debian install: security updates install
 themselves once a day (`unattended-upgrades`), and `sudo apt update && sudo
-apt upgrade` brings the rest. The kernel, its device tree and the WLAN/BT
-driver do not update: there is no package repository for them, and none is
-promised. A newer kernel comes as a new image; flashing it replaces
-everything on the card.
+apt upgrade` brings the rest.
+
+New kernels come as releases of the kernel recipe, the repository
+[a7s-linux-lts](https://github.com/DockSeed/a7s-linux-lts/releases) with the
+scripts and patches that build the kernel; `sudo a7s-kernel-update` installs the
+newest. A release has a tag (`v6.18.60-R2`) and the kernel in it has a release
+name (`6.18.60-r2`, what `uname -r` prints): both name the same release. There is no guarantee for how long new
+releases will be published. The kernel, its device tree and the WLAN/BT driver
+are not part of `apt upgrade`: there is no apt source for them.
+
+**1. Update the kernel.** The board needs network and the time of a download
+(three packages) and of the driver build (DKMS, which builds the WLAN driver for
+the new kernel on the board).
+
+    sudo a7s-kernel-update
+
+For a given release: `sudo a7s-kernel-update v6.18.60-R2`. A published test
+build (a pre-release, which "latest" leaves out) is named the same way,
+`v6.18.60-T1`; the command says that it is a test build.
+It downloads the release's packages, checks their sha256 against the release's
+`SHA256SUMS` (on a mismatch it removes them and stops), installs them and
+removes the download. The last line of its output tells what happens next:
+
+- `kernel 6.18.60-r2 starts at the next boot. Next: sudo reboot`: all is in place.
+- `already up to date`: this kernel is installed and set to start; nothing was done.
+- `installed but will NOT start at the next boot`: above that line, the
+  messages of `a7s-kernel-hook` give the reason and the command to run once the
+  cause is gone (usually `sudo dpkg-reconfigure linux-image-<release>`).
+- `the installation failed`: for example DKMS could not build the WLAN driver.
+  Nothing changed for the next start; it uses the old kernel. To undo what was
+  installed: `sudo apt remove linux-image-<release> linux-headers-<release>`,
+  then look at `dkms status`. The message names the directory with the
+  downloaded packages.
+- In safe mode it installs nothing and names the way back (step 4).
+
+**2. Restart.**
+
+    sudo reboot
+
+**3. Check what runs.** `uname -r` prints the release of the running kernel
+(`6.18.60-r2`). `grep kernel /boot/extlinux/extlinux.conf` names the kernel
+that starts at the next boot, `grep kernel /boot/extlinux/extlinux-fallback.conf`
+the one safe mode starts.
+
+**4. If the new kernel does not start.** After three starts that did not come
+up, the board starts safe mode with the kernel that worked before: no desktop,
+no WLAN; Ethernet (SSH) and the serial console work. Log in there. `uname -r`
+prints the old kernel's release (`dpkg -l 'linux-image-*'` lists all installed
+kernels). Then:
+
+    sudo dpkg-reconfigure linux-image-$(uname -r)
+    sudo reboot
+
+The first command sets the old kernel as the normal one again and clears the
+boot counter (the counter of failed starts; after three, the board starts safe
+mode); its output says so. After the restart the old kernel starts
+normally.
+
+**Back to the old kernel while the new one runs.** If the new kernel starts but
+you want the old one: `sudo dpkg-reconfigure linux-image-<old release>`, then
+`sudo reboot`. The old kernel becomes the one that starts; the kernel that runs
+now becomes the safe-mode kernel.
+
+**5. Remove a kernel you do not want.**
+
+    sudo apt remove linux-image-6.18.60-r2 linux-headers-6.18.60-r2
+
+`apt` refuses while `extlinux.conf` or `extlinux-fallback.conf` names the
+kernel; after step 4 neither names the failed one, so this works. An older kernel
+that is fine can be removed once two newer ones have been installed and started.
+
+**Without `a7s-kernel-update`** (a first install of the command, or by hand):
+download `linux-image-<release>_….deb`, `linux-headers-<release>_….deb`,
+`a7s-kernel-hook_….deb` and `SHA256SUMS` from the release page, check with
+`sha256sum -c --ignore-missing SHA256SUMS`, install the hook package first,
+`sudo apt install ./a7s-kernel-hook_*.deb` (a board without it, such as one
+running an image from before the command existed, needs this so that the hook
+files are configured when the kernel arrives), then `sudo apt install
+./linux-image-<release>_*.deb ./linux-headers-<release>_*.deb`, and `sudo reboot`.
+
+What the hook does and when it leaves things alone is in
+[docs/kernel.md](docs/kernel.md). An image built with `A7S_KERNEL=build` has the
+WLAN/BT driver only in its own kernel, so no release kernel becomes the default
+there. A newer kernel needs a newly built image, which replaces everything on
+the card.
 
 ## Switches
 
@@ -125,7 +207,7 @@ Environment variables, defaults in [config/defaults.conf](config/defaults.conf).
 | `A7S_DESKTOP` | `0` | `1`: Xfce desktop (LightDM) and patched xfwm4 |
 | `A7S_USER` | `a7s` | login user |
 | `A7S_HOSTNAME` | `a7s` | host name |
-| `A7S_KERNEL` | `build` | `build`: compile the kernel here; `release`: install the Debian packages of a pinned release of the kernel recipe and build the WLAN driver with DKMS ([docs/kernel.md](docs/kernel.md)) |
+| `A7S_KERNEL` | `release` | `release`: install the Debian packages of a pinned release of the kernel recipe and build the WLAN driver with DKMS; `build`: compile the kernel here ([docs/kernel.md](docs/kernel.md)) |
 | `A7S_SNAPSHOT` | fixed timestamp | snapshot.debian.org time of the packages; empty = live archive (not reproducible) |
 | `A7S_ENGINE` | podman, else docker | container engine |
 | `A7S_WORK`, `A7S_OUT`, `A7S_CACHE` | `work`, `out`, `cache` | scratch, output and download-cache directories |

@@ -25,10 +25,11 @@ The result lands in `out/`. `./build.sh --help` lists every stage and switch.
 - RAM: 8 GB is comfortable; lower `A7S_JOBS` on a small machine.
 - Time: a first full build takes on the order of an hour on 4 cores (kernel
   compile, root filesystem under emulation); root filesystem plus image from a
-  warm cache took about 5 minutes. Later builds reuse the cache. With
-  `A7S_KERNEL=release` the kernel compile (about 30 minutes on 4 cores) is replaced by
-  a download of two packages; the root filesystem takes several minutes longer, because
-  DKMS compiles the WLAN driver under emulation.
+  warm cache took about 5 minutes (those times are of `A7S_KERNEL=build`). Later
+  builds reuse the cache. With the default `A7S_KERNEL=release` the kernel
+  compile (about 30 minutes on 4 cores) is replaced by a download of three
+  packages; the root filesystem takes several minutes longer, because DKMS
+  compiles the WLAN driver under emulation.
 
 ## Usage
 
@@ -59,7 +60,7 @@ Environment variables, defaults in `config/defaults.conf` (printed by
 | `A7S_WORK`, `A7S_OUT`, `A7S_CACHE` | `work`, `out`, `cache` | scratch, artefact and download-cache directories (host only); the cache can be shared between checkouts |
 | `A7S_DISTRO` | `debian` | root filesystem flavour (`scripts/distro/<name>/`) |
 | `A7S_SUITE` | `trixie` | Debian suite |
-| `A7S_KERNEL` | `build` | `build`: the kernel is compiled here; `release`: the Debian packages of a pinned release of a7s-linux-lts are downloaded (sha256-pinned) and installed with dpkg, the WLAN driver is built by DKMS ([kernel](kernel.md)) |
+| `A7S_KERNEL` | `release` | `release`: the Debian packages of a pinned release of a7s-linux-lts are downloaded (sha256-pinned) and installed with dpkg, the WLAN driver is built by DKMS; `build`: the kernel is compiled here ([kernel](kernel.md)) |
 | `A7S_KERNEL_REVISION` | empty | `A7S_KERNEL=build` only: revision of the kernel build (`r1`, `t2`), as in the kernel release `6.18.59-t2` |
 | `A7S_SNAPSHOT` | `20261002T000000Z` | snapshot.debian.org timestamp of the image's packages; empty = live archive, not reproducible |
 | `A7S_DESKTOP` | `0` | `1`: Xfce desktop and patched xfwm4 |
