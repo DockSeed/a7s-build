@@ -119,7 +119,10 @@ New kernels come as releases of the kernel recipe, the repository
 scripts and patches that build the kernel; `sudo a7s-kernel-update` installs the
 newest. A release has a tag (`v6.18.60-R2`) and the kernel in it has a release
 name (`6.18.60-r2`, what `uname -r` prints): both name the same release. There is no guarantee for how long new
-releases will be published. The kernel, its device tree and the WLAN/BT driver
+releases will be published. Kernel releases follow Linux stable when we get to
+it. Whether and how soon a fix from Linux, security fixes included, reaches a
+release is not guaranteed. If a board needs kernel fixes on a schedule of its
+own, build the kernel with the recipe; the steps are in its README. The kernel, its device tree and the WLAN/BT driver
 are not part of `apt upgrade`: there is no apt source for them.
 
 **1. Update the kernel.** The board needs network and the time of a download
