@@ -6,13 +6,13 @@
 #
 # Pinned twice:
 #  - the base image by the digest of its multi-arch index (Debian trixie,
-#    created 2026-09-18; amd64 and arm64 hosts each get their own platform
+#    created 2026-10-27; amd64 and arm64 hosts each get their own platform
 #    image from the same index),
 #  - every package by packages.lock: the snapshot.debian.org timestamp APT
 #    uses, and the exact version of every package the image ends up with.
 # builder-packages.sh refuses to finish when the installed set differs from the
 # lock.
-FROM docker.io/library/debian:trixie@sha256:9cc080028c43b27d2074d63a5f9caf7166d731494965616c1a6d2827a004585c
+FROM docker.io/library/debian:trixie@sha256:2dc419c6d7fe3dad0a2f9fd469c34cc90b0f9ba642d8fde837fe3d7d34a0e7f1
 
 COPY builder-packages.sh packages.lock /etc/a7s-builder/
 COPY packages.d/ /etc/a7s-builder/packages.d/
