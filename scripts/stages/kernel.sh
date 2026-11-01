@@ -27,7 +27,7 @@
 # The recipe, pinned to a COMMIT (main moves). To bump it: build, compare the
 # result, test on a board, then change it here.
 KERNEL_RECIPE_URL="https://github.com/DockSeed/a7s-linux-lts.git"
-KERNEL_RECIPE_COMMIT="757873369f777d5d57e24121f64fe4ca7c250431"
+KERNEL_RECIPE_COMMIT="429c67c88db1ae4c5eba8766b498f5ee866f63a3"
 
 # The release of that recipe the image can install instead of building the
 # kernel (A7S_KERNEL=release). The packages are pinned by sha256; the release
@@ -35,18 +35,18 @@ KERNEL_RECIPE_COMMIT="757873369f777d5d57e24121f64fe4ca7c250431"
 # must be the recipe commit pinned above (the driver's patches come from it).
 # The asset names are the ones of the release's SHA256SUMS: the recipe names
 # the files of a test build without "~" (6.18.59~t4-1 is 6.18.59.t4-1); a
-# release's 6.18.59-2 has none.
-KERNEL_RELEASE_TAG="v6.18.59-R2"
-KERNEL_RELEASE_COMMIT="757873369f777d5d57e24121f64fe4ca7c250431"
-KERNEL_RELEASE_NAME="6.18.59-r2"
+# release's 6.18.60-1 has none.
+KERNEL_RELEASE_TAG="v6.18.60-R1"
+KERNEL_RELEASE_COMMIT="429c67c88db1ae4c5eba8766b498f5ee866f63a3"
+KERNEL_RELEASE_NAME="6.18.60-r1"
 KERNEL_RELEASE_DTB="allwinner/sun60i-a733-cubie-a7s.dtb"
 KERNEL_RELEASE_BASE_URL="https://github.com/DockSeed/a7s-linux-lts/releases/download/${KERNEL_RELEASE_TAG}"
-KERNEL_RELEASE_IMAGE_DEB="linux-image-${KERNEL_RELEASE_NAME}_6.18.59-2_arm64.deb"
-KERNEL_RELEASE_IMAGE_SHA256="435ad114491c8fe1f180e1cb2653dd3d1e9f905ab3c29ac163678502590931b8"
-KERNEL_RELEASE_HEADERS_DEB="linux-headers-${KERNEL_RELEASE_NAME}_6.18.59-2_arm64.deb"
-KERNEL_RELEASE_HEADERS_SHA256="b246359c906d8d00ca21e94f812bcd7ecd84ee8fdcac1782031d89fdc5cf1f4f"
-KERNEL_RELEASE_HOOK_DEB="a7s-kernel-hook_6.18.59-2_all.deb"
-KERNEL_RELEASE_HOOK_SHA256="b739f1b3b332bf1666c6df54acc4e5bc83cc3ae457b05864f52eacef3727e87d"
+KERNEL_RELEASE_IMAGE_DEB="linux-image-${KERNEL_RELEASE_NAME}_6.18.60-1_arm64.deb"
+KERNEL_RELEASE_IMAGE_SHA256="cb0763058f9592179aca03d5de121edd5677c7793e5b865302cbd079a774857e"
+KERNEL_RELEASE_HEADERS_DEB="linux-headers-${KERNEL_RELEASE_NAME}_6.18.60-1_arm64.deb"
+KERNEL_RELEASE_HEADERS_SHA256="fda09680d4aa2f8d960ef6aaca7a2af5924eaeb07cdf8cf6e62bffa5e14f8062"
+KERNEL_RELEASE_HOOK_DEB="a7s-kernel-hook_6.18.60-1_all.deb"
+KERNEL_RELEASE_HOOK_SHA256="0e90bf57f610a86daedb752650c170601556912ae30d616e5a106a261181f7d1"
 
 # Where the pinned recipe is checked out.
 kernel_dir() { printf '%s\n' "${WORK_DIR}/a7s-linux-lts"; }
