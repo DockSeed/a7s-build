@@ -65,7 +65,7 @@ Environment variables, defaults in `config/defaults.conf` (printed by
 | `A7S_SNAPSHOT` | `20261101T000000Z` | snapshot.debian.org timestamp of the image's packages; empty = live archive, not reproducible |
 | `A7S_DESKTOP` | `0` | `1`: Xfce desktop and patched xfwm4 |
 | `A7S_USER`, `A7S_HOSTNAME` | `a7s`, `a7s` | login user and host name |
-| `A7S_IMAGE_NAME` | `a7s-<distro>-<suite>-<minimal\|desktop>.img` | image file name |
+| `A7S_IMAGE_NAME` | `a7s-<suite>-<minimal\|desktop>.img` | image file name |
 | `A7S_IMAGE_SIZE_MB` | from the root filesystem | image size in MiB |
 | `A7S_ROOTFS_REBUILD` | `0` | `1`: rebuild a cached root filesystem |
 | `A7S_JOBS` | number of CPUs | parallel compile jobs |

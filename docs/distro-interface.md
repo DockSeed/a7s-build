@@ -14,7 +14,7 @@ A new distro is a new directory that keeps this contract.
 
 | Name | Contract |
 |---|---|
-| `DISTRO_NAME`, `DISTRO_RELEASE` | used in the image name |
+| `DISTRO_NAME`, `DISTRO_RELEASE` | `DISTRO_RELEASE` is used in the image name |
 | `distro_rootfs_inputs` | prints everything the root filesystem is made from (own files by content, package source and timestamp, switches, sha256 of every `OUT_DIR` file it installs); the `rootfs` stage reuses a tree only while this is unchanged |
 | `distro_rootfs_build <dir>` | builds the complete root filesystem into `<dir>` |
 | `distro_rootfs_assert <dir>` | fails (`die`) when the tree breaks a rule below; also run on the finished image tree |

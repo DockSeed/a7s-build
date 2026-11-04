@@ -27,9 +27,9 @@ cd a7s-build
 ./build.sh
 ```
 
-The image lands in `out/`: `a7s-debian-trixie-minimal.img.xz` (about 207 MB;
+The image lands in `out/`: `a7s-trixie-minimal.img.xz` (about 207 MB;
 1.8 GiB unpacked; with `A7S_KERNEL=build`, 155 MB and 1.5 GiB) and its `.sha256`. For the Xfce desktop, build with
-`A7S_DESKTOP=1 ./build.sh`; the image is then `a7s-debian-trixie-desktop.img.xz`.
+`A7S_DESKTOP=1 ./build.sh`; the image is then `a7s-trixie-desktop.img.xz`.
 `./build.sh --help` lists stages and switches; details in
 [docs/building.md](docs/building.md).
 
@@ -40,7 +40,7 @@ Find the target with `lsblk` first. A wrong device is lost data.
 **SD card** (on your computer; replace `<card>` with the device you found):
 
 ```sh
-xzcat out/a7s-debian-trixie-minimal.img.xz | sudo dd of=/dev/<card> bs=4M conv=fsync status=progress
+xzcat out/a7s-trixie-minimal.img.xz | sudo dd of=/dev/<card> bs=4M conv=fsync status=progress
 ```
 
 For the desktop image, use its file name instead.
@@ -253,7 +253,8 @@ the documentation were written by the agents. The decisions were the human's:
 - to ship Debian as Debian: no project name, logo or login banner in the
   image, nothing that presents Debian's work as ours;
 - what counts as proven: a statement about the hardware is made only after it
-  was measured on a board, and an image is released only after it has booted.
+  was measured on a board, and a change to the recipe is published only after
+  the image it builds has booted.
 
 ## A note on earlier versions
 
@@ -264,6 +265,16 @@ they needed. They have been rewritten, and we apologise to everyone they
 concerned. Their work is what made this project possible.
 
 ## Licence
+
+a7s-build is unofficial and not affiliated with or authorized by Debian,
+Radxa or Allwinner. Debian is a registered trademark owned by Software in the
+Public Interest, Inc. Problems with images built from this recipe belong in this
+repository, not in Debian's bug tracker.
+
+This project does not distribute images and does not support their
+distribution. Anyone who distributes an image built with this recipe does so
+on their own responsibility and must meet the licence and trademark terms of
+every component in it.
 
 Our own files are `GPL-2.0-only OR MIT`. Patches and bundled code keep the
 licence of the project they belong to (ORC BSD-2-Clause, xfwm4

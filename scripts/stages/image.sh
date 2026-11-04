@@ -50,7 +50,7 @@ image_switch() {  # <name>
 }
 
 image_file() {
-  printf '%s/%s' "${OUT_DIR}" "${A7S_IMAGE_NAME:-a7s-${DISTRO_NAME}-${DISTRO_RELEASE}-$([ "$(image_switch A7S_DESKTOP)" = 1 ] && echo desktop || echo minimal).img}"
+  printf '%s/%s' "${OUT_DIR}" "${A7S_IMAGE_NAME:-a7s-${DISTRO_RELEASE}-$([ "$(image_switch A7S_DESKTOP)" = 1 ] && echo desktop || echo minimal).img}"
 }
 
 # The key of the root filesystem: a sha256 over everything it is made from

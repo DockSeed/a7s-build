@@ -5,7 +5,7 @@ The last three stages of `./build.sh`:
 | Stage | Output |
 |---|---|
 | `rootfs` | Debian trixie arm64 root filesystem in `work/rootfs/` |
-| `image` | `out/a7s-debian-trixie-minimal.img` (or `-desktop.img`) + `.sha256` |
+| `image` | `out/a7s-trixie-minimal.img` (or `-desktop.img`) + `.sha256` |
 | `compress` | `out/…img.xz` + `.sha256` (replaces the raw image) |
 
 ## Flashing
@@ -15,7 +15,7 @@ data), then write the image. `xz -d` is only needed for the compressed copy.
 
 SD card (on your computer):
 
-    xzcat out/a7s-debian-trixie-minimal.img.xz | sudo dd of=/dev/<card> bs=4M conv=fsync status=progress
+    xzcat out/a7s-trixie-minimal.img.xz | sudo dd of=/dev/<card> bs=4M conv=fsync status=progress
 
 NVMe drive: the boot ROM does not read NVMe, so the card stays in and carries
 the boot chain. Boot the board from an SD card written as above, copy the image

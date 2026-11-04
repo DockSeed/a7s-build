@@ -9,7 +9,7 @@ x86_64, rootless podman 5.8 and 5.5), came out the same to the byte.
 
 Checked on 2026-10-25: the minimal image of commit `165c0e0`, built twice
 from fresh clones on each host architecture, came out the same to the byte
-per architecture. sha256 of `a7s-debian-trixie-minimal.img.xz`:
+per architecture. sha256 of `a7s-trixie-minimal.img.xz`:
 
 | Host | sha256 |
 |---|---|

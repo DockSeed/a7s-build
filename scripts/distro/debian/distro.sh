@@ -7,7 +7,7 @@
 # path once the packages are in.
 #
 # The interface this file provides:
-#   DISTRO_NAME, DISTRO_RELEASE   the image file name takes them
+#   DISTRO_NAME, DISTRO_RELEASE   DISTRO_RELEASE goes into the image file name
 #   distro_rootfs_inputs          prints what the root filesystem is made from
 #   distro_rootfs_build <dir>     builds the root filesystem into <dir>
 #   distro_rootfs_assert <dir>    fails when the root filesystem breaks a rule
