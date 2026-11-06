@@ -2,7 +2,7 @@
 
 ## What this is
 
-A Debian (trixie, arm64) image for the Radxa Cubie A7S (Allwinner A733),
+A *Debian* (trixie, arm64) image for the Radxa Cubie A7S (Allwinner A733),
 built from mainline Linux 6.18 plus our patch series. It was developed in a
 private lab repository over about eleven weeks and is published here as a
 recipe: you fetch the sources, build the image yourself, and no binary blob
@@ -31,7 +31,7 @@ history shown here. Two earlier tracks came first:
   nothing else from the pile is republished here.
 
 Both tracks depended on vendor code and blobs that cannot be published. So
-in mid-July the work moved to Debian on pristine mainline, with the vendor
+in mid-July the work moved to *Debian* on pristine mainline, with the vendor
 tree dropped and the closed parts pushed to the edges, fetched rather than
 shipped. That is the first commit of this history.
 
@@ -111,7 +111,7 @@ combined, and over four times their CI runs.
 | 20 May | First experiments (earliest repository) |
 | 16 Jun | Armbian track on the vendor 6.6 kernel |
 | 21 Jun | Fedora track, from scratch |
-| 16 Jul | Debian on mainline: first commit; mainline 6.18 boots on the board |
+| 16 Jul | *Debian* on mainline: first commit; mainline 6.18 boots on the board |
 | 18 Jul | SD card and eMMC work; USB 2 |
 | 21 Jul | USB 3 (10 Gbit/s), Ethernet, Type-C, PMIC, CPU topology |
 | 8-13 Aug | First image composed by our own build boots from SD |

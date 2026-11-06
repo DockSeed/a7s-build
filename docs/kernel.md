@@ -19,7 +19,7 @@ the build) is described there (`docs/kernel.md`).
 
 | `A7S_KERNEL` | The image's kernel | The aic8800 driver |
 |---|---|---|
-| `release` (default) | the Debian packages `linux-image` and `linux-headers` of a release of the recipe, downloaded and installed with dpkg | built by DKMS in the image, against the installed headers |
+| `release` (default) | the *Debian* packages `linux-image` and `linux-headers` of a release of the recipe, downloaded and installed with dpkg | built by DKMS in the image, against the installed headers |
 | `build` | built here from source by the recipe (`./build.sh kernel`), copied into the image | built by the recipe with the kernel, copied into the image |
 
 Stages: `fetch-kernel` (the recipe at the pin; with `release` also the
@@ -89,7 +89,7 @@ What the image gets:
 - `a7s-kernel-hook`, installed before the kernel packages ([below](#updating-the-kernel-on-the-board)).
 - `extlinux.conf` names those files directly (`kernel /boot/vmlinuz-<release>`,
   `fdt /usr/lib/linux-image-<release>/allwinner/sun60i-a733-cubie-a7s.dtb`), the
-  paths Debian's tools use, instead of the copies `build` writes to `/boot`.
+  paths *Debian*'s tools use, instead of the copies `build` writes to `/boot`.
 - The driver: the recipe's releases carry no AIC8800 driver. The wifi stage
   packages the driver's source (the upstream commit of `scripts/stages/wifi.sh`
   with the recipe's `out-of-tree/aic8800/patches`) as `a7s-aic8800-dkms`, with a

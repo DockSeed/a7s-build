@@ -14,13 +14,13 @@ per architecture. sha256 of `a7s-trixie-minimal.img.xz`:
 | Host | sha256 |
 |---|---|
 | x86_64, Fedora 44, rootless podman 5.8 | `330cfb393112f570e526d60a1e1bc50add5ac48b8e6eafb00901d2a4c28f3e5b` |
-| aarch64, Debian 13, rootless podman 5.4 | `07227f22a3ec51879148ee77dc08e977de226b4280ce6b49033b84446640615e` |
+| aarch64, *Debian* 13, rootless podman 5.4 | `07227f22a3ec51879148ee77dc08e977de226b4280ce6b49033b84446640615e` |
 
 ## What is pinned
 
 | Input | Pinned by | Checked |
 |---|---|---|
-| Builder base image | digest of the Debian `trixie` multi-arch index in `container/Containerfile` | by the engine on pull |
+| Builder base image | digest of the *Debian* `trixie` multi-arch index in `container/Containerfile` | by the engine on pull |
 | Builder packages | `container/packages.lock`: one snapshot.debian.org timestamp and the exact `name:arch=version` of every package, both architectures | image build fails unless the installed set equals the lock |
 | Builder package list | `container/packages.d/*.txt` | image build fails while a package is not in the lock |
 | Root filesystem packages | `A7S_SNAPSHOT` (APT sources point at that snapshot) | APT, against the signed `InRelease` |

@@ -1,8 +1,13 @@
 # a7s-build
 
-Build your own Debian 13 (trixie, arm64) image for the Radxa Cubie A7S
-(Allwinner A733): boot chain and Linux 6.18 with the A733 patch series (each a separate recipe,
-pinned to a commit), root filesystem and a flashable image, all from one `./build.sh`, inside a container.
+Build a disk image for the Radxa Cubie A7S (Allwinner A733) from the
+packages of *Debian* 13 (trixie, arm64), with a boot chain and Linux 6.18 with
+the A733 patch series that are not part of *Debian* (each a separate recipe,
+pinned to a commit): root filesystem and a flashable image, all from one
+`./build.sh`, inside a container. a7s-build is unofficial and not affiliated
+with or authorized by *Debian*, Radxa or Allwinner. *Debian* is a registered
+trademark owned by Software in the Public Interest, Inc.
+
 **You build your own image. We ship no image and no blob**: every vendor binary
 is downloaded at build time from its public origin and checked against a
 sha256 committed here.
@@ -73,7 +78,7 @@ accepts logins only once a password is set. SSH host keys, machine ID and so on
 are generated at first boot.
 
 SSH access: from then on `a7s` can log in over SSH with that password from your
-network, as on a default Debian install (`PasswordAuthentication` is on).
+network, as on a default *Debian* install (`PasswordAuthentication` is on).
 `a7s` has sudo. `root` is locked and has no password login. For key-only login,
 add your key and set `PasswordAuthentication no` in a file under
 `/etc/ssh/sshd_config.d/`.
@@ -81,7 +86,7 @@ add your key and set `PasswordAuthentication no` in a file under
 ## What runs on the board
 
 Both images run SSH and NetworkManager (which also writes `/etc/resolv.conf`,
-as on a Debian install). The desktop image adds Debian's desktop defaults, some
+as on a *Debian* install). The desktop image adds *Debian*'s desktop defaults, some
 of which talk to the local network:
 
 - `avahi-daemon`: mDNS/DNS-SD, announces and finds services on the local network
@@ -96,7 +101,7 @@ Language and keyboard: the desktop image uses English (`en_US.UTF-8`) and the
 US layout on the consoles, the login screen and the desktop; the minimal image
 uses `C.UTF-8` and the US layout. To switch the desktop image's layout, for
 example to German, run `sudo dpkg-reconfigure keyboard-configuration` and
-reboot (`localectl` does not stick on Debian).
+reboot (`localectl` does not stick on *Debian*).
 
 The board has no battery for its clock: after power-on the clock starts at the
 time the image was built, and NTP sets it once the network is up.
@@ -110,7 +115,7 @@ off. They are harmless.
 
 ## Updates
 
-Debian's packages update as on any Debian install: security updates install
+*Debian*'s packages update as on any *Debian* install: security updates install
 themselves once a day (`unattended-upgrades`), and `sudo apt update && sudo
 apt upgrade` brings the rest.
 
@@ -210,7 +215,7 @@ Environment variables, defaults in [config/defaults.conf](config/defaults.conf).
 | `A7S_DESKTOP` | `0` | `1`: Xfce desktop (LightDM) and patched xfwm4 |
 | `A7S_USER` | `a7s` | login user |
 | `A7S_HOSTNAME` | `a7s` | host name |
-| `A7S_KERNEL` | `release` | `release`: install the Debian packages of a pinned release of the kernel recipe and build the WLAN driver with DKMS; `build`: compile the kernel here ([docs/kernel.md](docs/kernel.md)) |
+| `A7S_KERNEL` | `release` | `release`: install the *Debian* packages of a pinned release of the kernel recipe and build the WLAN driver with DKMS; `build`: compile the kernel here ([docs/kernel.md](docs/kernel.md)) |
 | `A7S_SNAPSHOT` | fixed timestamp | snapshot.debian.org time of the packages; empty = live archive (not reproducible) |
 | `A7S_ENGINE` | podman, else docker | container engine |
 | `A7S_WORK`, `A7S_OUT`, `A7S_CACHE` | `work`, `out`, `cache` | scratch, output and download-cache directories |
@@ -245,13 +250,13 @@ or serial console.
 One human and AI coding agents (Claude). The scripts, the container recipe and
 the documentation were written by the agents. The decisions were the human's:
 
-- to build a plain Debian on a mainline-based kernel;
+- to build a plain *Debian* on a mainline-based kernel;
 - to follow the 6.18 LTS line and take stable releases as separate commits;
 - to keep the boot chain, the kernel and the image recipe in three repositories,
   with this one pinning the other two to commits and checking the sha256 of the
   result, no copies;
-- to ship Debian as Debian: no project name, logo or login banner in the
-  image, nothing that presents Debian's work as ours;
+- to ship *Debian* as *Debian*: no project name, logo or login banner in the
+  image, nothing that presents *Debian*'s work as ours;
 - what counts as proven: a statement about the hardware is made only after it
   was measured on a board, and a change to the recipe is published only after
   the image it builds has booted.
@@ -266,10 +271,10 @@ concerned. Their work is what made this project possible.
 
 ## Licence
 
-a7s-build is unofficial and not affiliated with or authorized by Debian,
-Radxa or Allwinner. Debian is a registered trademark owned by Software in the
+a7s-build is unofficial and not affiliated with or authorized by *Debian*,
+Radxa or Allwinner. *Debian* is a registered trademark owned by Software in the
 Public Interest, Inc. Problems with images built from this recipe belong in this
-repository, not in Debian's bug tracker.
+repository, not in *Debian*'s bug tracker.
 
 This project does not distribute images and does not support their
 distribution. Anyone who distributes an image built with this recipe does so

@@ -4,7 +4,7 @@ The last three stages of `./build.sh`:
 
 | Stage | Output |
 |---|---|
-| `rootfs` | Debian trixie arm64 root filesystem in `work/rootfs/` |
+| `rootfs` | *Debian* trixie arm64 root filesystem in `work/rootfs/` |
 | `image` | `out/a7s-trixie-minimal.img` (or `-desktop.img`) + `.sha256` |
 | `compress` | `out/…img.xz` + `.sha256` (replaces the raw image) |
 
@@ -61,24 +61,24 @@ NVMe host ID, gives its disk and root filesystem their own IDs
 ([Disk and filesystem IDs](#disk-and-filesystem-ids)), and grows the root
 partition to the end of its disk. The desktop
 image also makes its own ssl-cert snakeoil certificate and its icon caches
-(none of them ship in the image, as in Debian's live images).
+(none of them ship in the image, as in *Debian*'s live images).
 
 ## What is in it
 
-Debian 13 minbase plus: systemd, NetworkManager (Ethernet, WLAN), Bluetooth,
-OpenSSH, systemd-timesyncd, kmscon on tty1, Debian's Mesa from
+*Debian* 13 minbase plus: systemd, NetworkManager (Ethernet, WLAN), Bluetooth,
+OpenSSH, systemd-timesyncd, kmscon on tty1, *Debian*'s Mesa from
 trixie-backports (PowerVR Vulkan driver), zram swap, AppArmor, nftables, and
 the usual tools (`ip`, `iw`, `ethtool`, `lspci`, `lsusb`, `nvme`, `curl`,
 `nano`, …). The full list with reasons: `scripts/distro/debian/packages.sh`.
 
-AppArmor is the `apparmor` package every Debian install has (Debian's kernel
+AppArmor is the `apparmor` package every *Debian* install has (*Debian*'s kernel
 packages recommend it). `apparmor.service` loads its profiles when the kernel
 has AppArmor and is skipped otherwise.
 
-Security updates from Debian install themselves once a day
-(`unattended-upgrades`, as in Debian's cloud images; origins Debian and
-Debian-Security). This covers Debian's packages, not the kernel: the kernel
-is not a Debian package.
+Security updates from *Debian* install themselves once a day
+(`unattended-upgrades`, as in *Debian*'s cloud images; origins `Debian` and
+`Debian-Security`). This covers *Debian*'s packages, not the kernel: the kernel
+is not a *Debian* package.
 
 ## Swap
 
@@ -90,27 +90,27 @@ or boot with `systemd.zram=0`.
 
 Kubernetes: the kubelet refuses to start with swap unless `failSwapOn: false`;
 k3s sets that itself, so `curl -sfL https://get.k3s.io | sh -` installs as
-on any Debian system with swap. Pods do not swap (the kubelet's default
+on any *Debian* system with swap. Pods do not swap (the kubelet's default
 `memorySwap.swapBehavior: NoSwap`); other kubelets need `failSwapOn: false`
 or swap switched off.
 
 apt points at `deb.debian.org` and `security.debian.org` (`main
-non-free-firmware`, as a Debian 13 install writes them), so
-`sudo apt update && sudo apt upgrade` brings normal Debian updates. Only
+non-free-firmware`, as a *Debian* 13 install writes them), so
+`sudo apt update && sudo apt upgrade` brings normal *Debian* updates. Only
 kmscon, libtsm4 and Mesa come from trixie-backports (pinned).
 
 Kernel side: the kernel, device tree and modules of the kernel stage (with the
 WLAN/BT driver aic8800), the GPU firmware, and the WLAN/BT firmware when the
 wifi stage built it.
 
-With `A7S_KERNEL=build` the kernel is not a Debian package: the image
+With `A7S_KERNEL=build` the kernel is not a *Debian* package: the image
 stage copies it to `/boot/Image` and `/usr/lib/modules`, and U-Boot boots it
 without an initrd. The package `a7s-kernel` holds no files; it tells apt what
-that kernel provides (`wireguard-modules`, as Debian's kernel packages do), so
-installing `wireguard-tools` or `wireguard` brings no Debian kernel and no
-`initramfs-tools`. A Debian kernel installed by name (`linux-image-arm64`)
+that kernel provides (`wireguard-modules`, as *Debian*'s kernel packages do), so
+installing `wireguard-tools` or `wireguard` brings no *Debian* kernel and no
+`initramfs-tools`. A *Debian* kernel installed by name (`linux-image-arm64`)
 lands in `/boot` but is not booted: `extlinux.conf` names only the image's
-kernel, and the hook below never makes a Debian kernel the default.
+kernel, and the hook below never makes a *Debian* kernel the default.
 
 With the default `A7S_KERNEL=release` the kernel is the packages
 `linux-image-<release>` and `linux-headers-<release>` (with the hook package
