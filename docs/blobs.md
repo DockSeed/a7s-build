@@ -8,8 +8,8 @@ may not be redistributed. "Unknown" means no licence text came with the file.
 
 | What | Origin | Pin | Licence | Redistribute? |
 |---|---|---|---|---|
-| Kernel recipe `a7s-linux-lts` (Linux 6.18.60 and the patch series; fetches the row below itself) | github.com/DockSeed/a7s-linux-lts | commit `2142cd7d6ab1`, `scripts/stages/kernel.sh` | GPL-2.0 | yes |
-| Linux 6.18.60 | cdn.kernel.org | by `a7s-linux-lts`: sha256 | GPL-2.0 | yes |
+| Kernel recipe `a7s-linux-lts` (Linux 6.18.62 and the patch series; fetches the row below itself) | github.com/DockSeed/a7s-linux-lts | commit `d1176934016f`, `scripts/stages/kernel.sh` | GPL-2.0 | yes |
+| Linux 6.18.62 | cdn.kernel.org | by `a7s-linux-lts`: sha256 | GPL-2.0 | yes |
 | Kernel packages `linux-image`, `linux-headers`, `a7s-kernel-hook` (unless `A7S_KERNEL=build`) | github.com/DockSeed/a7s-linux-lts, the release of `KERNEL_RELEASE_TAG` | sha256 of each file, `scripts/stages/kernel.sh` | GPL-2.0 | yes |
 | Boot-chain recipe `a733-bootchain` (U-Boot, TF-A and the patches on both; fetches the rows below itself) | github.com/DockSeed/a733-bootchain | commit `bd0f37556b82`, `scripts/stages/bootchain.sh` | GPL / BSD-3-Clause, per file | yes |
 | Boot-chain package `u-boot-dlan17` (build glue, with the DRAM blob `awbin/a733/ddr.bin`) | github.com/radxa-pkg/u-boot-dlan17 | by `a733-bootchain`: commit, `ddr.bin` sha256 | glue GPL; `ddr.bin` closed vendor code, no licence text | `ddr.bin`: no |
