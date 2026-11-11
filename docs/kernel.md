@@ -8,7 +8,7 @@ to one commit (`KERNEL_RECIPE_COMMIT` in `scripts/stages/kernel.sh`):
 | | |
 |---|---|
 | Repository | `https://github.com/DockSeed/a7s-linux-lts` |
-| Pinned commit | `d1176934016f` |
+| Pinned commit | `d83a34b7c475` |
 | Result | `Image`, `sun60i-a733-cubie-a7s.dtb`, `config`, `System.map`, `modules/` (with aic8800), `KERNEL-ID` |
 
 Changes to the series are made there only; here the pin moves. What the kernel
@@ -36,8 +36,8 @@ directory (`work/linux-<version>`), and writes the result to `out/`. The recipe
 also builds the AIC8800 WLAN/BT driver against its kernel tree; the two modules
 are in `out/modules/`, and `KERNEL-ID` names the driver's upstream commit
 (`aic8800=`). `A7S_KERNEL_REVISION` (`r1`, `t2`, ...) gives the kernel a
-revision as the recipe's release workflow does (kernel release `6.18.62-r1`);
-empty, the kernel release is `6.18.62`.
+revision as the recipe's release workflow does (kernel release `6.18.63-r1`);
+empty, the kernel release is `6.18.63`.
 
 The image stage takes `Image`, the dtb and `modules/` as they are. Before it
 does, it checks that the `key=` field of `KERNEL-ID` is the key
@@ -52,7 +52,7 @@ the kernel does not change when only this repository does.
 
 The recipe's step `hook` also builds the package `a7s-kernel-hook` from the
 pinned checkout (no kernel build is needed for it); the kernel stage keeps it in
-`out/kernel-hook/`. Its version has the revision `t0` (`6.18.62~t0-1`), which
+`out/kernel-hook/`. Its version has the revision `t0` (`6.18.63~t0-1`), which
 only this step sets.
 
 ### `A7S_KERNEL=release`
@@ -68,7 +68,7 @@ result to a release. `scripts/stages/kernel.sh` pins one release:
 | URL | `https://github.com/DockSeed/a7s-linux-lts/releases/download/<tag>/<file>` |
 
 (The files of a test build are named without `~`: the package version
-`6.18.59~t4-1` is `6.18.59.t4-1` in the file name; a release's `6.18.62-1` has
+`6.18.59~t4-1` is `6.18.59.t4-1` in the file name; a release's `6.18.63-1` has
 none.) The
 download goes through `fetch_verified` like every other: the sha256 is checked
 before a file enters the cache and again on every use; a mismatch stops the

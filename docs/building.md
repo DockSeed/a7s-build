@@ -61,7 +61,7 @@ Environment variables, defaults in `config/defaults.conf` (printed by
 | `A7S_DISTRO` | `debian` | root filesystem flavour (`scripts/distro/<name>/`) |
 | `A7S_SUITE` | `trixie` | *Debian* suite |
 | `A7S_KERNEL` | `release` | `release`: the *Debian* packages of a pinned release of a7s-linux-lts are downloaded (sha256-pinned) and installed with dpkg, the WLAN driver is built by DKMS; `build`: the kernel is compiled here ([kernel](kernel.md)) |
-| `A7S_KERNEL_REVISION` | empty | `A7S_KERNEL=build` only: revision of the kernel build (`r1`, `t2`), as in the kernel release `6.18.62-t2` |
+| `A7S_KERNEL_REVISION` | empty | `A7S_KERNEL=build` only: revision of the kernel build (`r1`, `t2`), as in the kernel release `6.18.63-t2` |
 | `A7S_SNAPSHOT` | `20261101T000000Z` | snapshot.debian.org timestamp of the image's packages; empty = live archive, not reproducible |
 | `A7S_DESKTOP` | `0` | `1`: Xfce desktop and patched xfwm4 |
 | `A7S_USER`, `A7S_HOSTNAME` | `a7s`, `a7s` | login user and host name |

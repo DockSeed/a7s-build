@@ -122,8 +122,8 @@ apt upgrade` brings the rest.
 New kernels come as releases of the kernel recipe, the repository
 [a7s-linux-lts](https://github.com/DockSeed/a7s-linux-lts/releases) with the
 scripts and patches that build the kernel; `sudo a7s-kernel-update` installs the
-newest. A release has a tag (`v6.18.62-R1`) and the kernel in it has a release
-name (`6.18.62-r1`, what `uname -r` prints): both name the same release. There is no guarantee for how long new
+newest. A release has a tag (`v6.18.63-R1`) and the kernel in it has a release
+name (`6.18.63-r1`, what `uname -r` prints): both name the same release. There is no guarantee for how long new
 releases will be published. Kernel releases follow Linux stable when we get to
 it. Whether and how soon a fix from Linux, security fixes included, reaches a
 release is not guaranteed. If a board needs kernel fixes on a schedule of its
@@ -136,14 +136,14 @@ the new kernel on the board).
 
     sudo a7s-kernel-update
 
-For a given release: `sudo a7s-kernel-update v6.18.62-R1`. A published test
+For a given release: `sudo a7s-kernel-update v6.18.63-R1`. A published test
 build (a pre-release, which "latest" leaves out) is named the same way,
-`v6.18.62-T1`; the command says that it is a test build.
+`v6.18.63-T1`; the command says that it is a test build.
 It downloads the release's packages, checks their sha256 against the release's
 `SHA256SUMS` (on a mismatch it removes them and stops), installs them and
 removes the download. The last line of its output tells what happens next:
 
-- `kernel 6.18.62-r1 starts at the next boot. Next: sudo reboot`: all is in place.
+- `kernel 6.18.63-r1 starts at the next boot. Next: sudo reboot`: all is in place.
 - `already up to date`: this kernel is installed and set to start; nothing was done.
 - `installed but will NOT start at the next boot`: above that line, the
   messages of `a7s-kernel-hook` give the reason and the command to run once the
@@ -160,7 +160,7 @@ removes the download. The last line of its output tells what happens next:
     sudo reboot
 
 **3. Check what runs.** `uname -r` prints the release of the running kernel
-(`6.18.62-r1`). `grep kernel /boot/extlinux/extlinux.conf` names the kernel
+(`6.18.63-r1`). `grep kernel /boot/extlinux/extlinux.conf` names the kernel
 that starts at the next boot, `grep kernel /boot/extlinux/extlinux-fallback.conf`
 the one safe mode starts.
 
@@ -185,7 +185,7 @@ now becomes the safe-mode kernel.
 
 **5. Remove a kernel you do not want.**
 
-    sudo apt remove linux-image-6.18.62-r1 linux-headers-6.18.62-r1
+    sudo apt remove linux-image-6.18.63-r1 linux-headers-6.18.63-r1
 
 `apt` refuses while `extlinux.conf` or `extlinux-fallback.conf` names the
 kernel; after step 4 neither names the failed one, so this works. An older kernel
