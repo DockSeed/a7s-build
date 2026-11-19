@@ -338,7 +338,7 @@ Package: ${KERNEL_PACKAGE}
 Version: 1
 Architecture: all
 Multi-Arch: foreign
-Maintainer: a7s-build
+Maintainer: ${A7S_MAINTAINER}
 Section: kernel
 Priority: optional
 Provides: ${provides}

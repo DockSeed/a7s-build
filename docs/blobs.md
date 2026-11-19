@@ -17,7 +17,7 @@ may not be redistributed. "Unknown" means no licence text came with the file.
 | TF-A | git.trustedfirmware.org/TF-A/trusted-firmware-a master | by `a733-bootchain`: commit | BSD-3-Clause | yes |
 | AIC8800 driver | github.com/radxa-pkg/aic8800 | commit `b6e136a9fe30`, by `a7s-linux-lts` (`build`, or its release file `a7s-aic8800-dkms`, built by DKMS) | GPL-2.0 | yes |
 | AIC8800D80 firmware (7 files) | same | commit `b6e136a9fe30` in `scripts/stages/wifi.sh`, sha256 per file, `out-of-tree/aic8800/firmware.sha256` | vendor, no grant | no |
-| GPU firmware `rogue_36.56.104.183_v1.fw` | gitlab.freedesktop.org/imagination/linux-firmware | commit `8a58f81883f7`, sha256 | `LICENSE.powervr`: binary redistribution unmodified, with notice | yes, with the licence file |
+| GPU firmware `rogue_36.56.104.183_v1.fw` | gitlab.freedesktop.org/imagination/linux-firmware | commit `8a58f81883f7`, sha256 | `LICENSE.powervr`: binary redistribution unmodified, with notice and disclaimer; the name of Imagination or its suppliers not used to endorse or promote without written permission; no reverse engineering, decompilation or disassembly; only with products designed and licensed by Imagination | yes, with the licence file |
 | ORC 0.4.41, xfwm4 4.20.0-1 sources | gstreamer.freedesktop.org, deb.debian.org / snapshot.debian.org | sha256 | BSD / GPL-2.0+ | yes |
 
 A new download is added here in the same change that adds the fetch.

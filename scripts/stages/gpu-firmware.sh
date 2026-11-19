@@ -16,9 +16,12 @@
 # version string says so (1.1.OS@6976702).
 #
 # LICENCE. LICENSE.powervr in that repository grants redistribution in binary
-# form without modification, provided the copyright notice travels with it, and
-# forbids reverse engineering. That is why the licence text is fetched as well
-# and installed next to the firmware.
+# form without modification, on four conditions: the copyright notice and the
+# disclaimer travel with it; the name of Imagination (or of its suppliers) is
+# not used to endorse or promote derived products without written permission;
+# no reverse engineering, decompilation or disassembly; it is used only with
+# products designed and licensed by Imagination. That is why the licence text
+# is fetched as well and installed next to the firmware.
 #
 # What lands in OUT_DIR/gpu-firmware/: the firmware file and LICENSE.powervr.
 

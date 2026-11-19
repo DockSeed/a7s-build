@@ -51,7 +51,10 @@ XFWM4_FIX_SYMBOLS=(g_signal_handlers_block_matched g_signal_handlers_unblock_mat
 # SOURCE_DATE_EPOCH unset: an inherited one would change the package's sha256.
 XFWM4_CHANGELOG_DATE="Sat, 03 Oct 2026 00:00:00 +0000"
 XFWM4_CHANGELOG_TEXT="Block the xfconf channel callback while loadXfconfData() writes the defaults back (userspace/xfwm4/patches): the compositor started in the middle of loadSettings() without vsync on a user's first login, and init_compositor_screen() then logged 'Another compositing manager is running'."
-XFWM4_MAINTAINER="DockSeed <dockseed@proton.me>"
+# debian/control of Debian's source names Debian's maintainer. Our build names
+# A7S_MAINTAINER and keeps Debian's as XSBC-Original-Maintainer (dpkg shows it as
+# Original-Maintainer).
+XFWM4_ORIG_MAINTAINER="Debian Xfce Maintainers <debian-xfce@lists.debian.org>"
 XFWM4_APT_PIN="/etc/apt/preferences.d/xfwm4-a7s"
 XFWM4_DOC_DIR="/usr/local/share/doc/xfwm4-a7s"
 
@@ -87,6 +90,9 @@ xfwm4_check_deb() {  # <deb>
   [ "$(dpkg-deb -f "${deb}" Architecture)" = arm64 ] || die "xfwm4 check: ${deb##*/} is not an arm64 package"
   [ "$(dpkg-deb -f "${deb}" Version)" = "${XFWM4_DEB_VERSION}" ] \
     || die "xfwm4 check: ${deb##*/} is version $(dpkg-deb -f "${deb}" Version), not ${XFWM4_DEB_VERSION} -- Debian's package, not ours"
+  [ "$(dpkg-deb -f "${deb}" Maintainer)" = "${A7S_MAINTAINER}" ] \
+    && [ "$(dpkg-deb -f "${deb}" Original-Maintainer)" = "${XFWM4_ORIG_MAINTAINER}" ] \
+    || die "xfwm4 check: ${deb##*/} has Maintainer '$(dpkg-deb -f "${deb}" Maintainer)', Original-Maintainer '$(dpkg-deb -f "${deb}" Original-Maintainer)'"
   tmp="$(mktemp -d)"
   dpkg-deb --fsys-tarfile "${deb}" | tar -xf - -C "${tmp}" ./usr/bin/xfwm4 \
     || { rm -rf "${tmp:?}"; die "xfwm4 check: ${deb##*/} carries no /usr/bin/xfwm4"; }
@@ -187,13 +193,26 @@ stage_fetch_xfwm4() {
   {
     printf 'xfwm4 (%s) trixie; urgency=medium\n\n' "${XFWM4_DEB_VERSION}"
     printf '%s\n' "${XFWM4_CHANGELOG_TEXT}" | fold -s -w 72 | sed '1s/^/  * /; 2,$s/^/    /; s/[[:space:]]*$//'
-    printf '\n -- %s  %s\n\n' "${XFWM4_MAINTAINER}" "${XFWM4_CHANGELOG_DATE}"
+    printf '\n -- %s  %s\n\n' "${A7S_MAINTAINER}" "${XFWM4_CHANGELOG_DATE}"
     cat "${src}/debian/changelog"
   } > "${src}/debian/changelog.new"
   mv "${src}/debian/changelog.new" "${src}/debian/changelog"
   top="$(dpkg-parsechangelog -l "${src}/debian/changelog" -SVersion)"
   [ "${top}" = "${XFWM4_DEB_VERSION}" ] || die "debian/changelog starts with ${top}, expected ${XFWM4_DEB_VERSION}"
+  xfwm4_set_maintainer "${src}/debian/control"
   log "xfwm4: Debian's ${XFWM4_DEBIAN_VERSION} source + ${#SERIES[@]} patch(es) -> ${src} (${XFWM4_DEB_VERSION})"
+}
+
+# The source stanza of <control>: Maintainer becomes A7S_MAINTAINER, Debian's
+# (which must be XFWM4_ORIG_MAINTAINER) moves to XSBC-Original-Maintainer.
+xfwm4_set_maintainer() {  # <control>
+  local c="$1" m
+  m="$(sed -n '1,/^$/s/^Maintainer: //p' "${c}")"
+  [ "${m}" = "${XFWM4_ORIG_MAINTAINER}" ] \
+    || die "xfwm4: debian/control names the maintainer '${m}', the pin says ${XFWM4_ORIG_MAINTAINER}"
+  ! grep -q '^XSBC-Original-Maintainer:' "${c}" || die "xfwm4: debian/control has an XSBC-Original-Maintainer already"
+  sed -i "1,/^\$/s|^Maintainer: .*|Maintainer: ${A7S_MAINTAINER}\nXSBC-Original-Maintainer: ${m}|" "${c}"
+  [ "$(sed -n '1,/^$/s/^Maintainer: //p' "${c}")" = "${A7S_MAINTAINER}" ] || die "xfwm4: setting the maintainer in debian/control failed"
 }
 
 # A dedicated build chroot under WORK_DIR, and why it is a chroot.
