@@ -5,8 +5,8 @@ packages of *Debian* 13 (trixie, arm64), with a boot chain and Linux 6.18 with
 the A733 patch series that are not part of *Debian* (each a separate recipe,
 pinned to a commit): root filesystem and a flashable image, all from one
 `./build.sh`, inside a container. a7s-build is unofficial and not affiliated
-with or authorized by *Debian*, Radxa or Allwinner. *Debian* is a registered
-trademark owned by Software in the Public Interest, Inc.
+with or authorized by *Debian*, Radxa, Allwinner or Imagination. *Debian* is a
+registered trademark owned by Software in the Public Interest, Inc.
 
 **You build your own image. We ship no image and no blob**: every vendor binary
 is downloaded at build time from its public origin and checked against a
@@ -272,9 +272,19 @@ concerned. Their work is what made this project possible.
 ## Licence
 
 a7s-build is unofficial and not affiliated with or authorized by *Debian*,
-Radxa or Allwinner. *Debian* is a registered trademark owned by Software in the
-Public Interest, Inc. Problems with images built from this recipe belong in this
-repository, not in *Debian*'s bug tracker.
+Radxa, Allwinner or Imagination. *Debian* is a registered trademark owned by
+Software in the Public Interest, Inc. Problems with images built from this
+recipe belong in this repository, not in *Debian*'s bug tracker.
+
+Mesa implements OpenGL, OpenGL ES and Vulkan. Mesa lists its PowerVR Vulkan
+driver as conformant only on other PowerVR GPUs; this GPU (BVNC 36.56.104.183)
+is not among them, and this project makes no conformance claim.
+Linux® is the registered trademark of Linus Torvalds in the U.S. and other
+countries. Vulkan and the Vulkan logo are registered trademarks of the Khronos
+Group Inc. OpenGL® and the oval logo are trademarks or registered trademarks of
+Hewlett Packard Enterprise in the United States and/or other countries
+worldwide. OpenGL is a registered trademark and the OpenGL ES logo is a
+trademark of Hewlett Packard Enterprise used by permission by Khronos.
 
 This project does not distribute images and does not support their
 distribution. Anyone who distributes an image built with this recipe does so
