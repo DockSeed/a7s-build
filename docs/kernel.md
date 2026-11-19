@@ -8,7 +8,7 @@ to one commit (`KERNEL_RECIPE_COMMIT` in `scripts/stages/kernel.sh`):
 | | |
 |---|---|
 | Repository | `https://github.com/DockSeed/a7s-linux-lts` |
-| Pinned commit | `d83a34b7c475` |
+| Pinned commit | `64ada0352f34` |
 | Result | `Image`, `sun60i-a733-cubie-a7s.dtb`, `config`, `System.map`, `modules/` (with aic8800), `KERNEL-ID` |
 
 Changes to the series are made there only; here the pin moves. What the kernel
@@ -36,8 +36,8 @@ directory (`work/linux-<version>`), and writes the result to `out/`. The recipe
 also builds the AIC8800 WLAN/BT driver against its kernel tree; the two modules
 are in `out/modules/`, and `KERNEL-ID` names the driver's upstream commit
 (`aic8800=`). `A7S_KERNEL_REVISION` (`r1`, `t2`, ...) gives the kernel a
-revision as the recipe's release workflow does (kernel release `6.18.63-r1`);
-empty, the kernel release is `6.18.63`.
+revision as the recipe's release workflow does (kernel release `6.18.64-r1`);
+empty, the kernel release is `6.18.64`.
 
 The image stage takes `Image`, the dtb and `modules/` as they are. Before it
 does, it checks that the `key=` field of `KERNEL-ID` is the key
@@ -52,7 +52,7 @@ the kernel does not change when only this repository does.
 
 The recipe's step `hook` also builds the package `a7s-kernel-hook` from the
 pinned checkout (no kernel build is needed for it); the kernel stage keeps it in
-`out/kernel-hook/`. Its version has the revision `t0` (`6.18.63~t0-1`), which
+`out/kernel-hook/`. Its version has the revision `t0` (`6.18.64~t0-1`), which
 only this step sets.
 
 ### `A7S_KERNEL=release`
@@ -63,12 +63,12 @@ result to a release. `scripts/stages/kernel.sh` pins one release:
 | | |
 |---|---|
 | Release | `KERNEL_RELEASE_TAG` (the kernel release is `KERNEL_RELEASE_NAME`), built from the pinned commit |
-| Files | `linux-image-<release>_<version>_arm64.deb`, `linux-headers-<release>_<version>_arm64.deb`, `a7s-kernel-hook_<version>_all.deb` |
+| Files | `linux-image-<release>_<version>_arm64.deb`, `linux-headers-<release>_<version>_arm64.deb`, `a7s-kernel-hook_<version>_all.deb`, `a7s-aic8800-dkms_<version>_all.deb` |
 | Pin | the sha256 of each file, `KERNEL_RELEASE_*_SHA256` |
 | URL | `https://github.com/DockSeed/a7s-linux-lts/releases/download/<tag>/<file>` |
 
 (The files of a test build are named without `~`: the package version
-`6.18.59~t4-1` is `6.18.59.t4-1` in the file name; a release's `6.18.63-1` has
+`6.18.59~t4-1` is `6.18.59.t4-1` in the file name; a release's `6.18.64-1` has
 none.) The
 download goes through `fetch_verified` like every other: the sha256 is checked
 before a file enters the cache and again on every use; a mismatch stops the
@@ -90,13 +90,13 @@ What the image gets:
 - `extlinux.conf` names those files directly (`kernel /boot/vmlinuz-<release>`,
   `fdt /usr/lib/linux-image-<release>/allwinner/sun60i-a733-cubie-a7s.dtb`), the
   paths *Debian*'s tools use, instead of the copies `build` writes to `/boot`.
-- The driver: the recipe's releases carry no AIC8800 driver. The wifi stage
-  packages the driver's source (the upstream commit of `scripts/stages/wifi.sh`
-  with the recipe's `out-of-tree/aic8800/patches`) as `a7s-aic8800-dkms`, with a
-  `dkms.conf`. The image installs it with `dkms`, `gcc` and `make`; installing
-  the kernel's headers package makes DKMS build `aic_load_fw.ko` and
-  `aic8800_fdrv.ko` into `/usr/lib/modules/<release>/updates/dkms/`. The DKMS
-  package's version names the patch series it was made from.
+- The driver: the recipe's release carries the driver's source (the upstream
+  commit of `scripts/stages/wifi.sh` with the recipe's
+  `out-of-tree/aic8800/patches`) as `a7s-aic8800-dkms`, with a `dkms.conf`,
+  pinned by sha256 in `scripts/stages/kernel.sh`. The image installs it with
+  `dkms`, `gcc` and `make`; installing the kernel's headers package makes DKMS
+  build `aic_load_fw.ko` and `aic8800_fdrv.ko` into
+  `/usr/lib/modules/<release>/updates/dkms/`.
 - The firmware stays as it is: the wifi stage's seven files, verified against
   `out-of-tree/aic8800/firmware.sha256`.
 

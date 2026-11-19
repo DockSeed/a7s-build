@@ -1,4 +1,4 @@
-# AIC8800D80 firmware, from radxa-pkg/aic8800 tag 5.0+git20260123.5f7be68d-8,
+# AIC8800D80 firmware, from radxa-pkg/aic8800 tag 5.0+git20260123.5f7be68d-11,
 # subtree src/USB/driver_fw/fw/aic8800D80/. Hashes computed here, not taken from
 # the vendor manifest. In this tag the MD5 sums in src/firmware_version.md match
 # the six files it lists; aic_userconfig_8800d80.txt is not listed there (see

@@ -27,26 +27,30 @@
 # The recipe, pinned to a COMMIT (main moves). To bump it: build, compare the
 # result, test on a board, then change it here.
 KERNEL_RECIPE_URL="https://github.com/DockSeed/a7s-linux-lts.git"
-KERNEL_RECIPE_COMMIT="d83a34b7c47557296c72fa41e745f08b58c718dd"
+KERNEL_RECIPE_COMMIT="64ada0352f34d9ef6333eecaf8b70ba30370e916"
 
 # The release of that recipe the image can install instead of building the
 # kernel (A7S_KERNEL=release). The packages are pinned by sha256; the release
 # was built by the recipe's release workflow from KERNEL_RELEASE_COMMIT, which
-# must be the recipe commit pinned above (the driver's patches come from it).
+# must be the recipe commit pinned above (wifi.sh checks the driver pins
+# against it).
 # The asset names are the ones of the release's SHA256SUMS: the recipe names
 # the files of a test build without "~" (6.18.59~t4-1 is 6.18.59.t4-1); a
-# release's 6.18.63-1 has none.
-KERNEL_RELEASE_TAG="v6.18.63-R1"
-KERNEL_RELEASE_COMMIT="d83a34b7c47557296c72fa41e745f08b58c718dd"
-KERNEL_RELEASE_NAME="6.18.63-r1"
+# release's 6.18.64-1 has none.
+KERNEL_RELEASE_TAG="v6.18.64-R1"
+KERNEL_RELEASE_COMMIT="64ada0352f34d9ef6333eecaf8b70ba30370e916"
+KERNEL_RELEASE_NAME="6.18.64-r1"
 KERNEL_RELEASE_DTB="allwinner/sun60i-a733-cubie-a7s.dtb"
 KERNEL_RELEASE_BASE_URL="https://github.com/DockSeed/a7s-linux-lts/releases/download/${KERNEL_RELEASE_TAG}"
-KERNEL_RELEASE_IMAGE_DEB="linux-image-${KERNEL_RELEASE_NAME}_6.18.63-1_arm64.deb"
-KERNEL_RELEASE_IMAGE_SHA256="3cf80cff6990ed660cc8820cb63e4931b11359b8520153b1dfff84431b6ce9ea"
-KERNEL_RELEASE_HEADERS_DEB="linux-headers-${KERNEL_RELEASE_NAME}_6.18.63-1_arm64.deb"
-KERNEL_RELEASE_HEADERS_SHA256="fa295b7123f925a42c2b7988288882fe6fa9e366ca4b31a920c337ad4714dcc1"
-KERNEL_RELEASE_HOOK_DEB="a7s-kernel-hook_6.18.63-1_all.deb"
-KERNEL_RELEASE_HOOK_SHA256="096c2eaffdaee6de2f81a7f20deb9d29a4bd4464d764779a140b7ec08e3d058c"
+KERNEL_RELEASE_IMAGE_DEB="linux-image-${KERNEL_RELEASE_NAME}_6.18.64-1_arm64.deb"
+KERNEL_RELEASE_IMAGE_SHA256="a2558ec9e9c1a6e2a5fd9176e1655e0e0c239ca29c51a939695ab843228c3281"
+KERNEL_RELEASE_HEADERS_DEB="linux-headers-${KERNEL_RELEASE_NAME}_6.18.64-1_arm64.deb"
+KERNEL_RELEASE_HEADERS_SHA256="948d02adb9ac1efa32d4ddb2f0c18c7a1eb21e5e4bbc8f696aa307685456271b"
+KERNEL_RELEASE_HOOK_DEB="a7s-kernel-hook_6.18.64-1_all.deb"
+KERNEL_RELEASE_HOOK_SHA256="176244df05905e90c1f4660c9995192d4ae4c53bdb04aab7f9cef266e1127dbc"
+# The WLAN driver source for DKMS, from the same release (scripts/stages/wifi.sh).
+KERNEL_RELEASE_DKMS_DEB="a7s-aic8800-dkms_6.18.64-1_all.deb"
+KERNEL_RELEASE_DKMS_SHA256="9c9fe716ac252a9386253065ed2bededc33bd15f06985f19cb69d2d771b570bb"
 
 # Where the pinned recipe is checked out.
 kernel_dir() { printf '%s\n' "${WORK_DIR}/a7s-linux-lts"; }
