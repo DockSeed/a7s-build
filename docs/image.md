@@ -33,7 +33,8 @@ eMMC: boot the board from an SD card written as above, copy the image (or its
 not the card you booted from), write it with the same `dd` command, power off,
 remove the card.
 
-The image is 1.8 GiB (1.5 GiB with `A7S_KERNEL=build`); on the first boot the root partition grows to the end of
+The minimal image is 1.8 GiB (1.5 GiB with `A7S_KERNEL=build`; measured before
+the `mesa` stage), the desktop image 3.8 GiB; on the first boot the root partition grows to the end of
 its disk.
 
 ## First login
@@ -66,8 +67,8 @@ image also makes its own ssl-cert snakeoil certificate and its icon caches
 ## What is in it
 
 *Debian* 13 minbase plus: systemd, NetworkManager (Ethernet, WLAN), Bluetooth,
-OpenSSH, systemd-timesyncd, kmscon on tty1, *Debian*'s Mesa from
-trixie-backports (PowerVR Vulkan driver), zram swap, AppArmor, nftables, and
+OpenSSH, systemd-timesyncd, kmscon on tty1, Mesa 26.3.0 built by this recipe
+(PowerVR Vulkan driver; [below](#mesa)), zram swap, AppArmor, nftables, and
 the usual tools (`ip`, `iw`, `ethtool`, `lspci`, `lsusb`, `nvme`, `curl`,
 `nano`, …). The full list with reasons: `scripts/distro/debian/packages.sh`.
 
@@ -77,8 +78,8 @@ has AppArmor and is skipped otherwise.
 
 Security updates from *Debian* install themselves once a day
 (`unattended-upgrades`, as in *Debian*'s cloud images; origins `Debian` and
-`Debian-Security`). This covers *Debian*'s packages, not the kernel: the kernel
-is not a *Debian* package.
+`Debian-Security`). This covers *Debian*'s packages, not the kernel and not
+Mesa: neither is a *Debian* package.
 
 ## Swap
 
@@ -97,7 +98,7 @@ or swap switched off.
 apt points at `deb.debian.org` and `security.debian.org` (`main
 non-free-firmware`, as a *Debian* 13 install writes them), so
 `sudo apt update && sudo apt upgrade` brings normal *Debian* updates. Only
-kmscon, libtsm4 and Mesa come from trixie-backports (pinned).
+kmscon and libtsm4 come from trixie-backports (pinned).
 
 Kernel side: the kernel, device tree and modules of the kernel stage (with the
 WLAN/BT driver aic8800), the GPU firmware, and the WLAN/BT firmware when the
@@ -130,6 +131,38 @@ make a kernel package of the kernel recipe, installed later with `apt install
 that booted well in `extlinux-fallback.conf`. They are described in
 [kernel](kernel.md#updating-the-kernel-on-the-board). They change nothing while
 the image is built.
+
+## Mesa
+
+Mesa is the recipe's own build (`scripts/stages/mesa.sh`): Mesa 26.3.0 with the
+patches in `userspace/mesa/patches/`, packaged from *Debian*'s mesa source
+26.2.6-1 with `userspace/mesa/debian.diff`, version `26.3.0-1+a7s2`. The image
+has its runtime packages (`MESA_IMAGE_PACKAGES` in
+`scripts/distro/debian/packages.sh`) and no Mesa package of *Debian*'s; the
+`-dev` packages are build artefacts in `out/mesa-dev/`. `preferences.d/mesa-a7s`
+pins every package of the mesa source built by this recipe (`*+a7s*`, priority
+990), so apt keeps it whatever *Debian* publishes: a Mesa fix reaches the board
+only with a new build of this recipe. For the same reason `apt install
+libgbm-dev` (or any other package of the mesa source) fails on the board:
+*Debian*'s packages depend on *Debian*'s Mesa at the same version. Install the
+`-dev` packages from `out/mesa-dev/` instead, for example `sudo apt install
+./libgbm-dev_26.3.0-1+a7s2_arm64.deb`. The image carries the patches, `debian.diff` and the
+build record `MESA-ID` in `/usr/local/share/doc/mesa-a7s/`.
+
+Mesa lists its PowerVR Vulkan driver as not conformant on this GPU and starts
+it only in a process that has `PVR_I_WANT_A_BROKEN_VULKAN_DRIVER=1` set. The
+desktop image sets it for the X server alone: LightDM starts X through
+`/usr/libexec/a7s-xserver` (`/etc/lightdm/lightdm.conf.d/50-a7s-xserver.conf`),
+and modesetting draws with glamor (`/etc/X11/xorg.conf.d/20-a7s-modesetting.conf`),
+which renders through zink on that driver. The session does not get the
+variable, so applications render on the CPU and X shows their frames with
+glamor. With the variable in the session, Firefox rendered through zink itself
+and dropped a third or more of a video's frames on the board, and once, as it
+quit, the GPU reset a fragment job after a page fault (the kernel logs "Guilty
+lockup"); until that is solved, applications stay on the CPU by default. To
+try one application on the GPU:
+
+    PVR_I_WANT_A_BROKEN_VULKAN_DRIVER=1 <application>
 
 ## Switches
 

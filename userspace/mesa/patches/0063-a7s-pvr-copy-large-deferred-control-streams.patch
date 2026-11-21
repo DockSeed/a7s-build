@@ -1,0 +1,165 @@
+Description: pvr: copy deferred control streams of any size
+ vkCmdExecuteCommands() copies the host-side control stream of a secondary
+ command buffer recorded with RENDER_PASS_CONTINUE and SIMULTANEOUS_USE into
+ the primary with pvr_arch_csb_copy() (pvr_arch_csb.c). The function passed
+ the stream size in bytes to pvr_arch_csb_alloc_dwords(), which takes dwords,
+ so four times the needed space was reserved, and a stream larger than one
+ control stream buffer only reached pvr_finishme() and an assert.
+ pvr_csb_buffer_extend() always allocated one PVR_CMD_BUFFER_CSB_BO_SIZE
+ buffer and did not check that the request fits into it. With assertions
+ disabled, from about 1000 bytes of secondary control stream the reservation
+ ended beyond the buffer object, and the copy or the next commands of the
+ primary, including the stream link, were written past its end.
+ .
+ pvr_csb_buffer_extend() now takes the requested size and allocates a buffer
+ that holds the relocated state update, the request and the reserved link and
+ guard space, rounded up to PVR_CMD_BUFFER_CSB_BO_SIZE. Buffers of the
+ standard size are still taken from and returned to the per-device pool;
+ pvr_csb_bo_release() frees larger ones instead of pooling them.
+ pvr_arch_csb_copy() passes the size in dwords and sets the relocation mark,
+ so a link to a new buffer is placed at the current end of the destination
+ and the copied stream stays contiguous.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/vulkan/pvr_arch_csb.c
++++ b/src/imagination/vulkan/pvr_arch_csb.c
+@@ -97,7 +97,8 @@
+  * \param[in] csb Control Stream Builder object to extend.
+  * \return true on success and false otherwise.
+  */
+-static bool pvr_csb_buffer_extend(struct pvr_csb *csb)
++static bool pvr_csb_buffer_extend(struct pvr_csb *csb,
++                                  uint32_t required_space)
+ {
+    const uint8_t stream_link_space =
+       PVR_DW_TO_BYTES(pvr_cmd_length(VDMCTRL_STREAM_LINK0) +
+@@ -107,7 +108,8 @@
+    const uint32_t cache_line_size =
+       pvr_get_slc_cache_line_size(&csb->device->pdevice->dev_info);
+    size_t current_state_update_size = 0;
+-   struct pvr_bo *pvr_bo;
++   struct pvr_bo *pvr_bo = NULL;
++   uint64_t bo_size;
+    VkResult result;
+ 
+    /* Make sure extra space allocated for stream links is sufficient for both
+@@ -121,11 +123,25 @@
+    STATIC_ASSERT(ROGUE_VDMCTRL_GUARD_SIZE_DEFAULT ==
+                  ROGUE_CDMCTRL_GUARD_SIZE_DEFAULT);
+ 
+-   pvr_bo = pvr_csb_bo_pool_take(csb->device);
++   if (csb->pvr_bo) {
++      assert(csb->relocation_mark != NULL);
++      assert(csb->next >= csb->relocation_mark);
++
++      current_state_update_size =
++         (uint8_t *)csb->next - (uint8_t *)csb->relocation_mark;
++   }
++
++   bo_size = ALIGN_POT(current_state_update_size + required_space +
++                          stream_reserved_space,
++                       PVR_CMD_BUFFER_CSB_BO_SIZE);
++
++   if (bo_size == PVR_CMD_BUFFER_CSB_BO_SIZE)
++      pvr_bo = pvr_csb_bo_pool_take(csb->device);
++
+    if (!pvr_bo) {
+       result = pvr_bo_alloc(csb->device,
+                             csb->device->heaps.general_heap,
+-                            PVR_CMD_BUFFER_CSB_BO_SIZE,
++                            bo_size,
+                             cache_line_size,
+                             PVR_BO_ALLOC_FLAG_CPU_MAPPED,
+                             &pvr_bo);
+@@ -141,12 +157,6 @@
+       bool zero_after_move = PVR_IS_DEBUG_SET(DUMP_CONTROL_STREAM);
+       void *new_buffer = pvr_bo->bo->map;
+ 
+-      current_state_update_size =
+-         (uint8_t *)csb->next - (uint8_t *)csb->relocation_mark;
+-
+-      assert(csb->relocation_mark != NULL);
+-      assert(csb->next >= csb->relocation_mark);
+-
+       memcpy(new_buffer, csb->relocation_mark, current_state_update_size);
+ 
+ #if MESA_DEBUG
+@@ -183,9 +193,7 @@
+ /**
+  * \brief Provides a chunk of memory from the current csb buffer. In cases where
+  * the buffer is not able to fulfill the required amount of memory,
+- * #pvr_csb_buffer_extend() is called to allocate a new buffer. Maximum size
+- * allocable in bytes is #PVR_CMD_BUFFER_CSB_BO_SIZE - size of STREAM_LINK0
+- * and STREAM_LINK1 dwords.
++ * #pvr_csb_buffer_extend() is called to allocate a new buffer.
+  *
+  * \param[in] csb        Control Stream Builder object to allocate from.
+  * \param[in] num_dwords Number of dwords to allocate.
+@@ -213,7 +221,7 @@
+ #endif
+ 
+    if ((uint8_t *)csb->next + required_space > (uint8_t *)csb->end) {
+-      bool ret = pvr_csb_buffer_extend(csb);
++      bool ret = pvr_csb_buffer_extend(csb, required_space);
+       if (!ret)
+          return NULL;
+    }
+@@ -246,10 +254,6 @@
+  */
+ VkResult pvr_arch_csb_copy(struct pvr_csb *csb_dst, struct pvr_csb *csb_src)
+ {
+-   const uint8_t stream_reserved_space =
+-      PVR_DW_TO_BYTES(pvr_cmd_length(VDMCTRL_STREAM_LINK0) +
+-                      pvr_cmd_length(VDMCTRL_STREAM_LINK1)) +
+-      ROGUE_VDMCTRL_GUARD_SIZE_DEFAULT;
+    const uint32_t size =
+       util_dynarray_num_elements(&csb_src->deferred_cs_mem, char);
+    const uint8_t *start = util_dynarray_begin(&csb_src->deferred_cs_mem);
+@@ -261,18 +265,12 @@
+    /* Only graphics control stream supported as dst. */
+    assert(csb_dst->stream_type == PVR_CMD_STREAM_TYPE_GRAPHICS);
+ 
+-   if (size >= (PVR_CMD_BUFFER_CSB_BO_SIZE - stream_reserved_space)) {
+-      /* TODO: For now we don't support deferred streams bigger than one csb
+-       * buffer object size.
+-       *
+-       * While adding support for this make sure to not break the words/dwords
+-       * over two csb buffers.
+-       */
+-      pvr_finishme("Add support to copy streams bigger than one csb buffer");
+-      assert(!"CSB source buffer too large to do a full copy");
+-   }
++   assert(size % sizeof(uint32_t) == 0);
++
++   pvr_csb_set_relocation_mark(csb_dst);
++   destination = pvr_arch_csb_alloc_dwords(csb_dst, size / sizeof(uint32_t));
++   pvr_csb_clear_relocation_mark(csb_dst);
+ 
+-   destination = pvr_arch_csb_alloc_dwords(csb_dst, size);
+    if (!destination) {
+       assert(csb_dst->status != VK_SUCCESS);
+       return csb_dst->status;
+--- a/src/imagination/vulkan/pvr_csb.c
++++ b/src/imagination/vulkan/pvr_csb.c
+@@ -168,12 +168,16 @@
+ 
+ void pvr_csb_bo_release(struct pvr_device *device, struct pvr_bo *pvr_bo)
+ {
++   const uint64_t pool_bo_size =
++      ALIGN_POT(PVR_CMD_BUFFER_CSB_BO_SIZE, device->ws->page_size);
++
+    if (!pvr_bo)
+       return;
+ 
+    simple_mtx_lock(&device->csb_bo_pool_mtx);
+ 
+-   if (device->csb_bo_pool_count < PVR_CSB_BO_POOL_MAX) {
++   if (pvr_bo->bo->size == pool_bo_size &&
++       device->csb_bo_pool_count < PVR_CSB_BO_POOL_MAX) {
+       list_add(&pvr_bo->link, &device->csb_bo_pool);
+       device->csb_bo_pool_count++;
+       pvr_bo = NULL;

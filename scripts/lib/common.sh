@@ -23,8 +23,8 @@ warn() { printf '::warning:: %s\n' "$*" >&2; }
 die()  { printf '::error:: %s\n' "$*" >&2; exit 1; }
 
 # The Maintainer of the packages this recipe builds (Debian Policy 3.3: a name
-# and a working address).
-A7S_MAINTAINER="DockSeed <dockseed@proton.me>"
+# and a working address). Exported: the rootfs customize-hook reads it.
+export A7S_MAINTAINER="DockSeed <dockseed@proton.me>"
 
 # --- environment ------------------------------------------------------------
 

@@ -1,0 +1,149 @@
+Description: pvr: discard transform feedback primitives that do not fit
+ On the BXM-4-64 the stream-out STM does not honour the limit in SRC3:
+ with a bound range smaller than the draw it keeps writing
+ behind the end of the range, advances the address and counts the primitive
+ in the low word of its SRC1 persistent temp. The counter buffer value and
+ the transform feedback stream query are derived from that word, so both
+ report primitives that were never meant to be captured.
+ .
+ Check the space in the stream-out PDS program, which the TA runs once per
+ primitive. For every buffer group, the end of the primitive (address in
+ SRC0 bits 39..0 plus the bytes up to the end of its last vertex) is compared
+ against the limit (SRC3 bits 39..0), and if it does not fit, a branch skips
+ the STMs of all groups. A primitive is thus written to all buffers or to
+ none, as Vulkan and GL require, and the STM counter of every group only
+ counts primitives that were written. The written count is therefore the
+ same for every buffer, which makes the minimum over the buffers (separate
+ attribs) equal to the count of group 0 that the query already reads. The
+ per group size is computed on the CPU from the varyings of the group:
+ (vertices per primitive - 1) * stride + the end of the last captured
+ component. No division is needed and no further persistent temp is used.
+ .
+ The primitives generated count of VK_EXT_primitives_generated_query stays
+ behind the branch target, so it still counts every primitive.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/pdsc/programs/pdsc_xfb_main.h
++++ b/src/imagination/pdsc/programs/pdsc_xfb_main.h
+@@ -25,6 +25,7 @@
+                           enum pdsc_feature features,
+                           uint32_t group_count,
+                           const uint32_t *group_varying_counts,
++                          const uint32_t *group_prim_sizes,
+                           bool count_primitives)
+ {
+    pdsc_program *p = pdsc_program_create(mem_ctx, features, "xfb_main");
+@@ -62,6 +63,49 @@
+                             PVR_XFB_MAIN_PATCH_ID_STM_SRC2_CONST_0 + i);
+    }
+ 
++   pdsc_instr_t skip_stms[PVR_XFB_MAX_BUFFERS];
++   uint32_t skip_stm_count = 0;
++
++   if (total_varyings) {
++      ALLOC_TEMP32(p, addr_hi_mask);
++      ALLOC_TEMP64(p, prim_end);
++      ALLOC_TEMP64(p, buffer_limit);
++
++      pdsc_limm(p, addr_hi_mask, pdsc_ref_imm(0xff));
++
++      for (uint32_t g = 0; g < group_count; g++) {
++         if (group_varying_counts[g] == 0)
++            continue;
++
++         assert(group_prim_sizes[g] > 0 &&
++                group_prim_sizes[g] - 1 <= UINT16_MAX);
++
++         uint32_t src0_idx = g * PVR_XFB_PTEMP_ENTRIES_PER_VARYING;
++         uint32_t src3_idx = g * PVR_XFB_PTEMP_ENTRIES_PER_VARYING + 2;
++
++         pdsc_mov64(p, prim_end, stm_ptemps64[src0_idx]);
++         pdsc_and32(p,
++                    pdsc_ref_hi32(prim_end),
++                    pdsc_ref_hi32(prim_end),
++                    addr_hi_mask);
++         pdsc_limm(p,
++                   pdsc_ref_lo32(buffer_limit),
++                   pdsc_ref_imm(group_prim_sizes[g] - 1));
++         pdsc_limm(p, pdsc_ref_hi32(buffer_limit), pdsc_ref_imm(0));
++         pdsc_add64(p, prim_end, prim_end, buffer_limit);
++
++         pdsc_mov64(p, buffer_limit, stm_ptemps64[src3_idx]);
++         pdsc_and32(p,
++                    pdsc_ref_hi32(buffer_limit),
++                    pdsc_ref_hi32(buffer_limit),
++                    addr_hi_mask);
++
++         pdsc_cmp(p, prim_end, buffer_limit, .cop = PDSC_COP_LT);
++         skip_stms[skip_stm_count++] =
++            pdsc_branch_push(p, PDSC_PRED_P0, true);
++      }
++   }
++
+    /* Emit STMs for each group */
+    uint32_t varying_idx = 0;
+    for (uint32_t g = 0; g < group_count; g++) {
+@@ -104,6 +148,9 @@
+       varying_idx++;
+    }
+ 
++   for (uint32_t i = 0; i < skip_stm_count; i++)
++      pdsc_branch_pop(p, skip_stms[i]);
++
+    if (count_primitives) {
+       pdsc_ref primgen_src0 =
+          pdsc_decl_ptemp64(p, "primgen_src0", PVR_XFB_PRIMGEN_PTEMP_SRC0, true);
+--- a/src/imagination/vulkan/pvr_arch_xfb.c
++++ b/src/imagination/vulkan/pvr_arch_xfb.c
+@@ -536,11 +536,38 @@
+    for (uint32_t g = 0; g < xfb_shader_state->buffer_group_count; g++)
+       group_varying_counts[g] = xfb_shader_state->group_varying_count[g];
+ 
++   uint32_t group_prim_sizes[PVR_XFB_MAX_BUFFERS] = { 0 };
++   uint32_t var_i = 0;
++
++   for (uint32_t g = 0; g < xfb_shader_state->buffer_group_count; g++) {
++      const uint32_t group_start = var_i;
++      uint32_t vertex_size = 0;
++
++      var_i += group_varying_counts[g];
++      if (var_i == group_start)
++         continue;
++
++      for (uint32_t i = group_start; i < var_i; i++) {
++         const struct pvr_pds_xfb_varying_info *varying_info =
++            &xfb_config->data.varying_info_arr[i];
++
++         vertex_size = MAX2(vertex_size,
++                            varying_info->output_offset +
++                               PVR_DW_TO_BYTES(varying_info->dma_count));
++      }
++
++      group_prim_sizes[g] =
++         (xfb_config->primitive_type - 1) *
++            xfb_config->data.varying_info_arr[group_start].varying_stride +
++         vertex_size;
++   }
++
+    xfb_main_prog =
+       pdsc_xfb_main_runtime_gen(NULL,
+                                 0,
+                                 xfb_shader_state->buffer_group_count,
+                                 group_varying_counts,
++                                group_prim_sizes,
+                                 count_primitives);
+ 
+    program_pds_upload->temp_size = pdsc_program_temps_used(xfb_main_prog);
+@@ -1266,7 +1293,7 @@
+    pdsc_program *program;
+    VkResult result;
+ 
+-   program = pdsc_xfb_main_runtime_gen(NULL, 0, 0, NULL, true);
++   program = pdsc_xfb_main_runtime_gen(NULL, 0, 0, NULL, NULL, true);
+    info->temp_size = pdsc_program_temps_used(program);
+ 
+    result = pvr_xfb_primgen_program_upload(cmd_buffer, program, info);

@@ -1,0 +1,35 @@
+From f79b0bf7114453f8f54deafbd4f7f5680161434e Mon Sep 17 00:00:00 2001
+From: Erik Faye-Lund <erik.faye-lund@arm.com>
+Date: Fri, 23 Oct 2026 10:07:16 +0200
+Subject: [PATCH] nir: use dst_access for the store
+
+We use the src_access for the load, but we should've been using
+dst_access for the store. This looks like a simple typo.
+
+Fixes: 6f20643b471 ("nir: Allow qualifiers on copy_deref and image instructions")
+Reviewed-by: Connor Abbott <cwabbott0@gmail.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45539>
+(cherry picked from commit 1991790a9cf935c5c414d5cac3d60b053c7678c6)
+Link: https://gitlab.freedesktop.org/mesa/mesa/-/commit/f79b0bf7114453f8f54deafbd4f7f5680161434e
+[ adapted: dropped .pick_status.json, not in the 26.3.0 tarball or bookkeeping only ]
+---
+ .pick_status.json                       | 2 +-
+ src/compiler/nir/nir_lower_var_copies.c | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/compiler/nir/nir_lower_var_copies.c b/src/compiler/nir/nir_lower_var_copies.c
+index 6c5ddc3b0131..3e08e4d3a46d 100644
+--- a/src/compiler/nir/nir_lower_var_copies.c
++++ b/src/compiler/nir/nir_lower_var_copies.c
+@@ -86,7 +86,7 @@ emit_deref_copy_load_store(nir_builder *b,
+ 
+       nir_store_deref_with_access(b, dst_deref,
+                                   nir_load_deref_with_access(b, src_deref, src_access),
+-                                  ~0, src_access);
++                                  ~0, dst_access);
+    }
+ }
+ 
+-- 
+GitLab
+

@@ -58,7 +58,7 @@ Usage:
 
 Built-in stages:
   all     the whole chain: bootchain kernel wifi gpu-firmware orc
-          xfwm4(A7S_DESKTOP=1) rootfs image compress
+          xfwm4(A7S_DESKTOP=1) mesa rootfs image compress
   pins    print the pinned inputs
   clean   delete everything under the work directory
 Stages defined in scripts/: $(print_stages)

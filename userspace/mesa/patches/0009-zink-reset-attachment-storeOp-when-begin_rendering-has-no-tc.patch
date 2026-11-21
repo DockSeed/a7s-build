@@ -1,0 +1,63 @@
+From da804573e87fcb45a2c730e8c447d531b0ab7ac4 Mon Sep 17 00:00:00 2001
+From: Mike Blumenkrantz <michael.blumenkrantz@gmail.com>
+Date: Thu, 5 Nov 2026 13:35:07 -0500
+Subject: [PATCH] zink: reset attachment storeOp when begin_rendering has no tc
+ info
+
+zink_flush_clears() flushes a deferred clear as a clear-only pass. this
+pass runs with blitting set so begin_rendering() uses no tc info. it
+then keeps the storeOp of the previous renderpass
+
+that renderpass is often the last one of the previous frame. tc marked
+it invalidated at the swap so its storeOp is DONT_CARE. the clear is
+discarded and the next pass reads undefined depth
+
+fixes #16742
+
+Fixes: 73528dd3b70 ("zink: don't use/update tc rp info while blitting")
+Generated-by: LLM
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45986>
+(cherry picked from commit 2f42570a92cadca90d5f63c00788d691f9c73a07)
+Link: https://gitlab.freedesktop.org/mesa/mesa/-/commit/da804573e87fcb45a2c730e8c447d531b0ab7ac4
+[ adapted: dropped .pick_status.json, not in the 26.3.0 tarball or bookkeeping only ]
+---
+ .pick_status.json                       | 2 +-
+ src/gallium/drivers/zink/zink_context.c | 7 +++----
+ 2 files changed, 4 insertions(+), 5 deletions(-)
+
+diff --git a/src/gallium/drivers/zink/zink_context.c b/src/gallium/drivers/zink/zink_context.c
+index 91b3a9107627..400590c0b6dc 100644
+--- a/src/gallium/drivers/zink/zink_context.c
++++ b/src/gallium/drivers/zink/zink_context.c
+@@ -3251,13 +3251,13 @@ begin_rendering(struct zink_context *ctx, bool check_attachment_shadow)
+             ctx->dynamic_fb.attachments[i].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+          else
+             ctx->dynamic_fb.attachments[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
++         /* no tc info while blitting: do not keep the previous storeOp */
++         ctx->dynamic_fb.attachments[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+          if (use_tc_info) {
+             if (very_legal_and_conformant_msaa_opt ||
+                 /* don't invalidate cbufs without resolve */
+                 (ctx->dynamic_fb.tc_info.has_resolve && ctx->dynamic_fb.tc_info.cbuf_invalidate & BITFIELD_BIT(i)))
+                ctx->dynamic_fb.attachments[i].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+-            else
+-               ctx->dynamic_fb.attachments[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+          }
+          if (ctx->dynamic_fb.attachments[i].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) {
+             attachment_shadow_mask |= BITFIELD_BIT(i);
+@@ -3284,11 +3284,10 @@ begin_rendering(struct zink_context *ctx, bool check_attachment_shadow)
+          else
+             ctx->dynamic_fb.attachments[PIPE_MAX_COLOR_BUFS].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+ 
++         ctx->dynamic_fb.attachments[PIPE_MAX_COLOR_BUFS].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+          if (use_tc_info) {
+             if ((very_legal_and_conformant_msaa_opt && !ctx->fb_state.nr_cbufs) || ctx->dynamic_fb.tc_info.zsbuf_invalidate)
+                ctx->dynamic_fb.attachments[PIPE_MAX_COLOR_BUFS].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+-            else
+-               ctx->dynamic_fb.attachments[PIPE_MAX_COLOR_BUFS].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+          }
+ 
+          if (res->base.b.nr_samples > 1 && zink_debug & ZINK_DEBUG_PERFINFO) {
+-- 
+GitLab
+

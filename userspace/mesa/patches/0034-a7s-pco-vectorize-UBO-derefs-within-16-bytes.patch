@@ -1,0 +1,117 @@
+Description: pco: vectorize UBO loads within 16 bytes before explicit IO
+ Merge UBO load instructions again while they are still derefs: an extra
+ nir_opt_load_store_vectorize() pass for nir_var_mem_ubo in pco_lower_nir(),
+ directly before nir_lower_explicit_io. The descriptor layout is already
+ known there (pvr_init_descriptors), so inline UBOs are excluded. With
+ robustBufferAccess a vectorized load may span at most 128 bits: the Vulkan
+ spec (shaders.adoc, Robust Buffer Access) allows out-of-bounds UBO accesses
+ to be clamped as a whole only within a 16-byte window, so wider loads could
+ change which components read as zero. pco_nir_opt() stays as upstream,
+ including robust_modes = ubo|ssbo. With zink the descriptor set and binding
+ come from deref_cast(load_vulkan_descriptor(vulkan_resource_index)).
+ Replaces the earlier novec2 experiment.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/pco/pco_nir.c
++++ b/src/imagination/pco/pco_nir.c
+@@ -503,6 +503,78 @@
+    return true;
+ }
+ 
++static bool ubo_deref_desc(nir_deref_instr *deref,
++                           unsigned *desc_set,
++                           unsigned *binding)
++{
++   for (nir_deref_instr *parent = nir_deref_instr_parent(deref); parent;
++        parent = nir_deref_instr_parent(deref)) {
++      deref = parent;
++   }
++
++   if (deref->deref_type == nir_deref_type_var) {
++      *desc_set = deref->var->data.descriptor_set;
++      *binding = deref->var->data.binding;
++      return true;
++   }
++
++   if (deref->deref_type != nir_deref_type_cast)
++      return false;
++
++   nir_intrinsic_instr *load_vk_desc = nir_src_as_intrinsic(deref->parent);
++   if (!load_vk_desc ||
++       load_vk_desc->intrinsic != nir_intrinsic_load_vulkan_descriptor)
++      return false;
++
++   nir_intrinsic_instr *vk_res_idx = nir_src_as_intrinsic(load_vk_desc->src[0]);
++   if (!vk_res_idx ||
++       vk_res_idx->intrinsic != nir_intrinsic_vulkan_resource_index)
++      return false;
++
++   *desc_set = nir_intrinsic_desc_set(vk_res_idx);
++   *binding = nir_intrinsic_binding(vk_res_idx);
++   return true;
++}
++
++static bool should_vectorize_ubo_deref_cb(unsigned align_mul,
++                                          unsigned align_offset,
++                                          unsigned bit_size,
++                                          unsigned num_components,
++                                          int64_t hole_size,
++                                          nir_intrinsic_instr *low,
++                                          nir_intrinsic_instr *high,
++                                          void *data)
++{
++   const pco_common_data *common = data;
++
++   if (low->intrinsic != nir_intrinsic_load_deref)
++      return false;
++
++   if (bit_size > 32 || hole_size > 0)
++      return false;
++
++   if (!nir_num_components_valid(num_components))
++      return false;
++
++   if (common->robust_buffer_access && num_components * bit_size > 128)
++      return false;
++
++   nir_deref_instr *deref = nir_src_as_deref(low->src[0]);
++   unsigned desc_set;
++   unsigned binding;
++   if (!ubo_deref_desc(deref, &desc_set, &binding))
++      return false;
++
++   if (desc_set >= ARRAY_SIZE(common->desc_sets))
++      return false;
++
++   const pco_descriptor_set_data *desc_set_data = &common->desc_sets[desc_set];
++   if (!desc_set_data->bindings || binding >= desc_set_data->binding_count)
++      return false;
++
++   return !is_inline_ubo(desc_set, binding, common);
++}
++
+ static void pco_nir_opt(pco_ctx *ctx, nir_shader *nir, pco_data *data, bool algebraic)
+ {
+    bool progress;
+@@ -946,6 +1018,17 @@
+ 
+    NIR_PASS(_, nir, pco_nir_prop_access);
+ 
++   nir_load_store_vectorize_options ubo_vectorize_opts = {
++      .modes = nir_var_mem_ubo,
++      .callback = should_vectorize_ubo_deref_cb,
++      .cb_data = &data->common,
++   };
++
++   if (data->common.robust_buffer_access)
++      ubo_vectorize_opts.robust_modes = nir_var_mem_ubo;
++
++   NIR_PASS(_, nir, nir_opt_load_store_vectorize, &ubo_vectorize_opts);
++
+    bool progress = false;
+    NIR_PASS(progress,
+             nir,

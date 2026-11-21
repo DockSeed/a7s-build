@@ -1,0 +1,90 @@
+From b9ebb2544b8a01d235c16036eef1dbb581e2271d Mon Sep 17 00:00:00 2001
+From: David Rosca <david.rosca@amd.com>
+Date: Fri, 16 Oct 2026 13:36:24 +0200
+Subject: [PATCH] mesa: Handle import fail in ImportSemaphoreFd/Win32EXT
+
+If the import fails we should return error. In case of ImportSemaphoreFdEXT
+we only own the fd when the import succeeds.
+
+Cc: mesa-stable
+Reviewed-by: Pierre-Eric Pelloux-Prayer <pierre-eric.pelloux-prayer@amd.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45294>
+(cherry picked from commit dcd781ba7a6e5d5aaf7c6b32c062cd48bbaa54a7)
+Link: https://gitlab.freedesktop.org/mesa/mesa/-/commit/b9ebb2544b8a01d235c16036eef1dbb581e2271d
+[ adapted: dropped .pick_status.json, not in the 26.3.0 tarball or bookkeeping only ]
+---
+ .pick_status.json               |  2 +-
+ src/mesa/main/externalobjects.c | 18 +++++++++++++-----
+ 2 files changed, 14 insertions(+), 6 deletions(-)
+
+diff --git a/src/mesa/main/externalobjects.c b/src/mesa/main/externalobjects.c
+index 5972d41e75f4..bb0e2e873cb8 100644
+--- a/src/mesa/main/externalobjects.c
++++ b/src/mesa/main/externalobjects.c
+@@ -624,7 +624,7 @@ semaphoreobj_alloc(struct gl_context *ctx, GLuint name)
+    return obj;
+ }
+ 
+-static void
++static bool
+ import_semaphoreobj_fd(struct gl_context *ctx,
+                           struct gl_semaphore_object *semObj,
+                           int fd)
+@@ -633,13 +633,17 @@ import_semaphoreobj_fd(struct gl_context *ctx,
+ 
+    pipe->create_fence_fd(pipe, &semObj->fence, fd, semObj->type);
+ 
++   if (!semObj->fence)
++      return false;
++
+ #if !defined(_WIN32)
+    /* We own fd, but we no longer need it. So get rid of it */
+    close(fd);
+ #endif
++   return true;
+ }
+ 
+-static void
++static bool
+ import_semaphoreobj_win32(struct gl_context *ctx,
+                           struct gl_semaphore_object *semObj,
+                           void *handle,
+@@ -649,6 +653,7 @@ import_semaphoreobj_win32(struct gl_context *ctx,
+    struct pipe_context *pipe = ctx->pipe;
+ 
+    pipe->screen->create_fence_win32(pipe->screen, &semObj->fence, handle, name, type);
++   return semObj->fence;
+ }
+ 
+ static void
+@@ -1266,7 +1271,8 @@ _mesa_ImportSemaphoreFdEXT(GLuint semaphore,
+    if (!semObj)
+       return;
+ 
+-   import_semaphoreobj_fd(ctx, semObj, fd);
++   if (!import_semaphoreobj_fd(ctx, semObj, fd))
++      _mesa_error(ctx, GL_INVALID_VALUE, "%s(import failed)", func);
+ }
+ 
+ void GLAPIENTRY
+@@ -1305,7 +1311,8 @@ _mesa_ImportSemaphoreWin32HandleEXT(GLuint semaphore,
+    if (!semObj)
+       return;
+ 
+-   import_semaphoreobj_win32(ctx, semObj, handle, NULL, type);
++   if (!import_semaphoreobj_win32(ctx, semObj, handle, NULL, type))
++      _mesa_error(ctx, GL_INVALID_VALUE, "%s(import failed)", func);
+ }
+ 
+ void GLAPIENTRY
+@@ -1344,5 +1351,6 @@ _mesa_ImportSemaphoreWin32NameEXT(GLuint semaphore,
+    if (!semObj)
+       return;
+ 
+-   import_semaphoreobj_win32(ctx, semObj, NULL, name, type);
++   if (!import_semaphoreobj_win32(ctx, semObj, NULL, name, type))
++      _mesa_error(ctx, GL_INVALID_VALUE, "%s(import failed)", func);
+ }
+-- 
+GitLab
+

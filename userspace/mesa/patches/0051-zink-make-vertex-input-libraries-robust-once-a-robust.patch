@@ -1,0 +1,65 @@
+From 95460805cf12f3f78d7bbe29fd1814ddbf10fe2e Mon Sep 17 00:00:00 2001
+From: Mike Blumenkrantz <michael.blumenkrantz@gmail.com>
+Date: Tue, 27 Oct 2026 16:54:13 -0400
+Subject: [PATCH] zink: make vertex input libraries robust once a robust
+ context exists
+
+the vertex input library has no shader stage to carry the robustness
+struct, so its vertex fetches were never robust with the device features
+off. record when a robust context is created and build the library with
+robust vertex inputs from then on
+
+Fixes: b2282868d8f0 ("zink: use EXT_pipeline_robustness on drivers where it matters")
+
+Generated-by: LLM
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45689>
+Link: https://gitlab.freedesktop.org/mesa/mesa/-/commit/95460805cf12f3f78d7bbe29fd1814ddbf10fe2e
+[ adapted: context only: zink_context_create() in 26.3 has no zink_gfx_mesh_pipeline_state_dirty() call after the memset (zink_context.c); the added lines are unchanged ]
+---
+diff --git a/src/gallium/drivers/zink/zink_context.c b/src/gallium/drivers/zink/zink_context.c
+index f4821ce..896af95 100644
+--- a/src/gallium/drivers/zink/zink_context.c
++++ b/src/gallium/drivers/zink/zink_context.c
+@@ -5990,6 +5990,8 @@ zink_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
+       goto fail;
+ 
+    ctx->flags = flags;
++   if (is_robust)
++      screen->robust_vertex_input = true;
+    memset(ctx->pipeline_changed, 1, sizeof(ctx->pipeline_changed));
+    ctx->gfx_pipeline_state.dirty = ctx->gfx_pipeline_state.mesh_dirty = true;
+    ctx->gfx_pipeline_state.dyn_state2.vertices_per_patch = 1;
+diff --git a/src/gallium/drivers/zink/zink_pipeline.c b/src/gallium/drivers/zink/zink_pipeline.c
+index cd592db..4671990 100644
+--- a/src/gallium/drivers/zink/zink_pipeline.c
++++ b/src/gallium/drivers/zink/zink_pipeline.c
+@@ -669,9 +669,16 @@ zink_create_gfx_pipeline_input(struct zink_screen *screen,
+                                const uint8_t *binding_map,
+                                VkPrimitiveTopology primitive_topology)
+ {
++   /* the library is shared by all contexts: it is robust once any robust context exists */
++   VkPipelineRobustnessCreateInfo rb = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_ROBUSTNESS_CREATE_INFO,
++      .vertexInputs = screen->robust_vertex_input ?
++                      VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS :
++                      VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED,
++   };
+    VkGraphicsPipelineLibraryCreateInfoEXT gplci = {
+       VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT,
+-      NULL,
++      screen->info.have_EXT_pipeline_robustness ? &rb : NULL,
+       VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT
+    };
+ 
+diff --git a/src/gallium/drivers/zink/zink_types.h b/src/gallium/drivers/zink/zink_types.h
+index 88c33e3..e9dd699 100644
+--- a/src/gallium/drivers/zink/zink_types.h
++++ b/src/gallium/drivers/zink/zink_types.h
+@@ -1480,6 +1480,7 @@ struct zink_screen {
+    unsigned buffer_rebind_counter;
+    unsigned image_rebind_counter;
+    unsigned robust_ctx_count;
++   bool robust_vertex_input; //a robust context has been created, so vertex input libraries are robust
+ 
+    struct hash_table dts;
+    simple_mtx_t dt_lock;

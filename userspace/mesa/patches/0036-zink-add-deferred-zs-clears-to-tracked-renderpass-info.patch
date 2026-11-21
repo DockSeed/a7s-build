@@ -1,0 +1,45 @@
+From 403df1f1335954c2b2f726c76a84354688d8603b Mon Sep 17 00:00:00 2001
+From: Mike Blumenkrantz <michael.blumenkrantz@gmail.com>
+Date: Tue, 20 Oct 2026 11:29:49 -0400
+Subject: [PATCH] zink: add deferred zs clears to tracked renderpass info
+
+a zs clear deferred from an earlier tc renderpass, e.g. across a framebuffer
+change that keeps the zsbuf, is missing from tc's renderpass info, so the
+next renderpass would trip the zs asserts or drop the depth attachment and
+lose the clear
+
+Fixes: 8a439f89d42c ("zink: use tc renderpass tracking to optimize renderpasses")
+Generated-by: LLM
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45450>
+Link: https://gitlab.freedesktop.org/mesa/mesa/-/commit/403df1f1335954c2b2f726c76a84354688d8603b
+---
+ src/gallium/drivers/zink/zink_context.c | 13 ++++++++++---
+ 1 file changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/src/gallium/drivers/zink/zink_context.c b/src/gallium/drivers/zink/zink_context.c
+index 727022f8d853..8905ae7ceeca 100644
+--- a/src/gallium/drivers/zink/zink_context.c
++++ b/src/gallium/drivers/zink/zink_context.c
+@@ -70,9 +70,16 @@ static void
+ update_tc_info(struct zink_context *ctx)
+ {
+    if (ctx->track_renderpasses) {
+-      const struct tc_renderpass_info *info = threaded_context_get_renderpass_info(ctx->tc);
+-      ctx->rp_changed |= ctx->dynamic_fb.tc_info.data != info->data;
+-      ctx->dynamic_fb.tc_info = *info;
++      struct tc_renderpass_info info = *threaded_context_get_renderpass_info(ctx->tc);
++      /* add zs clears deferred from an earlier tc renderpass, which tc doesn't know about */
++      if (!info.zsbuf_clear && !info.zsbuf_clear_partial) {
++         if (ctx->clears_enabled & PIPE_CLEAR_DEPTHSTENCIL)
++            info.zsbuf_clear_partial = true;
++         if (ctx->rp_clears_enabled & PIPE_CLEAR_DEPTHSTENCIL)
++            info.zsbuf_clear = true;
++      }
++      ctx->rp_changed |= ctx->dynamic_fb.tc_info.data != info.data;
++      ctx->dynamic_fb.tc_info = info;
+       ctx->awaiting_resolve = ctx->dynamic_fb.tc_info.has_resolve;
+    } else {
+       struct tc_renderpass_info info = ctx->dynamic_fb.tc_info;
+-- 
+GitLab
+

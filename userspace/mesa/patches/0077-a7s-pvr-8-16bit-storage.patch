@@ -1,0 +1,50 @@
+Description: pvr: advertise 8-bit and 16-bit storage and shaderInt8
+ Enable storageBuffer16BitAccess, uniformAndStorageBuffer16BitAccess,
+ storagePushConstant16, storageBuffer8BitAccess,
+ uniformAndStorageBuffer8BitAccess, storagePushConstant8 and shaderInt8,
+ based on the lowering of the previous patch ("pco: lower 8-bit and 16-bit
+ integers and memory accesses to 32 bit"). storageInputOutput16 stays
+ disabled: 16-bit varyings are not handled (pvr_arch_pipeline.c asserts on
+ 16-bit outputs). The extension names VK_KHR_8bit_storage,
+ VK_KHR_16bit_storage and VK_KHR_shader_float16_int8 are not advertised;
+ the features are core in Vulkan 1.2, and zink switches to compute based
+ texture transfers once all three names are present.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/vulkan/pvr_physical_device.c
++++ b/src/imagination/vulkan/pvr_physical_device.c
+@@ -305,9 +305,9 @@
+       .inheritedQueries = false,
+ 
+       /* Vulkan 1.1 */
+-      .storageBuffer16BitAccess = false,
+-      .uniformAndStorageBuffer16BitAccess = false,
+-      .storagePushConstant16 = false,
++      .storageBuffer16BitAccess = true,
++      .uniformAndStorageBuffer16BitAccess = true,
++      .storagePushConstant16 = true,
+       .storageInputOutput16 = false,
+       .variablePointers = false,
+       .protectedMemory = false,
+@@ -316,13 +316,13 @@
+       /* Vulkan 1.2 */
+       .samplerMirrorClampToEdge = true,
+       .drawIndirectCount = false,
+-      .storageBuffer8BitAccess = false,
+-      .uniformAndStorageBuffer8BitAccess = false,
+-      .storagePushConstant8 = false,
++      .storageBuffer8BitAccess = true,
++      .uniformAndStorageBuffer8BitAccess = true,
++      .storagePushConstant8 = true,
+       .shaderBufferInt64Atomics = false,
+       .shaderSharedInt64Atomics = false,
+       .shaderFloat16 = false,
+-      .shaderInt8 = false,
++      .shaderInt8 = true,
+       .descriptorIndexing = false,
+       .shaderInputAttachmentArrayDynamicIndexing = true,
+       .shaderUniformTexelBufferArrayDynamicIndexing = true,

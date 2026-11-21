@@ -1,0 +1,299 @@
+Description: pvr: raise buffer descriptor limits, load only used descriptors
+ The per-pipeline-layout limits are n times the Vulkan 1.0 per-stage minimum
+ for the three supported stages. maxPerStageDescriptorStorageBuffers was
+ later raised to 16 (8ee23ece2bd), but maxDescriptorSetStorageBuffers stayed
+ at 3 * 4 = 12, below the per-stage value. wgpu reports
+ min(maxPerStageDescriptorStorageBuffers, maxDescriptorSetStorageBuffers / 2)
+ storage buffers per shader stage, which gives 6, and programs that need 10
+ fail.
+ .
+ Use 3 * 16 storage buffers per pipeline layout. Raise
+ maxPerStageDescriptorUniformBuffers from 13 to 15, the Vulkan 1.4 minimum,
+ with 3 * 15 per pipeline layout. Report 8 dynamic storage buffers
+ (PVR_MAX_DESCRIPTOR_SET_STORAGE_DYNAMIC_BUFFERS), the total that
+ VK_KHR_maintenance7 already reports. Compute maxPerStageResources as the
+ sum of the per-stage limits and maxColorAttachments, the value the
+ specification requires when the sum is below 128.
+ .
+ Nothing in the driver is sized by these limits: a set layout is as large as
+ its bindings (pvr_CreateDescriptorSetLayout()) and dynamic buffers live in
+ the set (struct pvr_descriptor_set). The PDS descriptor program of a stage
+ copies the descriptors into shared registers (pvr_setup_descriptors(),
+ pvr_pds_descriptor_program_create_and_upload()), 1024 of them for a vertex
+ or fragment task (ROGUE_MAX_VERTEX_SHARED_REGISTERS,
+ ROGUE_MAX_PIXEL_SHARED_REGISTERS). A buffer descriptor is 4 dwords. A set
+ layout holds the bindings of all stages, and a single set at the per-set
+ limits is more than 1400 dwords (48 samplers of 12 dwords, 48 sampled
+ images and 12 storage images of 8 dwords, 45 uniform and 48 storage buffers
+ of 4 dwords), while several sets can be bound.
+ .
+ The PDS program therefore copies, for each used set, only the span from the
+ first to the last binding the shader uses instead of the whole set. The
+ binding ranges are relative to that span, and the PDS program gets the
+ offset of the span in the set through the offset_in_dwords field of the
+ descriptor set entry, which the command buffer adds to the address of the
+ set. The start of the span is rounded down to a multiple of four dwords.
+ Bindings the shader does not use get no range. Dynamic buffers are still
+ copied for the whole set. If a stage still needs more shared registers than
+ the hardware provides, pipeline creation fails with
+ VK_ERROR_OUT_OF_DEVICE_MEMORY instead of overflowing the register file. The
+ size of the shared registers that is stored in the render job was a uint8_t
+ that cut every value above 255; it is now a uint32_t like the value it is
+ copied from.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/vulkan/pds/pvr_pds.h
++++ b/src/imagination/vulkan/pds/pvr_pds.h
+@@ -910,6 +910,7 @@
+    unsigned int destination; /* Destination shared register to which
+                               * descriptor entries should be loaded.
+                               */
++   unsigned int src_offset_in_dwords;
+ };
+ 
+ #define PVR_BUFFER_TYPE_UBO (0)
+--- a/src/imagination/vulkan/pds/pvr_pipeline_pds.c
++++ b/src/imagination/vulkan/pds/pvr_pipeline_pds.c
+@@ -1584,6 +1584,8 @@
+       descriptor_set_entry->type = PVR_PDS_CONST_MAP_ENTRY_TYPE_DESCRIPTOR_SET;
+       descriptor_set_entry->const_offset = next_const64 * 2;
+       descriptor_set_entry->descriptor_set = descriptor_set->descriptor_set;
++      descriptor_set_entry->offset_in_dwords =
++         descriptor_set->src_offset_in_dwords;
+ 
+       PVR_PDS_MODE_TOGGLE(code_section,
+                           instruction,
+--- a/src/imagination/vulkan/pvr_arch_cmd_buffer.c
++++ b/src/imagination/vulkan/pvr_arch_cmd_buffer.c
+@@ -5881,7 +5881,9 @@
+          descriptor_set = desc_state->sets[desc_set];
+          assert(descriptor_set);
+ 
+-         desc_set_addr = descriptor_set->dev_addr;
++         desc_set_addr = PVR_DEV_ADDR_OFFSET(
++            descriptor_set->dev_addr,
++            PVR_DW_TO_BYTES(desc_set_entry->offset_in_dwords));
+          PVR_WRITE(qword_buffer,
+                    desc_set_addr.addr,
+                    desc_set_entry->const_offset,
+--- a/src/imagination/vulkan/pvr_arch_pipeline.c
++++ b/src/imagination/vulkan/pvr_arch_pipeline.c
+@@ -473,6 +473,75 @@
+    return VK_SUCCESS;
+ }
+ 
++static VkResult pvr_check_shared_registers(struct pvr_device *device,
++                                           const pco_data *data,
++                                           mesa_shader_stage stage)
++{
++   unsigned max_shareds;
++
++   switch (stage) {
++   case MESA_SHADER_VERTEX:
++      max_shareds = ROGUE_MAX_VERTEX_SHARED_REGISTERS;
++      break;
++
++   case MESA_SHADER_FRAGMENT:
++      max_shareds = ROGUE_MAX_PIXEL_SHARED_REGISTERS;
++      break;
++
++   case MESA_SHADER_COMPUTE:
++      max_shareds = ROGUE_MAX_COMPUTE_SHARED_REGISTERS;
++      break;
++
++   default:
++      UNREACHABLE("");
++   }
++
++   if (data->common.shareds <= max_shareds)
++      return VK_SUCCESS;
++
++   return vk_errorf(device,
++                    VK_ERROR_OUT_OF_DEVICE_MEMORY,
++                    "%s stage needs %u shared registers, the limit is %u",
++                    _mesa_shader_stage_to_string(stage),
++                    data->common.shareds,
++                    max_shareds);
++}
++
++static void
++pvr_desc_set_load_range(const struct pvr_descriptor_set_layout *set_layout,
++                        const pco_descriptor_set_data *desc_set_data,
++                        unsigned *first_dw_out,
++                        unsigned *count_dw_out)
++{
++   unsigned first = ~0U;
++   unsigned last = 0;
++
++   for (unsigned binding = 0; binding < set_layout->binding_count; ++binding) {
++      const struct pvr_descriptor_set_layout_binding *layout_binding =
++         &set_layout->bindings[binding];
++      const unsigned size =
++         layout_binding->stride * layout_binding->descriptor_count;
++
++      if (!desc_set_data->bindings[binding].used || !size ||
++          layout_binding->offset == ~0)
++         continue;
++
++      first = MIN2(first, layout_binding->offset);
++      last = MAX2(last, layout_binding->offset + size);
++   }
++
++   if (first == ~0U) {
++      *first_dw_out = 0;
++      *count_dw_out = 0;
++      return;
++   }
++
++   assert(!(last % sizeof(uint32_t)));
++
++   *first_dw_out = ROUND_DOWN_TO(first / sizeof(uint32_t), 4);
++   *count_dw_out = last / sizeof(uint32_t) - *first_dw_out;
++}
++
+ static VkResult pvr_pds_descriptor_program_create_and_upload(
+    struct pvr_device *const device,
+    const VkAllocationCallbacks *const allocator,
+@@ -511,11 +580,21 @@
+          continue;
+ 
+       if (desc_set_range->count > 0) {
++         unsigned first_dw;
++         unsigned count_dw;
++
++         pvr_desc_set_load_range(set_layout,
++                                 desc_set_data,
++                                 &first_dw,
++                                 &count_dw);
++         assert(count_dw == desc_set_range->count);
++
+          program.descriptor_sets[program.descriptor_set_count++] =
+             (struct pvr_pds_descriptor_set){
+                .descriptor_set = desc_set,
+                .size_in_dwords = desc_set_range->count,
+                .destination = desc_set_range->start,
++               .src_offset_in_dwords = first_dw,
+             };
+       }
+ 
+@@ -1053,6 +1132,11 @@
+    pco_postprocess_nir(pco_ctx, nir, &shader_data);
+    pvr_postprocess_shader_data(&shader_data, nir, pCreateInfo, layout, NULL);
+ 
++   result =
++      pvr_check_shared_registers(device, &shader_data, MESA_SHADER_COMPUTE);
++   if (result != VK_SUCCESS)
++      goto err_free_build_context;
++
+    cs = pco_trans_nir(pco_ctx, nir, &shader_data, shader_mem_ctx);
+    if (!cs) {
+       result = VK_ERROR_INITIALIZATION_FAILED;
+@@ -2518,12 +2602,11 @@
+    for (unsigned desc_set = 0; desc_set < layout->set_count; ++desc_set) {
+       const struct pvr_descriptor_set_layout *set_layout =
+          vk_to_pvr_descriptor_set_layout(layout->set_layouts[desc_set]);
+-      const unsigned desc_set_size_dw = set_layout->size / sizeof(uint32_t);
+       pco_descriptor_set_data *desc_set_data =
+          &data->common.desc_sets[desc_set];
+       pco_range *desc_set_range = &desc_set_data->range;
+-
+-      assert(!(set_layout->size % sizeof(uint32_t)));
++      unsigned desc_set_first_dw;
++      unsigned desc_set_size_dw;
+ 
+       /* If the descriptor set isn't for this stage or is unused, skip it. */
+       if (!(BITFIELD_BIT(stage) & set_layout->stage_flags)) {
+@@ -2534,6 +2617,11 @@
+       if (!desc_set_data->used)
+          continue;
+ 
++      pvr_desc_set_load_range(set_layout,
++                              desc_set_data,
++                              &desc_set_first_dw,
++                              &desc_set_size_dw);
++
+       desc_set_range->start = data->common.shareds;
+       desc_set_range->count = desc_set_size_dw;
+       data->common.shareds += desc_set_size_dw;
+@@ -2545,12 +2633,13 @@
+          pco_binding_data *binding_data = &desc_set_data->bindings[binding];
+ 
+          /* Skip dynamic buffer bindings. */
+-         if (layout_binding->offset == ~0)
++         if (layout_binding->offset == ~0 || !binding_data->used)
+             continue;
+ 
+          binding_data->range = (pco_range){
+             .start = desc_set_range->start +
+-                     (layout_binding->offset / sizeof(uint32_t)),
++                     (layout_binding->offset / sizeof(uint32_t)) -
++                     desc_set_first_dw,
+             .count =
+                (layout_binding->stride * layout_binding->descriptor_count) /
+                sizeof(uint32_t),
+@@ -3270,6 +3359,10 @@
+                                   pCreateInfo,
+                                   layout,
+                                   &mrt_setup);
++
++      result = pvr_check_shared_registers(device, &shader_data[stage], stage);
++      if (result != VK_SUCCESS)
++         goto err_free_build_context;
+    }
+ 
+    if (!pCreateInfo->renderPass)
+--- a/src/imagination/vulkan/pvr_job_render.h
++++ b/src/imagination/vulkan/pvr_job_render.h
+@@ -126,7 +126,7 @@
+ 
+    uint32_t pixel_output_width;
+ 
+-   uint8_t max_shared_registers;
++   uint32_t max_shared_registers;
+ 
+    /* Upper limit for tiles in flight, '0' means use default limit based
+     * on partition store.
+--- a/src/imagination/vulkan/pvr_physical_device.c
++++ b/src/imagination/vulkan/pvr_physical_device.c
+@@ -684,17 +684,17 @@
+       .sparseAddressSpaceSize = 0U, /* Requires sparseBinding */
+       .maxBoundDescriptorSets = 4U,
+       .maxPerStageDescriptorSamplers = 16,
+-      .maxPerStageDescriptorUniformBuffers = 13,
++      .maxPerStageDescriptorUniformBuffers = 15,
+       .maxPerStageDescriptorStorageBuffers = 16,
+       .maxPerStageDescriptorSampledImages = 16,
+       .maxPerStageDescriptorStorageImages = 4,
+       .maxPerStageDescriptorInputAttachments = 4,
+-      .maxPerStageResources = 57,
+       .maxDescriptorSetSamplers = 3U * 16U,
+-      .maxDescriptorSetUniformBuffers = 3U * 12U,
++      .maxDescriptorSetUniformBuffers = 3U * 15U,
+       .maxDescriptorSetUniformBuffersDynamic = 8U,
+-      .maxDescriptorSetStorageBuffers = 3U * 4U,
+-      .maxDescriptorSetStorageBuffersDynamic = 4U,
++      .maxDescriptorSetStorageBuffers = 3U * 16U,
++      .maxDescriptorSetStorageBuffersDynamic =
++         PVR_MAX_DESCRIPTOR_SET_STORAGE_DYNAMIC_BUFFERS,
+       .maxDescriptorSetSampledImages = 3U * 16U,
+       .maxDescriptorSetStorageImages = 3U * 4U,
+       .maxDescriptorSetInputAttachments = 4U,
+@@ -1045,6 +1045,14 @@
+       .maxDescriptorSetUpdateAfterBindTotalBuffersDynamic = PVR_MAX_DYNAMIC_BUFFERS,
+    };
+ 
++   properties->maxPerStageResources =
++      properties->maxPerStageDescriptorUniformBuffers +
++      properties->maxPerStageDescriptorStorageBuffers +
++      properties->maxPerStageDescriptorSampledImages +
++      properties->maxPerStageDescriptorStorageImages +
++      properties->maxPerStageDescriptorInputAttachments +
++      properties->maxColorAttachments;
++
+    if (strlen(pdevice->instance->drirc.debug.force_vk_devicename) > 0) {
+       snprintf(properties->deviceName,
+                sizeof(properties->deviceName),

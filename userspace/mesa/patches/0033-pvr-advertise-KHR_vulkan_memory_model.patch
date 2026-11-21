@@ -1,0 +1,42 @@
+From 8604a0929168ae72b04a19a5b01ad8a3b0d10a42 Mon Sep 17 00:00:00 2001
+From: Frank Binns <frank.binns@imgtec.com>
+Date: Fri, 6 Nov 2026 16:30:54 +0000
+Subject: [PATCH] pvr: advertise KHR_vulkan_memory_model
+
+Reviewed-by: Ashish Chauhan <ashish.chauhan@imgtec.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/46198>
+Link: https://gitlab.freedesktop.org/mesa/mesa/-/commit/8604a0929168ae72b04a19a5b01ad8a3b0d10a42
+[ adapted: dropped docs/features.txt, docs/relnotes/new_features.txt, src/imagination/ci/axe-1-16m-fails.txt, not in the 26.3.0 tarball or bookkeeping only ]
+---
+ docs/features.txt                            |  2 +-
+ docs/relnotes/new_features.txt               |  1 +
+ src/imagination/ci/axe-1-16m-fails.txt       | 36 ++++++++++++++++++--
+ src/imagination/vulkan/pvr_physical_device.c |  5 +--
+ 4 files changed, 39 insertions(+), 5 deletions(-)
+
+diff --git a/src/imagination/vulkan/pvr_physical_device.c b/src/imagination/vulkan/pvr_physical_device.c
+index e26ea14bb941..2abc68580ee8 100644
+--- a/src/imagination/vulkan/pvr_physical_device.c
++++ b/src/imagination/vulkan/pvr_physical_device.c
+@@ -191,6 +191,7 @@ static void pvr_physical_device_get_supported_extensions(
+       .KHR_unified_image_layouts = true,
+       .KHR_uniform_buffer_standard_layout = true,
+       .KHR_vertex_attribute_divisor = true,
++      .KHR_vulkan_memory_model = true,
+       .KHR_workgroup_memory_explicit_layout = true,
+       .KHR_zero_initialize_workgroup_memory = true,
+       .EXT_border_color_swizzle = true,
+@@ -347,8 +348,8 @@ static void pvr_physical_device_get_supported_features(
+       .descriptorBindingVariableDescriptorCount = false,
+       .runtimeDescriptorArray = false,
+       .samplerFilterMinmax = false,
+-      .vulkanMemoryModel = false,
+-      .vulkanMemoryModelDeviceScope = false,
++      .vulkanMemoryModel = true,
++      .vulkanMemoryModelDeviceScope = true,
+       .vulkanMemoryModelAvailabilityVisibilityChains = false,
+       .shaderOutputViewportIndex = false,
+       .shaderOutputLayer = false,
+-- 
+GitLab
+

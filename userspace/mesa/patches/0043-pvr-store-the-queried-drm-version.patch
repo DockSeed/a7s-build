@@ -1,0 +1,130 @@
+From 158b3297a7a09714ef8172bc8c48d90ba9d82115 Mon Sep 17 00:00:00 2001
+From: Nick Hamilton <nick.hamilton@imgtec.com>
+Date: Fri, 2 Oct 2026 10:16:52 +0100
+Subject: [PATCH] pvr: store the queried drm version
+
+This can then be used to identify if new interfaces are supported in
+the kernel
+
+Signed-off-by: Nick Hamilton <nick.hamilton@imgtec.com>
+Acked-by: Luigi Santivetti <luigi.santivetti@imgtec.com>
+Reviewed-by: Alessio Belle <alessio.belle@imgtec.com>
+Reviewed-by: Frank Bouwer <frank.bouwer@imgtec.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/40973>
+Link: https://gitlab.freedesktop.org/mesa/mesa/-/commit/158b3297a7a09714ef8172bc8c48d90ba9d82115
+---
+ .../vulkan/winsys/powervr/pvr_drm.c           | 42 +++++++++++++++++++
+ .../vulkan/winsys/powervr/pvr_drm.h           |  3 ++
+ .../vulkan/winsys/powervr/pvr_drm_public.h    |  1 +
+ src/imagination/vulkan/winsys/pvr_winsys.c    |  2 +-
+ 4 files changed, 47 insertions(+), 1 deletion(-)
+
+diff --git a/src/imagination/vulkan/winsys/powervr/pvr_drm.c b/src/imagination/vulkan/winsys/powervr/pvr_drm.c
+index c45a5385e628..d2cf4fce4f7c 100644
+--- a/src/imagination/vulkan/winsys/powervr/pvr_drm.c
++++ b/src/imagination/vulkan/winsys/powervr/pvr_drm.c
+@@ -43,6 +43,39 @@
+ #include "vk_drm_syncobj.h"
+ #include "vk_log.h"
+ 
++#define PVR_DRM_VERSION_MAJOR_SHIFT    20
++#define PVR_DRM_VERSION_MINOR_SHIFT    10
++#define PVR_DRM_VERSION_PATCH_SHIFT    0
++
++#define PVR_DRM_VERSION_MAJOR_MASK     UINT32_C(0xFFF00000)
++#define PVR_DRM_VERSION_MINOR_MASK     UINT32_C(0x000FFC00)
++#define PVR_DRM_VERSION_PATCH_MASK     UINT32_C(0x000003FF)
++
++/**
++ * Packs the drm version.
++ *
++ * The packed layout is as follows:
++ *
++ * \verbatim
++ *    +--------+--------+--------+
++ *    | 31..20 | 19..10 | 9..0   |
++ *    +========+========+========+
++ *    | MAJOR  | MINOR  | PATCH  |
++ *    +--------+--------+--------+
++ * \endverbatim
++ *
++ */
++
++#define PVR_DRM_VERSION_PACK(major, minor, patch) \
++   ((((major) << PVR_DRM_VERSION_MAJOR_SHIFT) & PVR_DRM_VERSION_MAJOR_MASK) | \
++    (((minor) << PVR_DRM_VERSION_MINOR_SHIFT) & PVR_DRM_VERSION_MINOR_MASK) | \
++    (((patch) << PVR_DRM_VERSION_PATCH_SHIFT) & PVR_DRM_VERSION_PATCH_MASK))
++
++#define PVR_DRM_VERSION_VALID(major, minor, patch) \
++   ((((major) & ~(PVR_DRM_VERSION_MAJOR_MASK >> PVR_DRM_VERSION_MAJOR_SHIFT)) == 0) && \
++    (((minor) & ~(PVR_DRM_VERSION_MINOR_MASK >> PVR_DRM_VERSION_MINOR_SHIFT)) == 0) && \
++    (((patch) & ~(PVR_DRM_VERSION_PATCH_MASK >> PVR_DRM_VERSION_PATCH_SHIFT)) == 0))
++
+ static void pvr_drm_finish_heaps(struct pvr_drm_winsys *const drm_ws)
+ {
+    if (!pvr_winsys_helper_winsys_heap_finish(
+@@ -677,6 +710,7 @@ err_pvr_drm_heap_finish_all_heaps:
+ 
+ VkResult pvr_drm_winsys_create(const int render_fd,
+                                const int display_fd,
++                               drmVersionPtr version,
+                                const VkAllocationCallbacks *alloc,
+                                struct pvr_winsys **const ws_out)
+ {
+@@ -695,6 +729,14 @@ VkResult pvr_drm_winsys_create(const int render_fd,
+       goto err_out;
+    }
+ 
++   assert(PVR_DRM_VERSION_VALID(version->version_major,
++                                version->version_minor,
++                                version->version_patchlevel));
++
++   drm_ws->drm_version = PVR_DRM_VERSION_PACK(version->version_major,
++                                              version->version_minor,
++                                              version->version_patchlevel);
++
+    drm_ws->base.ops = &drm_winsys_ops;
+    drm_ws->base.render_fd = render_fd;
+    drm_ws->base.display_fd = display_fd;
+diff --git a/src/imagination/vulkan/winsys/powervr/pvr_drm.h b/src/imagination/vulkan/winsys/powervr/pvr_drm.h
+index c8b1aa0b8d89..3399fef8bf24 100644
+--- a/src/imagination/vulkan/winsys/powervr/pvr_drm.h
++++ b/src/imagination/vulkan/winsys/powervr/pvr_drm.h
+@@ -43,6 +43,9 @@ struct pvr_drm_winsys {
+    /* Packed bvnc */
+    uint64_t bvnc;
+ 
++   /* Packed drm version */
++   uint32_t drm_version;
++
+    /* Protects imported BOs creation/freeing, which includes the bo_map member
+     * below.
+     */
+diff --git a/src/imagination/vulkan/winsys/powervr/pvr_drm_public.h b/src/imagination/vulkan/winsys/powervr/pvr_drm_public.h
+index a3c719f28db4..8c984ac82e66 100644
+--- a/src/imagination/vulkan/winsys/powervr/pvr_drm_public.h
++++ b/src/imagination/vulkan/winsys/powervr/pvr_drm_public.h
+@@ -30,6 +30,7 @@
+ 
+ VkResult pvr_drm_winsys_create(int render_fd,
+                                int display_fd,
++                               drmVersionPtr version,
+                                const VkAllocationCallbacks *alloc,
+                                struct pvr_winsys **ws_out);
+ 
+diff --git a/src/imagination/vulkan/winsys/pvr_winsys.c b/src/imagination/vulkan/winsys/pvr_winsys.c
+index 64c5c76b175f..fad26f3bf7cf 100644
+--- a/src/imagination/vulkan/winsys/pvr_winsys.c
++++ b/src/imagination/vulkan/winsys/pvr_winsys.c
+@@ -96,7 +96,7 @@ VkResult pvr_winsys_create(const char *render_path,
+    }
+ 
+    if (strcmp(version->name, PVR_DRM_DRIVER_NAME) == 0) {
+-      result = pvr_drm_winsys_create(render_fd, display_fd, alloc, ws_out);
++      result = pvr_drm_winsys_create(render_fd, display_fd, version, alloc, ws_out);
+ #if defined(PVR_SUPPORT_SERVICES_DRIVER)
+    } else if (strcmp(version->name, PVR_SRV_DRIVER_NAME) == 0) {
+       result = pvr_srv_winsys_create(render_fd, display_fd, alloc, ws_out);
+-- 
+GitLab
+

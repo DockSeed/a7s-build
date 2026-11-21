@@ -1,0 +1,465 @@
+Description: pvr: cache render states for dynamic rendering
+ With dynamic rendering every vkCmdBeginRendering gets a new render state:
+ pvr_arch_render_state_setup() allocates the PPP state, compiles and uploads
+ the SPM end-of-tile program and allocates the SPM background object state,
+ and the first job of the render creates a render target dataset (HWRT
+ dataset, local free list and their buffers). All of it is destroyed when the
+ command buffer is reset or freed. Under zink, which only uses dynamic
+ rendering, this happens for every render pass: each one creates a new HWRT
+ dataset and free list, and several buffer objects are created, mapped and
+ unmapped per submit.
+ .
+ Keep the render states of dynamic rendering that have no references on a
+ per-device list in order of use, each with a key of everything
+ pvr_arch_render_state_setup() and the dataset creation read: width, height,
+ layers, sample count, output register count, tile buffer count and SPM
+ scratch buffer size. The list can hold several entries with the same key.
+ vkCmdBeginRendering first looks for a render state with the same key in the
+ graphics sub commands of its own command buffer and takes another reference
+ on it. Passes of one command buffer run in order, so a command buffer with
+ several passes of the same size shares one render state and dataset.
+ Otherwise it takes the most recently used idle render state with that key
+ off the list, or sets up a new one. Secondary command buffers that continue
+ a render pass only take idle render states.
+ .
+ A render state is never handed to a second command buffer while it is in
+ use: the dataset slot and the pending fragment job of its datasets are
+ updated without a lock and are meant for one user at a time. Freeing the sub
+ command drops the reference. When the last reference is dropped, the render
+ state goes back to the list, which keeps 16 entries and destroys the least
+ recently used one beyond that, or it is destroyed right away if a dataset
+ still waits for its fragment job (need_frag). The list is emptied at device
+ destruction. A command buffer that is submitted again while its previous
+ submission still executes keeps using the render states it holds. Render
+ passes with framebuffers are unchanged.
+ .
+ Error paths in vkCmdBeginRendering free the unused render state, and a
+ failure in pvr_arch_mrt_load_ops_setup() leaves render state and render info
+ to the sub command that already owns them.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/vulkan/pvr_arch_cmd_buffer.c
++++ b/src/imagination/vulkan/pvr_arch_cmd_buffer.c
+@@ -148,7 +148,7 @@
+          pvr_bo_suballoc_free(sub_cmd->gfx.depth_bias_bo);
+          pvr_bo_suballoc_free(sub_cmd->gfx.scissor_bo);
+          if (sub_cmd->is_dynamic_render && !secondary_cont) {
+-            pvr_rstate_entry_remove(cmd_buffer->device, sub_cmd->gfx.rstate);
++            pvr_render_state_cache_put(cmd_buffer->device, sub_cmd->gfx.rstate);
+             pvr_dynamic_render_info_destroy(cmd_buffer->device,
+                                             cmd_buffer,
+                                             sub_cmd->gfx.dr_info);
+@@ -4919,11 +4919,6 @@
+ 
+    *dr_info_out = dr_info;
+ 
+-   /* FIXME: When adding support for caching rt datasets and render states,
+-    * remove this and handle it with a proper hash table.
+-    */
+-   pvr_rstate_entry_add(device, rstate);
+-
+    return VK_SUCCESS;
+ 
+ err_free_cmd_buffer_clear_values:
+@@ -4956,6 +4951,69 @@
+       info->rstate->height);
+ }
+ 
++static struct pvr_render_state *
++pvr_cmd_buffer_find_render_state(struct pvr_cmd_buffer *cmd_buffer,
++                                 const struct pvr_render_state_key *key)
++{
++   if (pvr_cmd_buffer_is_secondary_cont(cmd_buffer))
++      return NULL;
++
++   list_for_each_entry_rev (struct pvr_sub_cmd,
++                            sub_cmd,
++                            &cmd_buffer->sub_cmds,
++                            link) {
++      if (sub_cmd->type != PVR_SUB_CMD_TYPE_GRAPHICS ||
++          !sub_cmd->is_dynamic_render || !sub_cmd->gfx.rstate)
++         continue;
++
++      if (!memcmp(&sub_cmd->gfx.rstate->key, key, sizeof(*key)))
++         return sub_cmd->gfx.rstate;
++   }
++
++   return NULL;
++}
++
++static VkResult pvr_dynamic_render_state_acquire(
++   struct pvr_cmd_buffer *cmd_buffer,
++   const struct pvr_renderpass_hwsetup_render *hw_render,
++   struct pvr_render_state **const rstate_inout)
++{
++   struct pvr_device *device = cmd_buffer->device;
++   struct pvr_render_state *rstate = *rstate_inout;
++   const struct pvr_render_state_key key = {
++      .width = rstate->width,
++      .height = rstate->height,
++      .layers = rstate->layers,
++      .sample_count = hw_render->sample_count,
++      .output_regs_count = hw_render->output_regs_count,
++      .tile_buffers_count = hw_render->tile_buffers_count,
++      .scratch_buffer_size = rstate->scratch_buffer_size,
++   };
++   struct pvr_render_state *cached;
++   VkResult result;
++
++   cached = pvr_cmd_buffer_find_render_state(cmd_buffer, &key);
++   if (cached)
++      pvr_render_state_cache_ref(device, cached);
++   else
++      cached = pvr_render_state_cache_get(device, &key);
++
++   if (cached) {
++      vk_free(&device->vk.alloc, rstate);
++      *rstate_inout = cached;
++      return VK_SUCCESS;
++   }
++
++   result = pvr_arch_render_state_setup(device, NULL, rstate, 1, hw_render);
++   if (result != VK_SUCCESS)
++      return result;
++
++   rstate->key = key;
++   rstate->refs = 1;
++
++   return VK_SUCCESS;
++}
++
+ void PVR_PER_ARCH(CmdBeginRendering)(VkCommandBuffer commandBuffer,
+                                      const VkRenderingInfo *pRenderingInfo)
+ {
+@@ -5044,11 +5102,9 @@
+       pvr_render_pass_info_get_scratch_buffer_size(device,
+                                                    &state->render_pass_info);
+ 
+-   result = pvr_arch_render_state_setup(device,
+-                                        NULL,
+-                                        state->render_pass_info.rstate,
+-                                        1,
+-                                        &dr_info->hw_render);
++   result = pvr_dynamic_render_state_acquire(cmd_buffer,
++                                             &dr_info->hw_render,
++                                             &state->render_pass_info.rstate);
+    if (result != VK_SUCCESS) {
+       vk_command_buffer_set_error(&cmd_buffer->vk, result);
+       goto err_cleanup_tile_buffers;
+@@ -5058,7 +5114,7 @@
+       pvr_arch_cmd_buffer_start_sub_cmd(cmd_buffer, PVR_SUB_CMD_TYPE_GRAPHICS);
+    if (result != VK_SUCCESS) {
+       vk_command_buffer_set_error(&cmd_buffer->vk, result);
+-      goto err_cleanup_render_state;
++      goto err_put_render_state;
+    }
+ 
+    sub_cmd = &state->current_sub_cmd->gfx;
+@@ -5071,20 +5127,23 @@
+                                         &dr_info->hw_render.load_op_state);
+    if (result != VK_SUCCESS) {
+       vk_command_buffer_set_error(&cmd_buffer->vk, result);
+-      goto err_cleanup_render_state;
++      return;
+    }
+ 
+    pvr_perform_start_of_render_clears(cmd_buffer, resume);
+ 
+    return;
+ 
+-err_cleanup_render_state:
+-   pvr_render_state_cleanup(device, &device->vk.alloc, state->render_pass_info.rstate);
++err_put_render_state:
++   pvr_render_state_cache_put(device, state->render_pass_info.rstate);
++   state->render_pass_info.rstate = NULL;
+ 
+ err_cleanup_tile_buffers:
+    pvr_device_free_tile_buffer_state(device);
+ 
+ err_destroy_dynamic_render_info:
++   vk_free(&device->vk.alloc, state->render_pass_info.rstate);
++   state->render_pass_info.rstate = NULL;
+    pvr_dynamic_render_info_destroy(device, cmd_buffer, dr_info);
+ }
+ 
+--- a/src/imagination/vulkan/pvr_arch_device.c
++++ b/src/imagination/vulkan/pvr_arch_device.c
+@@ -936,6 +936,10 @@
+    if (result != VK_SUCCESS)
+       goto err_pvr_border_color_table_finish;
+ 
++   result = pvr_render_state_cache_init(device);
++   if (result != VK_SUCCESS)
++      goto err_pvr_device_dummy_rt_finish;
++
+    /* Initialize GPU tracing infrastructure */
+    pvr_device_utrace_init(device);
+ 
+@@ -950,13 +954,13 @@
+    device->global_cmd_buffer_submit_count = 0;
+    device->global_queue_present_count = 0;
+ 
+-   simple_mtx_init(&device->rs_mtx, mtx_plain);
+-   list_inithead(&device->render_states);
+-
+    *pDevice = pvr_device_to_handle(device);
+ 
+    return VK_SUCCESS;
+ 
++err_pvr_device_dummy_rt_finish:
++   pvr_device_dummy_rt_finish(device);
++
+ err_pvr_border_color_table_finish:
+    pvr_arch_border_color_table_finish(device);
+ 
+@@ -1034,18 +1038,7 @@
+    /* Cleanup GPU tracing infrastructure */
+    pvr_device_utrace_finish(device);
+ 
+-   simple_mtx_lock(&device->rs_mtx);
+-   list_for_each_entry_safe (struct pvr_render_state,
+-                             rstate,
+-                             &device->render_states,
+-                             link) {
+-      pvr_render_state_cleanup(device, pAllocator, rstate);
+-      list_del(&rstate->link);
+-
+-      vk_free(&device->vk.alloc, rstate);
+-   }
+-   simple_mtx_unlock(&device->rs_mtx);
+-   simple_mtx_destroy(&device->rs_mtx);
++   pvr_render_state_cache_finish(device);
+ 
+    pvr_device_dummy_rt_finish(device);
+    pvr_arch_border_color_table_finish(device);
+--- a/src/imagination/vulkan/pvr_cmd_buffer.h
++++ b/src/imagination/vulkan/pvr_cmd_buffer.h
+@@ -642,6 +642,14 @@
+    return sub_cmd->job.run_frag && sub_cmd->rstate->layers > 1;
+ }
+ 
++static inline bool
++pvr_cmd_buffer_is_secondary_cont(const struct pvr_cmd_buffer *const cmd_buffer)
++{
++   return cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY &&
++          (cmd_buffer->usage_flags &
++           VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT);
++}
++
+ VkResult
+ pvr_cmd_buffer_insert_mid_frag_barrier_event(struct pvr_cmd_buffer *cmd_buffer,
+                                              uint32_t src_stage_mask,
+--- a/src/imagination/vulkan/pvr_device.c
++++ b/src/imagination/vulkan/pvr_device.c
+@@ -156,34 +156,121 @@
+    return result;
+ }
+ 
+-void pvr_rstate_entry_add(struct pvr_device *device,
+-                          struct pvr_render_state *rstate)
++#define PVR_RENDER_STATE_CACHE_IDLE_MAX 16
++
++static bool pvr_render_state_key_equal(const void *a, const void *b)
++{
++   return memcmp(a, b, sizeof(struct pvr_render_state_key)) == 0;
++}
++
++static void pvr_render_state_destroy(struct pvr_device *device,
++                                     struct pvr_render_state *rstate)
+ {
+-   simple_mtx_lock(&device->rs_mtx);
+-   list_addtail(&rstate->link, &device->render_states);
+-   simple_mtx_unlock(&device->rs_mtx);
++   pvr_render_state_cleanup(device, NULL, rstate);
++   vk_free(&device->vk.alloc, rstate);
++}
++
++static bool pvr_render_state_needs_frag(const struct pvr_render_state *rstate)
++{
++   for (uint32_t i = 0; i < rstate->render_targets_count; i++) {
++      const struct pvr_render_target *render_target =
++         &rstate->render_targets[i];
++
++      u_foreach_bit (view_idx, render_target->valid_mask) {
++         if (render_target->rt_dataset[view_idx]->need_frag)
++            return true;
++      }
++   }
++
++   return false;
+ }
+ 
+-void pvr_rstate_entry_remove(struct pvr_device *device,
+-                             const struct pvr_render_state *rstate)
++VkResult pvr_render_state_cache_init(struct pvr_device *device)
+ {
+-   simple_mtx_lock(&device->rs_mtx);
+-   assert(rstate);
++   simple_mtx_init(&device->rstate_cache_mtx, mtx_plain);
++   list_inithead(&device->rstate_cache_idle);
++   device->rstate_cache_idle_count = 0;
++
++   return VK_SUCCESS;
++}
+ 
++void pvr_render_state_cache_finish(struct pvr_device *device)
++{
+    list_for_each_entry_safe (struct pvr_render_state,
+-                             entry,
+-                             &device->render_states,
+-                             link) {
+-      if (entry != rstate)
++                             rstate,
++                             &device->rstate_cache_idle,
++                             link)
++      pvr_render_state_destroy(device, rstate);
++
++   simple_mtx_destroy(&device->rstate_cache_mtx);
++}
++
++struct pvr_render_state *
++pvr_render_state_cache_get(struct pvr_device *device,
++                           const struct pvr_render_state_key *key)
++{
++   struct pvr_render_state *found = NULL;
++
++   simple_mtx_lock(&device->rstate_cache_mtx);
++
++   list_for_each_entry_rev (struct pvr_render_state,
++                            rstate,
++                            &device->rstate_cache_idle,
++                            link) {
++      if (!pvr_render_state_key_equal(&rstate->key, key))
+          continue;
+ 
+-      pvr_render_state_cleanup(device, &device->vk.alloc, rstate);
+-      list_del(&entry->link);
++      list_del(&rstate->link);
++      device->rstate_cache_idle_count--;
++      rstate->refs = 1;
++      found = rstate;
++      break;
++   }
++
++   simple_mtx_unlock(&device->rstate_cache_mtx);
+ 
+-      vk_free(&device->vk.alloc, entry);
++   return found;
++}
++
++void pvr_render_state_cache_ref(struct pvr_device *device,
++                                struct pvr_render_state *rstate)
++{
++   simple_mtx_lock(&device->rstate_cache_mtx);
++   assert(rstate->refs);
++   rstate->refs++;
++   simple_mtx_unlock(&device->rstate_cache_mtx);
++}
++
++void pvr_render_state_cache_put(struct pvr_device *device,
++                                struct pvr_render_state *rstate)
++{
++   simple_mtx_lock(&device->rstate_cache_mtx);
++
++   assert(rstate->refs);
++   if (--rstate->refs) {
++      simple_mtx_unlock(&device->rstate_cache_mtx);
++      return;
+    }
+ 
+-   simple_mtx_unlock(&device->rs_mtx);
++   if (!pvr_render_state_needs_frag(rstate)) {
++      list_addtail(&rstate->link, &device->rstate_cache_idle);
++
++      if (++device->rstate_cache_idle_count <=
++          PVR_RENDER_STATE_CACHE_IDLE_MAX) {
++         simple_mtx_unlock(&device->rstate_cache_mtx);
++         return;
++      }
++
++      rstate = list_first_entry(&device->rstate_cache_idle,
++                                struct pvr_render_state,
++                                link);
++      list_del(&rstate->link);
++      device->rstate_cache_idle_count--;
++   }
++
++   simple_mtx_unlock(&device->rstate_cache_mtx);
++
++   pvr_render_state_destroy(device, rstate);
+ }
+ 
+ VkResult pvr_AllocateMemory(VkDevice _device,
+--- a/src/imagination/vulkan/pvr_device.h
++++ b/src/imagination/vulkan/pvr_device.h
+@@ -40,6 +40,7 @@
+ struct pvr_device_static_clear_state;
+ struct pvr_instance;
+ struct pvr_queue;
++struct pvr_render_state_key;
+ struct pvr_render_target;
+ 
+ struct pvr_compute_query_shader {
+@@ -167,8 +168,9 @@
+       pdsc_program *xfb_query_end;
+    } pdsc_precomp_programs;
+ 
+-   simple_mtx_t rs_mtx;
+-   struct list_head render_states;
++   simple_mtx_t rstate_cache_mtx;
++   struct list_head rstate_cache_idle;
++   uint32_t rstate_cache_idle_count;
+ 
+    /* Data Source for GPU tracing */
+    struct pvr_ds_device ds;
+@@ -230,11 +232,19 @@
+                             uint64_t code_alignment,
+                             struct pvr_suballoc_bo **const pvr_bo_out);
+ 
+-void pvr_rstate_entry_add(struct pvr_device *device,
+-                          struct pvr_render_state *rstate);
++VkResult pvr_render_state_cache_init(struct pvr_device *device);
+ 
+-void pvr_rstate_entry_remove(struct pvr_device *device,
+-                             const struct pvr_render_state *rstate);
++void pvr_render_state_cache_finish(struct pvr_device *device);
++
++struct pvr_render_state *
++pvr_render_state_cache_get(struct pvr_device *device,
++                           const struct pvr_render_state_key *key);
++
++void pvr_render_state_cache_put(struct pvr_device *device,
++                                struct pvr_render_state *rstate);
++
++void pvr_render_state_cache_ref(struct pvr_device *device,
++                                struct pvr_render_state *rstate);
+ 
+ void pvr_render_targets_fini(struct pvr_render_target *render_targets,
+                              uint32_t render_targets_count);
+--- a/src/imagination/vulkan/pvr_framebuffer.h
++++ b/src/imagination/vulkan/pvr_framebuffer.h
+@@ -31,8 +31,20 @@
+    uint32_t valid_mask;
+ };
+ 
++struct pvr_render_state_key {
++   uint32_t width;
++   uint32_t height;
++   uint32_t layers;
++   uint32_t sample_count;
++   uint32_t output_regs_count;
++   uint32_t tile_buffers_count;
++   uint64_t scratch_buffer_size;
++};
++
+ struct pvr_render_state {
+    struct list_head link;
++   struct pvr_render_state_key key;
++   uint32_t refs;
+ 
+    uint32_t width;
+    uint32_t height;

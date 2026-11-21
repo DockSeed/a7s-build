@@ -1,0 +1,762 @@
+Description: pvr: map transform feedback counter buffers to their binding
+ vkCmdBeginTransformFeedbackEXT and vkCmdEndTransformFeedbackEXT store the
+ counter buffers at binding firstCounterBuffer + j, but the init and end
+ programs read bindings 0..counterBufferCount-1 and applied counter i to
+ buffer group i. The init program loaded all counters with one load from
+ the first counter buffer and the end program stored all of them with one
+ contiguous store to the first counter buffer. With more than one buffer
+ the end store wrote behind the first counter buffer and the other counter
+ buffers were neither read nor written, and a non-zero firstCounterBuffer
+ used no counter at all.
+ .
+ Resolve the binding of each buffer group from its varyings and use that
+ binding's counter buffer and stride. The init program loads each counter
+ with its own 16-byte aligned load and dword select, and the end program
+ stores each counter with its own one dword store. A group without a counter
+ buffer starts at offset zero and stores nothing. The end program now loads
+ the four saved offsets (16 bytes) instead of a count of 8-byte units that
+ could exceed its temps.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/common/pvr_iface.h
++++ b/src/imagination/common/pvr_iface.h
+@@ -207,16 +207,19 @@
+    PVR_XFB_INIT_PATCH_ID_PTEMP_LD_SRC0_3,
+ 
+    /** Patch ID for transform feedback counter buffer load */
+-   PVR_XFB_INIT_PATCH_ID_COUNTER_BUFFER_LD_SRC0,
++   PVR_XFB_INIT_PATCH_ID_COUNTER_BUFFER_LD_SRC0_0,
++   PVR_XFB_INIT_PATCH_ID_COUNTER_BUFFER_LD_SRC0_1,
++   PVR_XFB_INIT_PATCH_ID_COUNTER_BUFFER_LD_SRC0_2,
++   PVR_XFB_INIT_PATCH_ID_COUNTER_BUFFER_LD_SRC0_3,
+ 
+    /** Patch ID for transform feedback counter buffer store */
+    PVR_XFB_INIT_PATCH_ID_COUNTER_BUFFER_ST_SRC0,
+ 
+    /** Patch ID for transform feedback counter buffer alignment dword select */
+-   PVR_XFB_INIT_PATCH_ID_COUNTER_BUFFER_DWORD_SELECT,
+-
+-   /** Patch ID for transform feedback counter buffer count */
+-   PVR_XFB_INIT_PATCH_ID_COUNTER_BUFFER_COUNT,
++   PVR_XFB_INIT_PATCH_ID_COUNTER_BUFFER_DWORD_SELECT_0,
++   PVR_XFB_INIT_PATCH_ID_COUNTER_BUFFER_DWORD_SELECT_1,
++   PVR_XFB_INIT_PATCH_ID_COUNTER_BUFFER_DWORD_SELECT_2,
++   PVR_XFB_INIT_PATCH_ID_COUNTER_BUFFER_DWORD_SELECT_3,
+ };
+ 
+ /* PDSC XFB init reference IDs */
+@@ -243,9 +246,6 @@
+ 
+ /* PDSC XFB end patch IDs */
+ enum pvr_xfb_end_patch_id {
+-   /** Patch ID for end transform feedback counter buffer count */
+-   PVR_XFB_END_PATCH_ID_COUNTER_BUFFER_COUNT,
+-
+    /** Patch ID for end transform feedback counter buffer stride 0 */
+    PVR_XFB_END_PATCH_ID_COUNTER_BUFFER_STRIDE_0,
+ 
+@@ -262,7 +262,10 @@
+    PVR_XFB_END_PATCH_ID_COUNTER_BUFFER_LD_SRC0,
+ 
+    /** Patch ID for end transform feedback counter buffer store source 0 */
+-   PVR_XFB_END_PATCH_ID_COUNTER_BUFFER_ST_SRC0,
++   PVR_XFB_END_PATCH_ID_COUNTER_BUFFER_ST_SRC0_0,
++   PVR_XFB_END_PATCH_ID_COUNTER_BUFFER_ST_SRC0_1,
++   PVR_XFB_END_PATCH_ID_COUNTER_BUFFER_ST_SRC0_2,
++   PVR_XFB_END_PATCH_ID_COUNTER_BUFFER_ST_SRC0_3,
+ 
+    /** Patch ID for stream query result load source 0 */
+    PVR_XFB_END_PATCH_ID_QUERY_RESULT_LD_SRC0,
+@@ -277,7 +280,10 @@
+    PVR_XFB_END_REF_ID_COUNTER_BUFFER_LD_DEST,
+ 
+    /** Ref ID for end transform feedback counter buffer store source 0 */
+-   PVR_XFB_END_REF_ID_COUNTER_BUFFER_ST_SRC0,
++   PVR_XFB_END_REF_ID_COUNTER_BUFFER_ST_SRC0_0,
++   PVR_XFB_END_REF_ID_COUNTER_BUFFER_ST_SRC0_1,
++   PVR_XFB_END_REF_ID_COUNTER_BUFFER_ST_SRC0_2,
++   PVR_XFB_END_REF_ID_COUNTER_BUFFER_ST_SRC0_3,
+ 
+    /** Ref ID for stream query result load destination */
+    PVR_XFB_END_REF_ID_QUERY_RESULT_LD_DEST,
+--- a/src/imagination/pdsc/programs/pdsc_xfb_end.h
++++ b/src/imagination/pdsc/programs/pdsc_xfb_end.h
+@@ -18,7 +18,6 @@
+ {
+    pdsc_program *p = pdsc_program_create(mem_ctx, features, "xfb_end");
+ 
+-   ALLOC_CONST64(p, counter_count, PVR_XFB_END_PATCH_ID_COUNTER_BUFFER_COUNT);
+    ALLOC_CONST32(p,
+                  counter_buffer_stride_0,
+                  PVR_XFB_END_PATCH_ID_COUNTER_BUFFER_STRIDE_0);
+@@ -31,8 +30,6 @@
+    ALLOC_CONST32(p,
+                  counter_buffer_stride_3,
+                  PVR_XFB_END_PATCH_ID_COUNTER_BUFFER_STRIDE_3);
+-   ALLOC_VAL_CONST64(p, const_one, 1);
+-
+    pdsc_ref counter_buffer_stride_arr[] = {
+       counter_buffer_stride_0,
+       counter_buffer_stride_1,
+@@ -40,10 +37,6 @@
+       counter_buffer_stride_3,
+    };
+ 
+-   ALLOC_TEMP64(p, izero);
+-   pdsc_limm(p, pdsc_ref_lo32(izero), pdsc_ref_imm(0));
+-   pdsc_limm(p, pdsc_ref_hi32(izero), pdsc_ref_imm(0));
+-
+    ALLOC_TEMP64(p, tzero);
+    pdsc_limm(p, pdsc_ref_lo32(tzero), pdsc_ref_imm(0));
+    pdsc_limm(p, pdsc_ref_hi32(tzero), pdsc_ref_imm(0));
+@@ -56,6 +49,9 @@
+       pdsc_ref_hi32(pdsc_ref_elem64(counter_buffer, 1)),
+    };
+ 
++   for (uint32_t i = 0; i < ARRAY_SIZE(counter_buffer_array); i++)
++      pdsc_limm(p, counter_buffer_array[i], pdsc_ref_imm(0));
++
+    ALLOC_TEMP32_ARRAY(p, st_buffer, PVR_XFB_MAX_BUFFERS);
+    pdsc_ref st_buffer_array[] = {
+       pdsc_ref_elem32(st_buffer, 0),
+@@ -64,7 +60,7 @@
+       pdsc_ref_elem32(st_buffer, 3),
+    };
+ 
+-   ALLOC_TEMP64_ARRAY(p, mad_result, PVR_XFB_MAX_BUFFERS);
++   ALLOC_TEMP64(p, mad_dst);
+ 
+    char buf[64];
+    pdsc_ref stm_ptemps64[PVR_XFB_MAX_PTEMPS_SETS];
+@@ -88,38 +84,36 @@
+ 
+    /* Update the number of primitives processed from the ptemps. */
+    for (uint32_t i = 0; i < ARRAY_SIZE(st_buffer_array); i++) {
+-      pdsc_cmp(p, izero, counter_count, .cop = PDSC_COP_LT);
+-      pdsc_setc(p, PDSC_PRED_P0);
+-
+-      pdsc_ref mad_dst = pdsc_ref_elem64(mad_result, i);
+-      pdsc_mov32(p, pdsc_ref_lo32(mad_dst), counter_buffer_array[i], .cc = true);
+-      pdsc_mov32(p, pdsc_ref_hi32(mad_dst), pdsc_ref_imm(0), .cc = true);
++      pdsc_mov32(p, pdsc_ref_lo32(mad_dst), counter_buffer_array[i]);
++      pdsc_mov32(p, pdsc_ref_hi32(mad_dst), pdsc_ref_imm(0));
+ 
+       pdsc_mad(
+          p,
+          mad_dst,
+          pdsc_ref_lo32(stm_ptemps64[i * PVR_XFB_PTEMP_ENTRIES_PER_VARYING + 1]),
+          counter_buffer_stride_arr[i],
+-         mad_dst,
+-         .cc = true);
++         mad_dst);
+ 
+-      pdsc_mov32(p, st_buffer_array[i], pdsc_ref_lo32(mad_dst), .cc = true);
+-      pdsc_add64(p, izero, izero, const_one, .cc = true);
++      pdsc_mov32(p, st_buffer_array[i], pdsc_ref_lo32(mad_dst));
+    }
+ 
+    /* Store counter buffer after updating with number of primitives processed */
+ 
+-   cmp = pdsc_cmp(p, tzero, pdsc_ref_null(), .cop = PDSC_COP_NE);
++   pdsc_instr_t st;
+ 
+-   pdsc_setc(p, PDSC_PRED_P0);
+-   pdsc_instr_t st = pdsc_st(p,
+-                             st_buffer_array[0],
+-                             PVR_XFB_END_REF_ID_COUNTER_BUFFER_ST_SRC0,
+-                             PVR_XFB_END_PATCH_ID_COUNTER_BUFFER_ST_SRC0,
+-                             false,
+-                             .mods.cc = true);
+-   pdsc_src_set(p, cmp, 1, pdsc_src_get(p, st, 0));
+-   pdsc_wdf(p);
++   for (uint32_t i = 0; i < ARRAY_SIZE(st_buffer_array); i++) {
++      cmp = pdsc_cmp(p, tzero, pdsc_ref_null(), .cop = PDSC_COP_NE);
++
++      pdsc_setc(p, PDSC_PRED_P0);
++      st = pdsc_st(p,
++                   st_buffer_array[i],
++                   PVR_XFB_END_REF_ID_COUNTER_BUFFER_ST_SRC0_0 + i,
++                   PVR_XFB_END_PATCH_ID_COUNTER_BUFFER_ST_SRC0_0 + i,
++                   false,
++                   .mods.cc = true);
++      pdsc_src_set(p, cmp, 1, pdsc_src_get(p, st, 0));
++      pdsc_wdf(p);
++   }
+ 
+    /* Accumulate this segment's primitive counts into the active stream query,
+     * as the next transform feedback begin resets them. The load and store are
+--- a/src/imagination/pdsc/programs/pdsc_xfb_init.h
++++ b/src/imagination/pdsc/programs/pdsc_xfb_init.h
+@@ -40,42 +40,19 @@
+    ALLOC_TEMP64(p, temp_result);
+ 
+    ALLOC_TEMP32(p, cb_dword0);
+-   ALLOC_CONST64(p,
+-                 alignment_sel,
+-                 PVR_XFB_INIT_PATCH_ID_COUNTER_BUFFER_DWORD_SELECT);
+    ALLOC_TEMP64(p, align_sel);
+ 
+-   ALLOC_CONST64(p,
+-                 counter_buffers_count,
+-                 PVR_XFB_INIT_PATCH_ID_COUNTER_BUFFER_COUNT);
+-
+    ALLOC_VAL_CONST64(p, const_one, 1);
+ 
+-   ALLOC_TEMP64_ARRAY(p, counter_buffer, PVR_XFB_MAX_BUFFERS);
++   ALLOC_TEMP64_ARRAY(p, counter_buffer, 2);
+    pdsc_ref counter_buffer_array[] = {
+       pdsc_ref_lo32(pdsc_ref_elem64(counter_buffer, 0)),
+       pdsc_ref_hi32(pdsc_ref_elem64(counter_buffer, 0)),
+       pdsc_ref_lo32(pdsc_ref_elem64(counter_buffer, 1)),
+       pdsc_ref_hi32(pdsc_ref_elem64(counter_buffer, 1)),
+-      pdsc_ref_lo32(pdsc_ref_elem64(counter_buffer, 2)),
+-      pdsc_ref_hi32(pdsc_ref_elem64(counter_buffer, 2)),
+-      pdsc_ref_lo32(pdsc_ref_elem64(counter_buffer, 3)),
+-      pdsc_ref_hi32(pdsc_ref_elem64(counter_buffer, 3)),
+    };
+ 
+-   for (uint32_t i = 0; i < ARRAY_SIZE(counter_buffer_array); i++)
+-      pdsc_limm(p, counter_buffer_array[i], pdsc_ref_imm(0));
+-
+    ALLOC_TEMP32_ARRAY(p, st_buffer, PVR_XFB_MAX_BUFFERS);
+-   pdsc_ref st_buffer_array[] = {
+-      pdsc_ref_elem32(st_buffer, 0),
+-      pdsc_ref_elem32(st_buffer, 1),
+-      pdsc_ref_elem32(st_buffer, 2),
+-      pdsc_ref_elem32(st_buffer, 3),
+-   };
+-
+-   for (uint32_t i = 0; i < ARRAY_SIZE(st_buffer_array); i++)
+-      pdsc_limm(p, pdsc_ref_elem32(st_buffer, i), pdsc_ref_imm(0));
+ 
+    /* Load ptemps per buffer */
+    for (uint32_t i = 0;
+@@ -94,72 +71,58 @@
+    }
+    pdsc_wdf(p);
+ 
+-   pdsc_instr_t cmp = pdsc_cmp(p, tzero, pdsc_ref_null(), .cop = PDSC_COP_NE);
+-
+-   pdsc_setc(p, PDSC_PRED_P0);
+-   pdsc_instr_t ld = pdsc_ld(p,
+-                             counter_buffer,
+-                             PVR_XFB_INIT_REF_ID_COUNTER_BUFFER_LD_DEST,
+-                             PVR_XFB_INIT_PATCH_ID_COUNTER_BUFFER_LD_SRC0,
+-                             false,
+-                             .mods.cc = true);
+-   pdsc_src_set(p, cmp, 1, pdsc_src_get(p, ld, 0));
+-   pdsc_wdf(p);
+-
+-   /* Apply counter buffer offsets to the SRC0 ptemp of each buffer group.
+-    * With fixed stride-3 allocation, group i's SRC0 is always at
+-    * ptemp64[i * PVR_XFB_PTEMP_ENTRIES_PER_VARYING].
+-    *
+-    * The counter buffer value is added to the buffer's SRC0 ptemp (address),
+-    * advancing the write pointer by the number of bytes already written.
+-    */
+-   pdsc_mov64(p, align_sel, alignment_sel);
+    pdsc_stmc(p, PDSC_SOMASK_GLOBAL);
+ 
+-   pdsc_limm(p, pdsc_ref_lo32(izero), pdsc_ref_imm(0));
+-   pdsc_limm(p, pdsc_ref_hi32(izero), pdsc_ref_imm(0));
+-
+-   for (uint32_t i = 0; i < ARRAY_SIZE(st_buffer_array); i++) {
+-      /* Group i's SRC0 is at ptemp64[i * PVR_XFB_PTEMP_ENTRIES_PER_VARYING]
+-       * (fixed stride-3 layout).
+-       */
++   for (uint32_t i = 0; i < PVR_XFB_MAX_BUFFERS; i++) {
+       pdsc_ref ptemp64 = so_ptemps64[i * PVR_XFB_PTEMP_ENTRIES_PER_VARYING];
+ 
+-      pdsc_cmp(p, align_sel, pdsc_ref_imm(0), .cop = PDSC_COP_EQ);
+-      pdsc_setc(p, PDSC_PRED_P0);
+-      pdsc_mov32(p, cb_dword0, counter_buffer_array[i]);
++      snprintf(buf, sizeof(buf), "alignment_sel_%u", i);
++      pdsc_ref alignment_sel =
++         pdsc_alloc_const64(p,
++                            buf,
++                            PDSC_TYPE_IMM,
++                            PVR_XFB_INIT_PATCH_ID_COUNTER_BUFFER_DWORD_SELECT_0 +
++                               i);
++
++      for (uint32_t j = 0; j < ARRAY_SIZE(counter_buffer_array); j++)
++         pdsc_limm(p, counter_buffer_array[j], pdsc_ref_imm(0));
++
++      pdsc_instr_t cmp =
++         pdsc_cmp(p, tzero, pdsc_ref_null(), .cop = PDSC_COP_NE);
++      pdsc_setc(p, PDSC_PRED_P0);
++      pdsc_instr_t ld =
++         pdsc_ld(p,
++                 counter_buffer,
++                 PVR_XFB_INIT_REF_ID_COUNTER_BUFFER_LD_DEST,
++                 PVR_XFB_INIT_PATCH_ID_COUNTER_BUFFER_LD_SRC0_0 + i,
++                 false,
++                 .mods.cc = true);
++      pdsc_src_set(p, cmp, 1, pdsc_src_get(p, ld, 0));
++      pdsc_wdf(p);
++
++      pdsc_mov64(p, align_sel, alignment_sel);
++      pdsc_mov32(p, cb_dword0, counter_buffer_array[0]);
++
++      for (uint32_t j = 1; j < ARRAY_SIZE(counter_buffer_array); j++) {
++         pdsc_cmp(p, align_sel, pdsc_ref_imm(j), .cop = PDSC_COP_EQ);
++         pdsc_setc(p, PDSC_PRED_P0);
++         pdsc_mov32(p, cb_dword0, counter_buffer_array[j], .cc = true);
++      }
+ 
+-      pdsc_cmp(p, align_sel, pdsc_ref_imm(1), .cop = PDSC_COP_EQ);
+-      pdsc_setc(p, PDSC_PRED_P0);
+-      pdsc_mov32(p, cb_dword0, counter_buffer_array[i + 1], .cc = true);
+-
+-      pdsc_cmp(p, align_sel, pdsc_ref_imm(2), .cop = PDSC_COP_EQ);
+-      pdsc_setc(p, PDSC_PRED_P0);
+-      pdsc_mov32(p, cb_dword0, counter_buffer_array[i + 2], .cc = true);
++      pdsc_mov32(p, pdsc_ref_elem32(st_buffer, i), cb_dword0);
+ 
+-      pdsc_cmp(p, align_sel, pdsc_ref_imm(3), .cop = PDSC_COP_EQ);
+-      pdsc_setc(p, PDSC_PRED_P0);
+-      pdsc_mov32(p, cb_dword0, counter_buffer_array[i + 3], .cc = true);
+-
+-      pdsc_cmp(p, izero, counter_buffers_count, .cop = PDSC_COP_LT);
+-      pdsc_setc(p, PDSC_PRED_P0);
++      pdsc_mov32(p, pdsc_ref_lo32(temp_result), cb_dword0);
++      pdsc_limm(p, pdsc_ref_hi32(temp_result), pdsc_ref_imm(0));
+ 
+-      pdsc_mov32(p, st_buffer_array[i], cb_dword0, .cc = true);
+-
+-      pdsc_mov32(p, pdsc_ref_lo32(temp_result), cb_dword0, .cc = true);
+-      pdsc_mov32(p, pdsc_ref_hi32(temp_result), pdsc_ref_imm(0), .cc = true);
+-
+-      pdsc_add64(p, temp_result, temp_result, ptemp64, .cc = true);
+-      pdsc_mov64(p, ptemp64, temp_result, .cc = true);
+-
+-      pdsc_add64(p, izero, izero, const_one, .cc = true);
++      pdsc_add64(p, temp_result, temp_result, ptemp64);
++      pdsc_mov64(p, ptemp64, temp_result);
+    }
+ 
+-   cmp = pdsc_cmp(p, tzero, pdsc_ref_null(), .cop = PDSC_COP_NE);
++   pdsc_instr_t cmp = pdsc_cmp(p, tzero, pdsc_ref_null(), .cop = PDSC_COP_NE);
+ 
+    pdsc_setc(p, PDSC_PRED_P0);
+    pdsc_instr_t st = pdsc_st(p,
+-                             st_buffer_array[0],
++                             pdsc_ref_elem32(st_buffer, 0),
+                              PVR_XFB_INIT_REF_ID_COUNTER_BUFFER_ST_SRC0,
+                              PVR_XFB_INIT_PATCH_ID_COUNTER_BUFFER_ST_SRC0,
+                              false,
+--- a/src/imagination/vulkan/pvr_arch_xfb.c
++++ b/src/imagination/vulkan/pvr_arch_xfb.c
+@@ -142,43 +142,34 @@
+    return vk_error(&cmd_buffer->device->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+ }
+ 
++static uint32_t
++pvr_xfb_group_buffer(const struct pvr_xfb_shader_state *xfb_shader_state,
++                     uint32_t group)
++{
++   uint32_t var_i = 0;
++
++   for (uint32_t g = 0; g < group; g++)
++      var_i += xfb_shader_state->group_varying_count[g];
++
++   return xfb_shader_state->varyings[var_i].xfb_buffer;
++}
++
+ static VkResult
+ pvr_setup_init_config(struct pvr_cmd_buffer *cmd_buffer,
+                       struct pvr_pds_xfb_init_program_input *init_input,
+                       struct pvr_xfb_program_input *input_config)
+ {
+    struct pvr_cmd_buffer_xfb_state *xfb_state = &cmd_buffer->state.xfb_state;
+-   const VkAllocationCallbacks *const allocator = &cmd_buffer->device->vk.alloc;
+-   bool has_valid_counter_buffer = false;
++   const struct pvr_xfb_shader_state *xfb_shader_state =
++      &cmd_buffer->state.gfx_pipeline->shader_state.xfb_shader_state;
+ 
+    init_input->device = cmd_buffer->device;
+ 
+-   if (xfb_state->counter_buffer_count) {
+-      init_input->counter_buffer_count = xfb_state->counter_buffer_count;
+-      init_input->data.counter_buffers_addr =
+-         vk_alloc(allocator,
+-                  sizeof(*init_input->data.counter_buffers_addr) *
+-                     init_input->counter_buffer_count,
+-                  8U,
+-                  VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
+-
+-      if (!init_input->data.counter_buffers_addr)
+-         return vk_error(&cmd_buffer->device->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+-
+-      for (uint32_t i = 0; i < init_input->counter_buffer_count; i++) {
+-         uint64_t addr = xfb_state->bindings[i].counter_buffer_addr.addr;
+-
+-         init_input->data.counter_buffers_addr[i].addr = addr;
+-         has_valid_counter_buffer |= !!addr;
+-      }
++   for (uint32_t g = 0; g < xfb_shader_state->buffer_group_count; g++) {
++      const uint32_t buffer = pvr_xfb_group_buffer(xfb_shader_state, g);
+ 
+-      init_input->load_from_counter_buffers = has_valid_counter_buffer;
+-      if (!has_valid_counter_buffer)
+-         init_input->counter_buffer_count = 0;
+-   } else {
+-      init_input->load_from_counter_buffers = false;
+-      init_input->counter_buffer_count = 0;
+-      init_input->data.counter_buffers_addr = NULL;
++      init_input->data.counter_buffers_addr[g] =
++         xfb_state->bindings[buffer].counter_buffer_addr;
+    }
+ 
+    assert(input_config->data.buffer_info);
+@@ -188,8 +179,7 @@
+    init_input->data.varying_info_arr = input_config->data.varying_info_arr;
+ 
+    init_input->data.counter_buffer_offsets_addr =
+-      &cmd_buffer->state.gfx_pipeline->shader_state.xfb_shader_state
+-          .counter_buffer_offsets->dev_addr;
++      &xfb_shader_state->counter_buffer_offsets->dev_addr;
+    init_input->primitive_type = input_config->primitive_type;
+ 
+    return VK_SUCCESS;
+@@ -200,8 +190,6 @@
+                              struct pvr_pds_xfb_end_program_input *input)
+ {
+    struct pvr_cmd_buffer_xfb_state *xfb_state = &cmd_buffer->state.xfb_state;
+-   const VkAllocationCallbacks *const allocator = &cmd_buffer->device->vk.alloc;
+-   bool has_valid_counter_buffer = false;
+ 
+    const struct pvr_graphics_pipeline *pipeline =
+       cmd_buffer->state.gfx_pipeline;
+@@ -212,42 +200,20 @@
+    const uint32_t prim_vert_count = pvr_get_output_primitive_vertex_count(
+       dynamic_state->ia.primitive_topology);
+ 
+-   if (xfb_state->counter_buffer_count) {
+-      input->counter_buffer_count = xfb_state->counter_buffer_count;
+-      assert(input->counter_buffer_count <= PVR_XFB_MAX_BUFFERS);
+-
+-      input->data.counter_buffers_addr =
+-         vk_alloc(allocator,
+-                  sizeof(*input->data.counter_buffers_addr) *
+-                     input->counter_buffer_count,
+-                  8U,
+-                  VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
+-      if (!input->data.counter_buffers_addr)
+-         return vk_error(&cmd_buffer->device->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+-
+-      for (uint32_t i = 0; i < input->counter_buffer_count; i++) {
+-         pvr_dev_addr_t *counter_buffers_addr =
+-            &input->data.counter_buffers_addr[i];
+-
+-         if (!xfb_state->bindings[i].last_counter_buffer_addr.addr) {
+-            counter_buffers_addr->addr = 0;
+-         } else {
+-            counter_buffers_addr->addr =
+-               xfb_state->bindings[i].last_counter_buffer_addr.addr;
+-            has_valid_counter_buffer = true;
+-
+-            input->buffer_strides[i] =
+-               xfb_shader_state->buffer_strides[i] * prim_vert_count;
+-         }
+-      }
++   input->has_store_counter_buffers = false;
++
++   for (uint32_t g = 0; g < xfb_shader_state->buffer_group_count; g++) {
++      const uint32_t buffer = pvr_xfb_group_buffer(xfb_shader_state, g);
++      const pvr_dev_addr_t addr =
++         xfb_state->bindings[buffer].last_counter_buffer_addr;
+ 
+-      input->has_store_counter_buffers = has_valid_counter_buffer;
+-      if (!has_valid_counter_buffer)
+-         input->counter_buffer_count = 0;
+-   } else {
+-      input->has_store_counter_buffers = false;
+-      input->counter_buffer_count = 0;
+-      input->data.counter_buffers_addr = NULL;
++      input->data.counter_buffers_addr[g] = addr;
++      if (!addr.addr)
++         continue;
++
++      input->has_store_counter_buffers = true;
++      input->buffer_strides[g] =
++         xfb_shader_state->buffer_strides[buffer] * prim_vert_count;
+    }
+ 
+    input->data.counter_buffer_offsets_addr =
+@@ -293,28 +259,33 @@
+       .dest = counter_buffer_ld_dest,
+ 
+       .cmode = PDSC_CMODE_LD_CACHED,
+-      .count8 = end_input.counter_buffer_count,
+-      .srcadd = end_input.has_store_counter_buffers
+-                   ? end_input.data.counter_buffer_offsets_addr[0].addr
+-                   : 0,
++      .count8 = DIV_ROUND_UP(PVR_XFB_MAX_BUFFERS, 2),
++      .srcadd = end_input.data.counter_buffer_offsets_addr->addr,
+    };
+ 
+-   struct pdsc_st32_src0 st_src0 = {
+-      .cmode = PDSC_CMODE_ST_WRITE_THROUGH,
+-      .slcmode = PDSC_SLC_MODE_ST_WRITE_THROUGH,
++   uint64_t st_src0_packed[PVR_XFB_MAX_BUFFERS] = { 0 };
+ 
+-      .ccpri = 0,
+-      .ccslc = PDSC_CCSLC_LD_NORMAL,
+-      .ccmcu = PDSC_CCMCU_LD_NORMAL,
++   for (uint32_t g = 0; g < PVR_XFB_MAX_BUFFERS; g++) {
++      if (!end_input.data.counter_buffers_addr[g].addr)
++         continue;
+ 
+-      .count4 = end_input.counter_buffer_count,
++      const struct pdsc_st32_src0 st_src0 = {
++         .cmode = PDSC_CMODE_ST_WRITE_THROUGH,
++         .slcmode = PDSC_SLC_MODE_ST_WRITE_THROUGH,
+ 
+-      .src = pdsc_load_ref(*end_program,
+-                           PVR_XFB_END_REF_ID_COUNTER_BUFFER_ST_SRC0),
+-      .dstadd = end_input.has_store_counter_buffers
+-                   ? end_input.data.counter_buffers_addr[0].addr
+-                   : 0,
+-   };
++         .ccpri = 0,
++         .ccslc = PDSC_CCSLC_LD_NORMAL,
++         .ccmcu = PDSC_CCMCU_LD_NORMAL,
++
++         .count4 = 1,
++
++         .src = pdsc_load_ref(*end_program,
++                              PVR_XFB_END_REF_ID_COUNTER_BUFFER_ST_SRC0_0 + g),
++         .dstadd = end_input.data.counter_buffers_addr[g].addr,
++      };
++
++      st_src0_packed[g] = pdsc_st32_src0_pack(*end_program, &st_src0);
++   }
+ 
+    /* While a stream query is active, add this segment's primitive counts to
+     * its result elem, as the next transform feedback begin resets them.
+@@ -358,8 +329,6 @@
+    };
+ 
+    pdsc_patch patches_end[] = {
+-      { .patch_id = PVR_XFB_END_PATCH_ID_COUNTER_BUFFER_COUNT,
+-        .value = end_input.counter_buffer_count },
+       { .patch_id = PVR_XFB_END_PATCH_ID_COUNTER_BUFFER_STRIDE_0,
+         .value = end_input.buffer_strides[0] },
+       { .patch_id = PVR_XFB_END_PATCH_ID_COUNTER_BUFFER_STRIDE_1,
+@@ -373,10 +342,14 @@
+                     ? pdsc_ld64_src0_pack(*end_program, &counter_buffers)
+                     : 0 },
+ 
+-      { .patch_id = PVR_XFB_END_PATCH_ID_COUNTER_BUFFER_ST_SRC0,
+-        .value = end_input.has_store_counter_buffers
+-                    ? pdsc_st32_src0_pack(*end_program, &st_src0)
+-                    : 0 },
++      { .patch_id = PVR_XFB_END_PATCH_ID_COUNTER_BUFFER_ST_SRC0_0,
++        .value = st_src0_packed[0] },
++      { .patch_id = PVR_XFB_END_PATCH_ID_COUNTER_BUFFER_ST_SRC0_1,
++        .value = st_src0_packed[1] },
++      { .patch_id = PVR_XFB_END_PATCH_ID_COUNTER_BUFFER_ST_SRC0_2,
++        .value = st_src0_packed[2] },
++      { .patch_id = PVR_XFB_END_PATCH_ID_COUNTER_BUFFER_ST_SRC0_3,
++        .value = st_src0_packed[3] },
+ 
+       { .patch_id = PVR_XFB_END_PATCH_ID_QUERY_RESULT_LD_SRC0,
+         .value = query_active
+@@ -422,8 +395,6 @@
+    pvr_arch_set_xfb_main_program_ppp_state(cmd_buffer);
+ 
+ out:
+-   vk_free(&cmd_buffer->device->vk.alloc, end_input.data.counter_buffers_addr);
+-   end_input.data.counter_buffers_addr = NULL;
+    return result;
+ }
+ 
+@@ -661,19 +632,6 @@
+    uint32_t data_size = pdsc_program_data_size(*p) / sizeof(uint32_t);
+    uint32_t code_size = pdsc_program_code_size(*p) / sizeof(uint32_t);
+ 
+-   pvr_dev_addr_t counter_buffer_addr = { 0 };
+-   uint32_t num_dwords = 0;
+-
+-   if (init_input.load_from_counter_buffers &&
+-       init_input.counter_buffer_count > 0) {
+-      counter_buffer_addr = init_input.data.counter_buffers_addr[0].addr != 0
+-                               ? init_input.data.counter_buffers_addr[0]
+-                               : PVR_DEV_ADDR_INVALID;
+-      uint32_t misalignment = counter_buffer_addr.addr & 0b1111;
+-      num_dwords = misalignment / 4;
+-      counter_buffer_addr.addr &= ~0b1111;
+-   }
+-
+    pdsc_ref ptemp_ld_dest[PVR_XFB_MAX_BUFFERS] = {
+       pdsc_load_ref(*p, PVR_XFB_INIT_REF_ID_PTEMPS_LD_DEST_0),
+       pdsc_load_ref(*p, PVR_XFB_INIT_REF_ID_PTEMPS_LD_DEST_1),
+@@ -699,18 +657,31 @@
+ 
+    pdsc_ref counter_buffer_ld_dest =
+       pdsc_load_ref(*p, PVR_XFB_INIT_REF_ID_COUNTER_BUFFER_LD_DEST);
+-   struct pdsc_ld64_src0 counter_buffers = {
+-      .slcmode = PDSC_SLC_MODE_LD_CACHED,
+-      .ccpri = 0,
+-      .ccslc = PDSC_CCSLC_LD_NORMAL,
+-      .ccmcu = PDSC_CCMCU_LD_NORMAL,
++   uint64_t counter_buffer_ld_src0[PVR_XFB_MAX_BUFFERS] = { 0 };
++   uint32_t counter_buffer_dword[PVR_XFB_MAX_BUFFERS] = { 0 };
+ 
+-      .dest = counter_buffer_ld_dest,
++   for (uint32_t g = 0; g < init_group_count; g++) {
++      const uint64_t addr = init_input.data.counter_buffers_addr[g].addr;
+ 
+-      .cmode = PDSC_CMODE_LD_CACHED,
+-      .count8 = DIV_ROUND_UP(init_input.counter_buffer_count + num_dwords, 2),
+-      .srcadd = counter_buffer_addr.addr,
+-   };
++      if (!addr)
++         continue;
++
++      const struct pdsc_ld64_src0 counter_buffers = {
++         .slcmode = PDSC_SLC_MODE_LD_CACHED,
++         .ccpri = 0,
++         .ccslc = PDSC_CCSLC_LD_NORMAL,
++         .ccmcu = PDSC_CCMCU_LD_NORMAL,
++
++         .dest = counter_buffer_ld_dest,
++
++         .cmode = PDSC_CMODE_LD_CACHED,
++         .count8 = 2,
++         .srcadd = addr & ~0b1111ULL,
++      };
++
++      counter_buffer_ld_src0[g] = pdsc_ld64_src0_pack(*p, &counter_buffers);
++      counter_buffer_dword[g] = (addr & 0b1111) / 4;
++   }
+ 
+    struct pdsc_st32_src0 st_src0 = {
+       .cmode = PDSC_CMODE_ST_WRITE_THROUGH,
+@@ -719,7 +690,7 @@
+       .ccpri = 0,
+       .ccslc = PDSC_CCSLC_LD_NORMAL,
+       .ccmcu = PDSC_CCMCU_LD_NORMAL,
+-      .count4 = MAX2(cmd_buffer->state.xfb_state.counter_buffer_count, 1),
++      .count4 = PVR_XFB_MAX_BUFFERS,
+ 
+       .src = pdsc_load_ref(*p, PVR_XFB_INIT_REF_ID_COUNTER_BUFFER_ST_SRC0),
+       .dstadd = init_input.data.counter_buffer_offsets_addr->addr,
+@@ -749,19 +720,26 @@
+                      ? pdsc_ld64_src0_pack(*p, &ptemp_buffers[3])
+                      : 0) },
+ 
+-      { .patch_id = PVR_XFB_INIT_PATCH_ID_COUNTER_BUFFER_LD_SRC0,
+-        .value = init_input.load_from_counter_buffers
+-                    ? pdsc_ld64_src0_pack(*p, &counter_buffers)
+-                    : 0 },
++      { .patch_id = PVR_XFB_INIT_PATCH_ID_COUNTER_BUFFER_LD_SRC0_0,
++        .value = counter_buffer_ld_src0[0] },
++      { .patch_id = PVR_XFB_INIT_PATCH_ID_COUNTER_BUFFER_LD_SRC0_1,
++        .value = counter_buffer_ld_src0[1] },
++      { .patch_id = PVR_XFB_INIT_PATCH_ID_COUNTER_BUFFER_LD_SRC0_2,
++        .value = counter_buffer_ld_src0[2] },
++      { .patch_id = PVR_XFB_INIT_PATCH_ID_COUNTER_BUFFER_LD_SRC0_3,
++        .value = counter_buffer_ld_src0[3] },
+ 
+       { .patch_id = PVR_XFB_INIT_PATCH_ID_COUNTER_BUFFER_ST_SRC0,
+         .value = pdsc_st32_src0_pack(*p, &st_src0) },
+ 
+-      { .patch_id = PVR_XFB_INIT_PATCH_ID_COUNTER_BUFFER_DWORD_SELECT,
+-        .value = num_dwords },
+-
+-      { .patch_id = PVR_XFB_INIT_PATCH_ID_COUNTER_BUFFER_COUNT,
+-        .value = init_input.counter_buffer_count },
++      { .patch_id = PVR_XFB_INIT_PATCH_ID_COUNTER_BUFFER_DWORD_SELECT_0,
++        .value = counter_buffer_dword[0] },
++      { .patch_id = PVR_XFB_INIT_PATCH_ID_COUNTER_BUFFER_DWORD_SELECT_1,
++        .value = counter_buffer_dword[1] },
++      { .patch_id = PVR_XFB_INIT_PATCH_ID_COUNTER_BUFFER_DWORD_SELECT_2,
++        .value = counter_buffer_dword[2] },
++      { .patch_id = PVR_XFB_INIT_PATCH_ID_COUNTER_BUFFER_DWORD_SELECT_3,
++        .value = counter_buffer_dword[3] },
+    };
+ 
+    assert((ARRAY_SIZE(patches) < pdsc_program_data_size(*p)));
+@@ -779,11 +757,9 @@
+       &init_pds_upload->pds_program);
+ 
+ out:
+-   vk_free(&cmd_buffer->device->vk.alloc, init_input.data.counter_buffers_addr);
+    vk_free(&cmd_buffer->device->vk.alloc, init_input.data.varying_info_arr);
+    vk_free(&cmd_buffer->device->vk.alloc, init_input.data.buffer_info);
+ 
+-   init_input.data.counter_buffers_addr = NULL;
+    init_input.data.varying_info_arr = NULL;
+    init_input.data.buffer_info = NULL;
+    return result;
+@@ -912,8 +888,6 @@
+ 
+    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
+ 
+-   xfb_state->counter_buffer_count = counterBufferCount;
+-
+    for (uint32_t i = 0; i < ARRAY_SIZE(xfb_state->bindings); i++) {
+       struct pvr_xfb_binding *binding = &xfb_state->bindings[i];
+ 
+@@ -960,8 +934,6 @@
+ 
+    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
+ 
+-   xfb_state->counter_buffer_count = counterBufferCount;
+-
+    for (uint32_t i = 0; i < ARRAY_SIZE(xfb_state->bindings); i++) {
+       struct pvr_xfb_binding *binding = &xfb_state->bindings[i];
+ 
+--- a/src/imagination/vulkan/pvr_cmd_buffer.h
++++ b/src/imagination/vulkan/pvr_cmd_buffer.h
+@@ -465,8 +465,6 @@
+ 
+    struct pvr_xfb_binding bindings[PVR_XFB_MAX_BUFFERS];
+ 
+-   uint32_t counter_buffer_count;
+-
+    /* XFB programs */
+    struct pvr_program_info pds_streamout_program;
+    struct pvr_program_info pds_init_program;
+--- a/src/imagination/vulkan/pvr_xfb.h
++++ b/src/imagination/vulkan/pvr_xfb.h
+@@ -42,21 +42,17 @@
+ };
+ 
+ struct pvr_pds_xfb_init_program_input {
+-   bool load_from_counter_buffers;
+-
+    struct pvr_device *device;
+ 
+    uint16_t primitive_type;
+ 
+-   uint32_t counter_buffer_count;
+-
+    struct {
+       pvr_dev_addr_t *counter_buffer_offsets_addr;
+ 
+       struct pvr_pds_xfb_varying_info *varying_info_arr;
+       struct pvr_pds_xfb_buffer_info *buffer_info;
+ 
+-      pvr_dev_addr_t *counter_buffers_addr;
++      pvr_dev_addr_t counter_buffers_addr[PVR_XFB_MAX_BUFFERS];
+ 
+       struct pvr_suballoc_bo
+          *ptemp_memory_buffer_addr_array[PVR_XFB_MAX_BUFFERS];
+@@ -66,10 +62,9 @@
+ struct pvr_pds_xfb_end_program_input {
+    bool has_store_counter_buffers;
+    uint32_t buffer_strides[PVR_XFB_MAX_BUFFERS];
+-   uint32_t counter_buffer_count;
+ 
+    struct {
+-      pvr_dev_addr_t *counter_buffers_addr;
++      pvr_dev_addr_t counter_buffers_addr[PVR_XFB_MAX_BUFFERS];
+       pvr_dev_addr_t *counter_buffer_offsets_addr;
+    } data;
+ };

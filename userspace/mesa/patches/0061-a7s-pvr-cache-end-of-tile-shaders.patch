@@ -1,0 +1,690 @@
+Description: pvr: cache compiled end-of-tile and load op shaders
+ pvr_sub_cmd_gfx_per_job_fragment_programs_create_and_upload() builds the
+ end-of-tile USC program of every graphics job with pvr_usc_eot(), a full
+ NIR and PCO compile (pco_preprocess_nir() to pco_encode_ir()), and then
+ uploads the binary into the command buffer. Under zink every render pass is
+ a graphics job, so every render pass costs one such compile on the
+ recording thread. The
+ program depends only on the end-of-tile properties: emit count, the PBE
+ state words, the layer strides, the tile buffer addresses, the sample count
+ and the output register count; they repeat for the same render targets.
+ .
+ With dynamic rendering every vkCmdBeginRendering that loads or clears a
+ colour attachment also builds its load op programs:
+ pvr_arch_mrt_load_ops_setup() calls pvr_mrt_load_op_init() and
+ pvr_arch_load_op_shader_generate(), which compiles the USC shader with
+ pvr_uscgen_loadop(), again a full NIR and PCO compile, before uploading it
+ with its PDS programs. Render pass objects do this once in
+ vkCreateRenderPass, zink pays it for every render pass on the recording
+ thread.
+ .
+ Keep the compiled binaries in two hash tables per device under one lock.
+ The end-of-tile table is keyed by the end-of-tile properties and keeps the
+ temp register count with the binary. The load op table is keyed by what
+ pvr_uscgen_loadop() reads: clear, load, 3D-view and unresolved MSAA masks,
+ the RTA load flag, the destination formats of the loaded or cleared render
+ targets, their MRT resources (type, intermediate size, output register or
+ tile buffer and offset) and the depth clear register. A load op entry also
+ keeps what the PDS fragment program and the load op state take from the
+ shader: temp count, entry offset, phase change, shared register counts and
+ tile buffer count. The command buffer and each load op still upload their
+ own copy of the binary and their PDS programs, so ownership and lifetime of
+ the device memory do not change and nothing in the caches is used by the
+ GPU. The other users of pvr_usc_eot() (transfer context, SPM end-of-tile
+ state) are not changed.
+ .
+ Each table holds up to 256 entries. Load op entries are immutable and stay
+ until the device is destroyed; once the table is full, new load op shaders
+ are compiled as before and not kept. The end-of-tile key contains the PBE
+ state words, which hold the address of each render target, and the tile
+ buffer addresses, so a workload that renders to many distinct surfaces,
+ for example a compositor that allocates a new buffer for each window and
+ frame, keeps adding entries that are not used again. The shader cannot be
+ made independent of the addresses by loading the state words from shared
+ registers: the PDS code segment of the render job is a single static
+ program that only starts the USC task, the PDS data segment holds no DMA or
+ register writes and the shared register size of the job is fixed; only the
+ transfer context uses that mode. End-of-tile entries are therefore kept on
+ a list in order of use and count their users: pvr_eot_cache_get() takes a
+ reference and pvr_eot_cache_entry_release() drops it. When the table is
+ full, the least recently used entry without users is destroyed to make
+ room. An entry that is not in the table, because every entry is in use or
+ because it could not be inserted, is freed on its last release.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/vulkan/pvr_arch_cmd_buffer.c
++++ b/src/imagination/vulkan/pvr_arch_cmd_buffer.c
+@@ -591,9 +591,9 @@
+       .shared_words = false,
+       .state_words = pbe_cs_words,
+    };
++   struct pvr_eot_cache_entry *eot;
+    uint32_t *staging_buffer;
+    uint32_t usc_temp_count;
+-   pco_shader *eot;
+    VkResult result;
+ 
+    bool has_tile_buffers = false;
+@@ -620,17 +620,19 @@
+          props.msaa_samples = 1;
+    }
+ 
+-   eot =
+-      pvr_usc_eot(device->pdevice->pco_ctx, &props, &device->pdevice->dev_info);
+-   usc_temp_count = pco_shader_data(eot)->common.temps;
++   eot = pvr_eot_cache_get(device, &props);
++   if (!eot)
++      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
++
++   usc_temp_count = eot->temps;
+ 
+    result = pvr_cmd_buffer_upload_usc(cmd_buffer,
+-                                      pco_shader_binary_data(eot),
+-                                      pco_shader_binary_size(eot),
++                                      eot->binary,
++                                      eot->binary_size,
+                                       4,
+                                       &usc_eot_program);
+ 
+-   ralloc_free(eot);
++   pvr_eot_cache_entry_release(device, eot);
+ 
+    if (result != VK_SUCCESS)
+       return result;
+--- a/src/imagination/vulkan/pvr_arch_device.c
++++ b/src/imagination/vulkan/pvr_arch_device.c
+@@ -940,6 +940,10 @@
+    if (result != VK_SUCCESS)
+       goto err_pvr_device_dummy_rt_finish;
+ 
++   result = pvr_usc_caches_init(device);
++   if (result != VK_SUCCESS)
++      goto err_pvr_render_state_cache_finish;
++
+    pvr_csb_bo_pool_init(device);
+ 
+    /* Initialize GPU tracing infrastructure */
+@@ -960,6 +964,9 @@
+ 
+    return VK_SUCCESS;
+ 
++err_pvr_render_state_cache_finish:
++   pvr_render_state_cache_finish(device);
++
+ err_pvr_device_dummy_rt_finish:
+    pvr_device_dummy_rt_finish(device);
+ 
+@@ -1042,6 +1049,7 @@
+ 
+    pvr_render_state_cache_finish(device);
+    pvr_csb_bo_pool_finish(device);
++   pvr_usc_caches_finish(device);
+ 
+    pvr_device_dummy_rt_finish(device);
+    pvr_arch_border_color_table_finish(device);
+--- a/src/imagination/vulkan/pvr_arch_mrt.c
++++ b/src/imagination/vulkan/pvr_arch_mrt.c
+@@ -580,19 +580,18 @@
+ static VkResult pvr_pds_fragment_program_create_and_upload(
+    struct pvr_device *device,
+    const VkAllocationCallbacks *allocator,
+-   pco_shader *fs,
++   const struct pvr_load_op_cache_entry *fs,
+    struct pvr_suballoc_bo *shader_bo,
+    struct pvr_pds_upload *pds_frag_prog,
+    bool msaa)
+ {
+    struct pvr_pds_kickusc_program program = { 0 };
+-   pco_data *fs_data = pco_shader_data(fs);
+    uint32_t staging_buffer_size;
+    uint32_t *staging_buffer;
+    VkResult result;
+ 
+    const pvr_dev_addr_t exec_addr =
+-      PVR_DEV_ADDR_OFFSET(shader_bo->dev_addr, fs_data->common.entry_offset);
++      PVR_DEV_ADDR_OFFSET(shader_bo->dev_addr, fs->entry_offset);
+ 
+    /* Note this is not strictly required to be done before calculating the
+     * staging_buffer_size in this particular case. It can also be done after
+@@ -600,10 +599,10 @@
+     */
+    pvr_pds_setup_doutu(&program.usc_task_control,
+                        exec_addr.addr,
+-                       fs_data->common.temps,
++                       fs->temps,
+                        msaa ? ROGUE_PDSINST_DOUTU_SAMPLE_RATE_FULL
+                             : ROGUE_PDSINST_DOUTU_SAMPLE_RATE_INSTANCE,
+-                       fs_data->fs.uses.phase_change);
++                       fs->phase_change);
+ 
+    pvr_pds_kick_usc(&program, NULL, 0, false, PDS_GENERATE_SIZES);
+ 
+@@ -651,16 +650,23 @@
+    const struct pvr_device_info *dev_info = &device->pdevice->dev_info;
+    const uint32_t cache_line_size = pvr_get_slc_cache_line_size(dev_info);
+ 
+-   pco_shader *loadop = pvr_uscgen_loadop(device->pdevice->pco_ctx, load_op);
++   struct pvr_load_op_cache_entry *loadop =
++      pvr_load_op_cache_get(device, load_op);
++   if (!loadop)
++      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
++
++   load_op->const_shareds_count = loadop->const_shareds_count;
++   load_op->shareds_count = loadop->shareds_count;
++   load_op->num_tile_buffers = loadop->num_tile_buffers;
+ 
+    VkResult result = pvr_gpu_upload_usc(device,
+-                                        pco_shader_binary_data(loadop),
+-                                        pco_shader_binary_size(loadop),
++                                        loadop->binary,
++                                        loadop->binary_size,
+                                         cache_line_size,
+                                         &load_op->usc_frag_prog_bo);
+ 
+    if (result != VK_SUCCESS) {
+-      ralloc_free(loadop);
++      pvr_load_op_cache_entry_release(device, loadop);
+       return result;
+    }
+ 
+@@ -675,8 +681,8 @@
+                                                  &load_op->pds_frag_prog,
+                                                  msaa);
+ 
+-   load_op->temps_count = pco_shader_data(loadop)->common.temps;
+-   ralloc_free(loadop);
++   load_op->temps_count = loadop->temps;
++   pvr_load_op_cache_entry_release(device, loadop);
+ 
+    if (result != VK_SUCCESS)
+       goto err_free_usc_frag_prog_bo;
+--- a/src/imagination/vulkan/pvr_device.c
++++ b/src/imagination/vulkan/pvr_device.c
+@@ -59,6 +59,7 @@
+ #include "pvr_util.h"
+ #include "pvr_winsys.h"
+ #include "pvr_wsi.h"
++#include "util/hash_table.h"
+ #include "util/log.h"
+ #include "util/macros.h"
+ #include "util/mesa-blake3.h"
+@@ -158,6 +159,378 @@
+ 
+ #define PVR_RENDER_STATE_CACHE_IDLE_MAX 16
+ 
++#define PVR_USC_CACHE_MAX_ENTRIES 256
++
++static uint32_t pvr_eot_cache_key_hash(const void *key)
++{
++   return _mesa_hash_data(key, sizeof(struct pvr_eot_cache_key));
++}
++
++static bool pvr_eot_cache_key_equal(const void *a, const void *b)
++{
++   return memcmp(a, b, sizeof(struct pvr_eot_cache_key)) == 0;
++}
++
++static uint32_t pvr_load_op_cache_key_hash(const void *key)
++{
++   return _mesa_hash_data(key, sizeof(struct pvr_load_op_cache_key));
++}
++
++static bool pvr_load_op_cache_key_equal(const void *a, const void *b)
++{
++   return memcmp(a, b, sizeof(struct pvr_load_op_cache_key)) == 0;
++}
++
++static void pvr_usc_cache_destroy(struct pvr_device *device,
++                                  struct hash_table *table)
++{
++   hash_table_foreach (table, entry)
++      vk_free(&device->vk.alloc, entry->data);
++
++   _mesa_hash_table_destroy(table, NULL);
++}
++
++VkResult pvr_usc_caches_init(struct pvr_device *device)
++{
++   device->eot_cache = _mesa_hash_table_create(NULL,
++                                               pvr_eot_cache_key_hash,
++                                               pvr_eot_cache_key_equal);
++   if (!device->eot_cache)
++      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
++
++   list_inithead(&device->eot_cache_lru);
++
++   device->load_op_cache =
++      _mesa_hash_table_create(NULL,
++                              pvr_load_op_cache_key_hash,
++                              pvr_load_op_cache_key_equal);
++   if (!device->load_op_cache) {
++      _mesa_hash_table_destroy(device->eot_cache, NULL);
++      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
++   }
++
++   simple_mtx_init(&device->usc_cache_mtx, mtx_plain);
++
++   return VK_SUCCESS;
++}
++
++void pvr_usc_caches_finish(struct pvr_device *device)
++{
++   pvr_usc_cache_destroy(device, device->eot_cache);
++   pvr_usc_cache_destroy(device, device->load_op_cache);
++   simple_mtx_destroy(&device->usc_cache_mtx);
++}
++
++static void *pvr_usc_cache_search(struct pvr_device *device,
++                                  struct hash_table *table,
++                                  const void *key)
++{
++   struct hash_entry *hash_entry;
++   void *data;
++
++   simple_mtx_lock(&device->usc_cache_mtx);
++   hash_entry = _mesa_hash_table_search(table, key);
++   data = hash_entry ? hash_entry->data : NULL;
++   simple_mtx_unlock(&device->usc_cache_mtx);
++
++   return data;
++}
++
++static void *pvr_usc_cache_add(struct pvr_device *device,
++                               struct hash_table *table,
++                               const void *key,
++                               void *data,
++                               bool *cached_out)
++{
++   struct hash_entry *hash_entry;
++   void *found = NULL;
++
++   simple_mtx_lock(&device->usc_cache_mtx);
++
++   hash_entry = _mesa_hash_table_search(table, key);
++   if (hash_entry)
++      found = hash_entry->data;
++   else if (table->entries < PVR_USC_CACHE_MAX_ENTRIES)
++      *cached_out = _mesa_hash_table_insert(table, key, data) != NULL;
++
++   simple_mtx_unlock(&device->usc_cache_mtx);
++
++   return found;
++}
++
++static void pvr_eot_cache_key_init(const struct pvr_eot_props *props,
++                                   struct pvr_eot_cache_key *key)
++{
++   assert(!props->shared_words);
++   assert(props->emit_count <= PVR_MAX_COLOR_ATTACHMENTS);
++
++   memset(key, 0, sizeof(*key));
++
++   memcpy(key->tile_buffer_addrs,
++          props->tile_buffer_addrs,
++          sizeof(key->tile_buffer_addrs));
++   memcpy(key->state_words,
++          props->state_words,
++          props->emit_count * ROGUE_NUM_PBESTATE_STATE_WORDS *
++             sizeof(*key->state_words));
++   memcpy(key->rta_element_stride,
++          props->rta_element_stride,
++          sizeof(key->rta_element_stride));
++   key->emit_count = props->emit_count;
++   key->msaa_samples = props->msaa_samples;
++   key->num_output_regs = props->num_output_regs;
++}
++
++static struct pvr_eot_cache_entry *
++pvr_eot_cache_entry_create(struct pvr_device *device,
++                           struct pvr_eot_props *props,
++                           const struct pvr_eot_cache_key *key)
++{
++   struct pvr_eot_cache_entry *entry;
++   uint32_t binary_size;
++   pco_shader *eot;
++
++   eot =
++      pvr_usc_eot(device->pdevice->pco_ctx, props, &device->pdevice->dev_info);
++   binary_size = pco_shader_binary_size(eot);
++
++   entry = vk_alloc(&device->vk.alloc,
++                    sizeof(*entry) + binary_size,
++                    8,
++                    VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
++   if (entry) {
++      entry->key = *key;
++      entry->refs = 1;
++      entry->cached = false;
++      entry->temps = pco_shader_data(eot)->common.temps;
++      entry->binary_size = binary_size;
++      memcpy(entry->binary, pco_shader_binary_data(eot), binary_size);
++   }
++
++   ralloc_free(eot);
++
++   return entry;
++}
++
++static struct pvr_eot_cache_entry *
++pvr_eot_cache_lookup(struct pvr_device *device,
++                     const struct pvr_eot_cache_key *key)
++{
++   struct hash_entry *hash_entry;
++   struct pvr_eot_cache_entry *entry;
++
++   simple_mtx_assert_locked(&device->usc_cache_mtx);
++
++   hash_entry = _mesa_hash_table_search(device->eot_cache, key);
++   if (!hash_entry)
++      return NULL;
++
++   entry = hash_entry->data;
++   entry->refs++;
++   list_del(&entry->link);
++   list_addtail(&entry->link, &device->eot_cache_lru);
++
++   return entry;
++}
++
++static void pvr_eot_cache_insert(struct pvr_device *device,
++                                 struct pvr_eot_cache_entry *entry)
++{
++   simple_mtx_assert_locked(&device->usc_cache_mtx);
++
++   if (device->eot_cache->entries >= PVR_USC_CACHE_MAX_ENTRIES) {
++      list_for_each_entry (struct pvr_eot_cache_entry,
++                           victim,
++                           &device->eot_cache_lru,
++                           link) {
++         if (victim->refs)
++            continue;
++
++         _mesa_hash_table_remove_key(device->eot_cache, &victim->key);
++         list_del(&victim->link);
++         vk_free(&device->vk.alloc, victim);
++         break;
++      }
++   }
++
++   if (device->eot_cache->entries >= PVR_USC_CACHE_MAX_ENTRIES)
++      return;
++
++   if (!_mesa_hash_table_insert(device->eot_cache, &entry->key, entry))
++      return;
++
++   list_addtail(&entry->link, &device->eot_cache_lru);
++   entry->cached = true;
++}
++
++struct pvr_eot_cache_entry *
++pvr_eot_cache_get(struct pvr_device *device, struct pvr_eot_props *props)
++{
++   struct pvr_eot_cache_entry *found;
++   struct pvr_eot_cache_entry *entry;
++   struct pvr_eot_cache_key key;
++
++   pvr_eot_cache_key_init(props, &key);
++
++   simple_mtx_lock(&device->usc_cache_mtx);
++   found = pvr_eot_cache_lookup(device, &key);
++   simple_mtx_unlock(&device->usc_cache_mtx);
++
++   if (found)
++      return found;
++
++   entry = pvr_eot_cache_entry_create(device, props, &key);
++   if (!entry)
++      return NULL;
++
++   simple_mtx_lock(&device->usc_cache_mtx);
++   found = pvr_eot_cache_lookup(device, &entry->key);
++   if (!found)
++      pvr_eot_cache_insert(device, entry);
++   simple_mtx_unlock(&device->usc_cache_mtx);
++
++   if (found) {
++      vk_free(&device->vk.alloc, entry);
++      return found;
++   }
++
++   return entry;
++}
++
++void pvr_eot_cache_entry_release(struct pvr_device *device,
++                                 struct pvr_eot_cache_entry *entry)
++{
++   simple_mtx_lock(&device->usc_cache_mtx);
++   assert(entry->refs);
++   if (--entry->refs == 0 && !entry->cached) {
++      simple_mtx_unlock(&device->usc_cache_mtx);
++      vk_free(&device->vk.alloc, entry);
++      return;
++   }
++   simple_mtx_unlock(&device->usc_cache_mtx);
++}
++
++static void
++pvr_load_op_cache_key_mrt(const struct usc_mrt_resource *mrt_resource,
++                          struct pvr_load_op_cache_mrt *key_mrt)
++{
++   key_mrt->type = mrt_resource->type;
++   key_mrt->intermediate_size = mrt_resource->intermediate_size;
++
++   if (mrt_resource->type == USC_MRT_RESOURCE_TYPE_OUTPUT_REG) {
++      key_mrt->index = mrt_resource->reg.output_reg;
++   } else {
++      key_mrt->index = mrt_resource->mem.tile_buffer;
++      key_mrt->offset_dw = mrt_resource->mem.offset_dw;
++   }
++}
++
++static void pvr_load_op_cache_key_init(const struct pvr_load_op *load_op,
++                                       struct pvr_load_op_cache_key *key)
++{
++   const struct usc_mrt_setup *mrt_setup =
++      load_op->clears_loads_state.mrt_setup;
++   const uint32_t rt_mask = load_op->clears_loads_state.rt_clear_mask |
++                            load_op->clears_loads_state.rt_load_mask;
++   const int32_t depth_idx = load_op->clears_loads_state.depth_clear_to_reg;
++
++   memset(key, 0, sizeof(*key));
++
++   u_foreach_bit (rt_idx, rt_mask) {
++      assert(rt_idx < ARRAY_SIZE(key->dest_vk_format));
++      key->dest_vk_format[rt_idx] =
++         load_op->clears_loads_state.dest_vk_format[rt_idx];
++      pvr_load_op_cache_key_mrt(&mrt_setup->mrt_resources[rt_idx],
++                                &key->mrts[rt_idx]);
++   }
++
++   if (depth_idx != PVR_NO_DEPTH_CLEAR_TO_REG) {
++      pvr_load_op_cache_key_mrt(&mrt_setup->mrt_resources[depth_idx],
++                                &key->depth_mrt);
++   }
++
++   key->depth_clear_to_reg = depth_idx;
++   key->rt_clear_mask = load_op->clears_loads_state.rt_clear_mask;
++   key->rt_load_mask = load_op->clears_loads_state.rt_load_mask;
++   key->rt_2d_view_3d_mask = load_op->clears_loads_state.rt_2d_view_3d_mask;
++   key->unresolved_msaa_mask =
++      load_op->clears_loads_state.unresolved_msaa_mask;
++   key->rta_load_clear = load_op->clears_loads_state.rta_load_clear;
++}
++
++static struct pvr_load_op_cache_entry *
++pvr_load_op_cache_entry_create(struct pvr_device *device,
++                               struct pvr_load_op *load_op,
++                               const struct pvr_load_op_cache_key *key)
++{
++   struct pvr_load_op_cache_entry *entry;
++   uint32_t binary_size;
++   pco_shader *loadop;
++   pco_data *data;
++
++   loadop = pvr_uscgen_loadop(device->pdevice->pco_ctx, load_op);
++   binary_size = pco_shader_binary_size(loadop);
++   data = pco_shader_data(loadop);
++
++   entry = vk_alloc(&device->vk.alloc,
++                    sizeof(*entry) + binary_size,
++                    8,
++                    VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
++   if (entry) {
++      entry->key = *key;
++      entry->cached = false;
++      entry->temps = data->common.temps;
++      entry->entry_offset = data->common.entry_offset;
++      entry->phase_change = data->fs.uses.phase_change;
++      entry->const_shareds_count = load_op->const_shareds_count;
++      entry->shareds_count = load_op->shareds_count;
++      entry->num_tile_buffers = load_op->num_tile_buffers;
++      entry->binary_size = binary_size;
++      memcpy(entry->binary, pco_shader_binary_data(loadop), binary_size);
++   }
++
++   ralloc_free(loadop);
++
++   return entry;
++}
++
++struct pvr_load_op_cache_entry *
++pvr_load_op_cache_get(struct pvr_device *device, struct pvr_load_op *load_op)
++{
++   struct pvr_load_op_cache_entry *found;
++   struct pvr_load_op_cache_entry *entry;
++   struct pvr_load_op_cache_key key;
++
++   pvr_load_op_cache_key_init(load_op, &key);
++
++   found = pvr_usc_cache_search(device, device->load_op_cache, &key);
++   if (found)
++      return found;
++
++   entry = pvr_load_op_cache_entry_create(device, load_op, &key);
++   if (!entry)
++      return NULL;
++
++   found = pvr_usc_cache_add(device,
++                             device->load_op_cache,
++                             &entry->key,
++                             entry,
++                             &entry->cached);
++   if (found) {
++      vk_free(&device->vk.alloc, entry);
++      return found;
++   }
++
++   return entry;
++}
++
++void pvr_load_op_cache_entry_release(struct pvr_device *device,
++                                     struct pvr_load_op_cache_entry *entry)
++{
++   if (!entry->cached)
++      vk_free(&device->vk.alloc, entry);
++}
++
+ static bool pvr_render_state_key_equal(const void *a, const void *b)
+ {
+    return memcmp(a, b, sizeof(struct pvr_render_state_key)) == 0;
+--- a/src/imagination/vulkan/pvr_device.h
++++ b/src/imagination/vulkan/pvr_device.h
+@@ -28,6 +28,7 @@
+ #include "pvr_bo.h"
+ #include "pvr_common.h"
+ #include "pvr_macros.h"
++#include "pvr_mrt.h"
+ #include "pvr_pds.h"
+ #include "pvr_spm.h"
+ #include "pvr_usc.h"
+@@ -176,6 +177,11 @@
+    struct list_head csb_bo_pool;
+    uint32_t csb_bo_pool_count;
+ 
++   simple_mtx_t usc_cache_mtx;
++   struct hash_table *eot_cache;
++   struct list_head eot_cache_lru;
++   struct hash_table *load_op_cache;
++
+    /* Data Source for GPU tracing */
+    struct pvr_ds_device ds;
+ };
+@@ -236,6 +242,74 @@
+                             uint64_t code_alignment,
+                             struct pvr_suballoc_bo **const pvr_bo_out);
+ 
++struct pvr_eot_cache_key {
++   uint64_t tile_buffer_addrs[PVR_MAX_COLOR_ATTACHMENTS];
++   uint32_t state_words[PVR_MAX_COLOR_ATTACHMENTS *
++                        ROGUE_NUM_PBESTATE_STATE_WORDS];
++   uint32_t rta_element_stride[PVR_MAX_COLOR_ATTACHMENTS];
++   uint32_t emit_count;
++   uint32_t msaa_samples;
++   uint32_t num_output_regs;
++};
++
++struct pvr_eot_cache_entry {
++   struct pvr_eot_cache_key key;
++   struct list_head link;
++   uint32_t refs;
++   bool cached;
++   uint32_t temps;
++   uint32_t binary_size;
++   uint8_t binary[];
++};
++
++struct pvr_load_op_cache_mrt {
++   uint32_t type;
++   uint32_t intermediate_size;
++   uint32_t index;
++   uint32_t offset_dw;
++};
++
++struct pvr_load_op_cache_key {
++   uint32_t dest_vk_format[PVR_LOAD_OP_CLEARS_LOADS_MAX_RTS];
++   struct pvr_load_op_cache_mrt mrts[PVR_LOAD_OP_CLEARS_LOADS_MAX_RTS];
++   struct pvr_load_op_cache_mrt depth_mrt;
++   int32_t depth_clear_to_reg;
++   uint32_t rt_clear_mask;
++   uint32_t rt_load_mask;
++   uint32_t rt_2d_view_3d_mask;
++   uint32_t unresolved_msaa_mask;
++   uint32_t rta_load_clear;
++};
++
++struct pvr_load_op_cache_entry {
++   struct pvr_load_op_cache_key key;
++   bool cached;
++   bool phase_change;
++   uint32_t temps;
++   uint32_t entry_offset;
++   uint32_t const_shareds_count;
++   uint32_t shareds_count;
++   uint32_t num_tile_buffers;
++   uint32_t binary_size;
++   uint8_t binary[];
++};
++
++VkResult pvr_usc_caches_init(struct pvr_device *device);
++
++void pvr_usc_caches_finish(struct pvr_device *device);
++
++struct pvr_eot_cache_entry *
++pvr_eot_cache_get(struct pvr_device *device, struct pvr_eot_props *props);
++
++void pvr_eot_cache_entry_release(struct pvr_device *device,
++                                 struct pvr_eot_cache_entry *entry);
++
++struct pvr_load_op_cache_entry *
++pvr_load_op_cache_get(struct pvr_device *device, struct pvr_load_op *load_op);
++
++void pvr_load_op_cache_entry_release(struct pvr_device *device,
++                                     struct pvr_load_op_cache_entry *entry);
++
+ VkResult pvr_render_state_cache_init(struct pvr_device *device);
+ 
+ void pvr_render_state_cache_finish(struct pvr_device *device);

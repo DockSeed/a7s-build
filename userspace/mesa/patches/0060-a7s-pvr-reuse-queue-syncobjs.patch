@@ -1,0 +1,283 @@
+Description: pvr: reuse the queue's internal sync objects
+ Every job submitted by the queue gets new binary sync objects: two per
+ graphics job (geometry and fragment signal), one per compute, transfer and
+ query job, one per barrier or event wait stage and one per stage with
+ semaphore waits. pvr_update_job_syncs() and the barrier code destroy them
+ again as soon as a newer one replaces them. Under zink every submit thus
+ creates and destroys sync objects (DRM_IOCTL_SYNCOBJ_CREATE,
+ DRM_IOCTL_SYNCOBJ_DESTROY).
+ .
+ Keep released sync objects in a small per-queue free list and take from it
+ before creating a new one. These sync objects are only ever used as the
+ signal of a job or null job before anything waits on them, and both the
+ kernel job signal and drmSyncobjTransfer() replace the fence of a binary
+ sync object, so the old fence does not matter. A wait on the geometry
+ signal from the partial render job of the same DRM_IOCTL_PVR_SUBMIT_JOBS
+ resolves to the new geometry job, as it does for the render context's
+ geom_to_pr_syncobj that is already reused for every split submit
+ (pvr_drm_winsys_render_submit()). Waits that reference a sync object are
+ resolved when the job or null job is submitted, and a sync object is only
+ put back after it is no longer referenced by the queue. Event sync
+ objects are owned by the event and are not pooled. All access happens in
+ driver_submit under the queue lock; the free list is destroyed with the
+ queue.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/vulkan/pvr_arch_queue.c
++++ b/src/imagination/vulkan/pvr_arch_queue.c
+@@ -204,8 +204,36 @@
+    return result;
+ }
+ 
++static VkResult pvr_queue_sync_get(struct pvr_queue *queue,
++                                   struct vk_sync **const sync_out)
++{
++   if (queue->free_sync_count) {
++      *sync_out = queue->free_syncs[--queue->free_sync_count];
++      return VK_SUCCESS;
++   }
++
++   return vk_sync_create(&queue->device->vk,
++                         &queue->device->pdevice->ws->syncobj_type,
++                         0U,
++                         0UL,
++                         sync_out);
++}
++
++static void pvr_queue_sync_put(struct pvr_queue *queue, struct vk_sync *sync)
++{
++   if (queue->free_sync_count < ARRAY_SIZE(queue->free_syncs)) {
++      queue->free_syncs[queue->free_sync_count++] = sync;
++      return;
++   }
++
++   vk_sync_destroy(&queue->device->vk, sync);
++}
++
+ static void pvr_queue_finish(struct pvr_queue *queue)
+ {
++   for (uint32_t i = 0; i < queue->free_sync_count; i++)
++      vk_sync_destroy(&queue->device->vk, queue->free_syncs[i]);
++
+    for (uint32_t i = 0; i < ARRAY_SIZE(queue->next_job_wait_sync); i++) {
+       if (queue->next_job_wait_sync[i])
+          vk_sync_destroy(&queue->device->vk, queue->next_job_wait_sync[i]);
+@@ -238,14 +266,13 @@
+                                  enum pvr_job_type submitted_job_type)
+ {
+    if (queue->next_job_wait_sync[submitted_job_type]) {
+-      vk_sync_destroy(&device->vk,
+-                      queue->next_job_wait_sync[submitted_job_type]);
++      pvr_queue_sync_put(queue, queue->next_job_wait_sync[submitted_job_type]);
+       queue->next_job_wait_sync[submitted_job_type] = NULL;
+    }
+ 
+    if (queue->last_job_signal_sync[submitted_job_type]) {
+-      vk_sync_destroy(&device->vk,
+-                      queue->last_job_signal_sync[submitted_job_type]);
++      pvr_queue_sync_put(queue,
++                         queue->last_job_signal_sync[submitted_job_type]);
+    }
+ 
+    queue->last_job_signal_sync[submitted_job_type] = new_signal_sync;
+@@ -268,20 +295,12 @@
+       (view_index + job->ds.base_array_layer));
+    job->view_state.view_index = view_index;
+ 
+-   result = vk_sync_create(&device->vk,
+-                           &device->pdevice->ws->syncobj_type,
+-                           0U,
+-                           0UL,
+-                           &geom_signal_sync);
++   result = pvr_queue_sync_get(queue, &geom_signal_sync);
+    if (result != VK_SUCCESS)
+       return result;
+ 
+    if (job->run_frag) {
+-      result = vk_sync_create(&device->vk,
+-                              &device->pdevice->ws->syncobj_type,
+-                              0U,
+-                              0UL,
+-                              &frag_signal_sync);
++      result = pvr_queue_sync_get(queue, &frag_signal_sync);
+       if (result != VK_SUCCESS)
+          goto err_destroy_geom_sync;
+    }
+@@ -358,9 +377,9 @@
+ 
+ err_destroy_frag_sync:
+    if (frag_signal_sync)
+-      vk_sync_destroy(&device->vk, frag_signal_sync);
++      pvr_queue_sync_put(queue, frag_signal_sync);
+ err_destroy_geom_sync:
+-   vk_sync_destroy(&device->vk, geom_signal_sync);
++   pvr_queue_sync_put(queue, geom_signal_sync);
+ 
+    return result;
+ }
+@@ -396,11 +415,7 @@
+    struct vk_sync *sync;
+    VkResult result;
+ 
+-   result = vk_sync_create(&device->vk,
+-                           &device->pdevice->ws->syncobj_type,
+-                           0U,
+-                           0UL,
+-                           &sync);
++   result = pvr_queue_sync_get(queue, &sync);
+    if (result != VK_SUCCESS)
+       return result;
+ 
+@@ -410,7 +425,7 @@
+       queue->next_job_wait_sync[PVR_JOB_TYPE_COMPUTE],
+       sync);
+    if (result != VK_SUCCESS) {
+-      vk_sync_destroy(&device->vk, sync);
++      pvr_queue_sync_put(queue, sync);
+       return result;
+    }
+ 
+@@ -426,11 +441,7 @@
+    struct vk_sync *sync;
+    VkResult result;
+ 
+-   result = vk_sync_create(&device->vk,
+-                           &device->pdevice->ws->syncobj_type,
+-                           0U,
+-                           0UL,
+-                           &sync);
++   result = pvr_queue_sync_get(queue, &sync);
+    if (result != VK_SUCCESS)
+       return result;
+ 
+@@ -440,7 +451,7 @@
+       queue->next_job_wait_sync[PVR_JOB_TYPE_TRANSFER],
+       sync);
+    if (result != VK_SUCCESS) {
+-      vk_sync_destroy(&device->vk, sync);
++      pvr_queue_sync_put(queue, sync);
+       return result;
+    }
+ 
+@@ -462,11 +473,7 @@
+     * commands?
+     */
+ 
+-   result = vk_sync_create(&device->vk,
+-                           &device->pdevice->ws->syncobj_type,
+-                           0U,
+-                           0UL,
+-                           &sync);
++   result = pvr_queue_sync_get(queue, &sync);
+    if (result != VK_SUCCESS)
+       return result;
+ 
+@@ -476,7 +483,7 @@
+                                   queue->next_job_wait_sync[PVR_JOB_TYPE_QUERY],
+                                   sync);
+    if (result != VK_SUCCESS) {
+-      vk_sync_destroy(&device->vk, sync);
++      pvr_queue_sync_put(queue, sync);
+       return result;
+    }
+ 
+@@ -520,11 +527,7 @@
+       struct vk_sync_signal signal;
+       struct vk_sync *signal_sync;
+ 
+-      result = vk_sync_create(&device->vk,
+-                              &device->pdevice->ws->syncobj_type,
+-                              0U,
+-                              0UL,
+-                              &signal_sync);
++      result = pvr_queue_sync_get(queue, &signal_sync);
+       if (result != VK_SUCCESS)
+          return result;
+ 
+@@ -547,12 +550,12 @@
+                                                 wait_count,
+                                                 &signal);
+       if (result != VK_SUCCESS) {
+-         vk_sync_destroy(&device->vk, signal_sync);
++         pvr_queue_sync_put(queue, signal_sync);
+          return result;
+       }
+ 
+       if (queue->next_job_wait_sync[stage])
+-         vk_sync_destroy(&device->vk, queue->next_job_wait_sync[stage]);
++         pvr_queue_sync_put(queue, queue->next_job_wait_sync[stage]);
+ 
+       queue->next_job_wait_sync[stage] = signal_sync;
+    }
+@@ -700,11 +703,7 @@
+ 
+       assert(wait_count <= (sub_cmd->count + 1));
+ 
+-      result = vk_sync_create(&device->vk,
+-                              &device->pdevice->ws->syncobj_type,
+-                              0U,
+-                              0UL,
+-                              &signal_sync);
++      result = pvr_queue_sync_get(queue, &signal_sync);
+       if (result != VK_SUCCESS)
+          goto err_free_waits;
+ 
+@@ -719,12 +718,12 @@
+                                                 wait_count,
+                                                 &signal);
+       if (result != VK_SUCCESS) {
+-         vk_sync_destroy(&device->vk, signal.sync);
++         pvr_queue_sync_put(queue, signal.sync);
+          goto err_free_waits;
+       }
+ 
+       if (queue->next_job_wait_sync[stage])
+-         vk_sync_destroy(&device->vk, queue->next_job_wait_sync[stage]);
++         pvr_queue_sync_put(queue, queue->next_job_wait_sync[stage]);
+ 
+       queue->next_job_wait_sync[stage] = signal.sync;
+    }
+@@ -982,11 +981,7 @@
+          };
+       }
+ 
+-      result = vk_sync_create(&device->vk,
+-                              &device->pdevice->ws->syncobj_type,
+-                              0U,
+-                              0UL,
+-                              &signal_sync);
++      result = pvr_queue_sync_get(queue, &signal_sync);
+       if (result != VK_SUCCESS)
+          goto err_free_waits;
+ 
+@@ -1001,12 +996,12 @@
+                                                 stage_wait_count,
+                                                 &next_job_wait_signal_sync);
+       if (result != VK_SUCCESS) {
+-         vk_sync_destroy(&device->vk, signal_sync);
++         pvr_queue_sync_put(queue, signal_sync);
+          goto err_free_waits;
+       }
+ 
+       if (prev_wait_sync)
+-         vk_sync_destroy(&device->vk, prev_wait_sync);
++         pvr_queue_sync_put(queue, prev_wait_sync);
+ 
+       queue->next_job_wait_sync[i] = signal_sync;
+    }
+--- a/src/imagination/vulkan/pvr_queue.h
++++ b/src/imagination/vulkan/pvr_queue.h
+@@ -38,6 +38,9 @@
+ 
+    struct vk_sync *last_job_signal_sync[PVR_JOB_TYPE_MAX];
+    struct vk_sync *next_job_wait_sync[PVR_JOB_TYPE_MAX];
++
++   struct vk_sync *free_syncs[2 * PVR_JOB_TYPE_MAX];
++   uint32_t free_sync_count;
+ };
+ 
+ VK_DEFINE_HANDLE_CASTS(pvr_queue, vk.base, VkQueue, VK_OBJECT_TYPE_QUEUE)

@@ -1,0 +1,82 @@
+From 9b93e7bbc7c2395f654b1fd72b3cf43ed4a8d09c Mon Sep 17 00:00:00 2001
+From: Simon Perretta <simon.perretta@imgtec.com>
+Date: Wed, 11 Nov 2026 14:15:13 +0000
+Subject: [PATCH] pco: fence before mutex release ops
+
+If local memory ops (primarily coeff writes/atomics) are performed
+before a mutex.release*, a fence must be inserted in order to ensure that
+writes are completed before the release is processed, otherwise the
+write can end up getting lost.
+
+This wasn't getting triggering when the barrier implementation was
+simpler, or when enough ops are performed in-between barriers such that
+there ends up being enough time for the local memory writes to complete.
+
+Ideally the fence should only be inserted if local memory ops are
+actually performed between a mutex.lock and mutex.release*, but the cost
+of a fence is negligible compared to that of a mutex (and the
+compile-time cost of iterating backwards to find local memory writes).
+
+Fixes: 8834fe3b869 ("pco: fix workgroup barrier race when reused across loop iterations")
+Signed-off-by: Simon Perretta <simon.perretta@imgtec.com>
+Reviewed-by: Radu Costas <radu.costas@imgtec.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/46234>
+(cherry picked from commit 4dda3dc16fb5fea511596774ba81a8b9719e0b33)
+Link: https://gitlab.freedesktop.org/mesa/mesa/-/commit/9b93e7bbc7c2395f654b1fd72b3cf43ed4a8d09c
+[ adapted: dropped .pick_status.json, not in the 26.3.0 tarball or bookkeeping only ]
+---
+ .pick_status.json                  |  2 +-
+ src/imagination/pco/pco_legalize.c | 30 ++++++++++++++++++++++++++++++
+ 2 files changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/src/imagination/pco/pco_legalize.c b/src/imagination/pco/pco_legalize.c
+index 8935c460f9b0..925d18bfbd61 100644
+--- a/src/imagination/pco/pco_legalize.c
++++ b/src/imagination/pco/pco_legalize.c
+@@ -895,6 +895,35 @@ static bool try_legalize_ditr_fence(pco_instr *instr)
+    return true;
+ }
+ 
++/**
++ * \brief Insert fences before mutex release ops if required.
++ *
++ * \param[in,out] instr PCO instr.
++ * \return True if progress was made.
++ */
++static bool try_legalize_mutex_fence(pco_instr *instr)
++{
++   if (instr->op != PCO_OP_MUTEX)
++      return false;
++
++   /* Only on release ops. */
++   if (pco_instr_get_mutex_op(instr) == PCO_MUTEX_OP_LOCK)
++      return false;
++
++   pco_builder b =
++      pco_builder_create(instr->parent_func, pco_cursor_before_instr(instr));
++
++   /* TODO: only insert if local memory ops were performed?
++    *
++    * Fine for the time being since the cost of a fence is negligible compared
++    * to the runtime cost of a mutex op and the compile-time cost of iterating
++    * backwards to find local memory ops.
++    */
++   pco_fence(&b);
++
++   return true;
++}
++
+ /**
+  * \brief Try to legalizes an instruction.
+  *
+@@ -907,6 +936,7 @@ static bool try_legalize(pco_instr *instr)
+    bool progress = false;
+ 
+    progress |= try_legalize_large_hwreg_offsets(instr, info);
++   progress |= try_legalize_mutex_fence(instr);
+    progress |= try_legalize_ditr_fence(instr);
+ 
+    return progress;
+-- 
+GitLab
+

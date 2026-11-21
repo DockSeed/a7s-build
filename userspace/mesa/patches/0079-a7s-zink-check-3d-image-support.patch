@@ -1,0 +1,30 @@
+Description: zink: check 3D image support in is_format_supported
+ zink_is_format_supported() only queries the image format properties when a
+ sample count is given. For sample count 0, which the state tracker uses when
+ it picks texture formats, it answers from the format features alone. These
+ do not say whether a 3D image of the format can be created: pvr reports
+ sampled-image support for the ASTC and ETC2 formats with optimal tiling but
+ rejects VK_IMAGE_TYPE_3D for every block-compressed format
+ (pvr_get_image_format_properties()). zink then claimed 3D ASTC textures and
+ failed later in resource creation, when check_ici() found no image config.
+ .
+ For PIPE_TEXTURE_3D query the image format properties as for one sample;
+ 3D images are single-sampled. Other targets are unchanged.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/gallium/drivers/zink/zink_screen.c
++++ b/src/gallium/drivers/zink/zink_screen.c
+@@ -1395,6 +1395,9 @@
+    if (vkformat == VK_FORMAT_UNDEFINED)
+       return false;
+ 
++   if (target == PIPE_TEXTURE_3D && !sample_count)
++      sample_count = 1;
++
+    if (sample_count >= 1) {
+       VkSampleCountFlagBits sample_mask = vk_sample_count_flags(sample_count);
+       if (!sample_mask)

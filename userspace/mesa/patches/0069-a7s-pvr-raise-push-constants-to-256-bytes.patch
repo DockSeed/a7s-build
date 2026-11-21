@@ -1,0 +1,43 @@
+Description: pvr: raise maxPushConstantsSize to 256 bytes
+ maxPushConstantsSize is a literal 128, equal to PVR_MAX_PUSH_CONSTANTS_SIZE.
+ The constant only sizes the CPU copy in struct pvr_push_constants
+ (pvr_cmd_buffer.h). vkCmdPushConstants2 copies into it, the copy is uploaded
+ as a buffer (pvr_cmd_upload_push_consts()) and the PDS descriptor program
+ loads the range the shader reads into shared registers
+ (PVR_BUFFER_TYPE_PUSH_CONSTS, pvr_setup_descriptors() in
+ pvr_arch_pipeline.c). The DOUTD burst size field has 12 bits
+ (PVR_ROGUE_PDSINST_DOUT_FIELDS_DOUTD_SRC1_BSIZE, pvr_rogue_pds_defs.h), so 64
+ dwords fit in one burst.
+ .
+ Raise the constant to 256, the Vulkan 1.4 minimum, and report it. A shader
+ that reads all of it uses 64 instead of 32 shared registers; vertex and
+ fragment shaders have 1024 (ROGUE_MAX_VERTEX_SHARED_REGISTERS,
+ ROGUE_MAX_PIXEL_SHARED_REGISTERS in rogue_hw_defs.h).
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/common/pvr_limits.h
++++ b/src/imagination/common/pvr_limits.h
+@@ -38,7 +38,7 @@
+ #define PVR_MAX_NEG_OFFSCREEN_OFFSET 4096U
+ #define PVR_MAX_MULTIVIEW 6U
+ 
+-#define PVR_MAX_PUSH_CONSTANTS_SIZE 128U
++#define PVR_MAX_PUSH_CONSTANTS_SIZE 256U
+ 
+ #define PVR_LINE_WIDTH_MIN (1.0f / 16.0f)
+ #define PVR_LINE_WIDTH_MAX 16.0f
+--- a/src/imagination/vulkan/pvr_physical_device.c
++++ b/src/imagination/vulkan/pvr_physical_device.c
+@@ -683,7 +683,7 @@
+       .maxTexelBufferElements = 64U * 1024U,
+       .maxUniformBufferRange = 128U * 1024U * 1024U,
+       .maxStorageBufferRange = 128U * 1024U * 1024U,
+-      .maxPushConstantsSize = 128U,
++      .maxPushConstantsSize = PVR_MAX_PUSH_CONSTANTS_SIZE,
+       .maxMemoryAllocationCount = 4096U,
+       .maxSamplerAllocationCount = 4000U,
+       .bufferImageGranularity = 1U,

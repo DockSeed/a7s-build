@@ -1,0 +1,31 @@
+Description: pvr: do not divide the copy stride of compressed images twice
+ pvr_setup_transfer_surface() takes the stride from the row pitch divided by
+ the block size of the copy format. For a block-compressed image copied with
+ an uncompressed format of the same block size (pvr_get_raw_copy_format() or
+ the format of the other image) that is already the number of blocks per row.
+ The stride was then divided by the block width a second time. For an ETC2
+ RGB8 image of 64x64 texels with linear tiling the row pitch is 128 bytes,
+ 16 blocks of 8 bytes; the surface got width 16 and stride 4, and
+ pvr_mem_layout_spec() rejects a linear surface whose stride is smaller than
+ its width. Twiddled surfaces ignore the stride, so only linear images were
+ affected. Linear tiling with transfer support for ETC2 and EAC comes from
+ "pvr: Add support for linear transfer for ETC2 formats" (patch 0037).
+ .
+ Keep the stride in blocks; width, height and the rectangle are still
+ converted from texels to blocks.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/vulkan/rogue/pvr_blit.c
++++ b/src/imagination/vulkan/rogue/pvr_blit.c
+@@ -240,7 +240,6 @@
+ 
+       surface->width = MAX2(1U, DIV_ROUND_UP(surface->width, block_width));
+       surface->height = MAX2(1U, DIV_ROUND_UP(surface->height, block_height));
+-      surface->stride = MAX2(1U, DIV_ROUND_UP(surface->stride, block_width));
+ 
+       rect->offset.x /= block_width;
+       rect->offset.y /= block_height;

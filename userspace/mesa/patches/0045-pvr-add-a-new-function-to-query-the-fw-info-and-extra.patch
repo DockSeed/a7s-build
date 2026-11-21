@@ -1,0 +1,189 @@
+From 2e28de517a6835fa0068a77a001ac8b6c180ca4f Mon Sep 17 00:00:00 2001
+From: Nick Hamilton <nick.hamilton@imgtec.com>
+Date: Fri, 2 Oct 2026 10:31:01 +0100
+Subject: [PATCH] pvr: add a new function to query the fw info and extract the
+ fw version
+
+Check if the new fw info query is supported by the kernel and use
+this to obtain the fw version. This can then be used to check for
+feature support that requires a specific version of the fw.
+
+If the query is not supported fall back to a default base fw version.
+
+Also add the fw info to the PVR_DEBUG=info dump.
+
+Signed-off-by: Nick Hamilton <nick.hamilton@imgtec.com
+Acked-by: Luigi Santivetti <luigi.santivetti@imgtec.com>
+Reviewed-by: Alessio Belle <alessio.belle@imgtec.com>
+Reviewed-by: Frank Bouwer <frank.bouwer@imgtec.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/40973>
+Link: https://gitlab.freedesktop.org/mesa/mesa/-/commit/2e28de517a6835fa0068a77a001ac8b6c180ca4f
+---
+ src/imagination/common/pvr_device_info.h      | 41 +++++++++++++++++++
+ src/imagination/common/pvr_dump_info.c        | 18 ++++++++
+ .../vulkan/winsys/powervr/pvr_drm.c           | 41 +++++++++++++++++++
+ 3 files changed, 100 insertions(+)
+
+diff --git a/src/imagination/common/pvr_device_info.h b/src/imagination/common/pvr_device_info.h
+index b593425daa4b..998d755e6f37 100644
+--- a/src/imagination/common/pvr_device_info.h
++++ b/src/imagination/common/pvr_device_info.h
+@@ -379,6 +379,46 @@ struct pvr_device_quirks {
+    bool has_brn74056 : 1;
+ };
+ 
++#define PVR_FW_VERSION_MAJOR_SHIFT     16
++#define PVR_FW_VERSION_MINOR_SHIFT     0
++
++#define PVR_FW_VERSION_MAJOR_MASK      UINT32_C(0xFFFF0000)
++#define PVR_FW_VERSION_MINOR_MASK      UINT32_C(0x0000FFFF)
++
++/**
++ * Packs the FW major and minor version.
++ *
++ * The packed layout is as follows:
++ *
++ * \verbatim
++ *    +--------+--------+
++ *    | 31..16 | 15..0  |
++ *    +========+========+
++ *    | MAJOR  | MINOR  |
++ *    +--------+--------+
++ * \endverbatim
++ *
++ * \sa #PVR_FW_VERSION_UNPACK_MAJOR(), #PVR_FW_VERSION_UNPACK_MINOR()
++ */
++
++#define PVR_FW_VERSION_PACK(major, minor) \
++   ((((major) << PVR_FW_VERSION_MAJOR_SHIFT) & PVR_FW_VERSION_MAJOR_MASK) | \
++    (((minor) << PVR_FW_VERSION_MINOR_SHIFT) & PVR_FW_VERSION_MINOR_MASK))
++
++#define PVR_FW_VERSION_UNPACK_MAJOR(version) \
++   (((version) & PVR_FW_VERSION_MAJOR_MASK) >> PVR_FW_VERSION_MAJOR_SHIFT)
++
++#define PVR_FW_VERSION_UNPACK_MINOR(version) \
++   (((version) & PVR_FW_VERSION_MINOR_MASK) >> PVR_FW_VERSION_MINOR_SHIFT)
++
++#define PVR_FW_VERSION_VALID(major, minor) \
++   ((((major) & ~(PVR_FW_VERSION_MAJOR_MASK >> PVR_FW_VERSION_MAJOR_SHIFT)) == 0) && \
++    (((minor) & ~(PVR_FW_VERSION_MINOR_MASK >> PVR_FW_VERSION_MINOR_SHIFT)) == 0))
++
++struct pvr_device_fw_info {
++   uint32_t fw_version;
++};
++
+ struct pvr_device_info {
+    struct pvr_device_ident ident;
+    struct pvr_device_features features;
+@@ -395,6 +435,7 @@ struct pvr_device_runtime_info {
+    uint64_t max_coeffs;
+    uint64_t cdm_max_local_mem_size_regs;
+    uint32_t core_count;
++   struct pvr_device_fw_info fw_info;
+ };
+ 
+ /**
+diff --git a/src/imagination/common/pvr_dump_info.c b/src/imagination/common/pvr_dump_info.c
+index 586c64da3dd3..5d14052569ab 100644
+--- a/src/imagination/common/pvr_dump_info.c
++++ b/src/imagination/common/pvr_dump_info.c
+@@ -58,6 +58,17 @@ static inline void pvr_dump_field_drm_version(struct pvr_dump_ctx *ctx,
+                   drm_date);
+ }
+ 
++static inline void pvr_dump_field_fw_version(struct pvr_dump_ctx *ctx,
++                                             const char *const name,
++                                             uint32_t fw_version)
++{
++   pvr_dump_field(ctx,
++                  name,
++                  "(%d.%d)",
++                  PVR_FW_VERSION_UNPACK_MAJOR(fw_version),
++                  PVR_FW_VERSION_UNPACK_MINOR(fw_version));
++}
++
+ static inline void pvr_dump_field_compatible_strings(struct pvr_dump_ctx *ctx,
+                                                      char *const *comp)
+ {
+@@ -84,6 +95,7 @@ void pvr_dump_physical_device_info(const struct pvr_device_dump_info *dump_info)
+ {
+    const struct pvr_device_runtime_info *run_info =
+       dump_info->device_runtime_info;
++   const struct pvr_device_fw_info *fw_info = &run_info->fw_info;
+    const struct pvr_device_info *dev_info = dump_info->device_info;
+    struct pvr_dump_ctx ctx;
+ 
+@@ -143,5 +155,11 @@ void pvr_dump_physical_device_info(const struct pvr_device_dump_info *dump_info)
+    pvr_dump_dedent(&ctx);
+    pvr_dump_print_eol(&ctx);
+ 
++   pvr_dump_mark_section(&ctx, "FW Info");
++   pvr_dump_indent(&ctx);
++   pvr_dump_field_fw_version(&ctx, "FW Version", fw_info->fw_version);
++   pvr_dump_dedent(&ctx);
++   pvr_dump_print_eol(&ctx);
++
+    pvr_dump_end(&ctx);
+ }
+diff --git a/src/imagination/vulkan/winsys/powervr/pvr_drm.c b/src/imagination/vulkan/winsys/powervr/pvr_drm.c
+index d2cf4fce4f7c..85dc36ad887b 100644
+--- a/src/imagination/vulkan/winsys/powervr/pvr_drm.c
++++ b/src/imagination/vulkan/winsys/powervr/pvr_drm.c
+@@ -154,6 +154,41 @@ pvr_u32_in_array(const uint32_t *array, const size_t len, const uint32_t val)
+    return false;
+ }
+ 
++static VkResult pvr_drm_get_fw_info(struct pvr_drm_winsys *drm_ws,
++                                    struct pvr_device_fw_info *fw_info)
++{
++   /* Default to oldest firmware version when FW info dev query is unsupported. */
++   struct drm_pvr_dev_query_fw_info query_fw_info = {
++      .major_version = 1,
++      .minor_version = 0,
++   };
++
++   VkResult result = VK_SUCCESS;
++
++   if (drm_ws->drm_version >= PVR_DRM_VERSION_PACK(1, 1, 0)) {
++      struct drm_pvr_ioctl_dev_query_args args = {
++         .type = DRM_PVR_DEV_QUERY_FW_INFO_GET,
++         .size = sizeof(query_fw_info),
++         .pointer = (__u64)&query_fw_info
++      };
++
++      result = pvr_ioctl(drm_ws->base.render_fd,
++                         DRM_IOCTL_PVR_DEV_QUERY,
++                         &args,
++                         VK_ERROR_INITIALIZATION_FAILED);
++      if (result != VK_SUCCESS)
++         return result;
++   }
++
++   assert(PVR_FW_VERSION_VALID(query_fw_info.major_version,
++                               query_fw_info.minor_version));
++
++   fw_info->fw_version =
++      PVR_FW_VERSION_PACK(query_fw_info.major_version, query_fw_info.minor_version);
++
++   return result;
++}
++
+ static VkResult pvr_drm_override_quirks(struct pvr_drm_winsys *drm_ws,
+                                         struct pvr_device_info *dev_info)
+ {
+@@ -372,6 +407,12 @@ pvr_drm_winsys_device_info_init(struct pvr_winsys *ws,
+       goto err_out;
+    }
+ 
++   result = pvr_drm_get_fw_info(drm_ws, &runtime_info->fw_info);
++   if (result != VK_SUCCESS) {
++      mesa_logw("Failed to check FW feature support for this GPU\n");
++      goto err_out;
++   }
++
+    /* TODO: When kernel support is added, fetch the actual core count. */
+    if (PVR_HAS_FEATURE(dev_info, gpu_multicore_support))
+       pvr_finishme("Core count fetching is unimplemented. Setting 1 for now.");
+-- 
+GitLab
+

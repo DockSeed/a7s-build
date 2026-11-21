@@ -1,0 +1,63 @@
+From 73ab7a2690bcf1295b83da45793fcaffaad26fae Mon Sep 17 00:00:00 2001
+From: Mike Blumenkrantz <michael.blumenkrantz@gmail.com>
+Date: Fri, 30 Oct 2026 11:34:57 -0400
+Subject: [PATCH] glsl: treat volatile as coherent when translating to nir
+
+the glsl spec says variables declared as volatile are automatically
+treated as coherent, but only ACCESS_VOLATILE was set, which drivers like
+zink ignore
+
+Generated-by: LLM
+
+cc: mesa-stable
+
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45782>
+(cherry picked from commit 3df8fc4058902bc622f4ecd950122df09f96ff87)
+Link: https://gitlab.freedesktop.org/mesa/mesa/-/commit/73ab7a2690bcf1295b83da45793fcaffaad26fae
+[ adapted: dropped .pick_status.json, not in the 26.3.0 tarball or bookkeeping only ]
+---
+ .pick_status.json                 |  2 +-
+ src/compiler/glsl/glsl_to_nir.cpp | 12 +++++++++---
+ 2 files changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/src/compiler/glsl/glsl_to_nir.cpp b/src/compiler/glsl/glsl_to_nir.cpp
+index de70f5cb78ca..85c3d804f4c0 100644
+--- a/src/compiler/glsl/glsl_to_nir.cpp
++++ b/src/compiler/glsl/glsl_to_nir.cpp
+@@ -563,8 +563,14 @@ nir_visitor::visit(ir_variable *ir)
+       mem_access |= ACCESS_NON_READABLE;
+    if (ir->data.memory_coherent)
+       mem_access |= ACCESS_COHERENT;
++   /* From the GLSL spec, section 4.10 (Memory Qualifiers):
++    *
++    *    "Since the external source reading or writing a volatile variable
++    *    may be another shader invocation, variables declared as volatile are
++    *    automatically treated as coherent."
++    */
+    if (ir->data.memory_volatile)
+-      mem_access |= ACCESS_VOLATILE;
++      mem_access |= ACCESS_VOLATILE | ACCESS_COHERENT;
+    if (ir->data.memory_restrict)
+       mem_access |= ACCESS_RESTRICT;
+ 
+@@ -587,7 +593,7 @@ nir_visitor::visit(ir_variable *ir)
+             if (field->memory_coherent)
+                mem_access |= ACCESS_COHERENT;
+             if (field->memory_volatile)
+-               mem_access |= ACCESS_VOLATILE;
++               mem_access |= ACCESS_VOLATILE | ACCESS_COHERENT;
+             if (field->memory_restrict)
+                mem_access |= ACCESS_RESTRICT;
+ 
+@@ -932,7 +938,7 @@ deref_get_qualifier(nir_deref_instr *deref)
+          if (field->memory_coherent)
+             qualifiers |= ACCESS_COHERENT;
+          if (field->memory_volatile)
+-            qualifiers |= ACCESS_VOLATILE;
++            qualifiers |= ACCESS_VOLATILE | ACCESS_COHERENT;
+          if (field->memory_restrict)
+             qualifiers |= ACCESS_RESTRICT;
+       }
+-- 
+GitLab
+

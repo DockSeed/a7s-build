@@ -1,0 +1,101 @@
+From 6a552e0e5774fcc637997c49d5abd9eb46512c31 Mon Sep 17 00:00:00 2001
+From: Nick Hamilton <nick.hamilton@imgtec.com>
+Date: Thu, 15 Oct 2026 15:56:19 +0100
+Subject: [PATCH] pvr: Fix load ops on a rta when doing clears with gs rta
+ feature enabled.
+
+When the gs rta feature is enabled doing a clear will insert geometry
+to render to clear the specified area with the surrounding area
+accumulated based on the load op.
+
+If the load op is a load then the background object shader needs to
+load from the required rta layer by offsetting the texture address.
+This offsetting was missing leading to the area around the clear been
+accumulated from the first layer.
+
+fix the follow tests when gs rta feature is enabled:
+dEQP-VK.renderpasses.dynamic_rendering.primary_cmd_buff.random.seed*_multiview
+dEQP-VK.renderpasses.dynamic_rendering.primary_cmd_buff.random.seed*
+
+Acked-by: Luigi Santivetti <luigi.santivetti@imgtec.com>
+Reviewed-by: Frank Bouwer <frank.bouwer@imgtec.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/40973>
+Link: https://gitlab.freedesktop.org/mesa/mesa/-/commit/6a552e0e5774fcc637997c49d5abd9eb46512c31
+---
+ src/imagination/vulkan/pvr_arch_mrt.c |  5 +++++
+ src/imagination/vulkan/pvr_mrt.h      |  2 ++
+ src/imagination/vulkan/pvr_usc.c      | 22 ++++++++++++++++++++++
+ 3 files changed, 29 insertions(+)
+
+diff --git a/src/imagination/vulkan/pvr_arch_mrt.c b/src/imagination/vulkan/pvr_arch_mrt.c
+index bd59ccd64c5f..54f6621d852f 100644
+--- a/src/imagination/vulkan/pvr_arch_mrt.c
++++ b/src/imagination/vulkan/pvr_arch_mrt.c
+@@ -328,6 +328,11 @@ static VkResult pvr_mrt_load_op_init(struct pvr_device *device,
+          load_op->clears_loads_state.rt_2d_view_3d_mask |= BITFIELD_BIT(i);
+       }
+ 
++      if (dr_info->hw_render.view_mask == 1 &&
++          rp_info->attachments[color_init->index]->vk.layer_count > 1) {
++         load_op->clears_loads_state.rta_load_clear = true;
++      }
++
+       switch (color_init->op) {
+       case VK_ATTACHMENT_LOAD_OP_CLEAR:
+          load_op->clears_loads_state.rt_clear_mask |= BITFIELD_BIT(i);
+diff --git a/src/imagination/vulkan/pvr_mrt.h b/src/imagination/vulkan/pvr_mrt.h
+index 249a913f770a..dee8bc82e674 100644
+--- a/src/imagination/vulkan/pvr_mrt.h
++++ b/src/imagination/vulkan/pvr_mrt.h
+@@ -127,6 +127,8 @@ struct pvr_load_op {
+       uint16_t rt_load_mask;
+       uint16_t rt_2d_view_3d_mask;
+ 
++      bool rta_load_clear;
++
+       uint16_t unresolved_msaa_mask;
+ 
+       /* The format to write to the output regs. */
+diff --git a/src/imagination/vulkan/pvr_usc.c b/src/imagination/vulkan/pvr_usc.c
+index c56f08c8ed77..eeaba8832519 100644
+--- a/src/imagination/vulkan/pvr_usc.c
++++ b/src/imagination/vulkan/pvr_usc.c
+@@ -1230,6 +1230,25 @@ pco_shader *pvr_uscgen_loadop(pco_ctx *ctx, struct pvr_load_op *load_op)
+          assert(var);
+          unsigned chans = glsl_get_vector_elements(var->type);
+ 
++         /* If this is for a rta then need to load the rta index and override
++          * the texture address to the required layer.
++          */
++         nir_def *addr_override = NULL;
++         if (load_op->clears_loads_state.rta_load_clear) {
++            nir_def *array_index = nir_load_layer_id(&b);
++            nir_def *array_stride =
++               nir_channel(&b, tex_meta, PCO_IMAGE_META_LAYER_SIZE);
++
++            nir_def *array_offset = nir_imul(&b, array_index, array_stride);
++
++            nir_def *base_addr = usclib_tex_state_address(&b, tex_state);
++            nir_def *base_addr_lo = nir_channel(&b, base_addr, 0);
++            nir_def *base_addr_hi = nir_channel(&b, base_addr, 1);
++
++            addr_override =
++               nir_uadd64_32(&b, base_addr_lo, base_addr_hi, array_offset);
++         }
++
+          pco_smp_params params = {
+             .tex_state = tex_state,
+             .smp_state = smp_state,
+@@ -1242,6 +1261,9 @@ pco_shader *pvr_uscgen_loadop(pco_ctx *ctx, struct pvr_load_op *load_op)
+             .sampler_dim = msaa ? GLSL_SAMPLER_DIM_MS : GLSL_SAMPLER_DIM_2D,
+ 
+             .ms_index = msaa ? nir_load_sample_id(&b) : NULL,
++
++            .addr_lo = addr_override ? nir_channel(&b, addr_override, 0) : NULL,
++            .addr_hi = addr_override ? nir_channel(&b, addr_override, 1) : NULL,
+          };
+ 
+          if (load_op->clears_loads_state.rt_2d_view_3d_mask & BITFIELD_BIT(rt_idx)) {
+-- 
+GitLab
+

@@ -1,0 +1,1188 @@
+Description: pvr: VK_EXT_primitives_generated_query from the stream-out counters
+ Count generated primitives with an extra STM instruction at the end of the
+ stream-out PDS program, which the TA runs once per primitive
+ (pvr_rogue_pds_defs.h). The STM has EOP set and writes one dword per
+ primitive into a small buffer of the command buffer. Its limit does not
+ stop the write on the BXM-4-64 and the STM advances its
+ address by one dword per primitive, so a copy of the initial SRC0 is kept in
+ a persistent temp and restored before every counting STM: every primitive
+ writes the same dword at the start of the buffer. On the BXM-4-64 the low
+ word of the STM counter persistent temp (SRC1 bits 31..0) counts every such
+ primitive, the high
+ word stays unchanged, with or without overflow. The low word is therefore
+ read.
+ .
+ The counter uses its own persistent temps behind the twelve of transform
+ feedback (ptemp64 24, 26, 28, and 30 for the copy of SRC0; 32 dwords,
+ lls.xml PDS_PERSISTENT_TEMPS_BUFFER_SIZE). A value set in a geometry-only kick
+ outside a render pass did not reach the next render (GL through zink, which
+ begins and ends the query outside the render pass, read 0 even with a
+ preloaded counter), so the temps are only trusted within one graphics sub
+ command: begin clears the result and availability in memory, the first draw
+ of each graphics sub command while the query is active sets up the temps,
+ the end of that sub command adds the counter to the result in memory, and
+ the end of the query adds the open sub command, if any, and writes the
+ availability. While the query is active the stream-out program ends with the
+ counting STM: the transform feedback program while transform feedback is
+ active, otherwise a program with only this STM, with stream 0 output to
+ memory enabled. Pausing transform feedback does not affect the count.
+ Results are one 32-bit report (transform_feedback_query_bits = 32) through
+ the existing copy, reset and host paths.
+ .
+ Rasterizer discard only disables the ISP, the stream-out program in the TA
+ still runs, so primitivesGeneratedQueryWithRasterizerDiscard is set. Non-zero
+ streams are not supported (maxTransformFeedbackStreams = 1).
+ .
+ With multiview, a query uses N consecutive indices, N being the number of
+ views, and the control stream of a graphics sub command is submitted once
+ per view (pvr_process_graphics_cmd()). When the query begins in a graphics
+ sub command with more than one view, the render is ended (store), results
+ and availability of all N indices are cleared with the query reset program,
+ and the render continues (load), as for an occlusion pool change. The clear
+ thus runs once, outside the per-view control stream, and each view adds its
+ count to the first index. At the end of the query the availability of all N
+ indices is written after the sub command, through the deferred timestamp
+ path without a timestamp, as for occlusion (0090) and timestamp queries.
+ The other indices read zero.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/common/pvr_iface.h
++++ b/src/imagination/common/pvr_iface.h
+@@ -369,4 +369,31 @@
+    PVR_XFB_QUERY_END_REF_ID_AVAILABILITY_ST_SRC0,
+ };
+ 
++enum pvr_xfb_primgen_begin_patch_id {
++   PVR_XFB_PRIMGEN_BEGIN_PATCH_ID_RESULT_ST_SRC0,
++   PVR_XFB_PRIMGEN_BEGIN_PATCH_ID_AVAILABILITY_ST_SRC0,
++};
++
++enum pvr_xfb_primgen_begin_ref_id {
++   PVR_XFB_PRIMGEN_BEGIN_REF_ID_RESULT_ST_SRC0,
++   PVR_XFB_PRIMGEN_BEGIN_REF_ID_AVAILABILITY_ST_SRC0,
++};
++
++enum pvr_xfb_primgen_init_patch_id {
++   PVR_XFB_PRIMGEN_INIT_PATCH_ID_STM_SRC0,
++   PVR_XFB_PRIMGEN_INIT_PATCH_ID_STM_SRC3,
++};
++
++enum pvr_xfb_primgen_end_patch_id {
++   PVR_XFB_PRIMGEN_END_PATCH_ID_RESULT_LD_SRC0,
++   PVR_XFB_PRIMGEN_END_PATCH_ID_RESULT_ST_SRC0,
++   PVR_XFB_PRIMGEN_END_PATCH_ID_AVAILABILITY_ST_SRC0,
++};
++
++enum pvr_xfb_primgen_end_ref_id {
++   PVR_XFB_PRIMGEN_END_REF_ID_RESULT_LD_DEST,
++   PVR_XFB_PRIMGEN_END_REF_ID_RESULT_ST_SRC0,
++   PVR_XFB_PRIMGEN_END_REF_ID_AVAILABILITY_ST_SRC0,
++};
++
+ #endif /* PVR_IFACE_H */
+--- a/src/imagination/common/pvr_limits.h
++++ b/src/imagination/common/pvr_limits.h
+@@ -80,6 +80,10 @@
+ /* Number of 64-bit persistent temps declared by the XFB PDS programs. */
+ #define PVR_XFB_MAX_PTEMPS_SETS \
+    (PVR_XFB_MAX_BUFFERS * PVR_XFB_PTEMP_ENTRIES_PER_VARYING)
++#define PVR_XFB_PRIMGEN_PTEMP_SRC0 (PVR_XFB_MAX_PTEMPS_SETS * 2U)
++#define PVR_XFB_PRIMGEN_PTEMP_SRC1 (PVR_XFB_PRIMGEN_PTEMP_SRC0 + 2U)
++#define PVR_XFB_PRIMGEN_PTEMP_SRC3 (PVR_XFB_PRIMGEN_PTEMP_SRC0 + 4U)
++#define PVR_XFB_PRIMGEN_PTEMP_SRC0_RESET (PVR_XFB_PRIMGEN_PTEMP_SRC0 + 6U)
+ #define PVR_XFB_MAX_TOTAL_VARYINGS 128U
+ #define PVR_XFB_MAX_DATA_SIZE 512U
+ #define PVR_XFB_MAX_DATA_STRIDE 2048U
+--- a/src/imagination/pdsc/pdsc_precomp.c
++++ b/src/imagination/pdsc/pdsc_precomp.c
+@@ -43,6 +43,9 @@
+ static const struct pdsc_precomp_info pdsc_precomp_infos[] = {
+    PRECOMP(xfb_end, 0),
+    PRECOMP(xfb_init, 0),
++   PRECOMP(xfb_primgen_begin, 0),
++   PRECOMP(xfb_primgen_end, 0),
++   PRECOMP(xfb_primgen_init, 0),
+    PRECOMP(xfb_query_begin, 0),
+    PRECOMP(xfb_query_end, 0),
+    PRECOMP(xfb_vertex_count, 0),
+--- a/src/imagination/pdsc/programs/pdsc_xfb_main.h
++++ b/src/imagination/pdsc/programs/pdsc_xfb_main.h
+@@ -24,7 +24,8 @@
+ pdsc_xfb_main_runtime_gen(void *mem_ctx,
+                           enum pdsc_feature features,
+                           uint32_t group_count,
+-                          const uint32_t *group_varying_counts)
++                          const uint32_t *group_varying_counts,
++                          bool count_primitives)
+ {
+    pdsc_program *p = pdsc_program_create(mem_ctx, features, "xfb_main");
+    char buf[64];
+@@ -103,6 +104,29 @@
+       varying_idx++;
+    }
+ 
++   if (count_primitives) {
++      pdsc_ref primgen_src0 =
++         pdsc_decl_ptemp64(p, "primgen_src0", PVR_XFB_PRIMGEN_PTEMP_SRC0, true);
++      pdsc_ref primgen_src1 =
++         pdsc_decl_ptemp64(p, "primgen_src1", PVR_XFB_PRIMGEN_PTEMP_SRC1, true);
++      pdsc_ref primgen_src3 =
++         pdsc_decl_ptemp64(p, "primgen_src3", PVR_XFB_PRIMGEN_PTEMP_SRC3, true);
++      pdsc_ref primgen_src0_reset =
++         pdsc_decl_ptemp64(p,
++                           "primgen_src0_reset",
++                           PVR_XFB_PRIMGEN_PTEMP_SRC0_RESET,
++                           true);
++      pdsc_ref primgen_src2 = pdsc_alloc_const32(p,
++                                                 "primgen_src2",
++                                                 PDSC_TYPE_IMM,
++                                                 PDSC_CONST_PATCH_ID_NONE);
++      const struct pdsc_stm_src2 src2 = { .dmasize = 1 };
++
++      pdsc_assign_const32(p, primgen_src2, pdsc_stm_src2_pack(p, &src2));
++      pdsc_mov64(p, primgen_src0, primgen_src0_reset);
++      pdsc_stm(p, primgen_src0, primgen_src1, primgen_src2, primgen_src3);
++   }
++
+    pdsc_halt(p);
+ 
+    pdsc_finalize_program(p);
+--- a/src/imagination/pdsc/programs/pdsc_xfb_query_begin.h
++++ b/src/imagination/pdsc/programs/pdsc_xfb_query_begin.h
+@@ -80,3 +80,77 @@
+ 
+    return p;
+ }
++
++static inline pdsc_program *
++pdsc_xfb_primgen_begin_gen(void *mem_ctx, enum pdsc_feature features)
++{
++   pdsc_program *p =
++      pdsc_program_create(mem_ctx, features, "xfb_primgen_begin");
++
++   ALLOC_TEMP64(p, tzero);
++   pdsc_limm(p, pdsc_ref_lo32(tzero), pdsc_ref_imm(0));
++   pdsc_limm(p, pdsc_ref_hi32(tzero), pdsc_ref_imm(0));
++
++   ALLOC_TEMP32(p, zero);
++   pdsc_limm(p, zero, pdsc_ref_imm(0));
++
++   pdsc_instr_t cmp = pdsc_cmp(p, tzero, pdsc_ref_null(), .cop = PDSC_COP_NE);
++   pdsc_setc(p, PDSC_PRED_P0);
++   pdsc_instr_t st = pdsc_st(p,
++                             zero,
++                             PVR_XFB_PRIMGEN_BEGIN_REF_ID_RESULT_ST_SRC0,
++                             PVR_XFB_PRIMGEN_BEGIN_PATCH_ID_RESULT_ST_SRC0,
++                             false,
++                             .mods.cc = true);
++   pdsc_src_set(p, cmp, 1, pdsc_src_get(p, st, 0));
++   pdsc_wdf(p);
++
++   cmp = pdsc_cmp(p, tzero, pdsc_ref_null(), .cop = PDSC_COP_NE);
++   pdsc_setc(p, PDSC_PRED_P0);
++   st = pdsc_st(p,
++                zero,
++                PVR_XFB_PRIMGEN_BEGIN_REF_ID_AVAILABILITY_ST_SRC0,
++                PVR_XFB_PRIMGEN_BEGIN_PATCH_ID_AVAILABILITY_ST_SRC0,
++                false,
++                .mods.cc = true);
++   pdsc_src_set(p, cmp, 1, pdsc_src_get(p, st, 0));
++   pdsc_wdf(p);
++
++   pdsc_halt(p);
++
++   return p;
++}
++
++static inline pdsc_program *
++pdsc_xfb_primgen_init_gen(void *mem_ctx, enum pdsc_feature features)
++{
++   pdsc_program *p = pdsc_program_create(mem_ctx, features, "xfb_primgen_init");
++
++   ALLOC_TEMP64(p, tzero);
++   pdsc_limm(p, pdsc_ref_lo32(tzero), pdsc_ref_imm(0));
++   pdsc_limm(p, pdsc_ref_hi32(tzero), pdsc_ref_imm(0));
++
++   ALLOC_CONST64(p, stm_src0, PVR_XFB_PRIMGEN_INIT_PATCH_ID_STM_SRC0);
++   ALLOC_CONST64(p, stm_src3, PVR_XFB_PRIMGEN_INIT_PATCH_ID_STM_SRC3);
++
++   pdsc_ref primgen_src0 =
++      pdsc_decl_ptemp64(p, "primgen_src0", PVR_XFB_PRIMGEN_PTEMP_SRC0, true);
++   pdsc_ref primgen_src1 =
++      pdsc_decl_ptemp64(p, "primgen_src1", PVR_XFB_PRIMGEN_PTEMP_SRC1, true);
++   pdsc_ref primgen_src3 =
++      pdsc_decl_ptemp64(p, "primgen_src3", PVR_XFB_PRIMGEN_PTEMP_SRC3, true);
++   pdsc_ref primgen_src0_reset =
++      pdsc_decl_ptemp64(p,
++                        "primgen_src0_reset",
++                        PVR_XFB_PRIMGEN_PTEMP_SRC0_RESET,
++                        true);
++
++   pdsc_mov64(p, primgen_src0, stm_src0);
++   pdsc_mov64(p, primgen_src0_reset, stm_src0);
++   pdsc_mov64(p, primgen_src1, tzero);
++   pdsc_mov64(p, primgen_src3, stm_src3);
++
++   pdsc_halt(p);
++
++   return p;
++}
+--- a/src/imagination/pdsc/programs/pdsc_xfb_query_end.h
++++ b/src/imagination/pdsc/programs/pdsc_xfb_query_end.h
+@@ -101,3 +101,71 @@
+ 
+    return p;
+ }
++
++static inline pdsc_program *
++pdsc_xfb_primgen_end_gen(void *mem_ctx, enum pdsc_feature features)
++{
++   pdsc_program *p = pdsc_program_create(mem_ctx, features, "xfb_primgen_end");
++
++   ALLOC_TEMP64(p, tzero);
++   pdsc_limm(p, pdsc_ref_lo32(tzero), pdsc_ref_imm(0));
++   pdsc_limm(p, pdsc_ref_hi32(tzero), pdsc_ref_imm(0));
++
++   ALLOC_TEMP64(p, prev);
++   pdsc_limm(p, pdsc_ref_lo32(prev), pdsc_ref_imm(0));
++   pdsc_limm(p, pdsc_ref_hi32(prev), pdsc_ref_imm(0));
++
++   ALLOC_TEMP64(p, acc);
++   ALLOC_TEMP64(p, seg);
++   ALLOC_TEMP32(p, result);
++
++   ALLOC_TEMP32(p, availability);
++   pdsc_limm(p, availability, pdsc_ref_imm(1));
++
++   pdsc_ref primgen_src1 =
++      pdsc_decl_ptemp64(p, "primgen_src1", PVR_XFB_PRIMGEN_PTEMP_SRC1, true);
++
++   pdsc_instr_t cmp = pdsc_cmp(p, tzero, pdsc_ref_null(), .cop = PDSC_COP_NE);
++   pdsc_setc(p, PDSC_PRED_P0);
++   pdsc_instr_t ld = pdsc_ld(p,
++                             prev,
++                             PVR_XFB_PRIMGEN_END_REF_ID_RESULT_LD_DEST,
++                             PVR_XFB_PRIMGEN_END_PATCH_ID_RESULT_LD_SRC0,
++                             false,
++                             .mods.cc = true);
++   pdsc_src_set(p, cmp, 1, pdsc_src_get(p, ld, 0));
++   pdsc_wdf(p);
++
++   pdsc_mov32(p, pdsc_ref_lo32(acc), pdsc_ref_lo32(prev));
++   pdsc_limm(p, pdsc_ref_hi32(acc), pdsc_ref_imm(0));
++   pdsc_mov32(p, pdsc_ref_lo32(seg), pdsc_ref_lo32(primgen_src1));
++   pdsc_limm(p, pdsc_ref_hi32(seg), pdsc_ref_imm(0));
++   pdsc_add64(p, acc, acc, seg);
++   pdsc_mov32(p, result, pdsc_ref_lo32(acc));
++
++   cmp = pdsc_cmp(p, tzero, pdsc_ref_null(), .cop = PDSC_COP_NE);
++   pdsc_setc(p, PDSC_PRED_P0);
++   pdsc_instr_t st = pdsc_st(p,
++                             result,
++                             PVR_XFB_PRIMGEN_END_REF_ID_RESULT_ST_SRC0,
++                             PVR_XFB_PRIMGEN_END_PATCH_ID_RESULT_ST_SRC0,
++                             false,
++                             .mods.cc = true);
++   pdsc_src_set(p, cmp, 1, pdsc_src_get(p, st, 0));
++   pdsc_wdf(p);
++
++   cmp = pdsc_cmp(p, tzero, pdsc_ref_null(), .cop = PDSC_COP_NE);
++   pdsc_setc(p, PDSC_PRED_P0);
++   st = pdsc_st(p,
++                availability,
++                PVR_XFB_PRIMGEN_END_REF_ID_AVAILABILITY_ST_SRC0,
++                PVR_XFB_PRIMGEN_END_PATCH_ID_AVAILABILITY_ST_SRC0,
++                false,
++                .mods.cc = true);
++   pdsc_src_set(p, cmp, 1, pdsc_src_get(p, st, 0));
++   pdsc_wdf(p);
++
++   pdsc_halt(p);
++
++   return p;
++}
+--- a/src/imagination/vulkan/pvr_arch_cmd_buffer.c
++++ b/src/imagination/vulkan/pvr_arch_cmd_buffer.c
+@@ -2513,6 +2513,10 @@
+          cmd_buffer->usage_flags &
+             VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT;
+ 
++      result = PVR_PER_ARCH(xfb_primgen_flush)(cmd_buffer);
++      if (result != VK_SUCCESS)
++         return pvr_cmd_buffer_set_error_unwarned(cmd_buffer, result);
++
+       query_indices_size =
+          util_dynarray_num_elements(&state->query_indices, char);
+ 
+@@ -7591,17 +7595,16 @@
+ 
+ static void pvr_setup_stream_out(struct pvr_cmd_buffer *const cmd_buffer,
+                                  uint32_t temp_size,
+-                                 const struct pvr_pds_upload *pds_program)
++                                 const struct pvr_pds_upload *pds_program,
++                                 bool mem_output)
+ {
+    struct pvr_cmd_buffer_state *const state = &cmd_buffer->state;
+    struct ROGUE_TA_STATE_HEADER *const header = &state->emit_header;
+    struct pvr_ppp_state *const ppp_state = &state->ppp_state;
+-   const struct pvr_xfb_shader_state *xfb_shader_state =
+-      &cmd_buffer->state.gfx_pipeline->shader_state.xfb_shader_state;
+    uint32_t stream0, stream1, stream2;
+ 
+    pvr_csb_pack (&stream0, TA_STATE_STREAM_OUT0, stream_out) {
+-      if (xfb_shader_state->varying_count > 0)
++      if (mem_output)
+          stream_out.stream0_mem_output = true;
+       if (pvr_has_active_fragment_stage(cmd_buffer))
+          stream_out.stream0_ta_output = true;
+@@ -7636,15 +7639,31 @@
+ void PVR_PER_ARCH(set_xfb_main_program_ppp_state)(
+    struct pvr_cmd_buffer *cmd_buffer)
+ {
+-   struct pvr_program_info *streamout_program =
+-      &cmd_buffer->state.xfb_state.pds_streamout_program;
+-   struct pvr_pds_upload *pds_program = &streamout_program->pds_program;
+-   const uint32_t temp_size = streamout_program->temp_size;
++   struct pvr_cmd_buffer_xfb_state *xfb_state = &cmd_buffer->state.xfb_state;
++   const struct pvr_graphics_pipeline *pipeline =
++      cmd_buffer->state.gfx_pipeline;
++   const bool primgen =
++      !!cmd_buffer->state.query_pools[PVR_QUERY_POOL_INDEX_PRIMGEN];
++   struct pvr_program_info *program;
++   bool xfb_output;
+ 
+-   if (!cmd_buffer->state.xfb_state.is_active)
++   if (!pipeline)
+       return;
+ 
+-   pvr_setup_stream_out(cmd_buffer, temp_size, pds_program);
++   xfb_output = xfb_state->is_active &&
++                pipeline->shader_state.xfb_shader_state.varying_count > 0;
++
++   if (xfb_output || (xfb_state->is_active && !primgen))
++      program = &xfb_state->pds_streamout_program;
++   else if (primgen)
++      program = &xfb_state->pds_primgen_main_program;
++   else
++      return;
++
++   pvr_setup_stream_out(cmd_buffer,
++                        program->temp_size,
++                        &program->pds_program,
++                        xfb_output || primgen);
+ }
+ 
+ static VkResult
+@@ -8792,6 +8811,10 @@
+    if (result != VK_SUCCESS)
+       return result;
+ 
++   result = PVR_PER_ARCH(xfb_primgen_validate)(cmd_buffer);
++   if (result != VK_SUCCESS)
++      return result;
++
+    sub_cmd = &state->current_sub_cmd->gfx;
+    sub_cmd->empty_cmd = false;
+ 
+--- a/src/imagination/vulkan/pvr_arch_cmd_query.c
++++ b/src/imagination/vulkan/pvr_arch_cmd_query.c
+@@ -240,6 +240,11 @@
+       PVR_PER_ARCH(xfb_query_pool_begin)(cmd_buffer, pool, query);
+       break;
+ 
++   case VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT:
++      assert(index == 0);
++      PVR_PER_ARCH(xfb_primgen_query_begin)(cmd_buffer, pool, query);
++      break;
++
+    default:
+       UNREACHABLE("unsupported query type");
+    }
+@@ -265,6 +270,11 @@
+       PVR_PER_ARCH(xfb_query_pool_end)(cmd_buffer, pool, query);
+       break;
+ 
++   case VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT:
++      assert(index == 0);
++      PVR_PER_ARCH(xfb_primgen_query_end)(cmd_buffer, pool, query);
++      break;
++
+    default:
+       UNREACHABLE("unsupported query type");
+    }
+@@ -272,7 +282,8 @@
+ 
+ static VkResult pvr_write_timestamp(struct pvr_cmd_buffer *cmd_buffer,
+                                     VkQueryPool query_pool,
+-                                    uint32_t query)
++                                    uint32_t query,
++                                    bool write_timestamp)
+ {
+    VK_FROM_HANDLE(pvr_query_pool, pool, query_pool);
+    const struct pvr_winsys_job_timestamp timestamp = {
+@@ -298,7 +309,7 @@
+          .index_bo = index_bo,
+          .num_queries = pool->query_count,
+          .availability_bo = pool->availability_buffer,
+-         .timestamp = &timestamp,
++         .timestamp = write_timestamp ? &timestamp : NULL,
+       },
+    };
+ 
+@@ -333,7 +344,8 @@
+       for (uint32_t i = 0; i < timestamp->query_count; i++) {
+          result = pvr_write_timestamp(cmd_buffer,
+                                       timestamp->query_pool,
+-                                      timestamp->query + i);
++                                      timestamp->query + i,
++                                      !timestamp->availability_only);
+          if (result != VK_SUCCESS)
+             break;
+       }
+@@ -358,7 +370,7 @@
+    prev_sub_cmd->gfx.empty_cmd = false;
+    prev_sub_cmd->gfx.barrier_store = true;
+ 
+-   result = pvr_write_timestamp(cmd_buffer, query_pool, query);
++   result = pvr_write_timestamp(cmd_buffer, query_pool, query, true);
+    if (result != VK_SUCCESS)
+       return result;
+ 
+@@ -422,5 +434,5 @@
+       return;
+    }
+ 
+-   pvr_write_timestamp(cmd_buffer, queryPool, query);
++   pvr_write_timestamp(cmd_buffer, queryPool, query, true);
+ }
+--- a/src/imagination/vulkan/pvr_arch_xfb.c
++++ b/src/imagination/vulkan/pvr_arch_xfb.c
+@@ -419,6 +419,8 @@
+                                                    PVR_PIPELINE_STAGE_GEOM_BIT);
+    }
+ 
++   pvr_arch_set_xfb_main_program_ppp_state(cmd_buffer);
++
+ out:
+    vk_free(&cmd_buffer->device->vk.alloc, end_input.data.counter_buffers_addr);
+    end_input.data.counter_buffers_addr = NULL;
+@@ -504,28 +506,21 @@
+    return result;
+ }
+ 
+-static VkResult pvr_setup_xfb_event_program(struct pvr_cmd_buffer *cmd_buffer)
++static VkResult
++pvr_xfb_main_program_upload(struct pvr_cmd_buffer *cmd_buffer,
++                            const struct pvr_xfb_program_input *xfb_config)
+ {
+-   struct pvr_device *device = cmd_buffer->device;
+-   struct pvr_xfb_program_input xfb_config = { 0 };
+-   struct pvr_pds_xfb_init_program_input init_input = { 0 };
+-   struct pvr_program_info *init_pds_upload =
+-      &cmd_buffer->state.xfb_state.pds_init_program;
+    struct pvr_program_info *program_pds_upload =
+       &cmd_buffer->state.xfb_state.pds_streamout_program;
+-   program_pds_upload->pds_program = (struct pvr_pds_upload){ 0 };
+-   init_pds_upload->pds_program = (struct pvr_pds_upload){ 0 };
+-   pdsc_program *xfb_main_prog = NULL;
+-   pdsc_program **p;
+-
+    const struct pvr_device_info *dev_info =
+       &cmd_buffer->device->pdevice->dev_info;
+    const uint32_t cache_line_size = pvr_get_slc_cache_line_size(dev_info);
++   const bool count_primitives =
++      !!cmd_buffer->state.query_pools[PVR_QUERY_POOL_INDEX_PRIMGEN];
++   pdsc_program *xfb_main_prog;
+    VkResult result;
+ 
+-   result = pvr_create_xfb_streamout_program_config(cmd_buffer, &xfb_config);
+-   if (result != VK_SUCCESS)
+-      goto out;
++   program_pds_upload->pds_program = (struct pvr_pds_upload){ 0 };
+ 
+    const struct pvr_graphics_pipeline *pipeline =
+       cmd_buffer->state.gfx_pipeline;
+@@ -545,16 +540,17 @@
+       pdsc_xfb_main_runtime_gen(NULL,
+                                 0,
+                                 xfb_shader_state->buffer_group_count,
+-                                group_varying_counts);
++                                group_varying_counts,
++                                count_primitives);
+ 
+    program_pds_upload->temp_size = pdsc_program_temps_used(xfb_main_prog);
+ 
+    /* Build SRC2 values for patching */
+-   assert(xfb_config.varying_count <= PVR_XFB_MAX_TOTAL_VARYINGS);
++   assert(xfb_config->varying_count <= PVR_XFB_MAX_TOTAL_VARYINGS);
+    struct pdsc_stm_src2 stm_src2[PVR_XFB_MAX_TOTAL_VARYINGS];
+-   for (uint32_t i = 0; i < xfb_config.varying_count; i++) {
++   for (uint32_t i = 0; i < xfb_config->varying_count; i++) {
+       const struct pvr_pds_xfb_varying_info *varying_info =
+-         &xfb_config.data.varying_info_arr[i];
++         &xfb_config->data.varying_info_arr[i];
+ 
+       stm_src2[i] = (struct pdsc_stm_src2){
+          .vioff = varying_info->varying_index,
+@@ -563,7 +559,10 @@
+       };
+    }
+ 
+-   pdsc_patch_xfb_main(xfb_main_prog, NULL, xfb_config.varying_count, stm_src2);
++   pdsc_patch_xfb_main(xfb_main_prog,
++                       NULL,
++                       xfb_config->varying_count,
++                       stm_src2);
+ 
+    result = pvr_arch_cmd_buffer_upload_pds(
+       cmd_buffer,
+@@ -575,10 +574,41 @@
+       ROGUE_TA_STATE_STREAM_OUT1_PDS_DATA_SIZE_UNIT_SIZE,
+       cache_line_size,
+       &program_pds_upload->pds_program);
+-   if (result != VK_SUCCESS) {
++   if (result != VK_SUCCESS)
+       pvr_cmd_buffer_set_error_unwarned(cmd_buffer, result);
++
++   ralloc_free(xfb_main_prog);
++
++   return result;
++}
++
++static VkResult pvr_setup_xfb_event_program(struct pvr_cmd_buffer *cmd_buffer)
++{
++   struct pvr_device *device = cmd_buffer->device;
++   struct pvr_xfb_program_input xfb_config = { 0 };
++   struct pvr_pds_xfb_init_program_input init_input = { 0 };
++   struct pvr_program_info *init_pds_upload =
++      &cmd_buffer->state.xfb_state.pds_init_program;
++   init_pds_upload->pds_program = (struct pvr_pds_upload){ 0 };
++   pdsc_program **p;
++
++   const struct pvr_device_info *dev_info =
++      &cmd_buffer->device->pdevice->dev_info;
++   const uint32_t cache_line_size = pvr_get_slc_cache_line_size(dev_info);
++   VkResult result;
++
++   result = pvr_create_xfb_streamout_program_config(cmd_buffer, &xfb_config);
++   if (result != VK_SUCCESS)
++      goto out;
++
++   const struct pvr_graphics_pipeline *pipeline =
++      cmd_buffer->state.gfx_pipeline;
++   const struct pvr_xfb_shader_state *xfb_shader_state =
++      &pipeline->shader_state.xfb_shader_state;
++
++   result = pvr_xfb_main_program_upload(cmd_buffer, &xfb_config);
++   if (result != VK_SUCCESS)
+       goto out;
+-   }
+ 
+    result = pvr_setup_init_config(cmd_buffer, &init_input, &xfb_config);
+    if (result != VK_SUCCESS)
+@@ -722,7 +752,6 @@
+       &init_pds_upload->pds_program);
+ 
+ out:
+-   ralloc_free(xfb_main_prog);
+    vk_free(&cmd_buffer->device->vk.alloc, init_input.data.counter_buffers_addr);
+    vk_free(&cmd_buffer->device->vk.alloc, init_input.data.varying_info_arr);
+    vk_free(&cmd_buffer->device->vk.alloc, init_input.data.buffer_info);
+@@ -1201,5 +1230,476 @@
+    if (result != VK_SUCCESS)
+       return;
+ 
++   pvr_arch_set_xfb_main_program_ppp_state(cmd_buffer);
++}
++
++static VkResult pvr_xfb_primgen_program_upload(struct pvr_cmd_buffer *cmd_buffer,
++                                               pdsc_program *program,
++                                               struct pvr_program_info *info)
++{
++   const struct pvr_device_info *dev_info =
++      &cmd_buffer->device->pdevice->dev_info;
++   const uint32_t cache_line_size = pvr_get_slc_cache_line_size(dev_info);
++   VkResult result;
++
++   result = pvr_arch_cmd_buffer_upload_pds(
++      cmd_buffer,
++      pdsc_program_data(program),
++      pdsc_program_data_size(program) / sizeof(uint32_t),
++      ROGUE_TA_STATE_STREAM_OUT1_PDS_DATA_SIZE_UNIT_SIZE,
++      pdsc_program_code(program),
++      pdsc_program_code_size(program) / sizeof(uint32_t),
++      ROGUE_TA_STATE_STREAM_OUT1_PDS_DATA_SIZE_UNIT_SIZE,
++      cache_line_size,
++      &info->pds_program);
++   if (result != VK_SUCCESS)
++      pvr_cmd_buffer_set_error_unwarned(cmd_buffer, result);
++
++   return result;
++}
++
++static VkResult
++pvr_xfb_primgen_main_program_generate(struct pvr_cmd_buffer *cmd_buffer)
++{
++   struct pvr_program_info *info =
++      &cmd_buffer->state.xfb_state.pds_primgen_main_program;
++   pdsc_program *program;
++   VkResult result;
++
++   program = pdsc_xfb_main_runtime_gen(NULL, 0, 0, NULL, true);
++   info->temp_size = pdsc_program_temps_used(program);
++
++   result = pvr_xfb_primgen_program_upload(cmd_buffer, program, info);
++
++   ralloc_free(program);
++
++   return result;
++}
++
++static VkResult
++pvr_xfb_primgen_streamout_update(struct pvr_cmd_buffer *cmd_buffer)
++{
++   struct pvr_cmd_buffer_xfb_state *xfb_state = &cmd_buffer->state.xfb_state;
++   const struct pvr_graphics_pipeline *pipeline =
++      cmd_buffer->state.gfx_pipeline;
++   struct pvr_xfb_program_input xfb_config = { 0 };
++   VkResult result;
++
++   if (!xfb_state->is_active || !pipeline ||
++       !pipeline->shader_state.xfb_shader_state.varying_count) {
++      return VK_SUCCESS;
++   }
++
++   result = pvr_create_xfb_streamout_program_config(cmd_buffer, &xfb_config);
++   if (result != VK_SUCCESS)
++      return result;
++
++   result = pvr_xfb_main_program_upload(cmd_buffer, &xfb_config);
++
++   pvr_destroy_xfb_program_input(&cmd_buffer->device->vk.alloc, &xfb_config);
++
++   return result;
++}
++
++static struct pdsc_st32_src0
++pvr_xfb_primgen_st32_src0(const pdsc_program *program,
++                          uint8_t ref_id,
++                          pvr_dev_addr_t addr)
++{
++   return (struct pdsc_st32_src0){
++      .cmode = PDSC_CMODE_ST_WRITE_THROUGH,
++      .slcmode = PDSC_SLC_MODE_ST_WRITE_THROUGH,
++      .ccpri = 0,
++      .ccslc = PDSC_CCSLC_LD_NORMAL,
++      .ccmcu = PDSC_CCMCU_LD_NORMAL,
++      .count4 = 1,
++      .src = pdsc_load_ref(program, ref_id),
++      .dstadd = addr.addr,
++   };
++}
++
++static pvr_dev_addr_t
++pvr_xfb_primgen_result_addr(const struct pvr_cmd_buffer_state *state)
++{
++   const struct pvr_query_pool *pool =
++      state->query_pools[PVR_QUERY_POOL_INDEX_PRIMGEN];
++   const uint32_t query_idx =
++      state->query_pool_indices[PVR_QUERY_POOL_INDEX_PRIMGEN];
++
++   return PVR_DEV_ADDR_OFFSET(pool->result_buffer->dev_addr,
++                              pool->result_elem_stride * query_idx);
++}
++
++static pvr_dev_addr_t
++pvr_xfb_primgen_availability_addr(const struct pvr_cmd_buffer_state *state)
++{
++   const struct pvr_query_pool *pool =
++      state->query_pools[PVR_QUERY_POOL_INDEX_PRIMGEN];
++   const uint32_t query_idx =
++      state->query_pool_indices[PVR_QUERY_POOL_INDEX_PRIMGEN];
++
++   return PVR_DEV_ADDR_OFFSET(pool->availability_buffer->dev_addr,
++                              query_idx * sizeof(uint32_t));
++}
++
++static VkResult pvr_xfb_primgen_emit(struct pvr_cmd_buffer *cmd_buffer,
++                                     pdsc_program *program,
++                                     unsigned num_patches,
++                                     const pdsc_patch *patches,
++                                     struct pvr_program_info *info)
++{
++   VkResult result;
++
++   info->temp_size = pdsc_program_temps_used(program);
++
++   assert(num_patches < pdsc_program_data_size(program));
++   pdsc_patch_program(program, num_patches, patches, NULL);
++
++   result = pvr_xfb_primgen_program_upload(cmd_buffer, program, info);
++
++   ralloc_free(program);
++
++   if (result != VK_SUCCESS)
++      return result;
++
++   return pvr_arch_emit_xfb_sync_state(cmd_buffer, info);
++}
++
++static VkResult pvr_xfb_primgen_begin_emit(struct pvr_cmd_buffer *cmd_buffer)
++{
++   const struct pvr_cmd_buffer_state *state = &cmd_buffer->state;
++   pdsc_program *program = pdsc_precomp_xfb_primgen_begin_variant(NULL, 0);
++
++   pdsc_finalize_program(program);
++
++   const struct pdsc_st32_src0 result_st_src0 =
++      pvr_xfb_primgen_st32_src0(program,
++                                PVR_XFB_PRIMGEN_BEGIN_REF_ID_RESULT_ST_SRC0,
++                                pvr_xfb_primgen_result_addr(state));
++   const struct pdsc_st32_src0 availability_st_src0 = pvr_xfb_primgen_st32_src0(
++      program,
++      PVR_XFB_PRIMGEN_BEGIN_REF_ID_AVAILABILITY_ST_SRC0,
++      pvr_xfb_primgen_availability_addr(state));
++
++   const pdsc_patch patches[] = {
++      { .patch_id = PVR_XFB_PRIMGEN_BEGIN_PATCH_ID_RESULT_ST_SRC0,
++        .value = pdsc_st32_src0_pack(program, &result_st_src0) },
++      { .patch_id = PVR_XFB_PRIMGEN_BEGIN_PATCH_ID_AVAILABILITY_ST_SRC0,
++        .value = pdsc_st32_src0_pack(program, &availability_st_src0) },
++   };
++
++   return pvr_xfb_primgen_emit(cmd_buffer,
++                               program,
++                               ARRAY_SIZE(patches),
++                               patches,
++                               &cmd_buffer->state.xfb_state
++                                   .pds_primgen_begin_program);
++}
++
++static VkResult pvr_xfb_primgen_init_emit(struct pvr_cmd_buffer *cmd_buffer)
++{
++   const uint32_t dummy[4] = { 0 };
++   struct pvr_suballoc_bo *dummy_bo;
++   pdsc_program *program;
++   VkResult result;
++
++   result = pvr_arch_cmd_buffer_upload_general(cmd_buffer,
++                                               dummy,
++                                               sizeof(dummy),
++                                               &dummy_bo);
++   if (result != VK_SUCCESS)
++      return result;
++
++   program = pdsc_precomp_xfb_primgen_init_variant(NULL, 0);
++   pdsc_finalize_program(program);
++
++   const struct pdsc_stm_src0 stm_src0 = {
++      .ptemp_prim_needed_written =
++         pdsc_ref_ptemp64(PVR_XFB_PRIMGEN_PTEMP_SRC1),
++      .ptemp_address = pdsc_ref_ptemp64(PVR_XFB_PRIMGEN_PTEMP_SRC0),
++      .address = dummy_bo->dev_addr.addr,
++   };
++   const struct pdsc_stm_src3 stm_src3 = {
++      .primtype = PDSC_PRIMTYPE_POINT,
++      .vosize = 1,
++      .eop = true,
++      .limit = dummy_bo->dev_addr.addr,
++   };
++
++   const pdsc_patch patches[] = {
++      { .patch_id = PVR_XFB_PRIMGEN_INIT_PATCH_ID_STM_SRC0,
++        .value = pdsc_stm_src0_pack(program, &stm_src0) },
++      { .patch_id = PVR_XFB_PRIMGEN_INIT_PATCH_ID_STM_SRC3,
++        .value = pdsc_stm_src3_pack(program, &stm_src3) },
++   };
++
++   return pvr_xfb_primgen_emit(cmd_buffer,
++                               program,
++                               ARRAY_SIZE(patches),
++                               patches,
++                               &cmd_buffer->state.xfb_state
++                                   .pds_primgen_init_program);
++}
++
++static VkResult pvr_xfb_primgen_end_emit(struct pvr_cmd_buffer *cmd_buffer,
++                                         bool accumulate,
++                                         bool available)
++{
++   const struct pvr_cmd_buffer_state *state = &cmd_buffer->state;
++   const pvr_dev_addr_t result_addr = pvr_xfb_primgen_result_addr(state);
++   pdsc_program *program = pdsc_precomp_xfb_primgen_end_variant(NULL, 0);
++
++   pdsc_finalize_program(program);
++
++   const struct pdsc_ld64_src0 result_ld_src0 = {
++      .slcmode = PDSC_SLC_MODE_LD_CACHED,
++      .ccpri = 0,
++      .ccslc = PDSC_CCSLC_LD_NORMAL,
++      .ccmcu = PDSC_CCMCU_LD_NORMAL,
++      .dest = pdsc_load_ref(program, PVR_XFB_PRIMGEN_END_REF_ID_RESULT_LD_DEST),
++      .cmode = PDSC_CMODE_LD_CACHED,
++      .count8 = 1,
++      .srcadd = result_addr.addr,
++   };
++   const struct pdsc_st32_src0 result_st_src0 =
++      pvr_xfb_primgen_st32_src0(program,
++                                PVR_XFB_PRIMGEN_END_REF_ID_RESULT_ST_SRC0,
++                                result_addr);
++   const struct pdsc_st32_src0 availability_st_src0 =
++      pvr_xfb_primgen_st32_src0(program,
++                                PVR_XFB_PRIMGEN_END_REF_ID_AVAILABILITY_ST_SRC0,
++                                pvr_xfb_primgen_availability_addr(state));
++
++   const pdsc_patch patches[] = {
++      { .patch_id = PVR_XFB_PRIMGEN_END_PATCH_ID_RESULT_LD_SRC0,
++        .value = accumulate ? pdsc_ld64_src0_pack(program, &result_ld_src0)
++                            : 0 },
++      { .patch_id = PVR_XFB_PRIMGEN_END_PATCH_ID_RESULT_ST_SRC0,
++        .value = accumulate ? pdsc_st32_src0_pack(program, &result_st_src0)
++                            : 0 },
++      { .patch_id = PVR_XFB_PRIMGEN_END_PATCH_ID_AVAILABILITY_ST_SRC0,
++        .value = available
++                    ? pdsc_st32_src0_pack(program, &availability_st_src0)
++                    : 0 },
++   };
++
++   return pvr_xfb_primgen_emit(cmd_buffer,
++                               program,
++                               ARRAY_SIZE(patches),
++                               patches,
++                               &cmd_buffer->state.xfb_state
++                                   .pds_primgen_end_program);
++}
++
++static struct pvr_sub_cmd_gfx *
++pvr_xfb_primgen_gfx_sub_cmd(struct pvr_cmd_buffer *cmd_buffer)
++{
++   struct pvr_sub_cmd *sub_cmd = cmd_buffer->state.current_sub_cmd;
++
++   if (!sub_cmd || sub_cmd->type != PVR_SUB_CMD_TYPE_GRAPHICS)
++      return NULL;
++
++   return &sub_cmd->gfx;
++}
++
++static uint32_t
++pvr_xfb_primgen_view_count(const struct pvr_sub_cmd_gfx *gfx_sub_cmd)
++{
++   if (!gfx_sub_cmd)
++      return 1;
++
++   return MAX2(util_bitcount(gfx_sub_cmd->view_mask), 1);
++}
++
++static VkResult
++pvr_xfb_primgen_multiview_reset(struct pvr_cmd_buffer *cmd_buffer,
++                                struct pvr_query_pool *pool,
++                                uint32_t query_idx,
++                                uint32_t view_count)
++{
++   struct pvr_cmd_buffer_state *state = &cmd_buffer->state;
++   struct pvr_sub_cmd *prev_sub_cmd = state->current_sub_cmd;
++   VkResult result;
++
++   assert(prev_sub_cmd && prev_sub_cmd->type == PVR_SUB_CMD_TYPE_GRAPHICS);
++
++   const struct pvr_query_info query_info = {
++      .type = PVR_QUERY_TYPE_RESET_QUERY_POOL,
++      .is_dynamic_render = prev_sub_cmd->is_dynamic_render,
++      .is_suspend = prev_sub_cmd->is_suspend,
++      .reset_query_pool = {
++         .query_pool = pvr_query_pool_to_handle(pool),
++         .first_query = query_idx,
++         .query_count = view_count,
++      },
++   };
++
++   prev_sub_cmd->gfx.empty_cmd = false;
++   prev_sub_cmd->gfx.barrier_store = true;
++
++   result =
++      pvr_arch_cmd_buffer_start_sub_cmd(cmd_buffer, PVR_SUB_CMD_TYPE_EVENT);
++   if (result != VK_SUCCESS)
++      return result;
++
++   state->current_sub_cmd->event = (struct pvr_sub_cmd_event){
++      .type = PVR_EVENT_TYPE_BARRIER,
++      .barrier = {
++         .wait_for_stage_mask = PVR_PIPELINE_STAGE_ALL_GRAPHICS_BITS,
++         .wait_at_stage_mask = PVR_PIPELINE_STAGE_QUERY_BIT,
++      },
++   };
++
++   result = pvr_arch_add_query_program(cmd_buffer, &query_info);
++   if (result != VK_SUCCESS)
++      return result;
++
++   result =
++      pvr_arch_cmd_buffer_start_sub_cmd(cmd_buffer, PVR_SUB_CMD_TYPE_EVENT);
++   if (result != VK_SUCCESS)
++      return result;
++
++   state->current_sub_cmd->event = (struct pvr_sub_cmd_event){
++      .type = PVR_EVENT_TYPE_BARRIER,
++      .barrier = {
++         .wait_for_stage_mask = PVR_PIPELINE_STAGE_QUERY_BIT,
++         .wait_at_stage_mask = PVR_PIPELINE_STAGE_ALL_GRAPHICS_BITS,
++      },
++   };
++
++   result =
++      pvr_arch_cmd_buffer_start_sub_cmd(cmd_buffer, PVR_SUB_CMD_TYPE_GRAPHICS);
++   if (result != VK_SUCCESS)
++      return result;
++
++   state->current_sub_cmd->gfx.barrier_load = true;
++   state->current_sub_cmd->gfx.barrier_store = false;
++   state->current_sub_cmd->gfx.empty_cmd = false;
++
++   state->current_sub_cmd->is_dynamic_render = prev_sub_cmd->is_dynamic_render;
++   state->current_sub_cmd->is_suspend = prev_sub_cmd->is_suspend;
++
++   return VK_SUCCESS;
++}
++
++VkResult PVR_PER_ARCH(xfb_primgen_validate)(struct pvr_cmd_buffer *cmd_buffer)
++{
++   struct pvr_sub_cmd_gfx *gfx_sub_cmd;
++   VkResult result;
++
++   if (!cmd_buffer->state.query_pools[PVR_QUERY_POOL_INDEX_PRIMGEN])
++      return VK_SUCCESS;
++
++   gfx_sub_cmd = pvr_xfb_primgen_gfx_sub_cmd(cmd_buffer);
++   if (!gfx_sub_cmd || gfx_sub_cmd->primgen_counting)
++      return VK_SUCCESS;
++
++   result = pvr_xfb_primgen_init_emit(cmd_buffer);
++   if (result != VK_SUCCESS)
++      return result;
++
++   gfx_sub_cmd->primgen_counting = true;
++
++   pvr_arch_set_xfb_main_program_ppp_state(cmd_buffer);
++
++   return VK_SUCCESS;
++}
++
++VkResult PVR_PER_ARCH(xfb_primgen_flush)(struct pvr_cmd_buffer *cmd_buffer)
++{
++   struct pvr_sub_cmd_gfx *gfx_sub_cmd = pvr_xfb_primgen_gfx_sub_cmd(cmd_buffer);
++
++   if (!gfx_sub_cmd || !gfx_sub_cmd->primgen_counting)
++      return VK_SUCCESS;
++
++   gfx_sub_cmd->primgen_counting = false;
++
++   if (!cmd_buffer->state.query_pools[PVR_QUERY_POOL_INDEX_PRIMGEN])
++      return VK_SUCCESS;
++
++   return pvr_xfb_primgen_end_emit(cmd_buffer, true, false);
++}
++
++void PVR_PER_ARCH(xfb_primgen_query_begin)(struct pvr_cmd_buffer *cmd_buffer,
++                                           struct pvr_query_pool *pool,
++                                           uint32_t query_idx)
++{
++   struct pvr_cmd_buffer_state *state = &cmd_buffer->state;
++   struct pvr_sub_cmd_gfx *gfx_sub_cmd = pvr_xfb_primgen_gfx_sub_cmd(cmd_buffer);
++   const uint32_t view_count = pvr_xfb_primgen_view_count(gfx_sub_cmd);
++   VkResult result;
++
++   if (view_count > 1) {
++      result = pvr_xfb_primgen_multiview_reset(cmd_buffer,
++                                               pool,
++                                               query_idx,
++                                               view_count);
++      if (result != VK_SUCCESS)
++         return;
++   }
++
++   state->query_pool_indices[PVR_QUERY_POOL_INDEX_PRIMGEN] = query_idx;
++   state->query_pools[PVR_QUERY_POOL_INDEX_PRIMGEN] = pool;
++
++   if (view_count == 1) {
++      result = pvr_xfb_primgen_begin_emit(cmd_buffer);
++      if (result != VK_SUCCESS)
++         return;
++   }
++
++   gfx_sub_cmd = pvr_xfb_primgen_gfx_sub_cmd(cmd_buffer);
++   if (gfx_sub_cmd)
++      gfx_sub_cmd->primgen_counting = false;
++
++   result = pvr_xfb_primgen_main_program_generate(cmd_buffer);
++   if (result != VK_SUCCESS)
++      return;
++
++   result = pvr_xfb_primgen_streamout_update(cmd_buffer);
++   if (result != VK_SUCCESS)
++      return;
++
++   pvr_arch_set_xfb_main_program_ppp_state(cmd_buffer);
++}
++
++void PVR_PER_ARCH(xfb_primgen_query_end)(struct pvr_cmd_buffer *cmd_buffer,
++                                         struct pvr_query_pool *pool,
++                                         uint32_t query_idx)
++{
++   struct pvr_cmd_buffer_state *state = &cmd_buffer->state;
++   struct pvr_sub_cmd_gfx *gfx_sub_cmd = pvr_xfb_primgen_gfx_sub_cmd(cmd_buffer);
++   const bool accumulate = gfx_sub_cmd && gfx_sub_cmd->primgen_counting;
++   const uint32_t view_count = pvr_xfb_primgen_view_count(gfx_sub_cmd);
++   VkResult result;
++
++   assert(state->query_pools[PVR_QUERY_POOL_INDEX_PRIMGEN] == pool);
++   assert(state->query_pool_indices[PVR_QUERY_POOL_INDEX_PRIMGEN] ==
++          query_idx);
++
++   if (gfx_sub_cmd)
++      gfx_sub_cmd->primgen_counting = false;
++
++   result = pvr_xfb_primgen_end_emit(cmd_buffer, accumulate, view_count == 1);
++
++   state->query_pools[PVR_QUERY_POOL_INDEX_PRIMGEN] = NULL;
++
++   if (result != VK_SUCCESS)
++      return;
++
++   if (view_count > 1) {
++      const struct pvr_deferred_timestamp availability = {
++         .query_pool = pvr_query_pool_to_handle(pool),
++         .query = query_idx,
++         .query_count = view_count,
++         .availability_only = true,
++      };
++
++      util_dynarray_append(&state->timestamps, availability);
++   }
++
++   result = pvr_xfb_primgen_streamout_update(cmd_buffer);
++   if (result != VK_SUCCESS)
++      return;
++
+    pvr_arch_set_xfb_main_program_ppp_state(cmd_buffer);
+ }
+--- a/src/imagination/vulkan/pvr_cmd_buffer.h
++++ b/src/imagination/vulkan/pvr_cmd_buffer.h
+@@ -146,6 +146,8 @@
+ };
+ 
+ struct pvr_sub_cmd_gfx {
++   bool primgen_counting;
++
+    struct pvr_dynamic_render_info *dr_info;
+    struct pvr_renderpass_hwsetup_render *hw_render;
+    uint32_t attachment_count;
+@@ -472,6 +474,10 @@
+    struct pvr_program_info pds_draw_program;
+    struct pvr_program_info pds_query_begin_program;
+    struct pvr_program_info pds_query_end_program;
++   struct pvr_program_info pds_primgen_begin_program;
++   struct pvr_program_info pds_primgen_init_program;
++   struct pvr_program_info pds_primgen_end_program;
++   struct pvr_program_info pds_primgen_main_program;
+ 
+    struct pvr_query_pool *pool;
+ };
+--- a/src/imagination/vulkan/pvr_common.h
++++ b/src/imagination/vulkan/pvr_common.h
+@@ -260,6 +260,7 @@
+ enum pvr_query_pool_index {
+    PVR_QUERY_POOL_INDEX_OCCLUSION,
+    PVR_QUERY_POOL_INDEX_XFB_STREAM_0,
++   PVR_QUERY_POOL_INDEX_PRIMGEN,
+    PVR_QUERY_POOL_INDEX_COUNT,
+ };
+ 
+--- a/src/imagination/vulkan/pvr_physical_device.c
++++ b/src/imagination/vulkan/pvr_physical_device.c
+@@ -218,6 +218,7 @@
+       .EXT_physical_device_drm = true,
+       .EXT_pipeline_robustness = true,
+       .EXT_primitive_topology_list_restart = true,
++      .EXT_primitives_generated_query = true,
+       .EXT_private_data = true,
+       .EXT_provoking_vertex = true,
+       .EXT_queue_family_foreign = true,
+@@ -562,6 +563,10 @@
+       /* VK_EXT_primitive_topology_list_restart */
+       .primitiveTopologyListRestart = true,
+ 
++      .primitivesGeneratedQuery = true,
++      .primitivesGeneratedQueryWithRasterizerDiscard = true,
++      .primitivesGeneratedQueryWithNonZeroStreams = false,
++
+       /* VK_EXT_custom_border_color */
+       .customBorderColors = true,
+ 
+--- a/src/imagination/vulkan/pvr_query.c
++++ b/src/imagination/vulkan/pvr_query.c
+@@ -54,6 +54,7 @@
+    switch (pool->query_type) {
+    case VK_QUERY_TYPE_OCCLUSION:
+    case VK_QUERY_TYPE_TIMESTAMP:
++   case VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT:
+       return 1u;
+ 
+    case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT:
+@@ -155,6 +156,7 @@
+       return pvr_occlusion_query_pool_setup(device, pool);
+ 
+    case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT:
++   case VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT:
+       return pvr_xfb_query_pool_setup(device, pool);
+ 
+    case VK_QUERY_TYPE_TIMESTAMP:
+@@ -188,6 +190,7 @@
+       break;
+ 
+    case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT:
++   case VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT:
+    case VK_QUERY_TYPE_TIMESTAMP:
+       pvr_xfb_query_pool_cleanup(pool);
+       break;
+@@ -426,6 +429,7 @@
+          break;
+ 
+       case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT:
++      case VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT:
+          pvr_xfb_query_pool_get_result(device, pool, query_idx, &count);
+          break;
+ 
+--- a/src/imagination/vulkan/pvr_query.h
++++ b/src/imagination/vulkan/pvr_query.h
+@@ -81,6 +81,7 @@
+    VkQueryPool query_pool;
+    uint32_t query;
+    uint32_t query_count;
++   bool availability_only;
+ };
+ 
+ VK_DEFINE_NONDISP_HANDLE_CASTS(pvr_query_pool,
+--- a/src/imagination/vulkan/pvr_xfb.h
++++ b/src/imagination/vulkan/pvr_xfb.h
+@@ -125,5 +125,17 @@
+                                       struct pvr_query_pool *pool,
+                                       uint32_t query_idx);
+ 
++void PVR_PER_ARCH(xfb_primgen_query_begin)(struct pvr_cmd_buffer *cmd_buffer,
++                                           struct pvr_query_pool *pool,
++                                           uint32_t query_idx);
++
++void PVR_PER_ARCH(xfb_primgen_query_end)(struct pvr_cmd_buffer *cmd_buffer,
++                                         struct pvr_query_pool *pool,
++                                         uint32_t query_idx);
++
++VkResult PVR_PER_ARCH(xfb_primgen_validate)(struct pvr_cmd_buffer *cmd_buffer);
++
++VkResult PVR_PER_ARCH(xfb_primgen_flush)(struct pvr_cmd_buffer *cmd_buffer);
++
+ #endif /* PVR_PER_ARCH */
+ #endif /* PVR_XFB_H */

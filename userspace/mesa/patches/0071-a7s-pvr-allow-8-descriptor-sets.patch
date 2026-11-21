@@ -1,0 +1,43 @@
+Description: pvr: allow 8 bound descriptor sets
+ maxBoundDescriptorSets is a literal 4, equal to PVR_MAX_DESCRIPTOR_SETS.
+ The constant sizes the bound sets in struct pvr_descriptor_state
+ (pvr_common.h) and the per-set data in pco_common_data (pco_data.h). The PDS
+ descriptor program takes up to 8 sets (descriptor_sets[8] in struct
+ pvr_pds_descriptor_program_input, pvr_pds.h, and PVR_PDS_MAX_DESC_UPLOAD_BYTES
+ counts 8). With 8 sets with dynamic buffers and all special buffers a stage
+ needs at most 19 of the PVR_PDS_MAX_BUFFERS (24) entries and 27 DMAs, so
+ the constant offsets stay below 256 (const_offset is uint8_t in the const
+ map entries) and the 81 data dwords fit the 6-bit pds_data_size fields of
+ VDMCTRL_PDS_STATE0 and CDMCTRL_KERNEL0 (16-byte units, vdm.xml, cdm.xml).
+ .
+ Raise the constant to 8 and report it; the Vulkan 1.4 minimum is 7. With 6
+ or more sets zink leaves its compact descriptor mode and uses one set per
+ descriptor type (zink_screen.c).
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/common/pvr_limits.h
++++ b/src/imagination/common/pvr_limits.h
+@@ -53,7 +53,7 @@
+ 
+ #define PVR_MAX_ARRAY_LAYERS (ROGUE_TEXSTATE_IMAGE_WORD1_DEPTH_MAX_SIZE + 1U)
+ 
+-#define PVR_MAX_DESCRIPTOR_SETS 4U
++#define PVR_MAX_DESCRIPTOR_SETS 8U
+ #define PVR_MAX_DESCRIPTOR_SET_UNIFORM_DYNAMIC_BUFFERS 8U
+ #define PVR_MAX_DESCRIPTOR_SET_STORAGE_DYNAMIC_BUFFERS 8U
+ 
+--- a/src/imagination/vulkan/pvr_physical_device.c
++++ b/src/imagination/vulkan/pvr_physical_device.c
+@@ -688,7 +688,7 @@
+       .maxSamplerAllocationCount = 4000U,
+       .bufferImageGranularity = 1U,
+       .sparseAddressSpaceSize = 0U, /* Requires sparseBinding */
+-      .maxBoundDescriptorSets = 4U,
++      .maxBoundDescriptorSets = PVR_MAX_DESCRIPTOR_SETS,
+       .maxPerStageDescriptorSamplers = 16,
+       .maxPerStageDescriptorUniformBuffers = 15,
+       .maxPerStageDescriptorStorageBuffers = 16,

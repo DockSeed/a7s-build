@@ -1,0 +1,72 @@
+From 494b0ed6e41da1e8ab300aef4740f31c384af0a4 Mon Sep 17 00:00:00 2001
+From: Nick Hamilton <nick.hamilton@imgtec.com>
+Date: Fri, 2 Oct 2026 10:36:00 +0100
+Subject: [PATCH] pvr: add new function for checking for fw feature support
+
+Add a new function to check for features that require fw support.
+
+If the fw version is below that which the support was added disable
+the feature.
+
+Add a check for gs rta support which requires fw verson 1.1.
+
+Signed-off-by: Nick Hamilton <nick.hamilton@imgtec.com>
+Acked-by: Luigi Santivetti <luigi.santivetti@imgtec.com>
+Reviewed-by: Alessio Belle <alessio.belle@imgtec.com>
+Reviewed-by: Frank Bouwer <frank.bouwer@imgtec.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/40973>
+Link: https://gitlab.freedesktop.org/mesa/mesa/-/commit/494b0ed6e41da1e8ab300aef4740f31c384af0a4
+---
+ .../vulkan/winsys/powervr/pvr_drm.c           | 29 +++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+
+diff --git a/src/imagination/vulkan/winsys/powervr/pvr_drm.c b/src/imagination/vulkan/winsys/powervr/pvr_drm.c
+index 85dc36ad887b..889b50866c79 100644
+--- a/src/imagination/vulkan/winsys/powervr/pvr_drm.c
++++ b/src/imagination/vulkan/winsys/powervr/pvr_drm.c
+@@ -340,6 +340,27 @@ out:
+    return result;
+ }
+ 
++static VkResult
++pvr_drm_override_features(struct pvr_drm_winsys *drm_ws,
++                          struct pvr_device_info *dev_info,
++                          const struct pvr_device_fw_info *fw_info)
++{
++   VkResult result = VK_SUCCESS;
++
++   /* GS RTA support requires support in the FW */
++   uint32_t fw_gs_rta_support_min_version = PVR_FW_VERSION_PACK(1, 1);
++   if (PVR_HAS_FEATURE(dev_info, gs_rta_support) &&
++       fw_info->fw_version < fw_gs_rta_support_min_version) {
++      mesa_logw("Missing FW support for GS RTA support, feature disabled. "
++                "Upgrade to a newer FW version. Min Required %d.%d",
++                PVR_FW_VERSION_UNPACK_MAJOR(fw_gs_rta_support_min_version),
++                PVR_FW_VERSION_UNPACK_MINOR(fw_gs_rta_support_min_version));
++      dev_info->features.has_gs_rta_support = false;
++   }
++
++   return result;
++}
++
+ static VkResult
+ pvr_drm_get_runtime_info(struct pvr_drm_winsys *drm_ws,
+                          struct drm_pvr_dev_query_runtime_info *const value)
+@@ -413,6 +434,14 @@ pvr_drm_winsys_device_info_init(struct pvr_winsys *ws,
+       goto err_out;
+    }
+ 
++   result = pvr_drm_override_features(drm_ws,
++                                      dev_info,
++                                      &runtime_info->fw_info);
++   if (result != VK_SUCCESS) {
++      mesa_logw("Failed to check FW feature support for this GPU");
++      goto err_out;
++   }
++
+    /* TODO: When kernel support is added, fetch the actual core count. */
+    if (PVR_HAS_FEATURE(dev_info, gpu_multicore_support))
+       pvr_finishme("Core count fetching is unimplemented. Setting 1 for now.");
+-- 
+GitLab
+

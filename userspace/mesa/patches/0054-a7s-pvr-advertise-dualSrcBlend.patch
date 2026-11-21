@@ -1,0 +1,52 @@
+Description: pvr: advertise dualSrcBlend
+ PowerVR blends in the fragment shader with nir_lower_blend(), and
+ nir_lower_blend() already handles dual-source blending: consume_dual_stores()
+ takes the store_output with dual_source_blend_index = 1 as the second source
+ for the SRC1 blend factors and removes it. The output variable with index 1
+ that nir_unlower_io_to_vars() recreated is then left without stores; remove
+ it after nir_lower_blend() so that the PFO lowering and the output setup in
+ pvr_setup_fs_outputs() only see the variable with index 0 at FRAG_RESULT_DATA0.
+ Advertise dualSrcBlend with maxFragmentDualSrcAttachments = 1.
+ .
+ zink exposes GL_ARB_blend_func_extended from dualSrcBlend
+ (zink_screen.c max_dual_source_render_targets), which is one of the two
+ extensions missing for OpenGL 3.3.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/pco/pco_nir.c
++++ b/src/imagination/pco/pco_nir.c
+@@ -1158,6 +1158,10 @@
+          NIR_PASS(_, nir, pco_nir_lower_alpha_to_coverage);
+ 
+       NIR_PASS(_, nir, nir_lower_blend, &data->fs.blend_opts);
++      nir_foreach_shader_out_variable_safe (var, nir) {
++         if (var->data.index)
++            exec_node_remove(&var->node);
++      }
+ 
+       nir_opt_peephole_select_options peep_opts = {
+          .limit = 0,
+--- a/src/imagination/vulkan/pvr_physical_device.c
++++ b/src/imagination/vulkan/pvr_physical_device.c
+@@ -254,7 +254,7 @@
+       .geometryShader = false,
+       .tessellationShader = false,
+       .sampleRateShading = true,
+-      .dualSrcBlend = false,
++      .dualSrcBlend = true,
+       .logicOp = true,
+       .multiDrawIndirect = true,
+       .drawIndirectFirstInstance = true,
+@@ -729,7 +729,7 @@
+       /* Fragment Shader Limits */
+       .maxFragmentInputComponents = 64U,
+       .maxFragmentOutputAttachments = 4U,
+-      .maxFragmentDualSrcAttachments = 0U, /* Requires dualSrcBlend */
++      .maxFragmentDualSrcAttachments = 1U, /* Requires dualSrcBlend */
+       .maxFragmentCombinedOutputResources = 4U,
+ 
+       /* Compute Shader Limits */

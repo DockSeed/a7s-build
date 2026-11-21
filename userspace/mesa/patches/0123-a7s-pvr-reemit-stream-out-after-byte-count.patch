@@ -1,0 +1,50 @@
+Description: pvr: re-emit stream-out state after the indirect byte count program
+ pvr_update_indirect_draw_byte_count_ext() emits its vertex count program as
+ a stream-out sync state and then restored the previous stream-out shadow.
+ The hardware state is the sync program at that point, but the shadow
+ claimed the earlier stream-out program, so pvr_setup_stream_out() saw no
+ change and did not send it again. A vkCmdDrawIndirectByteCountEXT after
+ another draw in the same sub command then ran without the stream-out
+ program, so it neither captured nor counted.
+ .
+ Leave the shadow cleared, as pvr_arch_emit_xfb_sync_state() does, so the
+ next draw sends the stream-out words again.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/vulkan/pvr_arch_cmd_buffer.c
++++ b/src/imagination/vulkan/pvr_arch_cmd_buffer.c
+@@ -9516,9 +9516,6 @@
+    const struct pvr_device_info *dev_info =
+       &cmd_buffer->device->pdevice->dev_info;
+    const uint32_t cache_line_size = pvr_get_slc_cache_line_size(dev_info);
+-   struct pvr_cmd_buffer_state *const state = &cmd_buffer->state;
+-   struct pvr_ppp_state *const ppp_state = &state->ppp_state;
+-   uint32_t stream0, stream1, stream2;
+    pdsc_program **draw_program;
+    VkResult result;
+ 
+@@ -9615,19 +9612,7 @@
+       return result;
+ 
+    /* Emit sync state */
+-   stream0 = ppp_state->stream_out.so0;
+-   stream1 = ppp_state->stream_out.so1;
+-   stream2 = ppp_state->stream_out.so2;
+-
+-   result = pvr_arch_emit_xfb_sync_state(cmd_buffer, draw_program_info);
+-   if (result != VK_SUCCESS)
+-      return result;
+-
+-   ppp_state->stream_out.so0 = stream0;
+-   ppp_state->stream_out.so1 = stream1;
+-   ppp_state->stream_out.so2 = stream2;
+-
+-   return VK_SUCCESS;
++   return pvr_arch_emit_xfb_sync_state(cmd_buffer, draw_program_info);
+ }
+ 
+ void PVR_PER_ARCH(CmdDrawIndirectByteCountEXT)(VkCommandBuffer commandBuffer,

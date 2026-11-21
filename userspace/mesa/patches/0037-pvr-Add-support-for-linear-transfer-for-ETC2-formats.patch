@@ -1,0 +1,44 @@
+From fa3dac634d2b56c7fcb0902300524c089c3ae3d6 Mon Sep 17 00:00:00 2001
+From: Arjob Mukherjee <arjob.mukherjee@imgtec.com>
+Date: Thu, 15 Oct 2026 21:47:19 +0530
+Subject: [PATCH] pvr: Add support for linear transfer for ETC2 formats
+
+The `TRANSFER_SRC_BIT` and `TRANSFER_DST_BIT` feature bits are
+advertised for ETC2 formats
+
+At least the following 24 tests now pass (previously were not supported):
+
+```
+dEQP-VK.image.extended_usage_bit_compatibility.image_format_properties.etc_*_linear_transfer_*_bit
+dEQP-VK.image.extended_usage_bit_compatibility.image_format_properties.etc2_*_linear_transfer_*_bit
+```
+
+Signed-off-by: Arjob Mukherjee <arjob.mukherjee@imgtec.com>
+Reviewed-by: Nick Hamilton <nick.hamilton@imgtec.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45612>
+Link: https://gitlab.freedesktop.org/mesa/mesa/-/commit/fa3dac634d2b56c7fcb0902300524c089c3ae3d6
+---
+ src/imagination/vulkan/pvr_formats.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/src/imagination/vulkan/pvr_formats.c b/src/imagination/vulkan/pvr_formats.c
+index 770e57390107..f45396a0bf89 100644
+--- a/src/imagination/vulkan/pvr_formats.c
++++ b/src/imagination/vulkan/pvr_formats.c
+@@ -265,7 +265,12 @@ pvr_get_image_format_features2(struct pvr_physical_device *pdevice,
+       const uint32_t first_component_size =
+          vk_format_get_component_bits(vk_format, UTIL_FORMAT_COLORSPACE_RGB, 0);
+ 
+-      if (vk_tiling == VK_IMAGE_TILING_OPTIMAL) {
++      if (vk_tiling == VK_IMAGE_TILING_LINEAR &&
++          vk_format_is_block_compressed(vk_format)) {
++         flags |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
++                  VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT |
++                  VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT;
++      } else if (vk_tiling == VK_IMAGE_TILING_OPTIMAL) {
+          flags |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
+                   VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT |
+                   VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT;
+-- 
+GitLab
+

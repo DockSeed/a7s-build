@@ -1,0 +1,188 @@
+Description: pvr: add VK_EXT_pipeline_robustness
+ Advertise VK_EXT_pipeline_robustness with pipelineRobustness and take the
+ buffer robustness of each shader stage from vk_pipeline_robustness_state_fill()
+ instead of the device-wide robustBufferAccess feature:
+ pco_common_data::robust_buffer_access is set when uniform or storage buffers
+ of the stage are robust, and the new robust_vertex_inputs selects the robust
+ vertex attribute PDS program. Without a VkPipelineRobustnessCreateInfo the
+ device default applies, so behaviour is unchanged for applications that do not
+ use the extension. The default robustness properties are DISABLED, which is
+ what the driver does when no robustness feature is enabled.
+ .
+ zink (patches 0048-0052, from Mesa main) then disables the device-wide
+ robustness features and requests robustness only for pipelines of robust GL
+ contexts, so the bounds checks on every UBO/SSBO access go away for ordinary
+ GL applications.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/pco/pco_data.h
++++ b/src/imagination/pco/pco_data.h
+@@ -229,6 +229,7 @@
+    } uses;
+ 
+    bool robust_buffer_access;
++   bool robust_vertex_inputs;
+    bool null_descriptor;
+    bool image_2d_view_of_3d;
+    bool image_sliced_view_of_3d;
+--- a/src/imagination/vulkan/pvr_arch_pipeline.c
++++ b/src/imagination/vulkan/pvr_arch_pipeline.c
+@@ -248,12 +248,13 @@
+    struct pvr_device *const device,
+    const VkAllocationCallbacks *const allocator,
+    struct pvr_pds_vertex_primary_program_input *const input,
++   bool robust_vertex_inputs,
+    struct pvr_pds_attrib_program *const program_out)
+ {
+    const size_t const_entries_size_in_bytes =
+       pvr_pds_get_max_vertex_program_const_map_size_in_bytes(
+          &device->pdevice->dev_info,
+-         device->vk.enabled_features.robustBufferAccess);
++         robust_vertex_inputs);
+    struct pvr_pds_upload *const program = &program_out->program;
+    struct pvr_pds_info *const info = &program_out->info;
+    struct pvr_const_map_entry *new_entries;
+@@ -280,7 +281,7 @@
+       input,
+       NULL,
+       info,
+-      device->vk.enabled_features.robustBufferAccess,
++      robust_vertex_inputs,
+       &device->pdevice->dev_info);
+ 
+    code_size_in_dwords = info->code_size_in_dwords;
+@@ -301,7 +302,7 @@
+       input,
+       staging_buffer,
+       info,
+-      device->vk.enabled_features.robustBufferAccess,
++      robust_vertex_inputs,
+       &device->pdevice->dev_info);
+ 
+    assert(info->code_size_in_dwords <= code_size_in_dwords);
+@@ -450,10 +451,12 @@
+       input.flags |= extra_flags;
+ 
+       result =
+-         pvr_pds_vertex_attrib_program_create_and_upload(device,
+-                                                         allocator,
+-                                                         &input,
+-                                                         &programs_out[i]);
++         pvr_pds_vertex_attrib_program_create_and_upload(
++            device,
++            allocator,
++            &input,
++            shader_data->common.robust_vertex_inputs,
++            &programs_out[i]);
+       if (result != VK_SUCCESS) {
+          for (uint32_t j = 0; j < i; j++) {
+             pvr_pds_vertex_attrib_program_destroy(device,
+@@ -924,10 +927,12 @@
+    vk_object_base_finish(&pipeline->base);
+ }
+ 
+-static void pvr_early_init_shader_data(pco_data *data,
+-                                       nir_shader *nir,
+-                                       const void *pCreateInfo,
+-                                       struct pvr_device *const device);
++static void
++pvr_early_init_shader_data(pco_data *data,
++                           nir_shader *nir,
++                           const void *pCreateInfo,
++                           const VkPipelineShaderStageCreateInfo *stage_info,
++                           struct pvr_device *const device);
+ 
+ static void
+ pvr_preprocess_shader_data(pco_data *data,
+@@ -1022,7 +1027,11 @@
+    if (result != VK_SUCCESS)
+       goto err_free_build_context;
+ 
+-   pvr_early_init_shader_data(&shader_data, nir, pCreateInfo, device);
++   pvr_early_init_shader_data(&shader_data,
++                              nir,
++                              pCreateInfo,
++                              &pCreateInfo->stage,
++                              device);
+    pco_preprocess_nir(pco_ctx, nir, &shader_data);
+    pvr_preprocess_shader_data(&shader_data,
+                               nir,
+@@ -2806,15 +2815,27 @@
+    /* TODO: common things, like large constants being put into shareds. */
+ }
+ 
+-static void pvr_early_init_shader_data(pco_data *data,
+-                                       nir_shader *nir,
+-                                       const void *pCreateInfo,
+-                                       struct pvr_device *const device)
++static void
++pvr_early_init_shader_data(pco_data *data,
++                           nir_shader *nir,
++                           const void *pCreateInfo,
++                           const VkPipelineShaderStageCreateInfo *stage_info,
++                           struct pvr_device *const device)
+ {
+    const VkGraphicsPipelineCreateInfo *pGraphicsCreateInfo = pCreateInfo;
++   const VkBaseInStructure *pipeline_info = pCreateInfo;
++   struct vk_pipeline_robustness_state rs;
++
++   vk_pipeline_robustness_state_fill(&device->vk.robustness_state,
++                                     &rs,
++                                     pipeline_info->pNext,
++                                     stage_info->pNext);
+ 
+    data->common.robust_buffer_access =
+-      device->vk.enabled_features.robustBufferAccess;
++      rs.uniform_buffers != VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED ||
++      rs.storage_buffers != VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED;
++   data->common.robust_vertex_inputs =
++      rs.vertex_inputs != VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED;
+ 
+    data->common.null_descriptor = device->vk.enabled_features.nullDescriptor;
+ 
+@@ -3191,6 +3212,7 @@
+       pvr_early_init_shader_data(&shader_data[stage],
+                                  nir_shaders[stage],
+                                  pCreateInfo,
++                                 &pCreateInfo->pStages[stage_index],
+                                  device);
+       pco_preprocess_nir(pco_ctx, nir_shaders[stage], &shader_data[stage]);
+    }
+--- a/src/imagination/vulkan/pvr_physical_device.c
++++ b/src/imagination/vulkan/pvr_physical_device.c
+@@ -216,6 +216,7 @@
+       .EXT_map_memory_placed = true,
+       .EXT_non_seamless_cube_map = true,
+       .EXT_physical_device_drm = true,
++      .EXT_pipeline_robustness = true,
+       .EXT_primitive_topology_list_restart = true,
+       .EXT_private_data = true,
+       .EXT_provoking_vertex = true,
+@@ -411,6 +412,8 @@
+       .robustImageAccess2 = false,
+       .nullDescriptor = true,
+ 
++      .pipelineRobustness = true,
++
+       /* Vulkan 1.2 / VK_KHR_uniform_buffer_standard_layout */
+       .uniformBufferStandardLayout = true,
+ 
+@@ -903,6 +906,14 @@
+       .robustStorageBufferAccessSizeAlignment = PVR_STORAGE_BUFFER_OFFSET_ALIGNMENT,
+       .robustUniformBufferAccessSizeAlignment = PVR_STORAGE_BUFFER_OFFSET_ALIGNMENT,
+ 
++      .defaultRobustnessStorageBuffers =
++         VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED,
++      .defaultRobustnessUniformBuffers =
++         VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED,
++      .defaultRobustnessVertexInputs =
++         VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED,
++      .defaultRobustnessImages = VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED,
++
+       /* Vulkan 1.2 / VK_KHR_shader_float_controls */
+       .denormBehaviorIndependence =
+          VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_32_BIT_ONLY,

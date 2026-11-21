@@ -1,0 +1,169 @@
+From eccb5c88d31163d248b81d23ee86f8593b90341c Mon Sep 17 00:00:00 2001
+From: Frank Binns <frank.binns@imgtec.com>
+Date: Thu, 19 Feb 2026 11:26:33 +0000
+Subject: [PATCH] pvr: re-enable gs_rta_support
+
+Signed-off-by: Frank Binns <frank.binns@imgtec.com>
+Acked-by: Luigi Santivetti <luigi.santivetti@imgtec.com>
+Reviewed-by: Frank Bouwer <frank.bouwer@imgtec.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/40973>
+Link: https://gitlab.freedesktop.org/mesa/mesa/-/commit/eccb5c88d31163d248b81d23ee86f8593b90341c
+---
+ src/imagination/common/device_info/bxe-2-32.h | 2 +-
+ src/imagination/common/device_info/bxe-4-32.h | 2 +-
+ src/imagination/common/device_info/bxm-4-64.h | 4 ++--
+ src/imagination/common/device_info/bxs-4-64.h | 2 +-
+ src/imagination/common/device_info/g6110.h    | 2 +-
+ src/imagination/common/device_info/ge7800.h   | 2 +-
+ src/imagination/common/device_info/ge8300.h   | 4 ++--
+ src/imagination/common/device_info/gx6250.h   | 4 ++--
+ src/imagination/common/device_info/gx6650.h   | 2 +-
+ 9 files changed, 12 insertions(+), 12 deletions(-)
+
+diff --git a/src/imagination/common/device_info/bxe-2-32.h b/src/imagination/common/device_info/bxe-2-32.h
+index bc1441b9a9c5..f7e901a23d66 100644
+--- a/src/imagination/common/device_info/bxe-2-32.h
++++ b/src/imagination/common/device_info/bxe-2-32.h
+@@ -22,7 +22,7 @@ static const struct pvr_device_features pvr_device_features_36_V_52_182 = {
+    .has_compute_overlap = true,
+    .has_fbcdc_algorithm = true,
+    .has_gpu_multicore_support = true,
+-   /* .has_gs_rta_support = true, */
++   .has_gs_rta_support = true,
+    .has_ipf_creq_pf = true,
+    .has_isp_max_tiles_in_flight = true,
+    .has_isp_samples_per_pixel = true,
+diff --git a/src/imagination/common/device_info/bxe-4-32.h b/src/imagination/common/device_info/bxe-4-32.h
+index 1a3e038fd24f..6c865d7998aa 100644
+--- a/src/imagination/common/device_info/bxe-4-32.h
++++ b/src/imagination/common/device_info/bxe-4-32.h
+@@ -22,7 +22,7 @@ static const struct pvr_device_features pvr_device_features_36_V_54_182 = {
+    .has_compute_overlap = true,
+    .has_fbcdc_algorithm = true,
+    .has_gpu_multicore_support = true,
+-   /* .has_gs_rta_support = true, */
++   .has_gs_rta_support = true,
+    .has_ipf_creq_pf = true,
+    .has_isp_max_tiles_in_flight = true,
+    .has_isp_samples_per_pixel = true,
+diff --git a/src/imagination/common/device_info/bxm-4-64.h b/src/imagination/common/device_info/bxm-4-64.h
+index 4dac6dbc9c21..b4330da2c434 100644
+--- a/src/imagination/common/device_info/bxm-4-64.h
++++ b/src/imagination/common/device_info/bxm-4-64.h
+@@ -22,7 +22,7 @@ static const struct pvr_device_features pvr_device_features_36_V_104_182 = {
+    .has_compute_overlap = true,
+    .has_fbcdc_algorithm = true,
+    .has_gpu_multicore_support = true,
+-   /* .has_gs_rta_support = true, */
++   .has_gs_rta_support = true,
+    .has_ipf_creq_pf = true,
+    .has_isp_max_tiles_in_flight = true,
+    .has_isp_samples_per_pixel = true,
+@@ -137,7 +137,7 @@ static const struct pvr_device_features pvr_device_features_36_V_104_183 = {
+    .has_compute_overlap = true,
+    .has_fbcdc_algorithm = true,
+    .has_gpu_multicore_support = true,
+-   /* .has_gs_rta_support = true, */
++   .has_gs_rta_support = true,
+    .has_ipf_creq_pf = true,
+    .has_isp_max_tiles_in_flight = true,
+    .has_isp_samples_per_pixel = true,
+diff --git a/src/imagination/common/device_info/bxs-4-64.h b/src/imagination/common/device_info/bxs-4-64.h
+index b2f5de57882f..9d64152b2b33 100644
+--- a/src/imagination/common/device_info/bxs-4-64.h
++++ b/src/imagination/common/device_info/bxs-4-64.h
+@@ -39,7 +39,7 @@ static const struct pvr_device_features pvr_device_features_36_V_104_796 = {
+    .has_compute_overlap = true,
+    .has_fbcdc_algorithm = true,
+    .has_gpu_multicore_support = true,
+-   /* .has_gs_rta_support = true, */
++   .has_gs_rta_support = true,
+    .has_ipf_creq_pf = true,
+    .has_isp_max_tiles_in_flight = true,
+    .has_isp_samples_per_pixel = true,
+diff --git a/src/imagination/common/device_info/g6110.h b/src/imagination/common/device_info/g6110.h
+index 4af1bafa3c59..e418603575fc 100644
+--- a/src/imagination/common/device_info/g6110.h
++++ b/src/imagination/common/device_info/g6110.h
+@@ -19,7 +19,7 @@ static const struct pvr_device_features pvr_device_features_5_V_1_46 = {
+    .has_common_store_size_in_dwords = true,
+    .has_compute = true,
+    .has_fbcdc_algorithm = true,
+-   /* .has_gs_rta_support = true, */
++   .has_gs_rta_support = true,
+    .has_isp_max_tiles_in_flight = true,
+    .has_isp_samples_per_pixel = true,
+    .has_max_instances_per_pds_task = true,
+diff --git a/src/imagination/common/device_info/ge7800.h b/src/imagination/common/device_info/ge7800.h
+index 65a351083ed4..84482808b1a8 100644
+--- a/src/imagination/common/device_info/ge7800.h
++++ b/src/imagination/common/device_info/ge7800.h
+@@ -20,7 +20,7 @@ static const struct pvr_device_features pvr_device_features_15_V_1_64 = {
+       .has_common_store_size_in_dwords = true,
+       .has_compute = true,
+       .has_fbcdc_algorithm = true,
+-      /* .has_gs_rta_support = true, */
++      .has_gs_rta_support = true,
+       .has_isp_max_tiles_in_flight = true,
+       .has_isp_samples_per_pixel = true,
+       .has_max_instances_per_pds_task = true,
+diff --git a/src/imagination/common/device_info/ge8300.h b/src/imagination/common/device_info/ge8300.h
+index d620ee6213e6..4589e4b46f20 100644
+--- a/src/imagination/common/device_info/ge8300.h
++++ b/src/imagination/common/device_info/ge8300.h
+@@ -20,7 +20,7 @@ static const struct pvr_device_features pvr_device_features_22_V_54_30 = {
+    .has_common_store_size_in_dwords = true,
+    .has_compute = true,
+    .has_compute_overlap = true,
+-   /* .has_gs_rta_support = true, */
++   .has_gs_rta_support = true,
+    .has_ipf_creq_pf = true,
+    .has_isp_max_tiles_in_flight = true,
+    .has_isp_samples_per_pixel = true,
+@@ -145,7 +145,7 @@ static const struct pvr_device_features pvr_device_features_22_V_54_38 = {
+    .has_common_store_size_in_dwords = true,
+    .has_compute = true,
+    .has_compute_overlap = true,
+-   /* .has_gs_rta_support = true, */
++   .has_gs_rta_support = true,
+    .has_ipf_creq_pf = true,
+    .has_isp_max_tiles_in_flight = true,
+    .has_isp_samples_per_pixel = true,
+diff --git a/src/imagination/common/device_info/gx6250.h b/src/imagination/common/device_info/gx6250.h
+index d4ad50dfcead..df59593e7420 100644
+--- a/src/imagination/common/device_info/gx6250.h
++++ b/src/imagination/common/device_info/gx6250.h
+@@ -41,7 +41,7 @@ static const struct pvr_device_features pvr_device_features_4_V_2_51 = {
+    .has_compute_overlap = true,
+    .has_eight_output_registers = true,
+    .has_fbcdc_algorithm = true,
+-   /* .has_gs_rta_support = true, */
++   .has_gs_rta_support = true,
+    .has_isp_max_tiles_in_flight = true,
+    .has_isp_samples_per_pixel = true,
+    .has_max_instances_per_pds_task = true,
+@@ -155,7 +155,7 @@ static const struct pvr_device_features pvr_device_features_4_V_2_58 = {
+    .has_compute_overlap = true,
+    .has_eight_output_registers = true,
+    .has_fbcdc_algorithm = true,
+-   /* .has_gs_rta_support = true, */
++   .has_gs_rta_support = true,
+    .has_isp_max_tiles_in_flight = true,
+    .has_isp_samples_per_pixel = true,
+    .has_max_instances_per_pds_task = true,
+diff --git a/src/imagination/common/device_info/gx6650.h b/src/imagination/common/device_info/gx6650.h
+index 6f77d2a4bd47..0111f7e3ec88 100644
+--- a/src/imagination/common/device_info/gx6650.h
++++ b/src/imagination/common/device_info/gx6650.h
+@@ -24,7 +24,7 @@ static const struct pvr_device_features pvr_device_features_4_V_6_62 = {
+    .has_compute_overlap = true,
+    .has_eight_output_registers = true,
+    .has_fbcdc_algorithm = true,
+-   /* .has_gs_rta_support = true, */
++   .has_gs_rta_support = true,
+    .has_isp_max_tiles_in_flight = true,
+    .has_isp_samples_per_pixel = true,
+    .has_max_instances_per_pds_task = true,
+-- 
+GitLab
+

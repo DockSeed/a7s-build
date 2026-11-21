@@ -1,0 +1,61 @@
+Description: pco: test one descriptor field for null instead of every dword
+ trans_is_null_desc() compares every dword of a descriptor with zero and
+ ANDs the results: 4 dwords for a buffer, 4 for a combined image sampler,
+ the whole stride for an image or texel buffer. A null descriptor is all
+ zeros (pvr_arch_descriptor_set.c memsets it), and every valid descriptor
+ has a field that is never zero: the size of a buffer descriptor (dword 2,
+ the bound range, which Vulkan requires to be non-zero; pco reads the size
+ there for get_ubo_size as well) and the texture address in image state
+ word 1 (dwords 2 and 3; TEXSTATE IMAGE_WORD1 texaddr, all pvr heaps start
+ above zero). Test only those. An inline uniform block can never be null.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/pco/pco_trans_nir.c
++++ b/src/imagination/pco/pco_trans_nir.c
+@@ -2461,18 +2461,31 @@ static pco_instr *trans_is_null_desc(trans_ctx *tctx,
+ 
+    unsigned stride;
+    bool is_img_smp;
++   bool is_inline_ubo;
+    unsigned sh_index =
+-      fetch_resource_base_reg_packed(common, packed_desc, elem, &stride, NULL, &is_img_smp, NULL);
++      fetch_resource_base_reg_packed(common, packed_desc, elem, &stride, NULL, &is_img_smp, &is_inline_ubo);
++
++   if (is_inline_ubo)
++      return pco_mov(&tctx->b, dest, pco_ref_bits(pco_zero, pco_ref_get_bits(dest)));
+ 
+    unsigned num_dwords = is_img_smp ? ROGUE_NUM_TEXSTATE_DWORDS : stride;
+ 
++   unsigned first_dword = 0;
++   if (!is_img_smp && stride == 4) {
++      first_dword = 2;
++      num_dwords = 3;
++   } else if (num_dwords >= ROGUE_NUM_TEXSTATE_DWORDS) {
++      first_dword = 2;
++      num_dwords = 4;
++   }
++
+    if (is_dynidx) {
+       dynidx_stride = pco_ref_new_ssa32(tctx->func);
+       pco_movi32(&tctx->b, dynidx_stride, pco_ref_imm32(stride));
+    }
+ 
+    pco_ref all_dwords_zero;
+-   for (unsigned u = 0; u < num_dwords; ++u) {
++   for (unsigned u = first_dword; u < num_dwords; ++u) {
+       pco_ref dword_is_zero =
+          pco_ref_new_ssa(tctx->func, pco_ref_get_bits(dest), 1);
+ 
+@@ -2496,7 +2509,7 @@ static pco_instr *trans_is_null_desc(trans_ctx *tctx,
+                dword_reg,
+                .tst_type_main = PCO_TST_TYPE_MAIN_U32);
+ 
+-      if (!u) {
++      if (u == first_dword) {
+          all_dwords_zero = dword_is_zero;
+          continue;
+       }

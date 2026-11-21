@@ -1,0 +1,89 @@
+Description: pvr: count buffer slices of compressed copies in blocks
+ Buffer to image and image to buffer copies use an uncompressed copy format
+ with the block size of the compressed image (pvr_get_raw_copy_format()).
+ The distance between two slices or array layers in the buffer was computed
+ from the row length and image height in texels times that block size. For
+ an ETC2 RGB8 image of 64x64 texels that is 64 * 64 * 8 = 32768 bytes instead
+ of 16 * 16 * 8 = 2048 bytes, so every layer after the first of a region was
+ read from or written to the wrong place in the buffer. The buffer to image
+ path did have a conversion to blocks, but it tested the copy format, which
+ is never compressed, and would have multiplied by the block size twice.
+ The row stride itself was already right: pvr_setup_buffer_surface() takes
+ it in texels and divides by the block width.
+ .
+ Convert the row length and image height to blocks of the image format
+ before computing the slice size, in both directions. Uncompressed formats
+ are unchanged.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/vulkan/rogue/pvr_blit.c
++++ b/src/imagination/vulkan/rogue/pvr_blit.c
+@@ -907,8 +907,11 @@
+                                        const VkFormat dst_format,
+                                        const uint32_t flags)
+ {
+-   enum pipe_format pformat = vk_format_to_pipe_format(dst_format);
++   enum pipe_format pformat = vk_format_to_pipe_format(
++      vk_format_get_plane_aspect_format(image->vk.format,
++                                        region->imageSubresource.aspectMask));
+    uint32_t row_length_in_texels;
++   uint32_t row_length_in_blks;
+    uint32_t buffer_slice_size;
+    uint32_t buffer_layer_size;
+    uint32_t height_in_blks;
+@@ -925,17 +928,17 @@
+    else
+       height_in_blks = region->bufferImageHeight;
+ 
++   row_length_in_blks = row_length_in_texels;
++
+    if (util_format_is_compressed(pformat)) {
+       uint32_t block_width = util_format_get_blockwidth(pformat);
+       uint32_t block_height = util_format_get_blockheight(pformat);
+-      uint32_t block_size = util_format_get_blocksize(pformat);
+ 
+       height_in_blks = DIV_ROUND_UP(height_in_blks, block_height);
+-      row_length_in_texels =
+-         DIV_ROUND_UP(row_length_in_texels, block_width) * block_size;
++      row_length_in_blks = DIV_ROUND_UP(row_length_in_texels, block_width);
+    }
+ 
+-   row_length = row_length_in_texels * vk_format_get_blocksize(src_format);
++   row_length = row_length_in_blks * vk_format_get_blocksize(src_format);
+ 
+    buffer_slice_size = height_in_blks * row_length;
+    buffer_layer_size = buffer_slice_size * region->imageExtent.depth;
+@@ -1090,6 +1093,8 @@
+                                         region->imageSubresource.aspectMask));
+    struct pvr_transfer_cmd_surface dst_surface = { 0 };
+    VkImageSubresource sub_resource;
++   uint32_t buffer_image_height_in_blks;
++   uint32_t buffer_row_length_in_blks;
+    uint32_t buffer_image_height;
+    uint32_t buffer_row_length;
+    uint32_t buffer_slice_size;
+@@ -1112,7 +1117,19 @@
+       region->imageSubresource.baseArrayLayer +
+       vk_image_subresource_layer_count(&image->vk, &region->imageSubresource);
+ 
+-   buffer_slice_size = buffer_image_height * buffer_row_length *
++   buffer_image_height_in_blks = buffer_image_height;
++   buffer_row_length_in_blks = buffer_row_length;
++
++   if (util_format_is_compressed(pformat)) {
++      uint32_t block_width = util_format_get_blockwidth(pformat);
++      uint32_t block_height = util_format_get_blockheight(pformat);
++
++      buffer_image_height_in_blks =
++         DIV_ROUND_UP(buffer_image_height, block_height);
++      buffer_row_length_in_blks = DIV_ROUND_UP(buffer_row_length, block_width);
++   }
++
++   buffer_slice_size = buffer_image_height_in_blks * buffer_row_length_in_blks *
+                        vk_format_get_blocksize(dst_format);
+ 
+    buffer_slice_size = align(buffer_slice_size, buffer_alignment);

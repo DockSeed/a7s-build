@@ -1,0 +1,706 @@
+Description: pvr: timestamp queries from firmware job timestamps
+ Implement VK_QUERY_TYPE_TIMESTAMP and vkCmdWriteTimestamp2, which were an
+ UNREACHABLE stub (pvr_arch_cmd_buffer.c).
+ .
+ A timestamp is an availability job for the query on the query compute context,
+ behind an event barrier that waits for all previous geometry, fragment, compute,
+ transfer and query jobs, so resets and copies of query pools recorded before it
+ have finished. The job asks the kernel for a PRE timestamp
+ (DRM_PVR_SUBMIT_JOB_TIMESTAMP_PRE, previous patch): the firmware writes the time
+ in ns of CLOCK_MONOTONIC_RAW into the query's result before the job starts, so
+ the value is in memory before the job marks the query available. Results of
+ timestamp pools come from a suballocator whose buffers are created with
+ PVR_BO_ALLOC_FLAG_FW_TIMESTAMPS; a pool larger than the kernel's limit
+ (bo_max_size, 64 KiB, 8192 queries) fails with VK_ERROR_OUT_OF_DEVICE_MEMORY.
+ Results are 64-bit; vkGetQueryPoolResults and the copy program read both halves
+ (PVR_QUERY_COPY_DATA_RESULT_64BIT).
+ .
+ Inside an owned graphics sub command with a single view, the render is split at
+ the timestamp the same way pvr_occlusion_query_begin() splits at a pool change
+ and the mid-fragment barrier splits for stencil: the render so far is kicked
+ with barrier_store, the timestamp is queued as its own query job, a barrier
+ makes the following graphics jobs wait for that query job, and the render
+ continues in a new sub command with barrier_load. The store writes the tile
+ contents, colour and depth/stencil, to the SPM scratch buffer and the load
+ restores them as the background object, so the pass sees the same attachment
+ contents as without the split, and the timestamp lies between the draws
+ recorded before and after it. A timestamp recorded before the first draw takes
+ the same path, which keeps load operations such as clears in the first part.
+ With multiview, and in secondary command buffers that continue a render pass,
+ the timestamp is deferred until the sub command ends: the store and load go
+ through one SPM scratch buffer while the render job is submitted once per view,
+ and secondaries hand their timestamps to the primary. With multiview a
+ timestamp fills one query per view (one job each).
+ .
+ struct pvr_query_info gets availability_write.timestamp, which
+ pvr_arch_add_query_program() passes on to the query job when it is not NULL.
+ The occlusion availability write in pvr_arch_cmd_buffer_end_sub_cmd(),
+ vkCmdResetQueryPool and vkCmdCopyQueryPoolResults zero-initialize the
+ struct, so the pointer and the fields they do not set, is_dynamic_render and
+ is_suspend among them, are zero.
+ .
+ vkGetQueryPoolResults reads the availability word with p_atomic_read(), an
+ acquire load, before it reads the result. The device writes the result first
+ and marks the query available afterwards; on an arm64 CPU a plain load of the
+ result could be satisfied before the load of the availability word. This
+ applies to every query type, both to the immediate check and the wait loop.
+ .
+ The limits do not advertise timestamps yet; that is the next patch.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/common/pvr_iface.h
++++ b/src/imagination/common/pvr_iface.h
+@@ -48,6 +48,8 @@
+    /** Number of 32-bit reports per query result. */
+    PVR_QUERY_COPY_DATA_REPORT_COUNT,
+ 
++   PVR_QUERY_COPY_DATA_RESULT_64BIT,
++
+    _PVR_QUERY_COPY_DATA_COUNT,
+ };
+ 
+--- a/src/imagination/pco/usclib/common.cl
++++ b/src/imagination/pco/usclib/common.cl
+@@ -96,6 +96,7 @@
+    uint dest_stride = nir_load_preamble(1, PVR_QUERY_COPY_DATA_DEST_STRIDE, 0);
+ 
+    uint report_count = nir_load_preamble(1, PVR_QUERY_COPY_DATA_REPORT_COUNT, 0);
++   bool result_64bit = nir_load_preamble(1, PVR_QUERY_COPY_DATA_RESULT_64BIT, 0);
+ 
+    uint flags = nir_load_preamble(1, PVR_QUERY_COPY_DATA_FLAGS, 0);
+    bool is_64bit = flags & VK_QUERY_RESULT_64_BIT;
+@@ -117,13 +118,13 @@
+          for (unsigned r = 0; r < report_count; ++r) {
+             uint2 dest_addr = nir_umad64_32(r, dest_elem_stride, dest_base_addr.x, dest_base_addr.y);
+             uint2 result_addr = nir_umad64_32(r, report_stride, result_base_addr.x, result_base_addr.y);
+-            uint result = nir_dma_ld_pco(1, result_addr);
++            uint2 result = result_64bit ? nir_dma_ld_pco(2, result_addr) : (uint2)(nir_dma_ld_pco(1, result_addr), 0);
+ 
+             /* TODO: for 64/32-bit writes, just prep the 64-bit one and set the burst-length variably. */
+             if (is_64bit)
+-               nir_dma_st_pco(false, dest_addr, result, 0);
++               nir_dma_st_pco(false, dest_addr, result.x, result.y);
+             else
+-               nir_dma_st_pco(false, dest_addr, result);
++               nir_dma_st_pco(false, dest_addr, result.x);
+          }
+       }
+ 
+--- a/src/imagination/vulkan/pvr_arch_cmd_buffer.c
++++ b/src/imagination/vulkan/pvr_arch_cmd_buffer.c
+@@ -141,6 +141,7 @@
+                            VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT);
+ 
+          util_dynarray_fini(&sub_cmd->gfx.sec_query_indices);
++         util_dynarray_fini(&sub_cmd->gfx.sec_timestamps);
+          util_dynarray_fini(&sub_cmd->gfx.unbound_deferred_clears);
+          pvr_csb_finish(&sub_cmd->gfx.control_stream);
+          pvr_csb_bo_release(cmd_buffer->device,
+@@ -206,6 +207,7 @@
+    pvr_cmd_buffer_clear_values_free(cmd_buffer);
+ 
+    util_dynarray_fini(&cmd_buffer->state.query_indices);
++   util_dynarray_fini(&cmd_buffer->state.timestamps);
+ 
+    pvr_cmd_buffer_free_sub_cmds(cmd_buffer);
+ 
+@@ -2541,6 +2543,10 @@
+       }
+ 
+       if (secondary_cont) {
++         util_dynarray_append_dynarray(&gfx_sub_cmd->sec_timestamps,
++                                       &state->timestamps);
++         util_dynarray_clear(&state->timestamps);
++
+          result = pvr_arch_csb_emit_return(&gfx_sub_cmd->control_stream);
+          if (result != VK_SUCCESS)
+             return pvr_cmd_buffer_set_error_unwarned(cmd_buffer, result);
+@@ -2649,7 +2655,7 @@
+    }
+ 
+    if (query_pool) {
+-      struct pvr_query_info query_info;
++      struct pvr_query_info query_info = { 0 };
+ 
+       assert(query_bo);
+       assert(query_indices_size);
+@@ -2690,9 +2696,14 @@
+          },
+       };
+ 
+-      return pvr_arch_add_query_program(cmd_buffer, &query_info);
++      result = pvr_arch_add_query_program(cmd_buffer, &query_info);
++      if (result != VK_SUCCESS)
++         return result;
+    }
+ 
++   if (sub_cmd->type == PVR_SUB_CMD_TYPE_GRAPHICS)
++      return pvr_arch_cmd_buffer_flush_timestamps(cmd_buffer);
++
+    return VK_SUCCESS;
+ }
+ 
+@@ -2896,6 +2907,7 @@
+       }
+ 
+       sub_cmd->gfx.sec_query_indices = UTIL_DYNARRAY_INIT;
++      sub_cmd->gfx.sec_timestamps = UTIL_DYNARRAY_INIT;
+       sub_cmd->gfx.unbound_deferred_clears = UTIL_DYNARRAY_INIT;
+       break;
+ 
+@@ -5449,6 +5461,7 @@
+    }
+ 
+    state->query_indices = UTIL_DYNARRAY_INIT;
++   state->timestamps = UTIL_DYNARRAY_INIT;
+ 
+    memset(state->barriers_needed,
+           0xFF,
+@@ -9889,6 +9902,9 @@
+                                        &sec_sub_cmd->gfx.sec_query_indices);
+       }
+ 
++      util_dynarray_append_dynarray(&state->timestamps,
++                                    &sec_sub_cmd->gfx.sec_timestamps);
++
+       if (!PVR_HAS_FEATURE(dev_info, gs_rta_support)) {
+          util_dynarray_foreach (&sec_sub_cmd->gfx.unbound_deferred_clears,
+                                 struct pvr_unbound_deferred_clear,
+@@ -10648,14 +10664,6 @@
+    pvr_arch_cmd_buffer_end_sub_cmd(cmd_buffer);
+ }
+ 
+-void PVR_PER_ARCH(CmdWriteTimestamp2)(VkCommandBuffer commandBuffer,
+-                                      VkPipelineStageFlags2 stage,
+-                                      VkQueryPool queryPool,
+-                                      uint32_t query)
+-{
+-   UNREACHABLE("Timestamp queries are not supported.");
+-}
+-
+ VkResult PVR_PER_ARCH(EndCommandBuffer)(VkCommandBuffer commandBuffer)
+ {
+    VK_FROM_HANDLE(pvr_cmd_buffer, cmd_buffer, commandBuffer);
+@@ -10673,6 +10681,7 @@
+       pvr_cmd_buffer_set_error_unwarned(cmd_buffer, result);
+ 
+    util_dynarray_fini(&state->query_indices);
++   util_dynarray_fini(&state->timestamps);
+ 
+    return vk_command_buffer_end(&cmd_buffer->vk);
+ }
+--- a/src/imagination/vulkan/pvr_arch_cmd_query.c
++++ b/src/imagination/vulkan/pvr_arch_cmd_query.c
+@@ -18,7 +18,7 @@
+                                      uint32_t queryCount)
+ {
+    VK_FROM_HANDLE(pvr_cmd_buffer, cmd_buffer, commandBuffer);
+-   struct pvr_query_info query_info;
++   struct pvr_query_info query_info = { 0 };
+    VkResult result;
+ 
+    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
+@@ -80,7 +80,7 @@
+                                            VkQueryResultFlags flags)
+ {
+    VK_FROM_HANDLE(pvr_cmd_buffer, cmd_buffer, commandBuffer);
+-   struct pvr_query_info query_info;
++   struct pvr_query_info query_info = { 0 };
+    VkResult result;
+ 
+    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
+@@ -269,3 +269,158 @@
+       UNREACHABLE("unsupported query type");
+    }
+ }
++
++static VkResult pvr_write_timestamp(struct pvr_cmd_buffer *cmd_buffer,
++                                    VkQueryPool query_pool,
++                                    uint32_t query)
++{
++   VK_FROM_HANDLE(pvr_query_pool, pool, query_pool);
++   const struct pvr_winsys_job_timestamp timestamp = {
++      .bo = pool->result_buffer->bo->bo,
++      .pre = true,
++      .pre_offset = pool->result_buffer->offset +
++                    (uint64_t)query * pool->result_elem_stride,
++   };
++   struct pvr_suballoc_bo *index_bo;
++   VkResult result;
++
++   result = pvr_arch_cmd_buffer_upload_general(cmd_buffer,
++                                               &query,
++                                               sizeof(query),
++                                               &index_bo);
++   if (result != VK_SUCCESS)
++      return result;
++
++   const struct pvr_query_info query_info = {
++      .type = PVR_QUERY_TYPE_AVAILABILITY_WRITE,
++      .availability_write = {
++         .num_query_indices = 1,
++         .index_bo = index_bo,
++         .num_queries = pool->query_count,
++         .availability_bo = pool->availability_buffer,
++         .timestamp = &timestamp,
++      },
++   };
++
++   result = pvr_arch_cmd_buffer_end_sub_cmd(cmd_buffer);
++   if (result != VK_SUCCESS)
++      return result;
++
++   result =
++      pvr_arch_cmd_buffer_start_sub_cmd(cmd_buffer, PVR_SUB_CMD_TYPE_EVENT);
++   if (result != VK_SUCCESS)
++      return result;
++
++   cmd_buffer->state.current_sub_cmd->event = (struct pvr_sub_cmd_event){
++      .type = PVR_EVENT_TYPE_BARRIER,
++      .barrier = {
++         .wait_for_stage_mask =
++            PVR_PIPELINE_STAGE_ALL_BITS | PVR_PIPELINE_STAGE_QUERY_BIT,
++         .wait_at_stage_mask = PVR_PIPELINE_STAGE_QUERY_BIT,
++      },
++   };
++
++   return pvr_arch_add_query_program(cmd_buffer, &query_info);
++}
++
++VkResult
++PVR_PER_ARCH(cmd_buffer_flush_timestamps)(struct pvr_cmd_buffer *cmd_buffer)
++{
++   struct util_dynarray *const timestamps = &cmd_buffer->state.timestamps;
++   VkResult result = VK_SUCCESS;
++
++   util_dynarray_foreach (timestamps, struct pvr_deferred_timestamp, timestamp) {
++      for (uint32_t i = 0; i < timestamp->query_count; i++) {
++         result = pvr_write_timestamp(cmd_buffer,
++                                      timestamp->query_pool,
++                                      timestamp->query + i);
++         if (result != VK_SUCCESS)
++            break;
++      }
++
++      if (result != VK_SUCCESS)
++         break;
++   }
++
++   util_dynarray_clear(timestamps);
++
++   return result;
++}
++
++static VkResult pvr_write_timestamp_in_render(struct pvr_cmd_buffer *cmd_buffer,
++                                              VkQueryPool query_pool,
++                                              uint32_t query)
++{
++   struct pvr_cmd_buffer_state *state = &cmd_buffer->state;
++   struct pvr_sub_cmd *prev_sub_cmd = state->current_sub_cmd;
++   VkResult result;
++
++   prev_sub_cmd->gfx.empty_cmd = false;
++   prev_sub_cmd->gfx.barrier_store = true;
++
++   result = pvr_write_timestamp(cmd_buffer, query_pool, query);
++   if (result != VK_SUCCESS)
++      return result;
++
++   result =
++      pvr_arch_cmd_buffer_start_sub_cmd(cmd_buffer, PVR_SUB_CMD_TYPE_EVENT);
++   if (result != VK_SUCCESS)
++      return result;
++
++   state->current_sub_cmd->event = (struct pvr_sub_cmd_event){
++      .type = PVR_EVENT_TYPE_BARRIER,
++      .barrier = {
++         .wait_for_stage_mask = PVR_PIPELINE_STAGE_QUERY_BIT,
++         .wait_at_stage_mask = PVR_PIPELINE_STAGE_ALL_GRAPHICS_BITS,
++      },
++   };
++
++   result =
++      pvr_arch_cmd_buffer_start_sub_cmd(cmd_buffer, PVR_SUB_CMD_TYPE_GRAPHICS);
++   if (result != VK_SUCCESS)
++      return result;
++
++   assert(state->current_sub_cmd->gfx.dr_info ==
++          state->render_pass_info.dr_info);
++
++   state->current_sub_cmd->gfx.barrier_load = true;
++   state->current_sub_cmd->gfx.barrier_store = false;
++   state->current_sub_cmd->gfx.empty_cmd = false;
++   state->current_sub_cmd->is_dynamic_render = prev_sub_cmd->is_dynamic_render;
++   state->current_sub_cmd->is_suspend = prev_sub_cmd->is_suspend;
++
++   return VK_SUCCESS;
++}
++
++void PVR_PER_ARCH(CmdWriteTimestamp2)(VkCommandBuffer commandBuffer,
++                                      VkPipelineStageFlags2 stage,
++                                      VkQueryPool queryPool,
++                                      uint32_t query)
++{
++   VK_FROM_HANDLE(pvr_cmd_buffer, cmd_buffer, commandBuffer);
++   struct pvr_cmd_buffer_state *state = &cmd_buffer->state;
++   const struct pvr_sub_cmd *sub_cmd = state->current_sub_cmd;
++
++   PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
++
++   if (sub_cmd && sub_cmd->owned && sub_cmd->type == PVR_SUB_CMD_TYPE_GRAPHICS &&
++       !sub_cmd->gfx.geom_only) {
++      const uint32_t view_count = pvr_cmd_buffer_state_get_view_count(state);
++
++      if (view_count == 1 && !pvr_cmd_buffer_is_secondary_cont(cmd_buffer)) {
++         pvr_write_timestamp_in_render(cmd_buffer, queryPool, query);
++         return;
++      }
++
++      const struct pvr_deferred_timestamp timestamp = {
++         .query_pool = queryPool,
++         .query = query,
++         .query_count = view_count,
++      };
++
++      util_dynarray_append(&state->timestamps, timestamp);
++      return;
++   }
++
++   pvr_write_timestamp(cmd_buffer, queryPool, query);
++}
+--- a/src/imagination/vulkan/pvr_arch_device.c
++++ b/src/imagination/vulkan/pvr_arch_device.c
+@@ -63,6 +63,7 @@
+ #define PVR_SUBALLOCATOR_TRANSFER_SIZE (128 * 1024)
+ #define PVR_SUBALLOCATOR_USC_SIZE (128 * 1024)
+ #define PVR_SUBALLOCATOR_VIS_TEST_SIZE (128 * 1024)
++#define PVR_SUBALLOCATOR_TIMESTAMP_SIZE (16 * 1024)
+ 
+ static uint32_t pvr_get_simultaneous_num_allocs(
+    const struct pvr_device_info *dev_info,
+@@ -858,6 +859,11 @@
+                             device->heaps.vis_test_heap,
+                             device,
+                             PVR_SUBALLOCATOR_VIS_TEST_SIZE);
++   pvr_bo_suballocator_init(&device->suballoc_timestamp,
++                            device->heaps.general_heap,
++                            device,
++                            PVR_SUBALLOCATOR_TIMESTAMP_SIZE);
++   device->suballoc_timestamp.alloc_flags |= PVR_BO_ALLOC_FLAG_FW_TIMESTAMPS;
+ 
+    if (p_atomic_inc_return(&instance->active_device_count) >
+        PVR_SECONDARY_DEVICE_THRESHOLD) {
+@@ -1017,6 +1023,7 @@
+ err_dec_device_count:
+    p_atomic_dec(&device->instance->active_device_count);
+ 
++   pvr_bo_suballocator_fini(&device->suballoc_timestamp);
+    pvr_bo_suballocator_fini(&device->suballoc_vis_test);
+    pvr_bo_suballocator_fini(&device->suballoc_usc);
+    pvr_bo_suballocator_fini(&device->suballoc_transfer);
+@@ -1071,6 +1078,7 @@
+    pvr_bo_suballoc_free(device->nop_program.usc);
+    pvr_free_list_destroy(device->global_free_list);
+    pvr_finish_null_pages(device);
++   pvr_bo_suballocator_fini(&device->suballoc_timestamp);
+    pvr_bo_suballocator_fini(&device->suballoc_vis_test);
+    pvr_bo_suballocator_fini(&device->suballoc_usc);
+    pvr_bo_suballocator_fini(&device->suballoc_transfer);
+--- a/src/imagination/vulkan/pvr_arch_job_compute.c
++++ b/src/imagination/vulkan/pvr_arch_job_compute.c
+@@ -206,6 +206,7 @@
+    submit_info->job_num = device->global_cmd_buffer_submit_count;
+ 
+    submit_info->wait = wait;
++   submit_info->timestamp = sub_cmd->timestamp;
+ 
+    pvr_submit_info_stream_init(ctx, sub_cmd, submit_info);
+    pvr_submit_info_ext_stream_init(ctx, submit_info);
+--- a/src/imagination/vulkan/pvr_arch_query_compute.c
++++ b/src/imagination/vulkan/pvr_arch_query_compute.c
+@@ -420,6 +420,12 @@
+       query_info->is_dynamic_render;
+    cmd_buffer->state.current_sub_cmd->is_suspend = query_info->is_suspend;
+ 
++   if (query_info->type == PVR_QUERY_TYPE_AVAILABILITY_WRITE &&
++       query_info->availability_write.timestamp) {
++      cmd_buffer->state.current_sub_cmd->compute.timestamp =
++         *query_info->availability_write.timestamp;
++   }
++
+    switch (query_info->type) {
+    case PVR_QUERY_TYPE_AVAILABILITY_WRITE:
+       /* Adds a compute shader (fenced on the last 3D) that writes a non-zero
+@@ -540,6 +546,8 @@
+ 
+       const_buffer[PVR_QUERY_COPY_DATA_RESULT_STRIDE] = result_stride;
+       const_buffer[PVR_QUERY_COPY_DATA_REPORT_COUNT] = report_count;
++      const_buffer[PVR_QUERY_COPY_DATA_RESULT_64BIT] =
++         pool->query_type == VK_QUERY_TYPE_TIMESTAMP;
+ 
+       break;
+    }
+--- a/src/imagination/vulkan/pvr_bo.c
++++ b/src/imagination/vulkan/pvr_bo.c
+@@ -283,6 +283,9 @@
+    if (flags & PVR_BO_ALLOC_FLAG_PM_FW_PROTECT)
+       ws_flags |= PVR_WINSYS_BO_FLAG_PM_FW_PROTECT;
+ 
++   if (flags & PVR_BO_ALLOC_FLAG_FW_TIMESTAMPS)
++      ws_flags |= PVR_WINSYS_BO_FLAG_FW_TIMESTAMPS;
++
+    return ws_flags;
+ }
+ 
+@@ -510,6 +513,7 @@
+    *allocator = (struct pvr_suballocator){
+       .device = device,
+       .default_size = default_size,
++      .alloc_flags = PVR_BO_ALLOC_FLAG_CPU_MAPPED,
+       .heap = heap,
+    };
+ 
+@@ -626,7 +630,7 @@
+                             allocator->heap,
+                             alloc_size,
+                             align,
+-                            PVR_BO_ALLOC_FLAG_CPU_MAPPED,
++                            allocator->alloc_flags,
+                             &allocator->bo);
+       if (result != VK_SUCCESS) {
+          vk_free(&allocator->device->vk.alloc, suballoc_bo);
+--- a/src/imagination/vulkan/pvr_bo.h
++++ b/src/imagination/vulkan/pvr_bo.h
+@@ -66,6 +66,7 @@
+    struct pvr_winsys_heap *heap;
+    /* Minimum size of the pvr_bo shared across multiple sub-allocations */
+    uint32_t default_size;
++   uint64_t alloc_flags;
+ 
+    /* Mutex to protect access to all of the members below this point */
+    simple_mtx_t mtx;
+@@ -116,6 +117,7 @@
+  * firmware processor.
+  */
+ #define PVR_BO_ALLOC_FLAG_PM_FW_PROTECT BITFIELD_BIT(3U)
++#define PVR_BO_ALLOC_FLAG_FW_TIMESTAMPS BITFIELD_BIT(4U)
+ 
+ VkResult pvr_bo_alloc(struct pvr_device *device,
+                       struct pvr_winsys_heap *heap,
+--- a/src/imagination/vulkan/pvr_cmd_buffer.h
++++ b/src/imagination/vulkan/pvr_cmd_buffer.h
+@@ -21,6 +21,7 @@
+ #include "pvr_job_render.h"
+ #include "pvr_hw_pass.h"
+ #include "pvr_types.h"
++#include "pvr_winsys.h"
+ 
+ #include "util/perf/u_trace.h"
+ 
+@@ -173,6 +174,7 @@
+ 
+    const struct pvr_query_pool *query_pool;
+    struct util_dynarray sec_query_indices;
++   struct util_dynarray sec_timestamps;
+ 
+    /* Control stream builder object */
+    struct pvr_csb control_stream;
+@@ -244,6 +246,8 @@
+    bool uses_barrier;
+ 
+    bool pds_sw_barrier_requires_clearing;
++
++   struct pvr_winsys_job_timestamp timestamp;
+ };
+ 
+ struct pvr_sub_cmd_transfer {
+@@ -549,6 +553,7 @@
+    uint32_t vis_reg;
+ 
+    struct util_dynarray query_indices;
++   struct util_dynarray timestamps;
+ 
+    uint32_t max_shared_regs;
+ 
+--- a/src/imagination/vulkan/pvr_device.h
++++ b/src/imagination/vulkan/pvr_device.h
+@@ -91,6 +91,7 @@
+    struct pvr_suballocator suballoc_transfer;
+    struct pvr_suballocator suballoc_usc;
+    struct pvr_suballocator suballoc_vis_test;
++   struct pvr_suballocator suballoc_timestamp;
+ 
+    struct {
+       struct pvr_pds_upload pds;
+--- a/src/imagination/vulkan/pvr_query.c
++++ b/src/imagination/vulkan/pvr_query.c
+@@ -45,6 +45,7 @@
+ #include "pvr_xfb.h"
+ #include "util/macros.h"
+ #include "util/os_time.h"
++#include "util/u_atomic.h"
+ #include "vk_log.h"
+ #include "vk_object.h"
+ 
+@@ -52,6 +53,7 @@
+ {
+    switch (pool->query_type) {
+    case VK_QUERY_TYPE_OCCLUSION:
++   case VK_QUERY_TYPE_TIMESTAMP:
+       return 1u;
+ 
+    case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT:
+@@ -115,13 +117,32 @@
+                           &pool->result_buffer);
+ }
+ 
++static VkResult pvr_timestamp_query_pool_setup(struct pvr_device *device,
++                                               struct pvr_query_pool *pool)
++{
++   const uint32_t cache_line_size =
++      pvr_get_slc_cache_line_size(&device->pdevice->dev_info);
++   const uint64_t result_buffer_alloc_size =
++      (uint64_t)pool->query_count * sizeof(uint64_t);
++
++   pool->result_elem_stride = sizeof(uint64_t);
++
++   if (!device->ws->features.supports_job_timestamps ||
++       result_buffer_alloc_size > device->ws->timestamp_bo_max_size)
++      return vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++
++   return pvr_bo_suballoc(&device->suballoc_timestamp,
++                          result_buffer_alloc_size,
++                          cache_line_size,
++                          true,
++                          &pool->result_buffer);
++}
++
+ static VkResult pvr_query_pool_setup(struct pvr_device *device,
+                                      struct pvr_query_pool *pool)
+ {
+    /* Vulkan 1.0 supports only occlusion, timestamp, and pipeline statistics
+     * query.
+-    * We don't currently support timestamp queries.
+-    * VkQueueFamilyProperties->timestampValidBits = 0.
+     * We don't currently support pipeline statistics queries.
+     * VkPhysicalDeviceFeatures->pipelineStatisticsQuery = false.
+     */
+@@ -136,6 +157,9 @@
+    case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT:
+       return pvr_xfb_query_pool_setup(device, pool);
+ 
++   case VK_QUERY_TYPE_TIMESTAMP:
++      return pvr_timestamp_query_pool_setup(device, pool);
++
+    default:
+       UNREACHABLE("Unsupported query type");
+    }
+@@ -164,6 +188,7 @@
+       break;
+ 
+    case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT:
++   case VK_QUERY_TYPE_TIMESTAMP:
+       pvr_xfb_query_pool_cleanup(pool);
+       break;
+ 
+@@ -245,7 +270,7 @@
+ {
+    volatile uint32_t *available =
+       pvr_bo_suballoc_get_map_addr(pool->availability_buffer);
+-   return !!available[query_idx];
++   return !!p_atomic_read(&available[query_idx]);
+ }
+ 
+ #define NSEC_PER_SEC UINT64_C(1000000000)
+@@ -334,6 +359,20 @@
+    *result_out = result;
+ }
+ 
++static void
++pvr_timestamp_query_pool_get_result(const struct pvr_query_pool *pool,
++                                    uint32_t query_idx,
++                                    uint64_t *result_out)
++{
++   const volatile uint32_t *timestamp_data =
++      pvr_bo_suballoc_get_map_addr(pool->result_buffer);
++   const uint32_t offset =
++      query_idx * pool->result_elem_stride / sizeof(*timestamp_data);
++
++   *result_out = (uint64_t)timestamp_data[offset + 1] << 32 |
++                 timestamp_data[offset];
++}
++
+ VkResult pvr_GetQueryPoolResults(VkDevice _device,
+                                  VkQueryPool queryPool,
+                                  uint32_t firstQuery,
+@@ -390,6 +429,10 @@
+          pvr_xfb_query_pool_get_result(device, pool, query_idx, &count);
+          break;
+ 
++      case VK_QUERY_TYPE_TIMESTAMP:
++         pvr_timestamp_query_pool_get_result(pool, query_idx, &count);
++         break;
++
+       default:
+          UNREACHABLE("Unsupported query type");
+       }
+--- a/src/imagination/vulkan/pvr_query.h
++++ b/src/imagination/vulkan/pvr_query.h
+@@ -18,7 +18,9 @@
+ 
+ #include "pvr_common.h"
+ 
++struct pvr_cmd_buffer;
+ struct pvr_device;
++struct pvr_winsys_job_timestamp;
+ 
+ struct pvr_query_pool {
+    struct vk_object_base base;
+@@ -53,6 +55,7 @@
+          struct pvr_suballoc_bo *index_bo;
+          uint32_t num_queries;
+          struct pvr_suballoc_bo *availability_bo;
++         const struct pvr_winsys_job_timestamp *timestamp;
+       } availability_write;
+ 
+       struct {
+@@ -70,14 +73,22 @@
+          VkDeviceSize stride;
+          VkQueryResultFlags flags;
+       } copy_query_results;
++
+    };
+ };
+ 
++struct pvr_deferred_timestamp {
++   VkQueryPool query_pool;
++   uint32_t query;
++   uint32_t query_count;
++};
++
+ VK_DEFINE_NONDISP_HANDLE_CASTS(pvr_query_pool,
+                                base,
+                                VkQueryPool,
+                                VK_OBJECT_TYPE_QUERY_POOL)
+ 
++
+ #ifdef PVR_PER_ARCH
+ 
+ VkResult PVR_PER_ARCH(device_create_compute_query_programs)(
+@@ -92,6 +103,12 @@
+ #   define pvr_arch_device_destroy_compute_query_programs \
+       PVR_PER_ARCH(device_destroy_compute_query_programs)
+ 
++VkResult
++   PVR_PER_ARCH(cmd_buffer_flush_timestamps)(struct pvr_cmd_buffer *cmd_buffer);
++
++#   define pvr_arch_cmd_buffer_flush_timestamps \
++      PVR_PER_ARCH(cmd_buffer_flush_timestamps)
++
+ #endif
+ 
+ #endif /* PVR_QUERY_H*/

@@ -181,9 +181,9 @@ Other cards, drives and board revisions are not claimed.
 | Wi-Fi | works | Vendor driver built out of tree; firmware fetched at build time |
 | Bluetooth | works | LE and classic, A2DP, PAN; classic HID and HFP not tested |
 | Display | partial | DisplayPort console and desktop up to 1920x1200 at 60 Hz (154 MHz pixel clock); higher modes need dual pixel mode, not done yet |
-| GPU | works | Mesa OpenGL (GLES 2 / GL via zink); about 4x slower than the vendor driver |
+| GPU | partial | Mesa built by this recipe: Vulkan (PowerVR driver), OpenGL and OpenGL ES through zink on it. The desktop's X server draws with glamor on the GPU; applications render on the CPU by default ([image](image.md#mesa)) |
 | Desktop | opt-in | `A7S_DESKTOP=1`: Xfce with LightDM |
-| CPU: 8 cores, DVFS, idle | works | DVFS measured on two silicon bins; other bins use the vendor's table |
+| CPU: 8 cores, DVFS, idle | works | DVFS measured on two silicon bins; the other bins use table values not measured here |
 | Thermal and throttling | works | Temperatures above about 74 C not calibrated |
 | Audio (I2S, DMA) | partial | Proven by loopback and Bluetooth A2DP; DP audio on a sink untested |
 | RTC, watchdog, PWM registers | works | PWM pin output not proven |

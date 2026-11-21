@@ -1,0 +1,46 @@
+From 81fbc39d23a8decaf07693ff74cb7a2eade50bdc Mon Sep 17 00:00:00 2001
+From: Ali Milhim <alimilhim5@gmail.com>
+Date: Thu, 12 Nov 2026 16:28:46 +0200
+Subject: [PATCH] nir: use temporary deref paths for alias invalidation
+
+kill_aliases() is called with derefs that do not always have a path
+attached. Build a path on the stack in that case, and free it again
+once invalidation is done, instead of leaving anything long-lived
+behind.
+
+Cc: mesa-stable
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/46213>
+(cherry picked from commit f55dc3328b93938419b8f698f1132c3c16080a78)
+Link: https://gitlab.freedesktop.org/mesa/mesa/-/commit/81fbc39d23a8decaf07693ff74cb7a2eade50bdc
+[ adapted: dropped .pick_status.json, not in the 26.3.0 tarball or bookkeeping only ]
+---
+ .pick_status.json                         |  2 +-
+ src/compiler/nir/nir_opt_copy_prop_vars.c | 12 +++++++++++-
+ 2 files changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/src/compiler/nir/nir_opt_copy_prop_vars.c b/src/compiler/nir/nir_opt_copy_prop_vars.c
+index 794bec04b43d..6dc2a95f0b2d 100644
+--- a/src/compiler/nir/nir_opt_copy_prop_vars.c
++++ b/src/compiler/nir/nir_opt_copy_prop_vars.c
+@@ -646,7 +646,17 @@ kill_aliases(struct copy_prop_var_state *state,
+ {
+    /* TODO: Take into account the write_mask. */
+ 
+-   lookup_entry_and_kill_aliases(state, copies, deref, write_mask, true);
++   nir_deref_path path;
++   nir_deref_and_path tmp = *deref;
++   if (!tmp._path) {
++      nir_deref_path_init(&path, tmp.instr, NULL);
++      tmp._path = &path;
++   }
++
++   lookup_entry_and_kill_aliases(state, copies, &tmp, write_mask, true);
++
++   if (!deref->_path)
++      nir_deref_path_finish(&path);
+ }
+ 
+ static struct copy_entry *
+-- 
+GitLab
+

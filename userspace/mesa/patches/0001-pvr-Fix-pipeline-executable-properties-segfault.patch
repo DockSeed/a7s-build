@@ -1,0 +1,55 @@
+From 9520a9b5d559bfabce9c7a4ca34f18247aa5fec3 Mon Sep 17 00:00:00 2001
+From: Duncan Brawley <duncan.brawley@imgtec.com>
+Date: Wed, 21 Oct 2026 14:09:10 +0100
+Subject: [PATCH] pvr: Fix pipeline executable properties segfault
+
+Null pointer dereference would occur when pipeline executable properties
+data is requested but the corresponding `VK_PIPELINE_CREATE_CAPTURE` flag
+was not set in the pipeline.
+
+Fix by checking for null pointer.
+
+Fixes: dfddb3fef1c ("pvr: Add support for VK_KHR_pipeline_executable_properties")
+Signed-off-by: Duncan Brawley <duncan.brawley@imgtec.com>
+Reviewed-by: Simon Perretta <simon.perretta@imgtec.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45696>
+(cherry picked from commit 5e1fc158146cb46254a74d93ded8141326498cf3)
+Link: https://gitlab.freedesktop.org/mesa/mesa/-/commit/9520a9b5d559bfabce9c7a4ca34f18247aa5fec3
+[ adapted: dropped .pick_status.json, not in the 26.3.0 tarball or bookkeeping only ]
+---
+ .pick_status.json                          | 2 +-
+ src/imagination/vulkan/pvr_arch_pipeline.c | 9 ++++++---
+ 2 files changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/src/imagination/vulkan/pvr_arch_pipeline.c b/src/imagination/vulkan/pvr_arch_pipeline.c
+index 7eae3bf39c42..2a4b3f3bcf21 100644
+--- a/src/imagination/vulkan/pvr_arch_pipeline.c
++++ b/src/imagination/vulkan/pvr_arch_pipeline.c
+@@ -3775,10 +3775,12 @@ VkResult PVR_PER_ARCH(GetPipelineExecutableStatisticsKHR)(
+          to_pvr_graphics_pipeline(pipeline);
+ 
+       if (pExecutableInfo->executableIndex == 0) {
+-         vk_add_pvr_stats(out, gfx_pipeline->vs_stats);
++         if (gfx_pipeline->vs_stats)
++            vk_add_pvr_stats(out, gfx_pipeline->vs_stats);
+       } else {
+          assert(pExecutableInfo->executableIndex == 1);
+-         vk_add_pvr_stats(out, gfx_pipeline->fs_stats);
++         if (gfx_pipeline->fs_stats)
++            vk_add_pvr_stats(out, gfx_pipeline->fs_stats);
+       }
+       break;
+    }
+@@ -3788,7 +3790,8 @@ VkResult PVR_PER_ARCH(GetPipelineExecutableStatisticsKHR)(
+          to_pvr_compute_pipeline(pipeline);
+ 
+       assert(pExecutableInfo->executableIndex == 0);
+-      vk_add_pvr_stats(out, compute_pipeline->cs_stats);
++      if (compute_pipeline->cs_stats)
++         vk_add_pvr_stats(out, compute_pipeline->cs_stats);
+       break;
+    }
+ 
+-- 
+GitLab
+

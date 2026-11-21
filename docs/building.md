@@ -10,7 +10,9 @@ The result lands in `out/`. `./build.sh --help` lists every stage and switch.
 
 ## What the host needs
 
-- x86_64 or aarch64 Linux (both tested); bash, coreutils, git.
+- x86_64 or aarch64 Linux; bash, coreutils, git. Both were tested before the
+  `mesa` stage existed. That stage cross-builds Mesa on x86_64 and builds it
+  natively on aarch64; the native build has not been tested yet.
 - **podman >= 4 or docker >= 24.** Tested: rootless podman 5.8 (x86_64) and
   5.4 (aarch64); docker 29.8 running inside a podman container (not yet on a
   real docker host).
@@ -20,8 +22,10 @@ The result lands in `out/`. `./build.sh --help` lists every stage and switch.
 - Network access to the public origins of the inputs (docker.io, snapshot.debian.org,
   cdn.kernel.org, github.com, ...). Everything is checked against a committed
   sha256 or commit id.
-- Disk: about 20 GB free (work, out, cache, builder image). Measured pieces:
-  kernel tree 2.7 GB, other stage work 8 GB, image 1.5 GB, cache about 1 GB.
+- Disk: about 30 GB free (work, out, cache, builder image). Measured pieces
+  (desktop image): Mesa build 6.8 GB, root filesystem and its image copy
+  2.7 GB each, xfwm4 2.6 GB, kernel tree 2.7 GB (`A7S_KERNEL=build` only),
+  builder image 1.4 GB, raw desktop image 3.9 GiB, cache about 1 GB.
 - RAM: 8 GB is comfortable; lower `A7S_JOBS` on a small machine.
 - Time: a first full build takes on the order of an hour on 4 cores (kernel
   compile, root filesystem under emulation); root filesystem plus image from a
@@ -29,7 +33,9 @@ The result lands in `out/`. `./build.sh --help` lists every stage and switch.
   builds reuse the cache. With the default `A7S_KERNEL=release` the kernel
   compile (about 30 minutes on 4 cores) is replaced by a download of three
   packages; the root filesystem takes several minutes longer, because DKMS
-  compiles the WLAN driver under emulation.
+  compiles the WLAN driver under emulation. These times were taken before the
+  `mesa` stage existed; the time it adds (Mesa's compiler tools, then Mesa,
+  built in a chroot of its own) has not been measured yet.
 
 ## Usage
 
@@ -41,7 +47,7 @@ The result lands in `out/`. `./build.sh --help` lists every stage and switch.
 
 | Stage | What it does |
 |---|---|
-| `all` | `bootchain kernel wifi gpu-firmware orc xfwm4 rootfs image compress`; `xfwm4` only with `A7S_DESKTOP=1` |
+| `all` | `bootchain kernel wifi gpu-firmware orc xfwm4 mesa rootfs image compress`; `xfwm4` only with `A7S_DESKTOP=1` |
 | `pins` | print every pinned input |
 | `clean` | delete the work directory (from inside the container, which can delete files your user cannot) |
 
@@ -62,7 +68,7 @@ Environment variables, defaults in `config/defaults.conf` (printed by
 | `A7S_SUITE` | `trixie` | *Debian* suite |
 | `A7S_KERNEL` | `release` | `release`: the *Debian* packages of a pinned release of a7s-linux-lts are downloaded (sha256-pinned) and installed with dpkg, the WLAN driver is built by DKMS; `build`: the kernel is compiled here ([kernel](kernel.md)) |
 | `A7S_KERNEL_REVISION` | empty | `A7S_KERNEL=build` only: revision of the kernel build (`r1`, `t2`), as in the kernel release `6.18.64-t2` |
-| `A7S_SNAPSHOT` | `20261101T000000Z` | snapshot.debian.org timestamp of the image's packages; empty = live archive, not reproducible |
+| `A7S_SNAPSHOT` | `20261115T000000Z` | snapshot.debian.org timestamp of the image's packages; empty = live archive, not reproducible |
 | `A7S_DESKTOP` | `0` | `1`: Xfce desktop and patched xfwm4 |
 | `A7S_USER`, `A7S_HOSTNAME` | `a7s`, `a7s` | login user and host name |
 | `A7S_IMAGE_NAME` | `a7s-<suite>-<minimal\|desktop>.img` | image file name |

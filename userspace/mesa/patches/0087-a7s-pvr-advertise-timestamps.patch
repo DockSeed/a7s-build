@@ -1,0 +1,45 @@
+Description: pvr: advertise timestamps
+ With a kernel that reports firmware job timestamps (winsys feature
+ supports_job_timestamps): timestampValidBits 64 for the queue family,
+ timestampPeriod 1 (the firmware writes ns) and timestampComputeAndGraphics.
+ Without it, as before, timestampValidBits 0. zink takes timestampValidBits of the
+ graphics queue family for the gallium caps query_timestamp and
+ query_time_elapsed (zink_screen.c), which give GL_ARB_timer_query.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/vulkan/pvr_physical_device.c
++++ b/src/imagination/vulkan/pvr_physical_device.c
+@@ -795,8 +795,10 @@
+       .sampledImageStencilSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT,
+       .storageImageSampleCounts = VK_SAMPLE_COUNT_1_BIT, /* Requires shaderStorageImageMultisample */
+       .maxSampleMaskWords = 1U,
+-      .timestampComputeAndGraphics = false,
+-      .timestampPeriod = 0.0f,
++      .timestampComputeAndGraphics =
++         pdevice->ws->features.supports_job_timestamps,
++      .timestampPeriod =
++         pdevice->ws->features.supports_job_timestamps ? 1.0f : 0.0f,
+ 
+       .maxClipDistances = PVR_MAX_USER_PLANES,
+       .maxCullDistances = PVR_MAX_USER_PLANES,
+@@ -1380,6 +1382,7 @@
+    uint32_t *pQueueFamilyPropertyCount,
+    VkQueueFamilyProperties2 *pQueueFamilyProperties)
+ {
++   VK_FROM_HANDLE(pvr_physical_device, pdevice, physicalDevice);
+    VK_OUTARRAY_MAKE_TYPED(VkQueueFamilyProperties2,
+                           out,
+                           pQueueFamilyProperties,
+@@ -1387,6 +1390,8 @@
+ 
+    vk_outarray_append_typed (VkQueueFamilyProperties2, &out, p) {
+       p->queueFamilyProperties = pvr_queue_family_properties;
++      if (pdevice->ws->features.supports_job_timestamps)
++         p->queueFamilyProperties.timestampValidBits = 64;
+ 
+       vk_foreach_struct (sType, ext, p->pNext) {
+          switch (sType) {

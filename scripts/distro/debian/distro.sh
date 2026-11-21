@@ -56,6 +56,10 @@ DEBIAN_HOOK_DIR="${OUT_DIR}/kernel-hook"
 DEBIAN_DKMS_DIR="${OUT_DIR}/aic8800/dkms"
 DEBIAN_XFWM4_APT_PIN="etc/apt/preferences.d/xfwm4-a7s"
 DEBIAN_XFWM4_DOC_DIR="usr/local/share/doc/xfwm4-a7s"
+# Our Mesa (the mesa stage): its runtime packages and MESA-ID.
+DEBIAN_MESA_DIR="${OUT_DIR}/mesa"
+DEBIAN_MESA_APT_PIN="etc/apt/preferences.d/mesa-a7s"
+DEBIAN_MESA_DOC_DIR="usr/local/share/doc/mesa-a7s"
 
 # --- small helpers --------------------------------------------------------------
 
@@ -106,6 +110,32 @@ debian_apt_install() {  # <root> [--with-recommends] <package>...
   in_root "${r}" apt-get -y -q "${rec}" install "$@"
 }
 
+# The version of our Mesa, from OUT_DIR/mesa/MESA-ID (the hooks run without the
+# stage scripts, so the version is read from the artefact, not from mesa.sh).
+debian_mesa_version() {
+  local v
+  v="$(sed -n 's/^version=//p' "${DEBIAN_MESA_DIR}/MESA-ID" 2>/dev/null)"
+  case "${v}" in
+    *+a7s*) printf '%s' "${v}" ;;
+    *) die "${DEBIAN_MESA_DIR}/MESA-ID names no version with a +a7s suffix ('${v}') -- run the mesa stage" ;;
+  esac
+}
+
+# The .deb of each MESA_IMAGE_PACKAGES entry, one path per line, in that order.
+debian_mesa_debs() {
+  local v p
+  v="$(debian_mesa_version)" || exit 1
+  for p in "${MESA_IMAGE_PACKAGES[@]}"; do printf '%s\n' "${DEBIAN_MESA_DIR}/${p}_${v}_${DEBIAN_ARCH}.deb"; done
+}
+
+# The patches and debian.diff in the checkout are the ones OUT_DIR/mesa was
+# built from (MESA-ID): the image's doc directory gets the checkout's copies.
+debian_mesa_sources_match() {
+  [ "$(awk 'NF {print "patch=" $2 " " $1}' "${SRC}/userspace/mesa/patches.sha256")" = "$(grep '^patch=' "${DEBIAN_MESA_DIR}/MESA-ID")" ] \
+    && grep -Fxq "debian_diff=userspace/mesa/debian.diff $(sha256sum "${SRC}/userspace/mesa/debian.diff" | cut -d' ' -f1)" "${DEBIAN_MESA_DIR}/MESA-ID" \
+    || die "userspace/mesa differs from what ${DEBIAN_MESA_DIR} was built from (MESA-ID) -- run the mesa stage again"
+}
+
 # --- inputs ---------------------------------------------------------------------
 
 # Everything the root filesystem is made from, one `key=value` per line. The
@@ -131,7 +161,7 @@ distro_rootfs_inputs() {
 # The OUT_DIR files this configuration installs, sorted. Missing ones are
 # reported by distro_rootfs_build, not here.
 debian_out_inputs() {
-  local -a dirs=("${DEBIAN_HOOK_DIR}")
+  local -a dirs=("${DEBIAN_HOOK_DIR}" "${DEBIAN_MESA_DIR}")
   if [ "$(debian_switch A7S_DESKTOP)" = 1 ]; then dirs+=("${DEBIAN_XFWM4_DIR}" "${DEBIAN_ORC_DIR}"); fi
   if [ "$(debian_kernel_source)" = release ]; then dirs+=("${DEBIAN_KERNEL_DIR}" "${DEBIAN_DKMS_DIR}"); fi
   [ "${#dirs[@]}" -gt 0 ] || return 0
@@ -179,8 +209,17 @@ distro_rootfs_build() {  # <dir>
   # against the signed index of the snapshot before it is used.
   local debs="${CACHE_DIR}/debian-${DEBIAN_SUITE}-${DEBIAN_ARCH}-debs"
   mkdir -p "${debs}"
-  local include
-  include="$(IFS=,; echo "${DEBIAN_BASE_PACKAGES[*]},${STANDARD_IMAGE_PACKAGES[*]},${MESA_IMAGE_PACKAGES[*]}")"
+  local include deb
+  include="$(IFS=,; echo "${DEBIAN_BASE_PACKAGES[*]},${STANDARD_IMAGE_PACKAGES[*]}")"
+  # Our Mesa goes in with the first packages, as local .deb files, so apt meets
+  # every dependency on a Mesa package (kmscon's on libgbm1, libglvnd's on a
+  # vendor library) with ours and Debian's Mesa is never installed, not even
+  # for a moment. A path is its own --include (mmdebstrap does not split it);
+  # the file-mirror-automount hook binds each file into the chroot under the
+  # same path and unbinds it before the customize hook, which removes the
+  # empty mount points it leaves (debian_mesa).
+  local -a mesa_include=()
+  while IFS= read -r deb; do mesa_include+=("--include=${deb}"); done < <(debian_mesa_debs)
 
   rm -rf "${r}"
   # Environment the customize hook reads (it is a separate process).
@@ -203,11 +242,13 @@ distro_rootfs_build() {  # <dir>
       --aptopt='Acquire::Retries "5"' \
       --aptopt='APT::Install-Recommends "false"' \
       --include="${include}" \
+      "${mesa_include[@]}" \
       --skip=download/empty --skip=essential/unlink \
       --setup-hook='mkdir -p "$1"/var/cache/apt/archives/' \
       --setup-hook="sync-in ${debs} /var/cache/apt/archives/" \
       --setup-hook='chown -R 0:0 "$1"/var/cache/apt/archives' \
       --setup-hook="${DEBIAN_DIR}/setup-hook" \
+      --hook-dir=/usr/share/mmdebstrap/hooks/file-mirror-automount \
       --customize-hook="${DEBIAN_DIR}/customize-hook" \
       --customize-hook="sync-out /var/cache/apt/archives ${debs}" \
       --customize-hook='rm -f "$1"/var/cache/apt/archives/*.deb' \
@@ -235,6 +276,18 @@ debian_check_out_inputs() {
   fi
   compgen -G "${DEBIAN_HOOK_DIR}/a7s-kernel-hook_*_all.deb" >/dev/null \
     || die "the image needs the a7s-kernel-hook package in ${DEBIAN_HOOK_DIR} (the kernel stage)"
+  # Our Mesa: MESA-ID lists exactly the runtime packages, each by its sha256.
+  [ -f "${DEBIAN_MESA_DIR}/MESA-ID" ] || die "the image needs our Mesa in ${DEBIAN_MESA_DIR} (the mesa stage)"
+  local deb listed n
+  while IFS= read -r deb; do
+    listed="$(awk -v f="${deb##*/}" '$1 == "deb=" f {print $2}' "${DEBIAN_MESA_DIR}/MESA-ID")"
+    [ -f "${deb}" ] && [ -n "${listed}" ] && [ "${listed}" = "$(sha256sum "${deb}" | cut -d' ' -f1)" ] \
+      || die "${deb##*/} is missing in ${DEBIAN_MESA_DIR} or not the one MESA-ID describes (the mesa stage)"
+  done < <(debian_mesa_debs)
+  n="$(grep -c '^deb=' "${DEBIAN_MESA_DIR}/MESA-ID" || true)"
+  [ "${n}" = "${#MESA_IMAGE_PACKAGES[@]}" ] \
+    || die "${DEBIAN_MESA_DIR}/MESA-ID lists ${n} packages, the image installs ${#MESA_IMAGE_PACKAGES[@]} (MESA_IMAGE_PACKAGES)"
+  debian_mesa_sources_match
   if [ "$(debian_kernel_source)" = release ]; then
     [ -f "${DEBIAN_KERNEL_DIR}/RELEASE-ID" ] && compgen -G "${DEBIAN_KERNEL_DIR}/linux-image-*_arm64.deb" >/dev/null \
       && compgen -G "${DEBIAN_DKMS_DIR}/a7s-aic8800-dkms_*_all.deb" >/dev/null && [ -f "${DEBIAN_DKMS_DIR}/DKMS-ID" ] \
@@ -252,22 +305,27 @@ debian_setup() {  # <root>
 # kmscon (>= ${KMSCON_MIN_VERSION}) and the libtsm4 it needs are backports-only.
 # Every other package keeps the archive default: backports at priority 100
 # loses to the release's 500, and the image is built with no package from
-# backports beyond these two and Mesa.
+# backports beyond these two.
 Package: kmscon libtsm4
 Pin: release n=${DEBIAN_SUITE}-backports
 Pin-Priority: 990
 EOF
-  cat > "${r}/etc/apt/preferences.d/mesa-backports" <<EOF
-# Mesa comes from ${DEBIAN_SUITE}-backports: ${DEBIAN_SUITE}'s own Mesa has no
-# PowerVR Vulkan driver. "Package: src:mesa" matches every binary package built
-# from the mesa source, so they move together and never split across two
-# archives (apt_preferences(5)). 990: above the release's 500, below 1000, so
-# apt never downgrades for it.
+  local mv; mv="$(debian_mesa_version)" || exit 1
+  case "${mv}" in *+a7s*) ;; *) die "Mesa ${mv} does not carry the +a7s mark ${DEBIAN_MESA_APT_PIN} pins" ;; esac
+  cat > "${r}/${DEBIAN_MESA_APT_PIN}" <<EOF
+# a7s-build: Mesa ${mv} is Mesa ${mv%%-*} with the patches in
+# /${DEBIAN_MESA_DOC_DIR}/patches, packaged from Debian's mesa source.
+# "Package: src:mesa" matches every binary package built from the mesa
+# source, so they move together and never mix with Debian's builds
+# (apt_preferences(5)). 990: above the release's 500, below 1000, so apt keeps
+# ours whatever version Debian publishes, and never downgrades for it. The
+# pin matches every build of this recipe (+a7s<n>), so a later one installed
+# by hand stays pinned too.
 Package: src:mesa
-Pin: release n=${DEBIAN_SUITE}-backports
+Pin: version *+a7s*
 Pin-Priority: 990
 EOF
-  chmod 0644 "${r}"/etc/apt/preferences.d/*-backports
+  chmod 0644 "${r}"/etc/apt/preferences.d/kmscon-backports "${r}/${DEBIAN_MESA_APT_PIN}"
 }
 
 # --- customize hook: after the packages, with /proc, /sys and /dev set up -----
@@ -284,9 +342,11 @@ debian_customize() {  # <root>
   debian_kernel_hook "${r}"
   if [ "$(debian_kernel_source)" = release ]; then debian_kernel_release "${r}"; fi
   debian_assert_kmscon "${r}"
-  debian_assert_mesa "${r}"
+  debian_mesa "${r}"
 
   if [ "${A7S_DESKTOP}" = 1 ]; then debian_desktop "${r}"; debian_orc "${r}"; fi
+  # After the desktop: nothing it installed may have brought a Mesa package.
+  debian_assert_mesa "${r}"
   assert_backports_allow_list "${r}"
   assert_no_pending_upgrades "${r}"
 
@@ -462,15 +522,56 @@ debian_assert_kmscon() {  # <root>
   log "kmscon ${v} from ${DEBIAN_SUITE}-backports"
 }
 
-# The image carries one Mesa, Debian's, from backports: every package built
-# from the mesa source is a backports build, the PowerVR Vulkan driver and its
-# ICD manifest are there, and there is exactly one libgallium.
+# Our Mesa is in (mmdebstrap installed it from OUT_DIR/mesa with the first
+# packages): the empty mount points the file-mirror-automount hook left go,
+# the stage's record and its sources go to DEBIAN_MESA_DOC_DIR.
+debian_mesa() {  # <root>
+  local r="$1" deb d ver p
+  ver="$(debian_mesa_version)" || exit 1
+  debian_mesa_sources_match
+  while IFS= read -r deb; do
+    if [ -e "${r}${deb}" ]; then
+      [ -f "${r}${deb}" ] && [ ! -s "${r}${deb}" ] || die "${deb} inside the rootfs is not the empty mount point the automount hook left"
+      rm -f "${r}${deb}"
+    fi
+  done < <(debian_mesa_debs)
+  d="${DEBIAN_MESA_DIR}"
+  while [ -n "${d}" ] && [ "${d}" != / ] && [ "${d}" != "${OUT_DIR%/*}" ]; do
+    rmdir "${r}${d}" 2>/dev/null || break
+    d="${d%/*}"
+  done
+  [ ! -e "${r}${DEBIAN_MESA_DIR}" ] || die "${DEBIAN_MESA_DIR} is left in the rootfs"
+  install -d -m0755 "${r}/${DEBIAN_MESA_DOC_DIR}/patches"
+  install -m0644 "${DEBIAN_MESA_DIR}/MESA-ID" "${SRC}/userspace/mesa/debian.diff" "${r}/${DEBIAN_MESA_DOC_DIR}/"
+  for p in "${SRC}"/userspace/mesa/patches/*.patch "${SRC}/userspace/mesa/patches/series"; do
+    [ -f "${p}" ] && install -m0644 "${p}" "${r}/${DEBIAN_MESA_DOC_DIR}/patches/"
+  done
+  log "Mesa ${ver} installed from ${DEBIAN_MESA_DIR} and pinned (${DEBIAN_MESA_APT_PIN})"
+}
+
+# The image carries one Mesa, ours: the packages built from the mesa source are
+# exactly MESA_IMAGE_PACKAGES at the version of MESA-ID, apt's candidate for
+# each is that version (the pin holds), the PowerVR Vulkan driver and its ICD
+# manifest are there, and there is exactly one libgallium.
 debian_assert_mesa() {  # <root>
-  local r="$1" bad ver g n v mlib="$1/usr/lib/aarch64-linux-gnu" ldcache lres lcanon wcanon dv
-  bad="$(in_root "${r}" dpkg-query -W -f='${Package}\t${Version}\t${source:Package}\n' \
-           | awk -F'\t' -v m="${MESA_BPO_MARK}" '$3 == "mesa" && index($2, m) == 0 {print $1 " " $2}')"
-  [ -z "${bad}" ] || die "Mesa packages not from ${DEBIAN_SUITE}-backports: $(tr '\n' ';' <<<"${bad}")"
+  local r="$1" bad ver g n v mlib="$1/usr/lib/aarch64-linux-gnu" ldcache lres lcanon wcanon dv have want pol
+  ver="$(debian_mesa_version)" || exit 1
+  bad="$(in_root "${r}" dpkg-query -W -f='${db:Status-Status}\t${Package}\t${Version}\t${source:Package}\n' \
+           | awk -F'\t' -v v="${ver}" '$1 == "installed" && $4 == "mesa" && $3 != v {print $2 " " $3}')"
+  [ -z "${bad}" ] || die "packages built from the mesa source that are not ours (${ver}): $(tr '\n' ';' <<<"${bad}")"
   assert_installed "${r}" "the image's Mesa is incomplete" "${MESA_IMAGE_PACKAGES[@]}"
+  have="$(in_root "${r}" dpkg-query -W -f='${db:Status-Status}\t${Package}\t${source:Package}\n' \
+            | awk -F'\t' '$1 == "installed" && $3 == "mesa" {print $2}' | LC_ALL=C sort)"
+  want="$(printf '%s\n' "${MESA_IMAGE_PACKAGES[@]}" | LC_ALL=C sort)"
+  [ "${have}" = "${want}" ] \
+    || die "the image carries other Mesa packages than its runtime set: $(LC_ALL=C comm -3 <(printf '%s\n' "${have}") <(printf '%s\n' "${want}") | tr -d '\t' | tr '\n' ' ')"
+  grep -Fxq "Pin: version *+a7s*" "${r}/${DEBIAN_MESA_APT_PIN}" && grep -Fxq "Package: src:mesa" "${r}/${DEBIAN_MESA_APT_PIN}" \
+    && grep -Fxq "Pin-Priority: 990" "${r}/${DEBIAN_MESA_APT_PIN}" \
+    || die "${DEBIAN_MESA_APT_PIN} does not pin src:mesa at *+a7s*, priority 990"
+  for v in "${MESA_IMAGE_PACKAGES[@]}"; do
+    pol="$(in_root "${r}" apt-cache policy "${v}")"
+    grep -Fxq "  Candidate: ${ver}" <<<"${pol}" || die "apt's candidate for ${v} is not ${ver}: ${pol//$'\n'/ | }"
+  done
   ver="$(in_root "${r}" dpkg-query -W -f='${Version}' mesa-vulkan-drivers)"
   [ -e "${r}/${MESA_POWERVR_VK_LIB}" ] || die "mesa-vulkan-drivers ${ver} has no /${MESA_POWERVR_VK_LIB}"
   compgen -G "${r}/usr/share/vulkan/icd.d/powervr_mesa_icd*.json" >/dev/null \
@@ -494,17 +595,17 @@ debian_assert_mesa() {  # <root>
   dv="$(in_root "${r}" dpkg -V "${MESA_IMAGE_PACKAGES[@]}" 2>&1)" || die "dpkg -V failed: ${dv}"
   [ -z "${dv}" ] || die "dpkg -V reports changed files in the Mesa packages: ${dv}"
   in_root "${r}" apt-get check >/dev/null 2>&1 || die "apt-get check reports a broken dependency state"
-  log "Mesa ${ver} from ${DEBIAN_SUITE}-backports, $(basename "${MESA_POWERVR_VK_LIB}") present, one libgallium"
+  log "Mesa ${ver} (ours, the only one), $(basename "${MESA_POWERVR_VK_LIB}") present, one libgallium"
 }
 
 # Nothing comes from backports but what the pins admit.
 assert_backports_allow_list() {  # <root>
   local bad
   bad="$(in_root "$1" dpkg-query -W -f='${db:Status-Status}\t${Package}\t${Version}\t${source:Package}\n' \
-           | awk -F'\t' -v m="${MESA_BPO_MARK}" -v pk=" ${BACKPORTS_ALLOWED_PACKAGES[*]} " -v src=" ${BACKPORTS_ALLOWED_SOURCES[*]} " \
-               '$1 == "installed" && index($3, m) && !index(pk, " " $2 " ") && !index(src, " " $4 " ") {print $2 " " $3 " (source " $4 ")"}')"
+           | awk -F'\t' -v m="${DEBIAN_BPO_MARK}" -v pk=" ${BACKPORTS_ALLOWED_PACKAGES[*]} " \
+               '$1 == "installed" && index($3, m) && !index(pk, " " $2 " ") {print $2 " " $3 " (source " $4 ")"}')"
   [ -z "${bad}" ] \
-    || die "packages from ${DEBIAN_SUITE}-backports that no pin admits (allowed: ${BACKPORTS_ALLOWED_PACKAGES[*]}, source ${BACKPORTS_ALLOWED_SOURCES[*]}): $(tr '\n' ';' <<<"${bad}")"
+    || die "packages from ${DEBIAN_SUITE}-backports that no pin admits (allowed: ${BACKPORTS_ALLOWED_PACKAGES[*]}): $(tr '\n' ';' <<<"${bad}")"
 }
 
 # Nothing is older than apt's candidate at the snapshot: -updates and -security
@@ -672,8 +773,37 @@ EOF
   log "xfwm4 ${ver} installed over Debian's ${base} and pinned"
 }
 
+# The X server of the desktop draws with glamor (20-a7s-modesetting.conf) and
+# is started by LightDM through a7s-xserver, the one place that sets
+# PVR_I_WANT_A_BROKEN_VULKAN_DRIVER (the file says why). Fails unless
+# a7s-xserver is the only xserver-command LightDM is given, starts /usr/bin/X,
+# and the variable is set nowhere a session or a login reads it.
+debian_desktop_xserver() {  # <root>
+  local r="$1" w=/usr/libexec/a7s-xserver cmds f
+  [ -x "${r}${w}" ] || die "${w} is missing or not executable"
+  [ -x "${r}/usr/bin/X" ] || die "no /usr/bin/X in the rootfs (${w} starts it)"
+  grep -Fxq 'exec /usr/bin/X "$@"' "${r}${w}" && grep -Fxq 'export PVR_I_WANT_A_BROKEN_VULKAN_DRIVER=1' "${r}${w}" \
+    || die "${w} does not export the variable and exec /usr/bin/X"
+  grep -Fxq '    Option     "AccelMethod" "glamor"' "${r}/etc/X11/xorg.conf.d/20-a7s-modesetting.conf" \
+    || die "20-a7s-modesetting.conf does not select glamor"
+  # Only the directories that exist: grep exits 2 on a missing one even with -s,
+  # which pipefail and errexit would turn into a silent stop of the hook.
+  local d dirs=()
+  for d in etc/lightdm usr/share/lightdm etc/xdg/lightdm; do if [ -d "${r}/${d}" ]; then dirs+=("${r}/${d}"); fi; done
+  cmds="$(grep -rhsE '^[[:space:]]*xserver-command[[:space:]]*=' "${dirs[@]}" | tr -d '[:space:]')" \
+    || die "no xserver-command in LightDM's configuration (${w})"
+  [ "${cmds}" = "xserver-command=${w}" ] \
+    || die "LightDM's xserver-command is not exactly ${w}: '${cmds}'"
+  for f in etc/environment etc/environment.d usr/lib/environment.d etc/X11/Xsession.d etc/profile etc/profile.d \
+           etc/security/pam_env.conf etc/xdg/xfce4 etc/xdg/autostart etc/skel \
+           etc/systemd/system.conf etc/systemd/system.conf.d etc/systemd/user.conf etc/systemd/user.conf.d etc/systemd/user; do
+    ! grep -rqsF PVR_I_WANT_A_BROKEN_VULKAN_DRIVER "${r}/${f}" \
+      || die "PVR_I_WANT_A_BROKEN_VULKAN_DRIVER is set in /${f}: only the X server may have it (${w})"
+  done
+}
+
 # The desktop's configuration: greeter outputs, greeter language menu, the
-# Xfce look, LightDM as display manager, graphical.target.
+# Xfce look, LightDM as display manager, the X server, graphical.target.
 debian_desktop_config() {  # <root>
   local r="$1" dm_link lookd="$1/${DESKTOP_LOOK_DIR}" pkg_panel="$1/etc/xdg/xfce4/panel/default.xml"
   local menu_line='<property name="plugin-1" type="string" value="applicationsmenu"/>' panel_diff
@@ -691,6 +821,7 @@ debian_desktop_config() {  # <root>
   if grep -rqsE '^[[:space:]]*autologin-user[[:space:]]*=' "${r}/etc/lightdm" "${r}/usr/share/lightdm"; then
     die "LightDM is configured to log in automatically -- the account would never get a password"
   fi
+  debian_desktop_xserver "${r}"
 
   # The look: Greybird, elementary-xfce icons, the Whisker menu as the panel's
   # main menu, in a configuration directory of the image's own that
@@ -931,8 +1062,8 @@ Components: main non-free-firmware
 Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
 EOF
   cat > "${r}/etc/apt/sources.list.d/${DEBIAN_SUITE}-backports.sources" <<EOF
-# Reachable for exactly the packages named in preferences.d/kmscon-backports and
-# preferences.d/mesa-backports; everything else stays on ${DEBIAN_SUITE}.
+# Reachable for exactly the packages named in preferences.d/kmscon-backports;
+# everything else stays on ${DEBIAN_SUITE}.
 Types: deb
 URIs: ${DEBIAN_MIRROR_FINAL}
 Suites: ${DEBIAN_SUITE}-backports
@@ -1052,6 +1183,9 @@ distro_rootfs_assert() {  # <dir>
   [ -z "$(find "${r}/var/lib/apt/lists" -maxdepth 1 -type f ! -name lock -print -quit 2>/dev/null)" ] || die "apt package lists in the rootfs"
   [ -z "$(find "${r}/var/log" -type f -print -quit)" ] || die "log files in the rootfs: $(find "${r}/var/log" -type f | head -3 | tr '\n' ' ')"
   ! grep -rqs 'snapshot\.debian\.org' "${r}/etc/apt" || die "a snapshot source in the rootfs's apt configuration"
+  [ ! -e "${r}${OUT_DIR}" ] || die "${OUT_DIR} is in the rootfs -- a mount point of the Mesa install is left (debian_mesa)"
+  [ -f "${r}/${DEBIAN_MESA_APT_PIN}" ] && grep -Fxq "Package: src:mesa" "${r}/${DEBIAN_MESA_APT_PIN}" \
+    || die "no ${DEBIAN_MESA_APT_PIN} pinning src:mesa -- apt upgrade would replace our Mesa"
   [ ! -e "${r}/etc/apt/apt.conf.d/99mmdebstrap" ] || die "mmdebstrap's build-time apt options are in the rootfs"
   # Ownership: nothing outside /home belongs to a regular uid/gid (a leak of
   # the builder's).

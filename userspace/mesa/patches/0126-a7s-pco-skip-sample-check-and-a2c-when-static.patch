@@ -1,0 +1,96 @@
+Description: pco: skip default sample check and alpha-to-coverage when static
+ Every non-internal fragment shader gets a default sample check
+ (sample_mask_in & (1 << sample_id), discard when zero) and the
+ alpha-to-coverage lowering, both driven by the FS meta word. With a
+ static single sample count the default check equals the helper
+ invocation test, which already uses sample_mask_in including the sample
+ mask from the meta word. With alpha-to-coverage statically disabled the
+ lowering only adds dead code. Record both static states in pco_fs_data
+ and skip the passes then. Explicit gl_SampleMask writes keep their check.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/pco/pco_data.h
++++ b/src/imagination/pco/pco_data.h
+@@ -105,6 +105,9 @@ typedef struct _pco_fs_data {
+ 
+    uint16_t rasterization_samples;
+ 
++   bool static_single_sample;
++   bool static_no_alpha_to_coverage;
++
+    pco_range tile_buffers;
+ 
+    pco_range sample_locations;
+--- a/src/imagination/pco/pco_internal.h
++++ b/src/imagination/pco/pco_internal.h
+@@ -1828,7 +1828,7 @@ bool pco_nir_lower_vs_intrinsics(nir_shader *shader);
+ bool pco_nir_lower_images(nir_shader *shader, pco_data *data, pco_ctx *ctx);
+ bool pco_nir_lower_interpolation(nir_shader *shader, pco_fs_data *fs);
+ bool pco_nir_lower_io(nir_shader *shader, pco_data *data);
+-bool pco_nir_lower_sample_mask_out(nir_shader *shader);
++bool pco_nir_lower_sample_mask_out(nir_shader *shader, bool single_sample);
+ bool pco_nir_lower_shared_io_to_global(nir_shader *shader, unsigned usc_slots);
+ bool pco_nir_lower_subgroups(nir_shader *shader);
+ bool pco_nir_lower_tex(nir_shader *shader, pco_data *data, pco_ctx *ctx);
+--- a/src/imagination/pco/pco_nir.c
++++ b/src/imagination/pco/pco_nir.c
+@@ -1251,7 +1251,7 @@ void pco_lower_nir(pco_ctx *ctx, nir_shader *nir, pco_data *data)
+    NIR_PASS(_, nir, pco_nir_lower_tex, data, ctx);
+ 
+    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+-      if (!internal)
++      if (!internal && !data->fs.static_no_alpha_to_coverage)
+          NIR_PASS(_, nir, pco_nir_lower_alpha_to_coverage);
+ 
+       NIR_PASS(_, nir, nir_lower_blend, &data->fs.blend_opts);
+@@ -1267,7 +1267,10 @@ void pco_lower_nir(pco_ctx *ctx, nir_shader *nir, pco_data *data)
+       NIR_PASS(_, nir, nir_opt_peephole_select, &peep_opts);
+       NIR_PASS(_, nir, pco_nir_lower_interpolation, &data->fs);
+       if (!internal)
+-         NIR_PASS(_, nir, pco_nir_lower_sample_mask_out);
++         NIR_PASS(_,
++                  nir,
++                  pco_nir_lower_sample_mask_out,
++                  data->fs.static_single_sample);
+       NIR_PASS(_, nir, pco_nir_pfo, &data->fs);
+       NIR_PASS(_, nir, nir_lower_is_helper_invocation);
+       NIR_PASS(_, nir, pco_nir_lower_fs_intrinsics);
+--- a/src/imagination/pco/pco_nir_pvfio.c
++++ b/src/imagination/pco/pco_nir_pvfio.c
+@@ -511,11 +511,11 @@ static bool lower_sample_mask_out(nir_builder *b, nir_intrinsic_instr *intr, UNU
+    return true;
+ }
+ 
+-bool pco_nir_lower_sample_mask_out(nir_shader *shader)
++bool pco_nir_lower_sample_mask_out(nir_shader *shader, bool single_sample)
+ {
+    bool progress = nir_shader_intrinsics_pass(shader, lower_sample_mask_out, nir_metadata_control_flow, NULL);
+-   if (progress)
+-      return true;
++   if (progress || single_sample)
++      return progress;
+ 
+    /* If the sample check isn't present, then add one ourselves. */
+    nir_builder b = nir_builder_at(
+--- a/src/imagination/vulkan/pvr_arch_pipeline.c
++++ b/src/imagination/vulkan/pvr_arch_pipeline.c
+@@ -2807,6 +2807,15 @@ pvr_preprocess_shader_data(pco_data *data,
+       if (state->ms)
+          data->fs.uses.alpha_to_coverage = state->ms->alpha_to_coverage_enable;
+ 
++      data->fs.static_no_alpha_to_coverage =
++         !BITSET_TEST(state->dynamic,
++                      MESA_VK_DYNAMIC_MS_ALPHA_TO_COVERAGE_ENABLE) &&
++         !data->fs.uses.alpha_to_coverage;
++
++      data->fs.static_single_sample =
++         !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_MS_RASTERIZATION_SAMPLES) &&
++         (!state->ms || state->ms->rasterization_samples <= 1);
++
+       if (BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_CB_COLOR_WRITE_ENABLES) ||
+           (state->cb && state->cb->color_write_enables !=
+                            BITFIELD_MASK(MESA_VK_MAX_COLOR_ATTACHMENTS))) {

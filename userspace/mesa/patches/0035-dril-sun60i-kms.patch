@@ -1,0 +1,33 @@
+Description: dril: add sun60i-kms to the driver list
+ Add sun60i-kms to the driver list in src/gallium/targets/dril/meson.build
+ (link sun60i-kms_dri.so to dril_dri.so) and the entry point
+ __driDriverGetExtensions_sun60i_kms to dril_target.c. AIGLX in the X server
+ looks up this symbol; without it loading fails with "undefined symbol:
+ __driDriverExtensions". It only has an effect with glamor (without glamor
+ there is no DRI2 and IGLX loads swrast); the goal is glamor over kmsro.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/gallium/targets/dril/meson.build
++++ b/src/gallium/targets/dril/meson.build
+@@ -97,6 +97,7 @@
+                'sti',
+                'stm',
+                'sun4i-drm',
++               'sun60i-kms',
+                'udl',
+                'vkms',
+                'zynqmp-dpsub',
+--- a/src/gallium/targets/dril/dril_target.c
++++ b/src/gallium/targets/dril/dril_target.c
+@@ -682,6 +682,7 @@
+ DEFINE_LOADER_DRM_ENTRYPOINT(sti)
+ DEFINE_LOADER_DRM_ENTRYPOINT(stm)
+ DEFINE_LOADER_DRM_ENTRYPOINT(sun4i_drm)
++DEFINE_LOADER_DRM_ENTRYPOINT(sun60i_kms)
+ DEFINE_LOADER_DRM_ENTRYPOINT(udl)
+ DEFINE_LOADER_DRM_ENTRYPOINT(zynqmp_dpsub)
+ DEFINE_LOADER_DRM_ENTRYPOINT(lima)

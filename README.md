@@ -14,15 +14,17 @@ sha256 committed here.
 
 ## Requirements
 
-- x86_64 or aarch64 Linux host (both tested).
+- x86_64 or aarch64 Linux host (both tested before the Mesa build was added;
+  the Mesa build on aarch64 is not tested yet,
+  [docs/building.md](docs/building.md#what-the-host-needs)).
 - On an x86_64 host: Linux kernel >= 6.7, or a `qemu-aarch64` binfmt handler
   registered on the host with the `F` flag (the root filesystem is arm64).
 - `git`, and **podman >= 4 or docker >= 24**. Tested: rootless podman 5.8,
   docker 29.8 (inside a podman container).
-- About 20 GB free disk, 8 GB RAM (lower `A7S_JOBS` if tight).
+- About 30 GB free disk, 8 GB RAM (lower `A7S_JOBS` if tight).
 - Internet access during the build.
 - Time: about an hour for the first build on 4 cores with `A7S_KERNEL=build` (the kernel is
-  compiled; [docs/building.md](docs/building.md) has the time of the default); later builds reuse the cache.
+  compiled; [docs/building.md](docs/building.md) has the time of the default), plus the Mesa build, not timed yet; later builds reuse the cache.
 
 ## Quick start
 
@@ -33,8 +35,10 @@ cd a7s-build
 ```
 
 The image lands in `out/`: `a7s-trixie-minimal.img.xz` (about 207 MB;
-1.8 GiB unpacked; with `A7S_KERNEL=build`, 155 MB and 1.5 GiB) and its `.sha256`. For the Xfce desktop, build with
-`A7S_DESKTOP=1 ./build.sh`; the image is then `a7s-trixie-desktop.img.xz`.
+1.8 GiB unpacked; with `A7S_KERNEL=build`, 155 MB and 1.5 GiB; measured before
+the `mesa` stage) and its `.sha256`. For the Xfce desktop, build with
+`A7S_DESKTOP=1 ./build.sh`; the image is then `a7s-trixie-desktop.img.xz`
+(about 600 MB; 3.8 GiB unpacked).
 `./build.sh --help` lists stages and switches; details in
 [docs/building.md](docs/building.md).
 
@@ -122,13 +126,17 @@ apt upgrade` brings the rest.
 New kernels come as releases of the kernel recipe, the repository
 [a7s-linux-lts](https://github.com/DockSeed/a7s-linux-lts/releases) with the
 scripts and patches that build the kernel; `sudo a7s-kernel-update` installs the
-newest. A release has a tag (`v6.18.64-R2`) and the kernel in it has a release
-name (`6.18.64-r2`, what `uname -r` prints): both name the same release. There is no guarantee for how long new
+newest. A release has a tag (`v6.18.64-R3`) and the kernel in it has a release
+name (`6.18.64-r3`, what `uname -r` prints): both name the same release. There is no guarantee for how long new
 releases will be published. Kernel releases follow Linux stable when we get to
 it. Whether and how soon a fix from Linux, security fixes included, reaches a
 release is not guaranteed. If a board needs kernel fixes on a schedule of its
 own, build the kernel with the recipe; the steps are in its README. The kernel, its device tree and the WLAN/BT driver
 are not part of `apt upgrade`: there is no apt source for them.
+
+Mesa is built by this recipe and pinned ([image](docs/image.md#mesa)): `apt
+upgrade` keeps it, and a Mesa fix, security fixes included, reaches the board
+only with a new build of this recipe.
 
 **1. Update the kernel.** The board needs network and the time of a download
 (four packages) and of the driver build (DKMS, which builds the WLAN driver for
@@ -136,14 +144,14 @@ the new kernel on the board). A release with a new WLAN driver brings it along.
 
     sudo a7s-kernel-update
 
-For a given release: `sudo a7s-kernel-update v6.18.64-R2`. A published test
+For a given release: `sudo a7s-kernel-update v6.18.64-R3`. A published test
 build (a pre-release, which "latest" leaves out) is named the same way,
 `v6.18.64-T1`; the command says that it is a test build.
 It downloads the release's packages, checks their sha256 against the release's
 `SHA256SUMS` (on a mismatch it removes them and stops), installs them and
 removes the download. The last line of its output tells what happens next:
 
-- `kernel 6.18.64-r2 starts at the next boot. Next: sudo reboot`: all is in place.
+- `kernel 6.18.64-r3 starts at the next boot. Next: sudo reboot`: all is in place.
 - `already up to date`: this kernel is installed and set to start; nothing was done.
 - `installed but will NOT start at the next boot`: above that line, the
   messages of `a7s-kernel-hook` give the reason and the command to run once the
@@ -160,7 +168,7 @@ removes the download. The last line of its output tells what happens next:
     sudo reboot
 
 **3. Check what runs.** `uname -r` prints the release of the running kernel
-(`6.18.64-r2`). `grep kernel /boot/extlinux/extlinux.conf` names the kernel
+(`6.18.64-r3`). `grep kernel /boot/extlinux/extlinux.conf` names the kernel
 that starts at the next boot, `grep kernel /boot/extlinux/extlinux-fallback.conf`
 the one safe mode starts.
 
@@ -185,7 +193,7 @@ now becomes the safe-mode kernel.
 
 **5. Remove a kernel you do not want.**
 
-    sudo apt remove linux-image-6.18.64-r2 linux-headers-6.18.64-r2
+    sudo apt remove linux-image-6.18.64-r3 linux-headers-6.18.64-r3
 
 `apt` refuses while `extlinux.conf` or `extlinux-fallback.conf` names the
 kernel; after step 4 neither names the failed one, so this works. An older kernel
@@ -293,7 +301,8 @@ every component in it.
 
 Our own files are `GPL-2.0-only OR MIT`. Patches and bundled code keep the
 licence of the project they belong to (ORC BSD-2-Clause, xfwm4
-GPL-2.0-or-later). The boot chain and the kernel are not
+GPL-2.0-or-later, Mesa MIT; `userspace/mesa/debian.diff` as *Debian*'s
+packaging of Mesa, see [REUSE.toml](REUSE.toml)). The boot chain and the kernel are not
 part of this repository: [a733-bootchain](https://github.com/DockSeed/a733-bootchain)
 and [a7s-linux-lts](https://github.com/DockSeed/a7s-linux-lts), each pinned to a
 commit, have their own licences. The repository as a whole can be shared under

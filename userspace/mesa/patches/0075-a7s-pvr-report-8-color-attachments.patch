@@ -1,0 +1,73 @@
+Description: pvr: report 8 color attachments
+ maxColorAttachments and maxFragmentOutputAttachments are literals of 4 and
+ maxFragmentCombinedOutputResources is 4, the Vulkan 1.0 minimums set by
+ a22ad99bdd2 ("pvr: set device features/props/extensions to Vulkan 1.0
+ minimums (unless implemented)"). Before that commit the driver reported
+ PVR_MAX_COLOR_ATTACHMENTS (8, PVR_NUM_PBE_EMIT_REGS in rogue_hw_defs.h) and
+ the sum of color attachments, storage buffers and storage images per stage.
+ The hardware has 8 PBE emits per tile: pbestate.xml STATE_WORD1 mrt_index is
+ 3 bits, kmd_stream.xml CMD_FRAG pbe_word holds 8 x 3 PBE register words.
+ .
+ On cores without eight_output_registers, such as BXM-4-64, the 4 output
+ registers hold one pixel of up to 128 bits (pbestate.xml SOURCE_POS
+ START_BIT0..96) and further attachments go to up to 7 tile buffers
+ (PVR_MAX_TILE_BUFFER_COUNT). All paths for these exist: allocation for
+ render passes and dynamic rendering (pvr_surface_alloc_color_storage(),
+ pvr_alloc_mrt()), fragment shader stores (trans_store_output() in
+ pco_trans_nir.c), load ops, clears, the end of tile program
+ (pvr_usc_eot()), and for partial renders the SPM end of tile program with
+ one emit for the output registers and one per tile buffer
+ (pvr_arch_spm_init_eot_state(), d1f2ad17dd6 "pvr: Add missing support for
+ tile buffers to SPM EOT programs") and the SPM background load
+ (pvr_uscgen_spm_load(), up to 7 tile buffers). The "Add support for tile
+ buffers in EOT" finishme is in the eight_output_registers branch only. Each
+ attachment takes at most 4 dwords, and an attachment only opens a new tile
+ buffer when it fits into none of the existing ones, so 8 attachments always
+ fit into the output registers and 7 tile buffers; the render pass fallback
+ with z replication needs the previous patch.
+ .
+ Report PVR_MAX_COLOR_ATTACHMENTS for maxColorAttachments and
+ maxFragmentOutputAttachments, and maxFragmentCombinedOutputResources as
+ color attachments plus storage buffers and storage images per stage. zink
+ takes PIPE_CAP max_render_targets and with it GL_MAX_DRAW_BUFFERS from
+ maxColorAttachments.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/vulkan/pvr_physical_device.c
++++ b/src/imagination/vulkan/pvr_physical_device.c
+@@ -733,9 +733,8 @@
+ 
+       /* Fragment Shader Limits */
+       .maxFragmentInputComponents = 64U,
+-      .maxFragmentOutputAttachments = 4U,
++      .maxFragmentOutputAttachments = PVR_MAX_COLOR_ATTACHMENTS,
+       .maxFragmentDualSrcAttachments = 1U, /* Requires dualSrcBlend */
+-      .maxFragmentCombinedOutputResources = 4U,
+ 
+       /* Compute Shader Limits */
+       .maxComputeSharedMemorySize = 16U * 1024U,
+@@ -794,7 +793,7 @@
+       .framebufferDepthSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT,
+       .framebufferStencilSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT,
+       .framebufferNoAttachmentsSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT,
+-      .maxColorAttachments = 4U,
++      .maxColorAttachments = PVR_MAX_COLOR_ATTACHMENTS,
+       .sampledImageColorSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT,
+       .sampledImageIntegerSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT,
+       .sampledImageDepthSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT,
+@@ -1060,6 +1059,11 @@
+       properties->maxPerStageDescriptorInputAttachments +
+       properties->maxColorAttachments;
+ 
++   properties->maxFragmentCombinedOutputResources =
++      properties->maxColorAttachments +
++      properties->maxPerStageDescriptorStorageBuffers +
++      properties->maxPerStageDescriptorStorageImages;
++
+    if (strlen(pdevice->instance->drirc.debug.force_vk_devicename) > 0) {
+       snprintf(properties->deviceName,
+                sizeof(properties->deviceName),

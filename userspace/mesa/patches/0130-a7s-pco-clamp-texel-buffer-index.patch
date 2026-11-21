@@ -1,0 +1,92 @@
+Description: pco: clamp texel buffer indices to the number of elements
+ A texel buffer view is a linear 2D texture 8192 texels wide with
+ DIV_ROUND_UP(elements, 8192) rows (pvr_CreateBufferView()), and pco
+ turns the element index into (index % 8192, index / 8192) for texel
+ fetches and for storage texel buffer access. The texture unit only checks
+ against that 2D extent, so an index past the last element but inside the
+ last row reads or writes up to 8191 elements beyond the buffer, which
+ faults when the next page is unmapped. Helper invocations at the edge of
+ a draw produce such indices, for example in the st/mesa PBO upload shader.
+ Without robust buffer access, clamp the index to the last element
+ (PCO_IMAGE_META_BUFFER_ELEMS). With it, send an index past the last
+ element to row 16383, outside every view, so the texture unit handles it
+ like any other out of bounds coordinate instead of reading past the buffer.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/pco/pco_nir_tex.c
++++ b/src/imagination/pco/pco_nir_tex.c
+@@ -227,6 +227,30 @@ static inline bool tex_src_is_float(nir_tex_instr *tex,
+    return nir_tex_instr_src_type(tex, src_idx) == nir_type_float;
+ }
+ 
++static nir_def *buffer_index_to_2d(nir_builder *b,
++                                   nir_def *index,
++                                   nir_def *buf_elems,
++                                   bool robust)
++{
++   nir_def *x;
++   nir_def *y;
++
++   if (robust) {
++      nir_def *in_bounds = nir_ult(b, index, buf_elems);
++      x = nir_bcsel(b, in_bounds, nir_umod_imm(b, index, 8192), nir_imm_int(b, 0));
++      y = nir_bcsel(b,
++                    in_bounds,
++                    nir_udiv_imm(b, index, 8192),
++                    nir_imm_int(b, 16383));
++   } else {
++      index = nir_umin(b, index, nir_iadd_imm(b, buf_elems, -1));
++      x = nir_umod_imm(b, index, 8192);
++      y = nir_udiv_imm(b, index, 8192);
++   }
++
++   return nir_vec2(b, x, y);
++}
++
+ nir_intrinsic_instr *pco_emit_nir_smp(nir_builder *b, pco_smp_params *params)
+ {
+    nir_def *comps[NIR_MAX_VEC_COMPONENTS];
+@@ -534,10 +558,14 @@ static bool lower_tex(nir_builder *b, nir_tex_instr *tex, void *cb_data)
+ 
+       tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
+       params.sampler_dim = tex->sampler_dim;
++
++      nir_def *buf_elems =
++         nir_channel(b, tex_meta, PCO_IMAGE_META_BUFFER_ELEMS);
+       tex_srcs[nir_tex_src_coord] =
+-         nir_vec2(b,
+-                  nir_umod_imm(b, tex_srcs[nir_tex_src_coord], 8192),
+-                  nir_udiv_imm(b, tex_srcs[nir_tex_src_coord], 8192));
++         buffer_index_to_2d(b,
++                            tex_srcs[nir_tex_src_coord],
++                            buf_elems,
++                            data->common.robust_buffer_access);
+    } else if (data->common.sampler_2d_view_of_3d && tex->op != nir_texop_lod &&
+               tex->sampler_dim == GLSL_SAMPLER_DIM_2D && !tex->is_array) {
+       tex->sampler_dim = GLSL_SAMPLER_DIM_3D;
+@@ -1453,9 +1481,18 @@ lower_image(nir_builder *b, nir_intrinsic_instr *intr, void *cb_data)
+    /* Special case, override buffers to be 2D. */
+    if (image_dim == GLSL_SAMPLER_DIM_BUF) {
+       image_dim = GLSL_SAMPLER_DIM_2D;
+-      coords = nir_vec2(b,
+-                        nir_umod_imm(b, coords, 8192),
+-                        nir_udiv_imm(b, coords, 8192));
++
++      nir_def *tex_meta = nir_load_tex_meta_pco(b,
++                                                PCO_IMAGE_META_COUNT,
++                                                elem,
++                                                .desc_set = desc_set,
++                                                .binding = binding);
++      nir_def *buf_elems =
++         nir_channel(b, tex_meta, PCO_IMAGE_META_BUFFER_ELEMS);
++      coords = buffer_index_to_2d(b,
++                                  coords,
++                                  buf_elems,
++                                  data->common.robust_buffer_access);
+    }
+    /* Special case; lower image cube to arrayed 2d textures. */
+    else if (image_dim == GLSL_SAMPLER_DIM_CUBE) {

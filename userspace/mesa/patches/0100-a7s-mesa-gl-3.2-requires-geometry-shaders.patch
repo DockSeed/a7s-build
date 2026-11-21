@@ -1,0 +1,35 @@
+Description: mesa: require geometry shader capability for desktop GL 3.2
+ OpenGL 3.2 core requires geometry shaders. The GL 3.2 specification lists
+ MAX_GEOMETRY_OUTPUT_VERTICES with a minimum of 256 (Table 6.42), and
+ context.h (_mesa_has_geometry_shaders) assumes geometry shaders for every
+ desktop context from 3.2 on. compute_version() did not check for them, so
+ a driver without geometry shaders still reported 3.2 or higher as soon as
+ GLSL 1.50 and the listed extensions were present. zink on a device without
+ the Vulkan geometryShader feature is such a case: it advertises GLSL 4.60
+ (zink_screen.c) and reports maxGeometryOutputVertices of 0 through the
+ state tracker (st_extensions.c, MaxGeometryOutputVertices).
+ .
+ Require MaxGeometryOutputVertices >= 256 for ver_3_2. The state tracker
+ fills this constant from the screen cap for every driver, and drivers with
+ geometry shaders report at least 256, so they are unchanged. Without it the
+ version falls back to 3.1 for core and compatibility contexts (both use
+ compute_version()), the GLSL version follows to 1.40 in
+ _mesa_compute_version(), and extensions such as ARB_timer_query and
+ ARB_blend_func_extended stay listed. OpenGL ES is unchanged
+ (OES_geometry_shader gates ES 3.2).
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/mesa/main/version.c
++++ b/src/mesa/main/version.c
+@@ -302,6 +302,7 @@
+                          consts->Program[MESA_SHADER_VERTEX].MaxTextureImageUnits >= 16);
+    const bool ver_3_2 = (ver_3_1 &&
+                          consts->GLSLVersion >= 150 &&
++                         consts->MaxGeometryOutputVertices >= 256 &&
+                          extensions->ARB_depth_clamp &&
+                          extensions->ARB_draw_elements_base_vertex &&
+                          extensions->ARB_fragment_coord_conventions &&

@@ -1,0 +1,66 @@
+From 89d94f9be0ed3397071c50b89348617aada2fabb Mon Sep 17 00:00:00 2001
+From: Samuel Pitoiset <samuel.pitoiset@gmail.com>
+Date: Tue, 3 Nov 2026 17:35:04 +0100
+Subject: [PATCH] spirv: fix memory semantics for image loads/stores
+
+For loads, the visible barrier must happen before and for stores, the
+available barrier must happen after.
+
+This partially fixes new VKCTS coverage
+dEQP-VK.memory_model.message_passing.cross_stage_readonly.ext.coherent.atomic_atomic.device.image_*.
+
+No fossils-db changes on NAVI33, except
+Totals from 7 (0.00% of 208626) affected shaders.
+
+Cc: mesa-stable
+Signed-off-by: Samuel Pitoiset <samuel.pitoiset@gmail.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45916>
+(cherry picked from commit 60e008560fce755fefb71e6d1e9704e75e816051)
+Link: https://gitlab.freedesktop.org/mesa/mesa/-/commit/89d94f9be0ed3397071c50b89348617aada2fabb
+[ adapted: dropped .pick_status.json, not in the 26.3.0 tarball or bookkeeping only ]
+---
+ .pick_status.json                 |  2 +-
+ src/compiler/spirv/spirv_to_nir.c | 13 +++++++++++--
+ 2 files changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/src/compiler/spirv/spirv_to_nir.c b/src/compiler/spirv/spirv_to_nir.c
+index 0cd190a43b38..0735c75e4eab 100644
+--- a/src/compiler/spirv/spirv_to_nir.c
++++ b/src/compiler/spirv/spirv_to_nir.c
+@@ -4615,7 +4615,6 @@ vtn_handle_image(struct vtn_builder *b, SpvOp opcode,
+                      "MakeTexelVisible requires NonPrivateTexel to also be set.");
+          uint32_t arg = image_operand_arg(b, w, count, 5,
+                                           SpvImageOperandsMakeTexelVisibleMask);
+-         semantics = SpvMemorySemanticsMakeVisibleMask;
+          scope = vtn_constant_uint(b, w[arg]);
+       }
+ 
+@@ -4658,7 +4657,6 @@ vtn_handle_image(struct vtn_builder *b, SpvOp opcode,
+                      "MakeTexelAvailable requires NonPrivateTexel to also be set.");
+          uint32_t arg = image_operand_arg(b, w, count, 4,
+                                           SpvImageOperandsMakeTexelAvailableMask);
+-         semantics = SpvMemorySemanticsMakeAvailableMask;
+          scope = vtn_constant_uint(b, w[arg]);
+       }
+ 
+@@ -4847,6 +4845,17 @@ vtn_handle_image(struct vtn_builder *b, SpvOp opcode,
+    SpvMemorySemanticsMask after_semantics;
+    vtn_split_barrier_semantics(b, semantics, &before_semantics, &after_semantics);
+ 
++   /* Unlike memory semantics of barriers, MakeTexelVisible/Available apply to
++    * this access, so visibility happens before the read and availability after
++    * the write.
++    */
++   if (operands & SpvImageOperandsMakeTexelVisibleMask)
++      before_semantics |= SpvMemorySemanticsMakeVisibleMask |
++                          SpvMemorySemanticsImageMemoryMask;
++   if (operands & SpvImageOperandsMakeTexelAvailableMask)
++      after_semantics |= SpvMemorySemanticsMakeAvailableMask |
++                         SpvMemorySemanticsImageMemoryMask;
++
+    if (before_semantics)
+       vtn_emit_memory_barrier(b, scope, before_semantics);
+ 
+-- 
+GitLab
+

@@ -1,0 +1,164 @@
+From 23e12273ed4ff218f6bd8dba3213e5d2148257fa Mon Sep 17 00:00:00 2001
+From: Mike Blumenkrantz <michael.blumenkrantz@gmail.com>
+Date: Tue, 27 Oct 2026 16:54:13 -0400
+Subject: [PATCH] zink: set pipeline robustness explicitly for every context
+
+only robust contexts passed the robustness struct, and the device
+features were dropped only when some driver default happened to be
+disabled, so other contexts got whatever the driver defaults to. always
+pass the struct, robust or none, and drop the features whenever the
+extension and its feature exist
+
+Fixes: b2282868d8f0 ("zink: use EXT_pipeline_robustness on drivers where it matters")
+
+Generated-by: LLM
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45689>
+Link: https://gitlab.freedesktop.org/mesa/mesa/-/commit/23e12273ed4ff218f6bd8dba3213e5d2148257fa
+---
+ src/gallium/drivers/zink/zink_pipeline.c | 29 +++++++++++++++---------
+ src/gallium/drivers/zink/zink_program.c  |  9 +++-----
+ src/gallium/drivers/zink/zink_screen.c   | 11 ++++-----
+ 3 files changed, 26 insertions(+), 23 deletions(-)
+
+diff --git a/src/gallium/drivers/zink/zink_pipeline.c b/src/gallium/drivers/zink/zink_pipeline.c
+index 51eff5c4b53e..cd592db23ca7 100644
+--- a/src/gallium/drivers/zink/zink_pipeline.c
++++ b/src/gallium/drivers/zink/zink_pipeline.c
+@@ -39,14 +39,21 @@
+ #define GFX_INPUT_MESH 32
+ 
+ static VkPipelineRobustnessCreateInfo
+-pipeline_robustness_info(const struct zink_screen *screen)
++pipeline_robustness_info(const struct zink_screen *screen, bool robust)
+ {
++   /* the device features are off, but a driver's default behavior may still be robust:
++    * non-robust contexts explicitly ask for none
++    */
++   const VkPipelineRobustnessBufferBehavior buffers = robust ?
++      VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS :
++      VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED;
+    return (VkPipelineRobustnessCreateInfo){
+       .sType = VK_STRUCTURE_TYPE_PIPELINE_ROBUSTNESS_CREATE_INFO,
+-      .storageBuffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS,
+-      .uniformBuffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS,
+-      .vertexInputs = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS,
+-      .images = screen->robustness & ZINK_ROBUSTNESS_IMAGE2 ?
++      .storageBuffers = buffers,
++      .uniformBuffers = buffers,
++      .vertexInputs = buffers,
++      .images = !robust ? VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED :
++                screen->robustness & ZINK_ROBUSTNESS_IMAGE2 ?
+                 VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_ROBUST_IMAGE_ACCESS_2 :
+                 VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_ROBUST_IMAGE_ACCESS,
+    };
+@@ -404,7 +411,7 @@ zink_create_gfx_pipeline(struct zink_screen *screen,
+ 
+    VkPipelineShaderStageCreateInfo shader_stages[MESA_SHADER_MESH_STAGES];
+    VkShaderModuleCreateInfo smci[MESA_SHADER_MESH_STAGES] = {0};
+-   VkPipelineRobustnessCreateInfo rb = pipeline_robustness_info(screen);
++   VkPipelineRobustnessCreateInfo rb = pipeline_robustness_info(screen, prog->robust);
+    uint32_t num_stages = 0;
+    for (int i = 0; i < MESA_SHADER_MESH_STAGES; ++i) {
+       if (!(prog->stages_present & BITFIELD_BIT(i)))
+@@ -414,7 +421,7 @@ zink_create_gfx_pipeline(struct zink_screen *screen,
+       stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+       stage.stage = mesa_to_vk_shader_stage(i);
+       stage.pName = "main";
+-      if (prog->robust)
++      if (screen->info.have_EXT_pipeline_robustness)
+          stage.pNext = &rb;
+       if (objs[i].mod) {
+          stage.module = objs[i].mod;
+@@ -456,13 +463,13 @@ zink_create_compute_pipeline(struct zink_screen *screen, struct zink_compute_pro
+    if (zink_descriptor_mode == ZINK_DESCRIPTOR_MODE_DB)
+       pci.flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+ 
+-   VkPipelineRobustnessCreateInfo rb = pipeline_robustness_info(screen);
++   VkPipelineRobustnessCreateInfo rb = pipeline_robustness_info(screen, comp->robust);
+    VkPipelineShaderStageCreateInfo stage = {0};
+    stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    stage.module = comp->curr->obj.mod;
+    stage.pName = "main";
+-   if (comp->robust)
++   if (screen->info.have_EXT_pipeline_robustness)
+       stage.pNext = &rb;
+ 
+    VkSpecializationInfo sinfo = {0};
+@@ -869,7 +876,7 @@ create_gfx_pipeline_library(struct zink_screen *screen, struct zink_shader_objec
+       tdci.domainOrigin = VK_TESSELLATION_DOMAIN_ORIGIN_LOWER_LEFT;
+    }
+ 
+-   VkPipelineRobustnessCreateInfo rb = pipeline_robustness_info(screen);
++   VkPipelineRobustnessCreateInfo rb = pipeline_robustness_info(screen, robust);
+    VkPipelineShaderStageCreateInfo shader_stages[MESA_SHADER_MESH_STAGES];
+    uint32_t num_stages = 0;
+    for (int i = 0; i < MESA_SHADER_MESH_STAGES; ++i) {
+@@ -881,7 +888,7 @@ create_gfx_pipeline_library(struct zink_screen *screen, struct zink_shader_objec
+       stage.stage = mesa_to_vk_shader_stage(i);
+       stage.module = objs[i].mod;
+       stage.pName = "main";
+-      if (robust)
++      if (screen->info.have_EXT_pipeline_robustness)
+          stage.pNext = &rb;
+       shader_stages[num_stages++] = stage;
+    }
+diff --git a/src/gallium/drivers/zink/zink_program.c b/src/gallium/drivers/zink/zink_program.c
+index 201de6acdf13..b93b5937019b 100644
+--- a/src/gallium/drivers/zink/zink_program.c
++++ b/src/gallium/drivers/zink/zink_program.c
+@@ -1294,8 +1294,7 @@ gfx_program_create(struct zink_context *ctx,
+    prog->gfx_hash = gfx_hash;
+    prog->base.removed = true;
+    prog->optimal_keys = screen->optimal_keys;
+-   if (ctx->flags & PIPE_CONTEXT_ROBUST_BUFFER_ACCESS)
+-      prog->robust = screen->info.have_EXT_pipeline_robustness;
++   prog->robust = ctx->flags & PIPE_CONTEXT_ROBUST_BUFFER_ACCESS;
+ 
+    for (int i = is_mesh ? MESA_SHADER_FRAGMENT : 0; i < (is_mesh ? MESA_SHADER_MESH_STAGES : MESA_SHADER_STAGES); ++i) {
+       util_dynarray_init(&prog->shader_cache[i][0][0], prog->base.ralloc_ctx);
+@@ -1738,8 +1737,7 @@ create_compute_program(struct zink_context *ctx, nir_shader *nir)
+    comp->scratch_size = nir->scratch_size;
+    comp->nir = nir;
+    comp->num_inlinable_uniforms = nir->info.num_inlinable_uniforms;
+-   if (ctx->flags & PIPE_CONTEXT_ROBUST_BUFFER_ACCESS)
+-      comp->robust = screen->info.have_EXT_pipeline_robustness;
++   comp->robust = ctx->flags & PIPE_CONTEXT_ROBUST_BUFFER_ACCESS;
+    comp->use_local_size = !(nir->info.workgroup_size[0] ||
+                             nir->info.workgroup_size[1] ||
+                             nir->info.workgroup_size[2]);
+@@ -2647,8 +2645,7 @@ zink_create_gfx_shader_state(struct pipe_context *pctx, const struct pipe_shader
+       zink_descriptor_util_init_fbfetch(zink_context(pctx));
+ 
+    struct zink_shader *zs = zink_shader_create(zink_screen(pctx->screen), nir);
+-   if (ctx->flags & PIPE_CONTEXT_ROBUST_BUFFER_ACCESS)
+-      zs->robust = screen->info.have_EXT_pipeline_robustness;
++   zs->robust = ctx->flags & PIPE_CONTEXT_ROBUST_BUFFER_ACCESS;
+    if (zink_debug & ZINK_DEBUG_NOBGC)
+       gfx_shader_init_job(zs, screen, 0);
+    else
+diff --git a/src/gallium/drivers/zink/zink_screen.c b/src/gallium/drivers/zink/zink_screen.c
+index a1821b174db1..84cc5ec937ef 100644
+--- a/src/gallium/drivers/zink/zink_screen.c
++++ b/src/gallium/drivers/zink/zink_screen.c
+@@ -3444,12 +3444,11 @@ disable_features(struct zink_screen *screen)
+ 
+    /* GL doesn't require this behavior */
+    screen->info.rb2_feats.robustBufferAccess2 = false;
+-   if (screen->info.have_EXT_pipeline_robustness &&
+-       (screen->info.pipeline_rb_props.defaultRobustnessStorageBuffers == VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED ||
+-        screen->info.pipeline_rb_props.defaultRobustnessUniformBuffers == VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED ||
+-        screen->info.pipeline_rb_props.defaultRobustnessVertexInputs == VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED ||
+-        screen->info.pipeline_rb_props.defaultRobustnessImages == VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED)) {
+-      /* possibly switch to pipeline robustness here */
++   if (screen->info.have_EXT_pipeline_robustness && screen->info.pipeline_rb_feats.pipelineRobustness) {
++      /* every pipeline sets its own robustness, so the device-wide features are not needed:
++       * robust contexts ask for robustness and all other contexts explicitly ask for none,
++       * regardless of what the driver does by default
++       */
+       screen->info.feats.features.robustBufferAccess = false;
+       screen->info.rb_image_feats.robustImageAccess = false;
+       screen->info.rb2_feats.robustImageAccess2 = false;
+-- 
+GitLab
+

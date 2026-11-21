@@ -37,7 +37,7 @@ export SRC
 . "${SRC}/scripts/lib/common.sh"
 
 # The full chain, in build order. xfwm4 runs only when switched on.
-ALL_CHAIN=(bootchain kernel wifi gpu-firmware orc xfwm4 rootfs image compress)
+ALL_CHAIN=(bootchain kernel wifi gpu-firmware orc xfwm4 mesa rootfs image compress)
 
 ARM64_LDSO=/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1
 QEMU_BINFMT_CONF=/usr/lib/binfmt.d/qemu-aarch64.conf

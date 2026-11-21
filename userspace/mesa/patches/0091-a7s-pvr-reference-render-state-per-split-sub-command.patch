@@ -1,0 +1,123 @@
+Description: pvr: hold render state and render info once per split sub command
+ A dynamic render can be split into several graphics sub commands: at the end
+ of transform feedback (CmdEndTransformFeedbackEXT, and the mid-fragment
+ barrier in pvr_xfb_end()), at the barrier event of
+ vkCmdDrawIndirectByteCountEXT, at stencil store/load barriers and when the
+ occlusion query pool changes. pvr_arch_cmd_buffer_start_sub_cmd() gives
+ each of them the render state and the render info of the render.
+ .
+ Freeing a sub command drops one reference on the render state
+ (pvr_render_state_cache_put()), but vkCmdBeginRendering takes only one. With
+ zink every transform feedback draw ends with CmdEndTransformFeedbackEXT, so
+ the reference count underflows, the render state goes back to the idle list
+ or is destroyed while later sub commands and command buffers still use it.
+ Before the render state cache, pvr_rstate_entry_remove() searched the device
+ list and did nothing the second time.
+ .
+ The render info had the same problem in the splits without an explicit
+ hand-over (barrier event, query pool change): each sub command destroyed it,
+ a double free. GL-CTS KHR-GL31.transform_feedback.draw_xfb_test
+ (glDrawTransformFeedback after paused and resumed transform feedback) runs
+ through both paths and ends with a segmentation fault.
+ .
+ Take a render state reference for each owned graphics sub command of a
+ dynamic render and move the render info to the newest one when it starts.
+ vkCmdBeginRendering drops its own reference once its sub command holds one.
+ The explicit hand-overs in the transform feedback and mid-fragment barrier
+ paths are covered by this and removed. Secondary command buffers that
+ continue a render pass are unchanged, they do not free either.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/vulkan/pvr_arch_cmd_buffer.c
++++ b/src/imagination/vulkan/pvr_arch_cmd_buffer.c
+@@ -2808,6 +2808,24 @@
+    return rp_info->pass || rp_info->dynamic_render;
+ }
+ 
++static void
++pvr_cmd_buffer_take_dynamic_render(struct pvr_cmd_buffer *const cmd_buffer,
++                                   struct pvr_sub_cmd *const sub_cmd)
++{
++   list_for_each_entry_rev (struct pvr_sub_cmd,
++                            prev,
++                            &cmd_buffer->sub_cmds,
++                            link) {
++      if (prev->type != PVR_SUB_CMD_TYPE_GRAPHICS || !prev->owned ||
++          prev->gfx.dr_info != sub_cmd->gfx.dr_info) {
++         continue;
++      }
++
++      prev->gfx.dr_info = NULL;
++      break;
++   }
++}
++
+ VkResult pvr_arch_cmd_buffer_start_sub_cmd(struct pvr_cmd_buffer *cmd_buffer,
+                                            enum pvr_sub_cmd_type type)
+ {
+@@ -2878,6 +2896,12 @@
+                state->render_pass_info.hw_render->multiview_enabled;
+             sub_cmd->gfx.hw_render_idx = 0;
+             sub_cmd->gfx.dr_info = state->render_pass_info.dr_info;
++
++            if (!pvr_cmd_buffer_is_secondary_cont(cmd_buffer)) {
++               pvr_cmd_buffer_take_dynamic_render(cmd_buffer, sub_cmd);
++               if (sub_cmd->gfx.rstate)
++                  pvr_render_state_cache_ref(device, sub_cmd->gfx.rstate);
++            }
+          } else {
+             sub_cmd->gfx.hw_render_idx =
+                state->render_pass_info.current_hw_subpass;
+@@ -5037,6 +5061,7 @@
+    struct pvr_cmd_buffer_state *state = &cmd_buffer->state;
+    struct pvr_device *const device = cmd_buffer->device;
+    struct pvr_dynamic_render_info *dr_info = NULL;
++   struct pvr_sub_cmd *prev_sub_cmd;
+    struct pvr_sub_cmd_gfx *sub_cmd;
+    bool resume, suspend;
+    VkResult result;
+@@ -5126,6 +5151,8 @@
+       goto err_destroy_dynamic_render_info;
+    }
+ 
++   prev_sub_cmd = state->current_sub_cmd;
++
+    result =
+       pvr_arch_cmd_buffer_start_sub_cmd(cmd_buffer, PVR_SUB_CMD_TYPE_GRAPHICS);
+    if (result != VK_SUCCESS) {
+@@ -5138,6 +5165,9 @@
+    sub_cmd->dr_info = dr_info;
+    assert(sub_cmd->dr_info);
+ 
++   if (state->current_sub_cmd != prev_sub_cmd)
++      pvr_render_state_cache_put(device, state->render_pass_info.rstate);
++
+    result = pvr_arch_mrt_load_ops_setup(cmd_buffer,
+                                         &cmd_buffer->vk.pool->alloc,
+                                         &dr_info->hw_render.load_op_state);
+@@ -10390,8 +10420,6 @@
+    if (result != VK_SUCCESS)
+       return result;
+ 
+-   cmd_buffer->state.current_sub_cmd->gfx.dr_info = prev_sub_cmd->gfx.dr_info;
+-   prev_sub_cmd->gfx.dr_info = NULL;
+    assert(cmd_buffer->state.current_sub_cmd->gfx.dr_info ==
+           cmd_buffer->state.render_pass_info.dr_info);
+ 
+--- a/src/imagination/vulkan/pvr_arch_xfb.c
++++ b/src/imagination/vulkan/pvr_arch_xfb.c
+@@ -950,10 +950,6 @@
+       assert(result == VK_SUCCESS);
+ 
+       if (prev_sub_cmd->type == PVR_SUB_CMD_TYPE_GRAPHICS) {
+-         cmd_buffer->state.current_sub_cmd->gfx.dr_info =
+-            prev_sub_cmd->gfx.dr_info;
+-         prev_sub_cmd->gfx.dr_info = NULL;
+-
+          /* Use existing render setup, but load color attachments from HW
+           * BGOBJ.
+           */

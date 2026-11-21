@@ -1,0 +1,33 @@
+From edb91b2df16adc4d101267bad85b4a558324b5aa Mon Sep 17 00:00:00 2001
+From: Georg Lehmann <dadschoorse@gmail.com>
+Date: Sun, 15 Nov 2026 19:25:18 +0100
+Subject: [PATCH] nir/range_analysis: fix 8/16bit ishr uub
+
+Cc: mesa-stable
+
+Reviewed-by: Rhys Perry <pendingchaos02@gmail.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/46324>
+(cherry picked from commit e7dedf0780c7918edae876cf90397706dce18fea)
+Link: https://gitlab.freedesktop.org/mesa/mesa/-/commit/edb91b2df16adc4d101267bad85b4a558324b5aa
+[ adapted: dropped .pick_status.json, not in the 26.3.0 tarball or bookkeeping only ]
+---
+ .pick_status.json                     | 2 +-
+ src/compiler/nir/nir_range_analysis.c | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/compiler/nir/nir_range_analysis.c b/src/compiler/nir/nir_range_analysis.c
+index 9f65339d92f9..5d57ad6871d5 100644
+--- a/src/compiler/nir/nir_range_analysis.c
++++ b/src/compiler/nir/nir_range_analysis.c
+@@ -2043,7 +2043,7 @@ get_alu_uub(struct analysis_state *state, struct scalar_query q, uint32_t *resul
+    case nir_op_ishr: {
+       nir_scalar src1_scalar = nir_scalar_chase_alu_src(q.scalar, 1);
+       uint32_t mask = q.scalar.def->bit_size - 1u;
+-      if (src[0] <= 2147483647 && nir_scalar_is_const(src1_scalar))
++      if (src[0] <= bitmask(mask) && nir_scalar_is_const(src1_scalar))
+          *result = src[0] >> (nir_scalar_as_uint(src1_scalar) & mask);
+       else
+          *result = src[0];
+-- 
+GitLab
+

@@ -1,0 +1,61 @@
+From 0eb7ae436fecef2a1a290a9c84e91a725077bf4d Mon Sep 17 00:00:00 2001
+From: Derek Lesho <dlesho@codeweavers.com>
+Date: Tue, 20 Oct 2026 14:33:22 +0200
+Subject: [PATCH] zink: Use zink uploader for clientptr maps.
+
+I overlooked this because the zink uploader is only used by systems without
+rebar. Now tested working when manually enabling this pass.
+
+Caught by Claude Code.
+
+Assisted-by: LLM
+(cherry picked from commit 7755599af401277611fa8764ea691510c63183a4)
+
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45778>
+Link: https://gitlab.freedesktop.org/mesa/mesa/-/commit/0eb7ae436fecef2a1a290a9c84e91a725077bf4d
+---
+ src/gallium/drivers/zink/zink_resource.c | 19 +++++++++++++------
+ 1 file changed, 13 insertions(+), 6 deletions(-)
+
+diff --git a/src/gallium/drivers/zink/zink_resource.c b/src/gallium/drivers/zink/zink_resource.c
+index bf10fcf34d43..337adb802bf5 100644
+--- a/src/gallium/drivers/zink/zink_resource.c
++++ b/src/gallium/drivers/zink/zink_resource.c
+@@ -3770,9 +3770,19 @@ zink_transfer_map_clientptr_range(struct pipe_context *pctx, struct pipe_transfe
+    if (!(res->base.b.clientptr_heap))
+       return NULL;
+ 
+-   if (!trans->clientptr) {
+-      assert(trans->clientptr_refcnt == 0);
++   if (trans->clientptr) {
++      trans->clientptr_refcnt++;
++      return trans->clientptr;
++   }
++
++   if (trans->clientptr_upload) {
++      uint8_t *ptr = zink_transfer_map_clientptr_range(pctx, trans->clientptr_upload, clientptr_range, size);
+ 
++      if (!ptr)
++         return NULL;
++
++      return trans->clientptr = ptr + trans->offset;
++   } else {
+       /* In order to ensure that the potential remap into the client range succeeds,
+        * make sure there are no current (short lived) direct
+        */
+@@ -3803,11 +3813,8 @@ zink_transfer_map_clientptr_range(struct pipe_context *pctx, struct pipe_transfe
+          }
+       }
+ 
+-      trans->clientptr = ptr + trans->offset;
++      return trans->clientptr = ptr + trans->offset;
+    }
+-
+-   trans->clientptr_refcnt++;
+-   return trans->clientptr;
+ }
+ 
+ static void
+-- 
+GitLab
+

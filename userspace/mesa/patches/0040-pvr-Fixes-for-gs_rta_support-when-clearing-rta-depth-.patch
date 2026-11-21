@@ -1,0 +1,164 @@
+From f8cb0ca03e1c12531821d00b8d86f12de43814cd Mon Sep 17 00:00:00 2001
+From: Nick Hamilton <nick.hamilton@imgtec.com>
+Date: Wed, 25 Mar 2026 10:47:02 +0000
+Subject: [PATCH] pvr: Fixes for gs_rta_support when clearing rta depth stencil
+
+When gs_rta_support feature is available and clearing a depth stencil
+rta whose dimension fall below the ZLS tile size, the ZLS sub tile
+handling is required. However the code path was not correctly
+handling the base array layer offset, the required buffer alignment
+and updating the sub command ZLS stride.
+
+With all of these issues resolved the following tests now pass with
+gs_rta_support enabled:
+
+dEQP-VK.api.image_clearing.core.clear_depth_stencil_attachment.multiple_layers.d16_unorm_*
+dEQP-VK.api.image_clearing.core.clear_depth_stencil_attachment.multiple_layers.x8_d24_unorm_pack32_*
+dEQP-VK.api.image_clearing.core.clear_depth_stencil_attachment.multiple_layers.d32_sfloat_*
+dEQP-VK.api.image_clearing.core.clear_depth_stencil_attachment.multiple_layers.s8_uint_*
+dEQP-VK.api.image_clearing.core.clear_depth_stencil_attachment.multiple_layers.d24_unorm_s8_uint_*
+dEQP-VK.api.image_clearing.core.clear_depth_stencil_attachment.multiple_layers.d32_sfloat_s8_uint_*
+
+Signed-off-by: Nick Hamilton <nick.hamilton@imgtec.com>
+Acked-by: Luigi Santivetti <luigi.santivetti@imgtec.com>
+Reviewed-by: Frank Bouwer <frank.bouwer@imgtec.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/40973>
+Link: https://gitlab.freedesktop.org/mesa/mesa/-/commit/f8cb0ca03e1c12531821d00b8d86f12de43814cd
+---
+ src/imagination/vulkan/pvr_arch_cmd_buffer.c |  5 ++++-
+ src/imagination/vulkan/pvr_blit.h            |  2 ++
+ src/imagination/vulkan/rogue/pvr_blit.c      | 10 ++++++++++
+ 3 files changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/src/imagination/vulkan/pvr_arch_cmd_buffer.c b/src/imagination/vulkan/pvr_arch_cmd_buffer.c
+index 26f012bc71bb..11e3bbf6c80d 100644
+--- a/src/imagination/vulkan/pvr_arch_cmd_buffer.c
++++ b/src/imagination/vulkan/pvr_arch_cmd_buffer.c
+@@ -1426,7 +1426,7 @@ pvr_sub_cmd_gfx_align_ds_subtiles(struct pvr_cmd_buffer *const cmd_buffer,
+       .pNext = NULL,
+       .bufferOffset = 0,
+       .bufferRowLength = rounded_size.width,
+-      .bufferImageHeight = 0,
++      .bufferImageHeight = rounded_size.height,
+       .imageSubresource = {
+          .aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT,
+          .mipLevel = ds->iview->vk.base_mip_level,
+@@ -1456,6 +1456,7 @@ pvr_sub_cmd_gfx_align_ds_subtiles(struct pvr_cmd_buffer *const cmd_buffer,
+       result = pvr_copy_image_to_buffer_region_format(cmd_buffer,
+                                                       ds_image,
+                                                       buffer->dev_addr,
++                                                      ds_image->alignment,
+                                                       &region,
+                                                       copy_format,
+                                                       copy_format);
+@@ -1489,6 +1490,7 @@ pvr_sub_cmd_gfx_align_ds_subtiles(struct pvr_cmd_buffer *const cmd_buffer,
+ 
+       result = pvr_copy_buffer_to_image_region_format(cmd_buffer,
+                                                       buffer->dev_addr,
++                                                      ds_image->alignment,
+                                                       ds_image,
+                                                       &region,
+                                                       copy_format,
+@@ -1513,6 +1515,7 @@ pvr_sub_cmd_gfx_align_ds_subtiles(struct pvr_cmd_buffer *const cmd_buffer,
+    ds->addr = buffer->dev_addr;
+    ds->base_array_layer = 0;
+    ds->physical_extent = rounded_size;
++   ds->layer_size = buffer_layer_size;
+ 
+    gfx_sub_cmd->wait_on_previous_transfer = true;
+ 
+diff --git a/src/imagination/vulkan/pvr_blit.h b/src/imagination/vulkan/pvr_blit.h
+index 323724a74fe9..1fc3116ed164 100644
+--- a/src/imagination/vulkan/pvr_blit.h
++++ b/src/imagination/vulkan/pvr_blit.h
+@@ -56,6 +56,7 @@ VkResult pvr_copy_or_resolve_depth_stencil_region(
+ VkResult
+ pvr_copy_buffer_to_image_region_format(struct pvr_cmd_buffer *cmd_buffer,
+                                        pvr_dev_addr_t buffer_dev_addr,
++                                       const uint32_t buffer_alignment,
+                                        const struct pvr_image *image,
+                                        const VkBufferImageCopy2 *region,
+                                        VkFormat src_format,
+@@ -66,6 +67,7 @@ VkResult
+ pvr_copy_image_to_buffer_region_format(struct pvr_cmd_buffer *cmd_buffer,
+                                        const struct pvr_image *image,
+                                        pvr_dev_addr_t buffer_dev_addr,
++                                       const uint32_t buffer_alignment,
+                                        const VkBufferImageCopy2 *region,
+                                        VkFormat src_format,
+                                        VkFormat dst_format);
+diff --git a/src/imagination/vulkan/rogue/pvr_blit.c b/src/imagination/vulkan/rogue/pvr_blit.c
+index a624f41bc698..7705f81d6246 100644
+--- a/src/imagination/vulkan/rogue/pvr_blit.c
++++ b/src/imagination/vulkan/rogue/pvr_blit.c
+@@ -901,6 +901,7 @@ end_cmd_copy_image2:
+ VkResult
+ pvr_copy_buffer_to_image_region_format(struct pvr_cmd_buffer *const cmd_buffer,
+                                        const pvr_dev_addr_t buffer_dev_addr,
++                                       const uint32_t buffer_alignment,
+                                        const struct pvr_image *const image,
+                                        const VkBufferImageCopy2 *const region,
+                                        const VkFormat src_format,
+@@ -939,6 +940,7 @@ pvr_copy_buffer_to_image_region_format(struct pvr_cmd_buffer *const cmd_buffer,
+ 
+    buffer_slice_size = height_in_blks * row_length;
+    buffer_layer_size = buffer_slice_size * region->imageExtent.depth;
++   buffer_layer_size = align(buffer_layer_size, buffer_alignment);
+ 
+    layer_count =
+       vk_image_subresource_layer_count(&image->vk, &region->imageSubresource);
+@@ -1010,6 +1012,7 @@ pvr_copy_buffer_to_image_region(struct pvr_cmd_buffer *const cmd_buffer,
+                                 const VkBufferImageCopy2 *const region)
+ {
+    const VkImageAspectFlags aspect_mask = region->imageSubresource.aspectMask;
++   const uint32_t buffer_alignment = 1;
+    VkFormat src_format;
+    VkFormat dst_format;
+    uint32_t flags = 0;
+@@ -1040,6 +1043,7 @@ pvr_copy_buffer_to_image_region(struct pvr_cmd_buffer *const cmd_buffer,
+ 
+    return pvr_copy_buffer_to_image_region_format(cmd_buffer,
+                                                  buffer_dev_addr,
++                                                 buffer_alignment,
+                                                  image,
+                                                  region,
+                                                  src_format,
+@@ -1077,6 +1081,7 @@ VkResult
+ pvr_copy_image_to_buffer_region_format(struct pvr_cmd_buffer *const cmd_buffer,
+                                        const struct pvr_image *const image,
+                                        const pvr_dev_addr_t buffer_dev_addr,
++                                       const uint32_t buffer_alignment,
+                                        const VkBufferImageCopy2 *const region,
+                                        const VkFormat src_format,
+                                        const VkFormat dst_format)
+@@ -1111,6 +1116,8 @@ pvr_copy_image_to_buffer_region_format(struct pvr_cmd_buffer *const cmd_buffer,
+    buffer_slice_size = buffer_image_height * buffer_row_length *
+                        vk_format_get_blocksize(dst_format);
+ 
++   buffer_slice_size = align(buffer_slice_size, buffer_alignment);
++
+    max_depth_slice = region->imageExtent.depth + region->imageOffset.z;
+ 
+    pvr_setup_buffer_surface(
+@@ -1216,8 +1223,10 @@ pvr_copy_image_to_buffer_region(struct pvr_cmd_buffer *const cmd_buffer,
+    const VkImageAspectFlags aspect_mask = region->imageSubresource.aspectMask;
+ 
+    VkFormat src_format = pvr_get_copy_format(image->vk.format, aspect_mask);
++   const uint32_t buffer_alignment = 1;
+    VkFormat dst_format;
+ 
++
+    /* From the Vulkan spec:
+     *
+     *    srcImage must have a sample count equal to VK_SAMPLE_COUNT_1_BIT
+@@ -1249,6 +1258,7 @@ pvr_copy_image_to_buffer_region(struct pvr_cmd_buffer *const cmd_buffer,
+    return pvr_copy_image_to_buffer_region_format(cmd_buffer,
+                                                  image,
+                                                  buffer_dev_addr,
++                                                 buffer_alignment,
+                                                  region,
+                                                  src_format,
+                                                  dst_format);
+-- 
+GitLab
+

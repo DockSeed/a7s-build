@@ -1,0 +1,145 @@
+From a54c32ecb1b3a617f3b43c60da97d4b757f18ab7 Mon Sep 17 00:00:00 2001
+From: Ashish Chauhan <ashish.chauhan@imgtec.com>
+Date: Mon, 26 Oct 2026 09:43:17 +0000
+Subject: [PATCH] pvr: Validate XFB primitive topology at draw
+
+XFB programs are built at Begin from the current topology, which may
+be unset with dynamic topology. Check the cached vertex count at draw
+and, on a mismatch, end XFB, barrier and kick again.
+
+Fixes: c374fb7308eb ("pvr: add transform feedback entry points support")
+Signed-off-by: Ashish Chauhan <ashish.chauhan@imgtec.com>
+Reviewed-by: Simon Perretta <simon.perretta@imgtec.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45632>
+(cherry picked from commit fef00314b672e7c88b37e5054a1c7226352ec8d8)
+
+Conflicts:
+	src/imagination/ci/axe-1-16m-fails.txt
+Link: https://gitlab.freedesktop.org/mesa/mesa/-/commit/a54c32ecb1b3a617f3b43c60da97d4b757f18ab7
+[ adapted: dropped .pick_status.json, not in the 26.3.0 tarball or bookkeeping only ]
+---
+ .pick_status.json                            |  2 +-
+ src/imagination/ci/bxs-4-64-fails.txt        |  2 -
+ src/imagination/vulkan/pvr_arch_cmd_buffer.c |  4 ++
+ src/imagination/vulkan/pvr_arch_xfb.c        | 48 ++++++++++++++++++++
+ src/imagination/vulkan/pvr_cmd_buffer.h      |  7 +++
+ 5 files changed, 60 insertions(+), 3 deletions(-)
+
+diff --git a/src/imagination/ci/bxs-4-64-fails.txt b/src/imagination/ci/bxs-4-64-fails.txt
+index e7eca5f215fa..a8dc5fa371ee 100644
+--- a/src/imagination/ci/bxs-4-64-fails.txt
++++ b/src/imagination/ci/bxs-4-64-fails.txt
+@@ -1,4 +1,2 @@
+ # xfb
+-dEQP-VK.transform_feedback.primitive_restart.dynamic_primitive_restart_dynamic_primitive_topology,Fail
+-dEQP-VK.transform_feedback.primitive_restart.static_primitive_restart_dynamic_primitive_topology,Fail
+ dEQP-VK.transform_feedback.simple.max_output_components_64,Crash
+diff --git a/src/imagination/vulkan/pvr_arch_cmd_buffer.c b/src/imagination/vulkan/pvr_arch_cmd_buffer.c
+index 64db280c6ead..84af8b846c61 100644
+--- a/src/imagination/vulkan/pvr_arch_cmd_buffer.c
++++ b/src/imagination/vulkan/pvr_arch_cmd_buffer.c
+@@ -8680,6 +8680,10 @@ static VkResult pvr_validate_draw_state(struct pvr_cmd_buffer *cmd_buffer)
+ 
+    pvr_arch_cmd_buffer_start_sub_cmd(cmd_buffer, PVR_SUB_CMD_TYPE_GRAPHICS);
+ 
++   result = pvr_arch_validate_xfb_state(cmd_buffer);
++   if (result != VK_SUCCESS)
++      return result;
++
+    sub_cmd = &state->current_sub_cmd->gfx;
+    sub_cmd->empty_cmd = false;
+ 
+diff --git a/src/imagination/vulkan/pvr_arch_xfb.c b/src/imagination/vulkan/pvr_arch_xfb.c
+index 0264f50657d2..bd67267b4bb9 100644
+--- a/src/imagination/vulkan/pvr_arch_xfb.c
++++ b/src/imagination/vulkan/pvr_arch_xfb.c
+@@ -758,6 +758,51 @@ static VkResult pvr_xfb_start(struct pvr_cmd_buffer *cmd_buffer)
+    return VK_SUCCESS;
+ }
+ 
++VkResult PVR_PER_ARCH(validate_xfb_state)(struct pvr_cmd_buffer *cmd_buffer)
++{
++   struct pvr_cmd_buffer_xfb_state *xfb_state = &cmd_buffer->state.xfb_state;
++   const struct pvr_graphics_pipeline *pipeline =
++      cmd_buffer->state.gfx_pipeline;
++   const struct pvr_xfb_shader_state *xfb_shader_state;
++   struct vk_dynamic_graphics_state *const dynamic_state =
++      &cmd_buffer->vk.dynamic_graphics_state;
++   uint32_t output_primitive_vertex_count;
++   VkResult result;
++
++   if (!xfb_state->is_active)
++      return VK_SUCCESS;
++
++   xfb_shader_state = &pipeline->shader_state.xfb_shader_state;
++
++   if (!xfb_shader_state->varying_count)
++      return VK_SUCCESS;
++
++   output_primitive_vertex_count = pvr_get_output_primitive_vertex_count(
++      dynamic_state->ia.primitive_topology);
++
++   /* Topology may be unset at Begin; rebuild with the real primitive type. */
++   if (xfb_state->output_primitive_vertex_count !=
++       output_primitive_vertex_count) {
++      /* TODO: handle class changes mid-segment
++       * (dynamicPrimitiveTopologyUnrestricted).
++       * TODO: this end may store to a stale last_counter_buffer_addr.
++       */
++      result = pvr_xfb_end(cmd_buffer);
++      if (result != VK_SUCCESS)
++         return result;
++
++      /* Rebuild init/stream-out with the new primitive type.
++       */
++      xfb_state->output_primitive_vertex_count = output_primitive_vertex_count;
++
++      result = pvr_xfb_start(cmd_buffer);
++      if (result != VK_SUCCESS)
++         return result;
++   }
++
++   return VK_SUCCESS;
++}
++
+ void PVR_PER_ARCH(CmdBindTransformFeedbackBuffersEXT)(
+    VkCommandBuffer commandBuffer,
+    uint32_t firstBinding,
+@@ -837,6 +882,9 @@ void PVR_PER_ARCH(CmdBeginTransformFeedbackEXT)(
+ 
+    if (state->gfx_pipeline->shader_state.xfb_shader_state.varying_count) {
+       xfb_state->is_active = true;
++      xfb_state->output_primitive_vertex_count =
++         pvr_get_output_primitive_vertex_count(
++            cmd_buffer->vk.dynamic_graphics_state.ia.primitive_topology);
+       pvr_xfb_start(cmd_buffer);
+    }
+ }
+diff --git a/src/imagination/vulkan/pvr_cmd_buffer.h b/src/imagination/vulkan/pvr_cmd_buffer.h
+index 3221a8e11838..36e9c5c033d9 100644
+--- a/src/imagination/vulkan/pvr_cmd_buffer.h
++++ b/src/imagination/vulkan/pvr_cmd_buffer.h
+@@ -453,6 +453,9 @@ struct pvr_cmd_buffer_xfb_state {
+    /* Whether transform feedback is currently active for the cmd_buffer. */
+    bool is_active;
+ 
++   /* Cached output primitive vertex count used for active XFB programs. */
++   uint32_t output_primitive_vertex_count;
++
+    struct pvr_xfb_binding bindings[PVR_XFB_MAX_BUFFERS];
+ 
+    uint32_t counter_buffer_count;
+@@ -843,6 +846,10 @@ VkResult PVR_PER_ARCH(emit_xfb_sync_state)(
+ 
+ #   define pvr_arch_emit_xfb_sync_state PVR_PER_ARCH(emit_xfb_sync_state)
+ 
++VkResult PVR_PER_ARCH(validate_xfb_state)(struct pvr_cmd_buffer *cmd_buffer);
++
++#   define pvr_arch_validate_xfb_state PVR_PER_ARCH(validate_xfb_state)
++
+ #endif /* PVR_PER_ARCH */
+ 
+ #endif /* PVR_CMD_BUFFER_H */
+-- 
+GitLab
+

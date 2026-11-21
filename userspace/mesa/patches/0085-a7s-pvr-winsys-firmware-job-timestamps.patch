@@ -1,0 +1,319 @@
+Description: pvr: winsys support for firmware job timestamps
+ Copy the uAPI of a7s-linux-lts (drm-imagination-firmware-timestamps-around-jobs)
+ into include/drm-uapi/pvr_drm.h: the query DRM_PVR_DEV_QUERY_TIMESTAMP_INFO_GET
+ (0x100), the buffer flag DRM_PVR_BO_FW_TIMESTAMPS and the timestamp fields at the
+ end of struct drm_pvr_job. The powervr winsys asks the query once; a kernel that
+ does not know it fails it and the winsys reports no support. The winsys passes
+ the buffer flag (PVR_WINSYS_BO_FLAG_FW_TIMESTAMPS) and, for compute jobs, the
+ timestamps asked for in pvr_winsys_compute_submit_info. The buffer flag is bit 32,
+ so pvr_drm_create_gem_bo() now takes the flags as 64 bits. struct drm_pvr_job is
+ copied by the kernel with copy_struct_from_user(), so the longer struct with
+ zeroed timestamp fields is accepted by a kernel without them.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/include/drm-uapi/pvr_drm.h
++++ b/include/drm-uapi/pvr_drm.h
+@@ -450,6 +450,35 @@
+ };
+ 
+ /**
++ * struct drm_pvr_dev_query_timestamp_info - Container used to fetch information
++ * about job timestamps.
++ *
++ * When the query succeeds, the firmware writes job timestamps (see
++ * &drm_pvr_job.timestamp_flags) into buffer objects created with
++ * %DRM_PVR_BO_FW_TIMESTAMPS. Each timestamp is a __u64 in nanoseconds of
++ * @clock_id. The query fails with -%EOPNOTSUPP when the device or its firmware
++ * is not known to write timestamps.
++ *
++ * Structure filled in by %DRM_PVR_DEV_QUERY_TIMESTAMP_INFO_GET.
++ */
++struct drm_pvr_dev_query_timestamp_info {
++	/**
++	 * @clock_id: The clock the timestamps are taken in, as a clockid_t
++	 * (CLOCK_MONOTONIC_RAW).
++	 */
++	__u32 clock_id;
++
++	/** @valid_bits: Number of valid bits in a timestamp. */
++	__u32 valid_bits;
++
++	/**
++	 * @bo_max_size: Maximum size of one buffer object created with
++	 * %DRM_PVR_BO_FW_TIMESTAMPS, in bytes.
++	 */
++	__u64 bo_max_size;
++};
++
++/**
+  * enum drm_pvr_dev_query - For use with &drm_pvr_ioctl_dev_query_args.type to
+  * indicate the type of the receiving container.
+  *
+@@ -497,6 +526,15 @@
+ 	 * a pointer to &struct drm_pvr_dev_query_fw_info.
+ 	 */
+ 	DRM_PVR_DEV_QUERY_FW_INFO_GET,
++
++	/**
++	 * @DRM_PVR_DEV_QUERY_TIMESTAMP_INFO_GET: The dev query args contain a
++	 * pointer to &struct drm_pvr_dev_query_timestamp_info.
++	 *
++	 * The value is set apart from the values above, which mainline
++	 * allocates in order.
++	 */
++	DRM_PVR_DEV_QUERY_TIMESTAMP_INFO_GET = 0x100,
+ };
+ 
+ /**
+@@ -553,14 +591,23 @@
+  * CPU mapping options
+  *    :DRM_PVR_BO_ALLOW_CPU_USERSPACE_ACCESS: Allow userspace to map and access the contents of this
+  *       memory. It is not valid to specify this flag with DRM_PVR_BO_PM_FW_PROTECT.
++ *
++ * Firmware options
++ *    :DRM_PVR_BO_FW_TIMESTAMPS: Also map the buffer for the firmware, so that it can be the target
++ *       of job timestamps (&drm_pvr_job.timestamp_bo_handle). Only valid when
++ *       %DRM_PVR_DEV_QUERY_TIMESTAMP_INFO_GET succeeds, for a size of at most
++ *       &drm_pvr_dev_query_timestamp_info.bo_max_size, and not with DRM_PVR_BO_PM_FW_PROTECT.
++ *       Such a buffer cannot be exported.
+  */
+ #define DRM_PVR_BO_BYPASS_DEVICE_CACHE _BITULL(0)
+ #define DRM_PVR_BO_PM_FW_PROTECT _BITULL(1)
+ #define DRM_PVR_BO_ALLOW_CPU_USERSPACE_ACCESS _BITULL(2)
+-/* Bits 3..63 are reserved. */
++/* Bits 3..31 are reserved. */
++#define DRM_PVR_BO_FW_TIMESTAMPS _BITULL(32)
++/* Bits 33..63 are reserved. */
+ 
+ #define DRM_PVR_BO_FLAGS_MASK (DRM_PVR_BO_BYPASS_DEVICE_CACHE | DRM_PVR_BO_PM_FW_PROTECT | \
+-			       DRM_PVR_BO_ALLOW_CPU_USERSPACE_ACCESS)
++			       DRM_PVR_BO_ALLOW_CPU_USERSPACE_ACCESS | DRM_PVR_BO_FW_TIMESTAMPS)
+ 
+ /**
+  * struct drm_pvr_ioctl_create_bo_args - Arguments for %DRM_IOCTL_PVR_CREATE_BO
+@@ -1098,6 +1145,28 @@
+ };
+ 
+ /**
++ * DOC: Timestamp flags for SUBMIT_JOB.
++ *
++ * .. c:macro:: DRM_PVR_SUBMIT_JOB_TIMESTAMP_PRE
++ *
++ *    The firmware writes the time at which the job starts to
++ *    &drm_pvr_job.timestamp_pre_offset.
++ *
++ * .. c:macro:: DRM_PVR_SUBMIT_JOB_TIMESTAMP_POST
++ *
++ *    The firmware writes the time at which the job has completed to
++ *    &drm_pvr_job.timestamp_post_offset, before the job's fences signal.
++ *
++ * .. c:macro:: DRM_PVR_SUBMIT_JOB_TIMESTAMP_FLAGS_MASK
++ *
++ *    Logical OR of all the timestamp flags.
++ */
++#define DRM_PVR_SUBMIT_JOB_TIMESTAMP_PRE _BITULL(0)
++#define DRM_PVR_SUBMIT_JOB_TIMESTAMP_POST _BITULL(1)
++#define DRM_PVR_SUBMIT_JOB_TIMESTAMP_FLAGS_MASK \
++	(DRM_PVR_SUBMIT_JOB_TIMESTAMP_PRE | DRM_PVR_SUBMIT_JOB_TIMESTAMP_POST)
++
++/**
+  * DOC: Flags for SUBMIT_JOB ioctl geometry command.
+  *
+  * .. c:macro:: DRM_PVR_SUBMIT_JOB_GEOM_CMD_FIRST
+@@ -1295,6 +1364,34 @@
+ 	 * Must be zero for non-render jobs.
+ 	 */
+ 	struct drm_pvr_hwrt_data_ref hwrt;
++
++	/**
++	 * @timestamp_flags: [IN] Combination of ``DRM_PVR_SUBMIT_JOB_TIMESTAMP_*``
++	 * flags. Zero for no timestamps, in which case the other timestamp
++	 * fields must be zero too.
++	 *
++	 * Only valid when %DRM_PVR_DEV_QUERY_TIMESTAMP_INFO_GET succeeds, and
++	 * not for %DRM_PVR_JOB_TYPE_NULL.
++	 */
++	__u32 timestamp_flags;
++
++	/**
++	 * @timestamp_bo_handle: [IN] Buffer object created with
++	 * %DRM_PVR_BO_FW_TIMESTAMPS the timestamps are written to.
++	 */
++	__u32 timestamp_bo_handle;
++
++	/**
++	 * @timestamp_pre_offset: [IN] Offset in @timestamp_bo_handle of the
++	 * __u64 taken before the job starts. Must be 8-byte aligned.
++	 */
++	__u64 timestamp_pre_offset;
++
++	/**
++	 * @timestamp_post_offset: [IN] Offset in @timestamp_bo_handle of the
++	 * __u64 taken after the job completes. Must be 8-byte aligned.
++	 */
++	__u64 timestamp_post_offset;
+ };
+ 
+ /**
+--- a/src/imagination/vulkan/winsys/powervr/pvr_drm.c
++++ b/src/imagination/vulkan/winsys/powervr/pvr_drm.c
+@@ -24,6 +24,7 @@
+ #include <assert.h>
+ #include <stdbool.h>
+ #include <stdint.h>
++#include <time.h>
+ #include <vulkan/vulkan.h>
+ #include <xf86drm.h>
+ 
+@@ -189,6 +190,26 @@
+    return result;
+ }
+ 
++static void pvr_drm_get_timestamp_info(struct pvr_drm_winsys *drm_ws)
++{
++   struct drm_pvr_dev_query_timestamp_info info = { 0 };
++   struct drm_pvr_ioctl_dev_query_args args = {
++      .type = DRM_PVR_DEV_QUERY_TIMESTAMP_INFO_GET,
++      .size = sizeof(info),
++      .pointer = (__u64)&info,
++   };
++
++   if (drmIoctl(drm_ws->base.render_fd, DRM_IOCTL_PVR_DEV_QUERY, &args))
++      return;
++
++   if (info.clock_id != CLOCK_MONOTONIC_RAW || info.valid_bits != 64 ||
++       !info.bo_max_size)
++      return;
++
++   drm_ws->base.features.supports_job_timestamps = true;
++   drm_ws->base.timestamp_bo_max_size = info.bo_max_size;
++}
++
+ static VkResult pvr_drm_override_quirks(struct pvr_drm_winsys *drm_ws,
+                                         struct pvr_device_info *dev_info)
+ {
+@@ -835,6 +856,8 @@
+ 
+    drm_ws->bvnc = gpu_info.gpu_id;
+ 
++   pvr_drm_get_timestamp_info(drm_ws);
++
+    result = pvr_ioctl(render_fd,
+                       DRM_IOCTL_PVR_CREATE_VM_CONTEXT,
+                       &create_vm_context_args,
+--- a/src/imagination/vulkan/winsys/powervr/pvr_drm_bo.c
++++ b/src/imagination/vulkan/winsys/powervr/pvr_drm_bo.c
+@@ -43,7 +43,7 @@
+ #include "vk_log.h"
+ 
+ static VkResult pvr_drm_create_gem_bo(struct pvr_drm_winsys *drm_ws,
+-                                      uint32_t drm_flags,
++                                      uint64_t drm_flags,
+                                       uint64_t size,
+                                       uint32_t *const handle_out)
+ {
+@@ -177,6 +177,9 @@
+    if (ws_flags & PVR_WINSYS_BO_FLAG_CPU_ACCESS)
+       drm_flags |= DRM_PVR_BO_ALLOW_CPU_USERSPACE_ACCESS;
+ 
++   if (ws_flags & PVR_WINSYS_BO_FLAG_FW_TIMESTAMPS)
++      drm_flags |= DRM_PVR_BO_FW_TIMESTAMPS;
++
+    return drm_flags;
+ }
+ 
+--- a/src/imagination/vulkan/winsys/powervr/pvr_drm_job_compute.c
++++ b/src/imagination/vulkan/winsys/powervr/pvr_drm_job_compute.c
+@@ -31,6 +31,7 @@
+ 
+ #include "drm-uapi/pvr_drm.h"
+ #include "pvr_drm.h"
++#include "pvr_drm_bo.h"
+ #include "pvr_drm_job_common.h"
+ #include "pvr_drm_job_compute.h"
+ #include "pvr_winsys.h"
+@@ -166,6 +167,26 @@
+    return flags;
+ }
+ 
++static void
++pvr_drm_job_timestamp_init(const struct pvr_winsys_job_timestamp *timestamp,
++                           struct drm_pvr_job *job_args)
++{
++   if (!timestamp->bo)
++      return;
++
++   job_args->timestamp_bo_handle = to_pvr_drm_winsys_bo(timestamp->bo)->handle;
++
++   if (timestamp->pre) {
++      job_args->timestamp_flags |= DRM_PVR_SUBMIT_JOB_TIMESTAMP_PRE;
++      job_args->timestamp_pre_offset = timestamp->pre_offset;
++   }
++
++   if (timestamp->post) {
++      job_args->timestamp_flags |= DRM_PVR_SUBMIT_JOB_TIMESTAMP_POST;
++      job_args->timestamp_post_offset = timestamp->post_offset;
++   }
++}
++
+ VkResult pvr_drm_winsys_compute_submit(
+    const struct pvr_winsys_compute_ctx *ctx,
+    const struct pvr_winsys_compute_submit_info *submit_info,
+@@ -192,6 +213,8 @@
+       .jobs = DRM_PVR_OBJ_ARRAY(1, &job_args),
+    };
+ 
++   pvr_drm_job_timestamp_init(&submit_info->timestamp, &job_args);
++
+    if (submit_info->wait) {
+       struct vk_sync *sync = submit_info->wait;
+ 
+--- a/src/imagination/vulkan/winsys/pvr_winsys.h
++++ b/src/imagination/vulkan/winsys/pvr_winsys.h
+@@ -114,6 +114,7 @@
+  * accessible to the Parameter Manager unit and firmware processor.
+  */
+ #define PVR_WINSYS_BO_FLAG_PM_FW_PROTECT BITFIELD_BIT(2U)
++#define PVR_WINSYS_BO_FLAG_FW_TIMESTAMPS BITFIELD_BIT(3U)
+ 
+ struct pvr_winsys_bo {
+    struct pvr_winsys *ws;
+@@ -292,10 +293,22 @@
+    struct pvr_winsys_transfer_cmd cmds[PVR_TRANSFER_MAX_PREPARES_PER_SUBMIT];
+ };
+ 
++struct pvr_winsys_job_timestamp {
++   struct pvr_winsys_bo *bo;
++
++   bool pre;
++   uint64_t pre_offset;
++
++   bool post;
++   uint64_t post_offset;
++};
++
+ struct pvr_winsys_compute_submit_info {
+    uint32_t frame_num;
+    uint32_t job_num;
+ 
++   struct pvr_winsys_job_timestamp timestamp;
++
+    struct vk_sync *wait;
+ 
+    /* Firmware stream buffer. This is the maximum possible size taking into
+@@ -468,8 +481,11 @@
+ 
+    struct {
+       bool supports_threaded_submit : 1;
++      bool supports_job_timestamps : 1;
+    } features;
+ 
++   uint64_t timestamp_bo_max_size;
++
+    const struct pvr_winsys_ops *ops;
+ };
+ 

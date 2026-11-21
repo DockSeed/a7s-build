@@ -1,0 +1,51 @@
+From e42630b6dc9cbc2adff3763380910fd98ec55257 Mon Sep 17 00:00:00 2001
+From: David Rosca <david.rosca@amd.com>
+Date: Fri, 16 Oct 2026 13:45:26 +0200
+Subject: [PATCH] mesa: Fix crash in Wait/SignalSemaphoreEXT with null fence
+
+The fence is null if no import was called or it failed.
+
+Cc: mesa-stable
+Reviewed-by: Pierre-Eric Pelloux-Prayer <pierre-eric.pelloux-prayer@amd.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45294>
+(cherry picked from commit 02391bf168280708072fd8f714a54f159f3a5ff6)
+Link: https://gitlab.freedesktop.org/mesa/mesa/-/commit/e42630b6dc9cbc2adff3763380910fd98ec55257
+[ adapted: dropped .pick_status.json, not in the 26.3.0 tarball or bookkeeping only ]
+---
+ .pick_status.json               |  2 +-
+ src/mesa/main/externalobjects.c | 12 ++++++++++++
+ 2 files changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/src/mesa/main/externalobjects.c b/src/mesa/main/externalobjects.c
+index bb0e2e873cb8..56a0efe10994 100644
+--- a/src/mesa/main/externalobjects.c
++++ b/src/mesa/main/externalobjects.c
+@@ -1047,6 +1047,12 @@ _mesa_WaitSemaphoreEXT(GLuint semaphore,
+    if (!semObj)
+       return;
+ 
++   if (!semObj->fence) {
++      _mesa_error(ctx, GL_INVALID_OPERATION, "%s(no associated semaphore)",
++                  func);
++      return;
++   }
++
+    FLUSH_VERTICES(ctx, 0, 0);
+ 
+    bufObjs = malloc(sizeof(struct gl_buffer_object *) * numBufferBarriers);
+@@ -1107,6 +1113,12 @@ _mesa_SignalSemaphoreEXT(GLuint semaphore,
+    if (!semObj)
+       return;
+ 
++   if (!semObj->fence) {
++      _mesa_error(ctx, GL_INVALID_OPERATION, "%s(no associated semaphore)",
++                  func);
++      return;
++   }
++
+    FLUSH_VERTICES(ctx, 0, 0);
+ 
+    bufObjs = malloc(sizeof(struct gl_buffer_object *) * numBufferBarriers);
+-- 
+GitLab
+

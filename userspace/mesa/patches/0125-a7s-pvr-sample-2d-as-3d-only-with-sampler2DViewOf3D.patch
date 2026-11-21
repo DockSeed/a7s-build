@@ -1,0 +1,47 @@
+Description: pvr: sample 2D textures as 3D only with sampler2DViewOf3D
+ pco rewrites every non-array 2D texture sample into a 3D sample with the
+ z slice from the image meta data when image2DViewOf3D is enabled. For
+ sampled and combined image descriptors the 2D view of a 3D image is
+ allowed only with sampler2DViewOf3D; image2DViewOf3D covers storage
+ images, which pco handles in the image path. Key the texture path on
+ sampler2DViewOf3D. zink enables image2DViewOf3D but turns
+ sampler2DViewOf3D off, so its 2D samples stay 2D.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/pco/pco_data.h
++++ b/src/imagination/pco/pco_data.h
+@@ -232,6 +232,7 @@ typedef struct _pco_common_data {
+    bool robust_vertex_inputs;
+    bool null_descriptor;
+    bool image_2d_view_of_3d;
++   bool sampler_2d_view_of_3d;
+    bool image_sliced_view_of_3d;
+    bool multiview;
+ } pco_common_data;
+--- a/src/imagination/pco/pco_nir_tex.c
++++ b/src/imagination/pco/pco_nir_tex.c
+@@ -538,7 +538,7 @@ static bool lower_tex(nir_builder *b, nir_tex_instr *tex, void *cb_data)
+          nir_vec2(b,
+                   nir_umod_imm(b, tex_srcs[nir_tex_src_coord], 8192),
+                   nir_udiv_imm(b, tex_srcs[nir_tex_src_coord], 8192));
+-   } else if (data->common.image_2d_view_of_3d && tex->op != nir_texop_lod &&
++   } else if (data->common.sampler_2d_view_of_3d && tex->op != nir_texop_lod &&
+               tex->sampler_dim == GLSL_SAMPLER_DIM_2D && !tex->is_array) {
+       tex->sampler_dim = GLSL_SAMPLER_DIM_3D;
+       params.sampler_dim = tex->sampler_dim;
+--- a/src/imagination/vulkan/pvr_arch_pipeline.c
++++ b/src/imagination/vulkan/pvr_arch_pipeline.c
+@@ -2919,6 +2919,9 @@ pvr_early_init_shader_data(pco_data *data,
+    data->common.image_2d_view_of_3d =
+       device->vk.enabled_features.image2DViewOf3D;
+ 
++   data->common.sampler_2d_view_of_3d =
++      device->vk.enabled_features.sampler2DViewOf3D;
++
+    data->common.image_sliced_view_of_3d =
+       device->vk.enabled_features.imageSlicedViewOf3D;
+ 

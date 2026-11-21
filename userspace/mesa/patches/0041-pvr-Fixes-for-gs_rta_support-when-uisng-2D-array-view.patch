@@ -1,0 +1,43 @@
+From be665098775a13e596961aa0eece5a427e3706db Mon Sep 17 00:00:00 2001
+From: Nick Hamilton <nick.hamilton@imgtec.com>
+Date: Tue, 31 Mar 2026 13:36:30 +0100
+Subject: [PATCH] pvr: Fixes for gs_rta_support when uisng 2D array view on a
+ 3D image.
+
+When generating the emit state for a 2D array view of a 3D image the
+array layer size should not be taken into account as the rta is
+iterating over each z slice of the image. Otherwise each iteration
+will apply both the layer and z slice offset leading to an incorrect
+address been calculated.
+
+Fix for the following tests with gs_rta_support enabled:
+dEQP-VK.renderpass.remaining_array_layers.multi_layer_fb.*
+
+Signed-off-by: Nick Hamilton <nick.hamilton@imgtec.com>
+Acked-by: Luigi Santivetti <luigi.santivetti@imgtec.com>
+Reviewed-by: Frank Bouwer <frank.bouwer@imgtec.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/40973>
+Link: https://gitlab.freedesktop.org/mesa/mesa/-/commit/be665098775a13e596961aa0eece5a427e3706db
+---
+ src/imagination/vulkan/pvr_arch_cmd_buffer.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/imagination/vulkan/pvr_arch_cmd_buffer.c b/src/imagination/vulkan/pvr_arch_cmd_buffer.c
+index 11e3bbf6c80d..3ebfd63c56a6 100644
+--- a/src/imagination/vulkan/pvr_arch_cmd_buffer.c
++++ b/src/imagination/vulkan/pvr_arch_cmd_buffer.c
+@@ -1577,8 +1577,10 @@ pvr_setup_emit_state(const struct pvr_device_info *dev_info,
+             continue;
+ 
+          const struct pvr_image *image = pvr_image_view_get_image(iview);
++
+          if (PVR_HAS_FEATURE(dev_info, gs_rta_support) &&
+-             rstate->layers > 1) {
++             rstate->layers > 1 &&
++             image->memlayout != PVR_MEMLAYOUT_3DTWIDDLED) {
+             const struct pvr_image_plane *plane = pvr_single_plane_const(image);
+ 
+             emit_state->layer_size[emit_state->emit_count] = plane->layer_size;
+-- 
+GitLab
+

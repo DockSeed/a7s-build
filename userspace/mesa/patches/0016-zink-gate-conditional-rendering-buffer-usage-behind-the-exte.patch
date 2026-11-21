@@ -1,0 +1,36 @@
+From 0d45a8157ea823a17511f9d33eb074c03501eb6c Mon Sep 17 00:00:00 2001
+From: Yiwei Zhang <zzyiwei@chromium.org>
+Date: Wed, 11 Nov 2026 20:10:47 -0800
+Subject: [PATCH] zink: gate conditional rendering buffer usage behind the
+ extension
+
+Avoid VVL error on some proprietary driver that still hasn't implemented
+VK_EXT_conditional_rendering.
+
+Cc: mesa-stable
+Reviewed-by: Valentine Burley <valentine.burley@collabora.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/46220>
+(cherry picked from commit a062ae1df4bd9f8109f609aeeccd159a5fa6ca94)
+Link: https://gitlab.freedesktop.org/mesa/mesa/-/commit/0d45a8157ea823a17511f9d33eb074c03501eb6c
+[ adapted: dropped .pick_status.json, not in the 26.3.0 tarball or bookkeeping only ]
+---
+ .pick_status.json                        | 2 +-
+ src/gallium/drivers/zink/zink_resource.c | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/gallium/drivers/zink/zink_resource.c b/src/gallium/drivers/zink/zink_resource.c
+index 0c53b51d1f13..0de19b3951c0 100644
+--- a/src/gallium/drivers/zink/zink_resource.c
++++ b/src/gallium/drivers/zink/zink_resource.c
+@@ -339,7 +339,7 @@ create_bci(struct zink_screen *screen, const struct pipe_resource *templ, unsign
+ 
+    bci.usage |= VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT;
+ 
+-   if (bind & PIPE_BIND_QUERY_BUFFER)
++   if ((bind & PIPE_BIND_QUERY_BUFFER) && screen->info.have_EXT_conditional_rendering)
+       bci.usage |= VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT;
+ 
+    if (templ->flags & PIPE_RESOURCE_FLAG_SPARSE)
+-- 
+GitLab
+

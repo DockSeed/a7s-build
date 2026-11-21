@@ -1,0 +1,41 @@
+From 52ffd1cb2a38c5172323faa5b60c994aae321012 Mon Sep 17 00:00:00 2001
+From: Samuel Pitoiset <samuel.pitoiset@gmail.com>
+Date: Tue, 3 Nov 2026 17:03:45 +0100
+Subject: [PATCH] nir/lower_memory_model: don't skip readonly accesses
+
+NON_WRITEABLE means this shader doesn't write the memory, but other
+invocations can, so a MakePointerVisible load still needs to be
+coherent.
+
+This fixes new VKCTS coverage
+dEQP-VK.fragment_shader_interlock.readonly_reader.device_address.*.
+
+No fossils-db changes on NAVI33.
+
+Cc: mesa-stable
+Signed-off-by: Samuel Pitoiset <samuel.pitoiset@gmail.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45916>
+(cherry picked from commit dc6dd422f0f0de90f7fe7bddc52dcbf8df5215c1)
+Link: https://gitlab.freedesktop.org/mesa/mesa/-/commit/52ffd1cb2a38c5172323faa5b60c994aae321012
+[ adapted: dropped .pick_status.json, not in the 26.3.0 tarball or bookkeeping only ]
+---
+ .pick_status.json                         | 2 +-
+ src/compiler/nir/nir_lower_memory_model.c | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/compiler/nir/nir_lower_memory_model.c b/src/compiler/nir/nir_lower_memory_model.c
+index ef5b81ef8571..4f018f1d2800 100644
+--- a/src/compiler/nir/nir_lower_memory_model.c
++++ b/src/compiler/nir/nir_lower_memory_model.c
+@@ -145,7 +145,7 @@ visit_instr(nir_instr *instr, uint32_t *cur_modes, unsigned vis_avail_sem)
+ 
+    unsigned access = nir_intrinsic_access(intrin);
+ 
+-   if (access & (ACCESS_NON_READABLE | ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER | ACCESS_COHERENT))
++   if (access & (ACCESS_CAN_REORDER | ACCESS_COHERENT))
+       return false;
+ 
+    if (*cur_modes & modes) {
+-- 
+GitLab
+

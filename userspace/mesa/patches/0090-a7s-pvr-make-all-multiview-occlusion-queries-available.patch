@@ -1,0 +1,31 @@
+Description: pvr: make all multiview occlusion queries available
+ With multiview, a query uses N consecutive query indices starting at the
+ given query, N being the number of views in the view mask (Vulkan spec,
+ Queries, "Query Operation"). pvr_occlusion_query_begin() added the first
+ index N times to the list of the render, so only that index was marked
+ available. The counters themselves are fine: all views write to the visreg
+ of the first index and the per-view fragment jobs add up there
+ (dEQP-VK.multiview.queries_and_timestamps.cmd_copy_query_pool_results.5_10_5_10
+ passes). vkGetQueryPoolResults with VK_QUERY_RESULT_WAIT_BIT then waited
+ for the remaining indices until the timeout and returned early, which fails
+ dEQP-VK.multiview.*queries_and_timestamps.get_query_pool_results.5_10_5_10.
+ .
+ Add query + i for each view, so the other indices become available with a
+ result of zero, as the spec allows.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/vulkan/pvr_arch_cmd_query.c
++++ b/src/imagination/vulkan/pvr_arch_cmd_query.c
+@@ -209,7 +209,7 @@
+ 
+    /* Add the index to the list for this render. */
+    for (uint32_t i = 0; i < view_count; i++) {
+-      util_dynarray_append(&state->query_indices, query);
++      util_dynarray_append(&state->query_indices, query + i);
+    }
+ }
+ 

@@ -8,7 +8,7 @@ to one commit (`KERNEL_RECIPE_COMMIT` in `scripts/stages/kernel.sh`):
 | | |
 |---|---|
 | Repository | `https://github.com/DockSeed/a7s-linux-lts` |
-| Pinned commit | `02e8144e2763` |
+| Pinned commit | `2a76e318f483` |
 | Result | `Image`, `sun60i-a733-cubie-a7s.dtb`, `config`, `System.map`, `modules/` (with aic8800), `KERNEL-ID` |
 
 Changes to the series are made there only; here the pin moves. What the kernel
@@ -36,7 +36,7 @@ directory (`work/linux-<version>`), and writes the result to `out/`. The recipe
 also builds the AIC8800 WLAN/BT driver against its kernel tree; the two modules
 are in `out/modules/`, and `KERNEL-ID` names the driver's upstream commit
 (`aic8800=`). `A7S_KERNEL_REVISION` (`r1`, `t2`, ...) gives the kernel a
-revision as the recipe's release workflow does (kernel release `6.18.64-r2`);
+revision as the recipe's release workflow does (kernel release `6.18.64-r3`);
 empty, the kernel release is `6.18.64`.
 
 The image stage takes `Image`, the dtb and `modules/` as they are. Before it
@@ -68,7 +68,7 @@ result to a release. `scripts/stages/kernel.sh` pins one release:
 | URL | `https://github.com/DockSeed/a7s-linux-lts/releases/download/<tag>/<file>` |
 
 (The files of a test build are named without `~`: the package version
-`6.18.59~t4-1` is `6.18.59.t4-1` in the file name; a release's `6.18.64-2` has
+`6.18.59~t4-1` is `6.18.59.t4-1` in the file name; a release's `6.18.64-3` has
 none.) The
 download goes through `fetch_verified` like every other: the sha256 is checked
 before a file enters the cache and again on every use; a mismatch stops the

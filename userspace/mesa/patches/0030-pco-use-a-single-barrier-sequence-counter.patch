@@ -1,0 +1,89 @@
+From 22f6a6b638737434351e5cb354bafb91902c4b48 Mon Sep 17 00:00:00 2001
+From: Simon Perretta <simon.perretta@imgtec.com>
+Date: Wed, 14 Oct 2026 08:50:32 +0100
+Subject: [PATCH] pco: use a single barrier/sequence counter
+
+By using a sequence number to track when to break out of the current
+barrier wait loop, we no longer need to allocate counters per-barrier,
+but can instead just share one for all of them within a shader.
+
+Signed-off-by: Simon Perretta <simon.perretta@imgtec.com>
+Reviewed-by: Radu Costas <radu.costas@imgtec.com>
+Reviewed-by: Duncan Brawley <duncan.brawley@imgtec.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45202>
+Link: https://gitlab.freedesktop.org/mesa/mesa/-/commit/22f6a6b638737434351e5cb354bafb91902c4b48
+---
+ src/imagination/pco/pco_nir_sync.c | 32 +++++++++++++++++++++---------
+ 1 file changed, 23 insertions(+), 9 deletions(-)
+
+diff --git a/src/imagination/pco/pco_nir_sync.c b/src/imagination/pco/pco_nir_sync.c
+index 06936e043f53..c8c46328d9a8 100644
+--- a/src/imagination/pco/pco_nir_sync.c
++++ b/src/imagination/pco/pco_nir_sync.c
+@@ -24,6 +24,12 @@
+ #include <stdbool.h>
+ #include <stdio.h>
+ 
++/** Context struct for barrier lowering. */
++struct pco_barrier_ctx {
++   bool *uses_usclib;
++   unsigned cnt_seq_offset;
++};
++
+ /**
+  * \brief Lowers a barrier instruction.
+  *
+@@ -39,7 +45,6 @@ lower_barrier(nir_builder *b, nir_intrinsic_instr *intr, void *cb_data)
+       return false;
+ 
+    struct shader_info *info = &b->shader->info;
+-   bool *uses_usclib = cb_data;
+ 
+    mesa_scope exec_scope = nir_intrinsic_execution_scope(intr);
+ 
+@@ -52,14 +57,18 @@ lower_barrier(nir_builder *b, nir_intrinsic_instr *intr, void *cb_data)
+       return true;
+    }
+ 
+-   /* TODO: We might be able to re-use barrier counters. */
+-   unsigned counter_offset = info->shared_size;
+-   info->shared_size += sizeof(uint32_t);
+-   unsigned sequence_offset = info->shared_size;
+-   info->shared_size += sizeof(uint32_t);
+-   info->zero_initialize_shared_memory = true;
++   struct pco_barrier_ctx *ctx = cb_data;
++   if (ctx->cnt_seq_offset == ~0) {
++      ctx->cnt_seq_offset = info->shared_size;
++      /* Reserve 2x 32-bit coeffs for the barrier and sequence counters. */
++      info->shared_size += 2 * sizeof(uint32_t);
++      info->zero_initialize_shared_memory = true;
++   }
+ 
+-   *uses_usclib = true;
++   unsigned counter_offset = ctx->cnt_seq_offset;
++   unsigned sequence_offset = counter_offset + sizeof(uint32_t);
++
++   *ctx->uses_usclib = true;
+ 
+    unsigned num_slots = DIV_ROUND_UP(wg_size, ROGUE_MAX_INSTANCES_PER_TASK);
+ 
+@@ -80,10 +89,15 @@ lower_barrier(nir_builder *b, nir_intrinsic_instr *intr, void *cb_data)
+  */
+ bool pco_nir_lower_barriers(nir_shader *shader, pco_data *data)
+ {
++   struct pco_barrier_ctx ctx = {
++      .uses_usclib = &data->common.uses.usclib,
++      .cnt_seq_offset = ~0,
++   };
++
+    bool progress = nir_shader_intrinsics_pass(shader,
+                                               lower_barrier,
+                                               nir_metadata_none,
+-                                              &data->common.uses.usclib);
++                                              &ctx);
+ 
+    data->common.uses.barriers |= progress;
+ 
+-- 
+GitLab
+

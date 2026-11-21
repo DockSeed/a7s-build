@@ -73,27 +73,28 @@ KERNEL_PROVIDES_MODULES=(wireguard)
 #   apt-utils        apt-extracttemplates, so debconf can preconfigure packages
 STANDARD_IMAGE_PACKAGES=(logrotate bash-completion libnss-systemd whiptail debconf-i18n apt-utils)
 
-# Debian's Mesa from trixie-backports: the 26.1 series carries the PowerVR
-# Vulkan driver trixie's 25.0 lacks. Every image gets the same set (kmscon needs
-# libgbm1 anyway); the X desktop runs without GPU acceleration.
+# Our Mesa (the mesa stage, scripts/stages/mesa.sh), installed from
+# OUT_DIR/mesa in place of Debian's: these are its runtime packages, and the
+# only packages built from the mesa source the image may carry. Every image
+# gets the same set (kmscon needs libgbm1 anyway). On the desktop the X server
+# draws with glamor on the GPU (files/desktop/usr/libexec/a7s-xserver).
 MESA_IMAGE_PACKAGES=(
   libgbm1 libegl-mesa0 libglx-mesa0 libgl1-mesa-dri
   mesa-libgallium mesa-va-drivers mesa-vdpau-drivers mesa-vulkan-drivers
 )
-# deb-version(7) of a trixie backport: <upstream>-<revision>~bpo13+<n>.
-MESA_BPO_MARK="~bpo13+"
 MESA_POWERVR_VK_LIB="usr/lib/aarch64-linux-gnu/libvulkan_powervr_mesa.so"
+# deb-version(7) of a trixie backport: <upstream>-<revision>~bpo13+<n>.
+DEBIAN_BPO_MARK="~bpo13+"
 # kmscon 10.0.3 is the first release that handles a DRM card that fails to
 # initialise; this SoC always has such a card (the GPU's render-only node), and
 # earlier releases crashed on every stop of kmscon.
 KMSCON_MIN_VERSION="10.0.3"
 
-# Exactly what the two backports pins admit (preferences.d/kmscon-backports,
-# preferences.d/mesa-backports). Any other package with a backports version got
-# in at apt's default priority 100 because no other suite has it; the build
-# fails on that (assert_backports_allow_list).
+# Exactly what the backports pin admits (preferences.d/kmscon-backports). Any
+# other package with a backports version got in at apt's default priority 100
+# because no other suite has it; the build fails on that
+# (assert_backports_allow_list).
 BACKPORTS_ALLOWED_PACKAGES=(kmscon libtsm4)
-BACKPORTS_ALLOWED_SOURCES=(mesa)
 
 # --- A7S_DESKTOP=1: Debian's Xfce task with LightDM -----------------------------
 # Named in the same apt-get call as task-desktop and task-xfce-desktop, so each

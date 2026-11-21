@@ -1,0 +1,423 @@
+Description: pco: lower 8-bit and 16-bit integers and memory accesses to 32 bit
+ The backend only allocates 32-bit registers (pco_ra.c asserts only_32bit),
+ the buffer, push constant, shared memory and scratch paths in
+ pco_trans_nir.c only handle 32-bit data, and byte offsets of push constants
+ and shared memory become dword offsets in pco_nir_lower_io(). Integer
+ conversions to and from 16 bit were plain moves.
+ .
+ Memory accesses of UBOs, SSBOs, push constants, shared memory and scratch
+ are split into dword-aligned 32-bit accesses with
+ nir_lower_mem_access_bit_sizes() after the robustness lowering, so bounds
+ checks still see the original access. Partial dword stores become a pair of
+ 32-bit atomic and/or operations (SSBO, shared) or a read-modify-write
+ (scratch), so neighbouring bytes written by other invocations are kept.
+ 32-bit accesses that are already aligned are left unchanged.
+ .
+ ALU operations and subgroup operations on 8-bit and 16-bit values are
+ widened with nir_lower_bit_size() before pco_nir_lower_subgroups(), after
+ the memory lowering and at the end of pco_postprocess_nir(). Only moves,
+ vectors, phis and conversions reach the backend at small bit sizes; they are
+ held in 32-bit registers whose upper bits are undefined. Widening
+ conversions now zero- or sign-extend with ubfe/ibfe, narrowing conversions
+ stay moves, conversions from float16 and to float16 go through float32,
+ and pack_32_2x16_split and unpack_32_2x16_split_x/y are lowered by
+ nir_opt_algebraic. The shared memory size is aligned to a dword, since the
+ coefficient allocation in pvr_alloc_cs_shmem() rounds it down.
+ .
+ No device feature changes here.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/pco/pco_nir.c
++++ b/src/imagination/pco/pco_nir.c
+@@ -71,6 +71,8 @@
+    .lower_pack_64_2x32 = true,
+    .lower_pack_64_2x32_split = true,
+    .lower_unpack_64_2x32_split = true,
++   .lower_pack_32_2x16_split = true,
++   .lower_unpack_32_2x16_split = true,
+ 
+    .lower_interpolate_at = true,
+ 
+@@ -667,6 +669,103 @@
+    return false;
+ }
+ 
++static inline bool is_small_bit_size(unsigned bit_size)
++{
++   return bit_size == 8 || bit_size == 16;
++}
++
++static unsigned lower_alu_bit_size(const nir_alu_instr *alu)
++{
++   const nir_op_info *info = &nir_op_infos[alu->op];
++
++   if (info->is_conversion || nir_op_is_vec_or_mov(alu->op))
++      return 0;
++
++   if (!nir_alu_type_get_type_size(info->output_type) &&
++       is_small_bit_size(alu->def.bit_size)) {
++      return 32;
++   }
++
++   for (unsigned s = 0; s < info->num_inputs; ++s) {
++      if (!nir_alu_type_get_type_size(info->input_types[s]) &&
++          is_small_bit_size(nir_src_bit_size(alu->src[s].src))) {
++         return 32;
++      }
++   }
++
++   return 0;
++}
++
++static unsigned lower_intrinsic_bit_size(const nir_intrinsic_instr *intr)
++{
++   switch (intr->intrinsic) {
++   case nir_intrinsic_read_invocation:
++   case nir_intrinsic_read_first_invocation:
++   case nir_intrinsic_shuffle:
++   case nir_intrinsic_shuffle_xor:
++   case nir_intrinsic_shuffle_up:
++   case nir_intrinsic_shuffle_down:
++   case nir_intrinsic_quad_broadcast:
++   case nir_intrinsic_quad_swap_horizontal:
++   case nir_intrinsic_quad_swap_vertical:
++   case nir_intrinsic_quad_swap_diagonal:
++   case nir_intrinsic_reduce:
++   case nir_intrinsic_inclusive_scan:
++   case nir_intrinsic_exclusive_scan:
++      return is_small_bit_size(intr->def.bit_size) ? 32 : 0;
++
++   default:
++      break;
++   }
++
++   return 0;
++}
++
++static unsigned lower_bit_size_cb(const nir_instr *instr, UNUSED void *data)
++{
++   switch (instr->type) {
++   case nir_instr_type_alu:
++      return lower_alu_bit_size(nir_instr_as_alu(instr));
++
++   case nir_instr_type_intrinsic:
++      return lower_intrinsic_bit_size(nir_instr_as_intrinsic(instr));
++
++   default:
++      break;
++   }
++
++   return 0;
++}
++
++static nir_mem_access_size_align
++mem_access_size_align_cb(nir_intrinsic_op intrin,
++                         uint8_t bytes,
++                         uint8_t bit_size,
++                         uint32_t align_mul,
++                         uint32_t align_offset,
++                         UNUSED bool offset_is_const,
++                         UNUSED enum gl_access_qualifier access,
++                         UNUSED const void *cb_data)
++{
++   uint32_t align = nir_combined_align(align_mul, align_offset);
++   bool is_store = !nir_intrinsic_infos[intrin].has_dest;
++   unsigned num_components = bytes / 4;
++
++   if (bit_size != 32 || align < 4 || !nir_num_components_valid(num_components)) {
++      if (is_store)
++         num_components = align < 4 ? 1 : CLAMP(bytes / 4, 1, 4);
++      else
++         num_components = MIN2(DIV_ROUND_UP(bytes, 4), 4);
++   }
++
++   return (nir_mem_access_size_align){
++      .num_components = num_components,
++      .bit_size = 32,
++      .align = 4,
++      .shift = nir_mem_access_shift_method_scalar,
++   };
++}
++
+ /**
+  * \brief Runs pre-processing passes on a NIR shader.
+  *
+@@ -731,6 +830,7 @@
+          .lower_boolean_shuffle = true,
+       });
+ 
++   NIR_PASS(_, nir, nir_lower_bit_size, lower_bit_size_cb, NULL);
+    NIR_PASS(_, nir, pco_nir_lower_subgroups);
+ 
+    NIR_PASS(_,
+@@ -1092,6 +1192,7 @@
+             nir_lower_vars_to_explicit_types,
+             nir_var_mem_shared,
+             shared_var_info);
++   nir->info.shared_size = ALIGN_POT(nir->info.shared_size, 4);
+ 
+    NIR_PASS(_,
+             nir,
+@@ -1113,6 +1214,15 @@
+                &data->common);
+    }
+ 
++   nir_lower_mem_access_bit_sizes_options mem_access_opts = {
++      .callback = mem_access_size_align_cb,
++      .modes = nir_var_mem_ubo | nir_var_mem_ssbo | nir_var_mem_push_const |
++               nir_var_mem_shared | nir_var_function_temp,
++      .may_lower_unaligned_stores_to_atomics = true,
++   };
++   NIR_PASS(_, nir, nir_lower_mem_access_bit_sizes, &mem_access_opts);
++   NIR_PASS(_, nir, nir_lower_bit_size, lower_bit_size_cb, NULL);
++
+    if (nir->info.stage == MESA_SHADER_COMPUTE &&
+        (PCO_DEBUG(GLOBAL_SHMEM) ||
+         should_spill_shmem(ctx, nir->info.shared_size))) {
+@@ -1357,6 +1467,7 @@
+ 
+    pco_nir_opt(ctx, nir, data, false);
+ 
++   NIR_PASS(_, nir, nir_lower_bit_size, lower_bit_size_cb, NULL);
+    NIR_PASS(_, nir, nir_lower_all_phis_to_scalar);
+ 
+    /* Temporary: lower phi undefs to zero because at this stage we don't want to
+--- a/src/imagination/pco/pco_trans_nir.c
++++ b/src/imagination/pco/pco_trans_nir.c
+@@ -72,6 +72,11 @@
+    _mesa_hash_table_u64_insert(func->vec_infos, dest.val, vec_info);
+ }
+ 
++static inline unsigned pco_nir_bits(unsigned bit_size)
++{
++   return bit_size == 8 || bit_size == 16 ? 32 : bit_size;
++}
++
+ /**
+  * \brief Translates a NIR def into a PCO reference.
+  *
+@@ -80,7 +85,9 @@
+  */
+ static inline pco_ref pco_ref_nir_def(const nir_def *def)
+ {
+-   return pco_ref_ssa(def->index, def->bit_size, def->num_components);
++   return pco_ref_ssa(def->index,
++                      pco_nir_bits(def->bit_size),
++                      def->num_components);
+ }
+ 
+ /**
+@@ -2303,7 +2310,7 @@
+    }
+ 
+    nir_intrinsic_instr *reg_decl = nir_reg_get_decl(reg);
+-   return nir_intrinsic_bit_size(reg_decl);
++   return pco_nir_bits(nir_intrinsic_bit_size(reg_decl));
+ }
+ 
+ static pco_instr *trans_reg_intr(trans_ctx *tctx,
+@@ -3627,9 +3634,33 @@
+                         fred_dest_b);
+ }
+ 
+-static pco_instr *
+-trans_conv(trans_ctx *tctx, nir_op op, pco_ref dest, pco_ref src)
++static pco_instr *trans_int_ext(trans_ctx *tctx,
++                                pco_ref dest,
++                                pco_ref src,
++                                unsigned src_bits,
++                                bool is_signed)
+ {
++   pco_ref offset = pco_ref_new_ssa32(tctx->func);
++   pco_movi32(&tctx->b, offset, pco_ref_imm32(0));
++
++   pco_ref width = pco_ref_new_ssa32(tctx->func);
++   pco_movi32(&tctx->b, width, pco_ref_imm32(src_bits));
++
++   if (is_signed)
++      return pco_ibfe(&tctx->b, dest, src, offset, width);
++
++   return pco_ubfe(&tctx->b, dest, src, offset, width);
++}
++
++static pco_instr *trans_conv(trans_ctx *tctx,
++                             nir_op op,
++                             pco_ref dest,
++                             pco_ref src,
++                             unsigned src_bits)
++{
++   const nir_op_info *info = &nir_op_infos[op];
++   nir_alu_type dest_base_type = nir_alu_type_get_base_type(info->output_type);
++   unsigned dest_bits = nir_alu_type_get_type_size(info->output_type);
+    bool roundzero;
+    enum pco_pck_fmt pck_fmt;
+    bool unpck;
+@@ -3637,6 +3668,8 @@
+    switch (op) {
+    /* b2* ops are just sels. */
+    case nir_op_b2f32:
++   case nir_op_b2i8:
++   case nir_op_b2i16:
+    case nir_op_b2i32:
+       return pco_bcsel(&tctx->b,
+                        dest,
+@@ -3647,47 +3680,76 @@
+    case nir_op_f2f16:
+    case nir_op_f2f16_rtne:
+    case nir_op_f2f16_rtz:
+-      assert(pco_ref_get_bits(src) == 32);
++      assert(src_bits == 32);
+ 
+       roundzero = (op != nir_op_f2f16_rtne);
+       pck_fmt = PCO_PCK_FMT_F16F16;
+       unpck = false;
+-
+-      /* TODO: support non-32 bit vars. */
+-      dest = pco_ref_bits(dest, 32);
+       break;
+ 
+    case nir_op_f2f32:
+-      assert(pco_ref_get_bits(src) == 16);
++      assert(src_bits == 16);
+ 
+       roundzero = false;
+       pck_fmt = PCO_PCK_FMT_F16F16;
+       unpck = true;
+-
+-      /* TODO: support non-32 bit vars. */
+-      src = pco_ref_bits(src, 32);
+       break;
+ 
++   case nir_op_f2i8:
++   case nir_op_f2i16:
+    case nir_op_f2i32:
+    case nir_op_f2i32_rtne:
++   case nir_op_f2u8:
++   case nir_op_f2u16:
+    case nir_op_f2u32:
++      if (src_bits == 16) {
++         pco_ref src32 = pco_ref_new_ssa32(tctx->func);
++         trans_conv(tctx, nir_op_f2f32, src32, src, src_bits);
++         src = src32;
++      }
++
+       roundzero = (op != nir_op_f2i32_rtne);
+-      pck_fmt = (op == nir_op_f2u32) ? PCO_PCK_FMT_U32 : PCO_PCK_FMT_S32;
++      pck_fmt = (dest_base_type == nir_type_uint) ? PCO_PCK_FMT_U32
++                                                  : PCO_PCK_FMT_S32;
+       unpck = false;
+       break;
+ 
+-   /* Just consume/treat as 32-bit for now. */
+-   /* TODO: support non-32 bit vars. */
++   case nir_op_i2i8:
+    case nir_op_i2i16:
+    case nir_op_i2i32:
++   case nir_op_u2u8:
+    case nir_op_u2u16:
+    case nir_op_u2u32:
+-      dest = pco_ref_bits(dest, 32);
+-      src = pco_ref_bits(src, 32);
++      if (dest_bits > src_bits) {
++         return trans_int_ext(tctx,
++                              dest,
++                              src,
++                              src_bits,
++                              dest_base_type == nir_type_int);
++      }
++
+       return pco_mov(&tctx->b, dest, src);
+ 
++   case nir_op_i2f16:
++   case nir_op_u2f16: {
++      pco_ref src32 = pco_ref_new_ssa32(tctx->func);
++      trans_conv(tctx,
++                 op == nir_op_i2f16 ? nir_op_i2f32 : nir_op_u2f32,
++                 src32,
++                 src,
++                 src_bits);
++
++      return trans_conv(tctx, nir_op_f2f16, dest, src32, 32);
++   }
++
+    case nir_op_i2f32:
+    case nir_op_u2f32:
++      if (src_bits < 32) {
++         pco_ref src32 = pco_ref_new_ssa32(tctx->func);
++         trans_int_ext(tctx, src32, src, src_bits, op == nir_op_i2f32);
++         src = src32;
++      }
++
+       roundzero = tctx->ftz32b;
+       pck_fmt = (op == nir_op_u2f32) ? PCO_PCK_FMT_U32 : PCO_PCK_FMT_S32;
+       unpck = true;
+@@ -4030,21 +4092,35 @@
+       break;
+ 
+    case nir_op_b2f32:
++   case nir_op_b2i8:
++   case nir_op_b2i16:
+    case nir_op_b2i32:
+    case nir_op_f2f16:
+    case nir_op_f2f16_rtne:
+    case nir_op_f2f16_rtz:
+    case nir_op_f2f32:
++   case nir_op_f2i8:
++   case nir_op_f2i16:
+    case nir_op_f2i32:
+    case nir_op_f2i32_rtne:
++   case nir_op_f2u8:
++   case nir_op_f2u16:
+    case nir_op_f2u32:
++   case nir_op_i2f16:
+    case nir_op_i2f32:
++   case nir_op_i2i8:
+    case nir_op_i2i16:
+    case nir_op_i2i32:
++   case nir_op_u2f16:
+    case nir_op_u2f32:
++   case nir_op_u2u8:
+    case nir_op_u2u16:
+    case nir_op_u2u32:
+-      instr = trans_conv(tctx, alu->op, dest, src[0]);
++      instr = trans_conv(tctx,
++                         alu->op,
++                         dest,
++                         src[0],
++                         nir_src_bit_size(alu->src[0].src));
+       break;
+ 
+    case nir_op_fmin:
+@@ -4217,8 +4293,9 @@
+       comps[c] = pco_ref_new_ssa(tctx->func, pco_ref_get_bits(dest), 1);
+ 
+       uint64_t val = nir_const_value_as_uint(nconst->value[c], num_bits);
+-      pco_ref imm =
+-         pco_ref_imm(val, pco_bits(num_bits), pco_ref_get_dtype(dest));
++      pco_ref imm = pco_ref_imm(val,
++                                pco_bits(pco_nir_bits(num_bits)),
++                                pco_ref_get_dtype(dest));
+ 
+       pco_movi32(&tctx->b, comps[c], imm);
+    }
+@@ -4242,12 +4319,14 @@
+       return pco_mov(&tctx->b, dest, pco_ref_bits(pco_zero, 1));
+    }
+ 
+-   assert(num_bits == 32);
++   assert(pco_nir_bits(num_bits) == 32);
+ 
+    if (pco_ref_is_scalar(dest)) {
+       assert(chans == 1);
+ 
+-      pco_ref imm = pco_ref_imm(0, pco_bits(num_bits), pco_ref_get_dtype(dest));
++      pco_ref imm = pco_ref_imm(0,
++                                pco_bits(pco_nir_bits(num_bits)),
++                                pco_ref_get_dtype(dest));
+ 
+       return pco_movi32(&tctx->b, dest, imm);
+    }

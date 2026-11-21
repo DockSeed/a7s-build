@@ -1,0 +1,24 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only OR MIT
+#
+# a7s-xserver -- the X server LightDM starts (xserver-command in
+# /etc/lightdm/lightdm.conf.d/50-a7s-xserver.conf). Installed by the image
+# build (scripts/distro/debian) as /usr/libexec/a7s-xserver.
+#
+# The X server draws with glamor (/etc/X11/xorg.conf.d/20-a7s-modesetting.conf).
+# glamor renders through Mesa's kmsro driver for the display device, which uses
+# zink on the PowerVR Vulkan driver. Mesa starts that driver on this GPU only
+# when PVR_I_WANT_A_BROKEN_VULKAN_DRIVER is set, because Mesa does not list the
+# GPU as conformant.
+#
+# The variable is set here, for the X server and nothing else, and not in
+# Xsession.d or /etc/environment: Mesa reads it in every process, and with it
+# in the session applications render on the GPU through zink themselves. On
+# this board that made Firefox drop a third or more of the frames of a
+# video. Without it, applications render on the CPU and the X server shows
+# their frames with glamor. To try one application on the GPU, start it with
+# the variable set:
+#
+#   PVR_I_WANT_A_BROKEN_VULKAN_DRIVER=1 <application>
+export PVR_I_WANT_A_BROKEN_VULKAN_DRIVER=1
+exec /usr/bin/X "$@"

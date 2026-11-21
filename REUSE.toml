@@ -17,10 +17,35 @@ precedence = "override"
 SPDX-FileCopyrightText = "The Xfce contributors"
 SPDX-License-Identifier = "GPL-2.0-or-later"
 
+# Mesa patches change Mesa files under MIT (or without a header, Debian's
+# "Files: *", License: MIT). Backports: the author of each is in its From:
+# line. Our own (Author: DockSeed, names with -a7s-, and 0035) below.
+[[annotations]]
+path = "userspace/mesa/patches/*.patch"
+precedence = "override"
+SPDX-FileCopyrightText = "the Mesa contributors (author of each patch: its From: line)"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["userspace/mesa/patches/*-a7s-*.patch", "userspace/mesa/patches/0035-dril-sun60i-kms.patch"]
+precedence = "override"
+SPDX-FileCopyrightText = "the a7s-build contributors"
+SPDX-License-Identifier = "MIT"
+
+# debian.diff changes Debian's packaging of mesa 26.2.6-1, whose
+# debian/copyright says "Files: debian/*  Copyright: 2006, Thierry Reding
+# License: GPL" without a version; it also carries Mesa copyright lines for
+# debian/copyright (MIT).
+[[annotations]]
+path = "userspace/mesa/debian.diff"
+precedence = "override"
+SPDX-FileCopyrightText = ["2006 Thierry Reding <thierry@gilfi.de>", "the a7s-build contributors"]
+SPDX-License-Identifier = "GPL-1.0-or-later AND MIT"
+
 # Everything else without an inline header: our own scripts, docs, pins and
 # build data.
 [[annotations]]
-path = ["README.md", "docs/**", "container/**", ".gitignore", "**/series", "out-of-tree/**/*.sha256", "out-of-tree/**/*.md"]
+path = ["README.md", "docs/**", "container/**", ".gitignore", "**/series", "out-of-tree/**/*.sha256", "out-of-tree/**/*.md", "userspace/**/*.sha256"]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "the a7s-build contributors"
 SPDX-License-Identifier = "GPL-2.0-only OR MIT"
@@ -33,6 +58,6 @@ SPDX-License-Identifier = "GPL-2.0-only OR MIT"
 
 # Our own files that carry a licence header but no copyright line.
 [[annotations]]
-path = ["build.sh", "config/**", "scripts/*.sh", "scripts/lib/**", "scripts/stages/**", "scripts/distro/debian/*", "userspace/**/*.c"]
+path = ["build.sh", "config/**", "scripts/*.sh", "scripts/lib/**", "scripts/stages/**", "scripts/distro/debian/*", "userspace/**/*.c", "userspace/**/*.sh"]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "the a7s-build contributors"

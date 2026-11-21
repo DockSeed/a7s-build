@@ -1,0 +1,80 @@
+Description: pvr: calibrated timestamps on CLOCK_MONOTONIC_RAW
+ The firmware's job timestamps are in ns of CLOCK_MONOTONIC_RAW, so the device
+ time domain is that clock. Set vk_device.get_timestamp to read it and enable
+ VK_KHR_calibrated_timestamps and VK_EXT_calibrated_timestamps with the common
+ entry points, only with a kernel that reports job timestamps. zink then reads
+ GL_TIMESTAMP without a round trip to the GPU (zink_get_timestamp).
+ .
+ vk_common_GetCalibratedTimestampsKHR() adds device_time_domain_period to the
+ maximum deviation it returns. The job timestamps are nanoseconds, but the
+ firmware takes them from the GPU CR timer, and one tick of it is
+ ROGUE_CRTIME_TICK_IN_CYCLES = 256 core clock cycles, 640 ns at the lowest
+ operating point of the GPU, 400 MHz. The device sets device_time_domain_period
+ to the tick length at that clock, rounded up to whole nanoseconds, instead of
+ the ceil(timestampPeriod) of 1 ns that vk_device_init() sets. The kernel
+ interface does not report the clock range, so it is a constant here and the
+ value is a bound that holds at every higher clock, where a tick is shorter.
+ timestampPeriod stays 1 ns per unit because the reported values are
+ nanoseconds.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/vulkan/pvr_arch_device.c
++++ b/src/imagination/vulkan/pvr_arch_device.c
+@@ -65,6 +65,12 @@
+ #define PVR_SUBALLOCATOR_VIS_TEST_SIZE (128 * 1024)
+ #define PVR_SUBALLOCATOR_TIMESTAMP_SIZE (16 * 1024)
+ 
++#define PVR_FW_TIMESTAMP_TICK_CYCLES 256U
++#define PVR_FW_TIMESTAMP_SLOWEST_CLOCK_HZ UINT64_C(400000000)
++#define PVR_FW_TIMESTAMP_RESOLUTION_NS                                  \
++   DIV_ROUND_UP(PVR_FW_TIMESTAMP_TICK_CYCLES * UINT64_C(1000000000),    \
++                PVR_FW_TIMESTAMP_SLOWEST_CLOCK_HZ)
++
+ static uint32_t pvr_get_simultaneous_num_allocs(
+    const struct pvr_device_info *dev_info,
+    ASSERTED const struct pvr_device_runtime_info *dev_runtime_info)
+@@ -770,6 +776,14 @@
+    pvr_render_target_dataset_destroy(device->dummy_rt.rt_dataset);
+ }
+ 
++static VkResult pvr_device_get_timestamp(struct vk_device *vk_device,
++                                         uint64_t *timestamp)
++{
++   return vk_device_get_timestamp(NULL,
++                                  VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_KHR,
++                                  timestamp);
++}
++
+ VkResult PVR_PER_ARCH(create_device)(struct pvr_physical_device *pdevice,
+                                      const VkDeviceCreateInfo *pCreateInfo,
+                                      const VkAllocationCallbacks *pAllocator,
+@@ -826,6 +840,11 @@
+ 
+    vk_device_set_drm_fd(&device->vk, ws->render_fd);
+ 
++   if (ws->features.supports_job_timestamps) {
++      device->vk.get_timestamp = pvr_device_get_timestamp;
++      device->vk.device_time_domain_period = PVR_FW_TIMESTAMP_RESOLUTION_NS;
++   }
++
+    if (ws->features.supports_threaded_submit) {
+       /* Queue submission can be blocked if the kernel CCBs become full,
+        * so enable threaded submit to not block the submitter.
+--- a/src/imagination/vulkan/pvr_physical_device.c
++++ b/src/imagination/vulkan/pvr_physical_device.c
+@@ -1284,6 +1284,11 @@
+    pdevice->memory.memoryTypes[0].heapIndex = 0;
+ 
+    pvr_physical_device_get_supported_extensions(&supported_extensions, instance);
++
++   if (ws->features.supports_job_timestamps) {
++      supported_extensions.KHR_calibrated_timestamps = true;
++      supported_extensions.EXT_calibrated_timestamps = true;
++   }
+    pvr_physical_device_get_supported_features(&pdevice->dev_info,
+                                               &supported_features);
+    if (!pvr_physical_device_get_properties(pdevice, &supported_properties)) {

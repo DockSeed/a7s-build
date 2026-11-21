@@ -1,0 +1,143 @@
+Description: pvr: bound the idle render states by size as well
+ The render state cache for dynamic rendering keeps up to 16 render states
+ without references. Each of them holds its SPM scratch buffer, which scales
+ with width, height, sample count, output registers and tile buffers
+ (pvr_arch_spm_scratch_buffer_calc_required_size()), and the render target
+ dataset of its first job, whose buffers grow with the number of tiles and
+ layers. The scratch buffer store only shares a buffer
+ between render states of exactly the size of the last one, so render states
+ of different sizes each hold their own. At 1920x1080 with one sample and one
+ output register a scratch buffer is about 8 MiB, at 3840x2160 about 32 MiB,
+ and with 4 samples at 3840x2160 about 127 MiB; 16 idle render states can then
+ hold several hundred MiB to about 2 GiB, for example after a window was
+ resized through many sizes.
+ .
+ Count the scratch buffer sizes of the idle render states and evict the
+ least recently used ones while the sum exceeds 64 MiB, in addition to the
+ limit of 16 entries. The most recently used idle render state is always kept,
+ so a single large render target still gets the cached render state. The
+ datasets are not counted. Evicted render states are taken off the idle list
+ under the cache lock and destroyed after it is released; render states with
+ references are never on the idle list and are not touched.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/vulkan/pvr_device.c
++++ b/src/imagination/vulkan/pvr_device.c
+@@ -159,6 +159,8 @@
+ 
+ #define PVR_RENDER_STATE_CACHE_IDLE_MAX 16
+ 
++#define PVR_RENDER_STATE_CACHE_IDLE_MAX_BYTES (64ULL * 1024ULL * 1024ULL)
++
+ #define PVR_USC_CACHE_MAX_ENTRIES 256
+ 
+ static uint32_t pvr_eot_cache_key_hash(const void *key)
+@@ -543,6 +545,27 @@
+    vk_free(&device->vk.alloc, rstate);
+ }
+ 
++static void pvr_render_state_cache_idle_del(struct pvr_device *device,
++                                            struct pvr_render_state *rstate)
++{
++   simple_mtx_assert_locked(&device->rstate_cache_mtx);
++   assert(!rstate->refs);
++
++   list_del(&rstate->link);
++   device->rstate_cache_idle_count--;
++   device->rstate_cache_idle_bytes -= rstate->scratch_buffer_size;
++}
++
++static bool pvr_render_state_cache_idle_full(const struct pvr_device *device)
++{
++   if (device->rstate_cache_idle_count > PVR_RENDER_STATE_CACHE_IDLE_MAX)
++      return true;
++
++   return device->rstate_cache_idle_count > 1 &&
++          device->rstate_cache_idle_bytes >
++             PVR_RENDER_STATE_CACHE_IDLE_MAX_BYTES;
++}
++
+ static bool pvr_render_state_needs_frag(const struct pvr_render_state *rstate)
+ {
+    for (uint32_t i = 0; i < rstate->render_targets_count; i++) {
+@@ -563,6 +586,7 @@
+    simple_mtx_init(&device->rstate_cache_mtx, mtx_plain);
+    list_inithead(&device->rstate_cache_idle);
+    device->rstate_cache_idle_count = 0;
++   device->rstate_cache_idle_bytes = 0;
+ 
+    return VK_SUCCESS;
+ }
+@@ -593,8 +617,7 @@
+       if (!pvr_render_state_key_equal(&rstate->key, key))
+          continue;
+ 
+-      list_del(&rstate->link);
+-      device->rstate_cache_idle_count--;
++      pvr_render_state_cache_idle_del(device, rstate);
+       rstate->refs = 1;
+       found = rstate;
+       break;
+@@ -617,6 +640,10 @@
+ void pvr_render_state_cache_put(struct pvr_device *device,
+                                 struct pvr_render_state *rstate)
+ {
++   struct list_head evicted;
++
++   list_inithead(&evicted);
++
+    simple_mtx_lock(&device->rstate_cache_mtx);
+ 
+    assert(rstate->refs);
+@@ -627,23 +654,26 @@
+ 
+    if (!pvr_render_state_needs_frag(rstate)) {
+       list_addtail(&rstate->link, &device->rstate_cache_idle);
++      device->rstate_cache_idle_count++;
++      device->rstate_cache_idle_bytes += rstate->scratch_buffer_size;
+ 
+-      if (++device->rstate_cache_idle_count <=
+-          PVR_RENDER_STATE_CACHE_IDLE_MAX) {
+-         simple_mtx_unlock(&device->rstate_cache_mtx);
+-         return;
+-      }
++      while (pvr_render_state_cache_idle_full(device)) {
++         struct pvr_render_state *oldest =
++            list_first_entry(&device->rstate_cache_idle,
++                             struct pvr_render_state,
++                             link);
+ 
+-      rstate = list_first_entry(&device->rstate_cache_idle,
+-                                struct pvr_render_state,
+-                                link);
+-      list_del(&rstate->link);
+-      device->rstate_cache_idle_count--;
++         pvr_render_state_cache_idle_del(device, oldest);
++         list_addtail(&oldest->link, &evicted);
++      }
++   } else {
++      list_addtail(&rstate->link, &evicted);
+    }
+ 
+    simple_mtx_unlock(&device->rstate_cache_mtx);
+ 
+-   pvr_render_state_destroy(device, rstate);
++   list_for_each_entry_safe (struct pvr_render_state, entry, &evicted, link)
++      pvr_render_state_destroy(device, entry);
+ }
+ 
+ VkResult pvr_AllocateMemory(VkDevice _device,
+--- a/src/imagination/vulkan/pvr_device.h
++++ b/src/imagination/vulkan/pvr_device.h
+@@ -172,6 +172,7 @@
+    simple_mtx_t rstate_cache_mtx;
+    struct list_head rstate_cache_idle;
+    uint32_t rstate_cache_idle_count;
++   uint64_t rstate_cache_idle_bytes;
+ 
+    simple_mtx_t csb_bo_pool_mtx;
+    struct list_head csb_bo_pool;

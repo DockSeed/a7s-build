@@ -1,0 +1,106 @@
+From dfd0a679d4c54a10a50a4ad9b39ecf82ca6634f0 Mon Sep 17 00:00:00 2001
+From: David Rosca <david.rosca@amd.com>
+Date: Fri, 16 Oct 2026 12:37:12 +0200
+Subject: [PATCH] mesa: Handle import fail in ImportMemoryFd/Win32EXT
+
+If the import fails we should return error. In case of ImportMemoryFdEXT
+we only own the fd when the import succeeds.
+Also fixes crash caused by dereferencing nullptr when TexStorageMem2DEXT
+was called on a memory object with no imported memory.
+
+Cc: mesa-stable
+Closes: https://gitlab.freedesktop.org/mesa/mesa/-/work_items/16574
+Reviewed-by: Pierre-Eric Pelloux-Prayer <pierre-eric.pelloux-prayer@amd.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45294>
+(cherry picked from commit 24ad6e0dc315b9bf954a127db4545b77ad289524)
+Link: https://gitlab.freedesktop.org/mesa/mesa/-/commit/dfd0a679d4c54a10a50a4ad9b39ecf82ca6634f0
+[ adapted: dropped .pick_status.json, not in the 26.3.0 tarball or bookkeeping only ]
+---
+ .pick_status.json               |  2 +-
+ src/mesa/main/externalobjects.c | 32 +++++++++++++++++++++++++-------
+ 2 files changed, 26 insertions(+), 8 deletions(-)
+
+diff --git a/src/mesa/main/externalobjects.c b/src/mesa/main/externalobjects.c
+index 7fdd4e3bcb1d..5972d41e75f4 100644
+--- a/src/mesa/main/externalobjects.c
++++ b/src/mesa/main/externalobjects.c
+@@ -59,7 +59,7 @@ memoryobj_alloc(struct gl_context *ctx, GLuint name)
+    return obj;
+ }
+ 
+-static void
++static bool
+ import_memoryobj_fd(struct gl_context *ctx,
+                     struct gl_memory_object *obj,
+                     GLuint64 size,
+@@ -79,12 +79,17 @@ import_memoryobj_fd(struct gl_context *ctx,
+                                                    &whandle,
+                                                    obj->Dedicated);
+ 
+-   /* We own fd, but we no longer need it. So get rid of it */
+-   close(fd);
++   if (obj->memory) {
++      /* We own fd, but we no longer need it. So get rid of it */
++      close(fd);
++      return true;
++   }
+ #endif
++
++   return false;
+ }
+ 
+-static void
++static bool
+ import_memoryobj_win32(struct gl_context *ctx,
+                        struct gl_memory_object *obj,
+                        GLuint64 size,
+@@ -108,6 +113,7 @@ import_memoryobj_win32(struct gl_context *ctx,
+    obj->memory = screen->memobj_create_from_handle(screen,
+                                                    &whandle,
+                                                    obj->Dedicated);
++   return obj->memory;
+ }
+ 
+ /**
+@@ -1154,7 +1160,11 @@ _mesa_ImportMemoryFdEXT(GLuint memory,
+    if (!memObj)
+       return;
+ 
+-   import_memoryobj_fd(ctx, memObj, size, fd);
++   if (!import_memoryobj_fd(ctx, memObj, size, fd)) {
++      _mesa_error(ctx, GL_INVALID_VALUE, "%s(import failed)", func);
++      return;
++   }
++
+    memObj->Immutable = GL_TRUE;
+ }
+ 
+@@ -1185,7 +1195,11 @@ _mesa_ImportMemoryWin32HandleEXT(GLuint memory,
+    if (!memObj)
+       return;
+ 
+-   import_memoryobj_win32(ctx, memObj, size, handle, NULL);
++   if (!import_memoryobj_win32(ctx, memObj, size, handle, NULL)) {
++      _mesa_error(ctx, GL_INVALID_VALUE, "%s(import failed)", func);
++      return;
++   }
++
+    memObj->Immutable = GL_TRUE;
+ }
+ 
+@@ -1216,7 +1230,11 @@ _mesa_ImportMemoryWin32NameEXT(GLuint memory,
+    if (!memObj)
+       return;
+ 
+-   import_memoryobj_win32(ctx, memObj, size, NULL, name);
++   if (!import_memoryobj_win32(ctx, memObj, size, NULL, name)) {
++      _mesa_error(ctx, GL_INVALID_VALUE, "%s(import failed)", func);
++      return;
++   }
++
+    memObj->Immutable = GL_TRUE;
+ }
+ 
+-- 
+GitLab
+

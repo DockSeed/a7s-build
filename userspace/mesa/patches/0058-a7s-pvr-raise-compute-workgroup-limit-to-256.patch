@@ -1,0 +1,49 @@
+Description: pvr: raise the compute workgroup limit to 256 invocations
+ maxComputeWorkGroupInvocations is a literal 128 with a size of
+ (128, 128, 64), while the driver already handles larger workgroups: sizes
+ above 32 invocations are padded to whole tasks
+ (pvr_compute_flat_pad_workgroup_size()), barriers across tasks are lowered
+ to the shared memory counter in usclib_barrier() (pco_nir_sync.c), the
+ register allocator limits temporaries per slot for such workgroups
+ (rogue_max_wg_temps()) and spills beyond that, and the CDM workgroup size
+ fields take up to 512 per dimension. rogue_get_compute_max_work_group_size()
+ returns 512 on cores with ERN 35421 such as BXM-4-64, and the unused
+ max_compute_work_group_invocations in pvr_physical_device.c computes 512 for
+ its 64 USC slots. Applications such as wgpu programs with
+ workgroup_size(256) fail on 128.
+ .
+ Report 256 invocations, a size of (256, 256, 64) and 8 subgroups per
+ workgroup. A barrier in a workgroup of 256 needs 8 of the 64 USC slots at
+ the same time. This needs the fix "pco: fence before mutex release ops"
+ (patch 0003 in this series), which keeps shared memory writes in barriers.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/vulkan/pvr_physical_device.c
++++ b/src/imagination/vulkan/pvr_physical_device.c
+@@ -744,10 +744,10 @@
+          [1] = (64U * 1024U) - 1,
+          [2] = (64U * 1024U) - 1,
+       },
+-      .maxComputeWorkGroupInvocations = 128U,
++      .maxComputeWorkGroupInvocations = 256U,
+       .maxComputeWorkGroupSize = {
+-        [0] = 128U,
+-        [1] = 128U,
++        [0] = 256U,
++        [1] = 256U,
+         [2] = 64U,
+       },
+ 
+@@ -976,7 +976,7 @@
+       /* Vulkan 1.3 / VK_EXT_subgroup_size_control */
+       .minSubgroupSize = ROGUE_MAX_INSTANCES_PER_TASK,
+       .maxSubgroupSize = ROGUE_MAX_INSTANCES_PER_TASK,
+-      .maxComputeWorkgroupSubgroups = 128U / ROGUE_MAX_INSTANCES_PER_TASK,
++      .maxComputeWorkgroupSubgroups = 256U / ROGUE_MAX_INSTANCES_PER_TASK,
+       .requiredSubgroupSizeStages = VK_SHADER_STAGE_COMPUTE_BIT,
+ 
+       /* Vulkan 1.2 / VK_KHR_timeline_semaphore */

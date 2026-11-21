@@ -1,0 +1,43 @@
+From 5f01c054832e97186bc4148bd5b95e2bb39715c0 Mon Sep 17 00:00:00 2001
+From: mozixun <ronforever@outlook.com>
+Date: Fri, 6 Nov 2026 15:28:28 +0800
+Subject: [PATCH] zink: don't charge a batch the whole slab for a suballocated
+ resource
+
+zink_bo_get_size() returns the slab a suballocation lives in, not the slice
+the resource occupies, so moving N small resources into a batch charged N
+slabs. For 1 KiB texture uploads that is ~2 MiB each, which reaches
+clamp_video_mem and makes the batch end itself after a few thousand uploads
+while almost nothing is actually live.
+
+Charge the size the allocation owns instead. This only differs for
+suballocated BOs; a dedicated allocation reports the same value either way.
+
+Cc: mesa-stable
+Generated-by: LLM
+Signed-off-by: mozixun <ronforever@outlook.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45818>
+(cherry picked from commit 23f2d1025f5a767db5f2b25c90a624fd96b23c7a)
+Link: https://gitlab.freedesktop.org/mesa/mesa/-/commit/5f01c054832e97186bc4148bd5b95e2bb39715c0
+[ adapted: dropped .pick_status.json, not in the 26.3.0 tarball or bookkeeping only ]
+---
+ .pick_status.json                     | 2 +-
+ src/gallium/drivers/zink/zink_batch.c | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/gallium/drivers/zink/zink_batch.c b/src/gallium/drivers/zink/zink_batch.c
+index 67f222e3cfac..ad1093a356cd 100644
+--- a/src/gallium/drivers/zink/zink_batch.c
++++ b/src/gallium/drivers/zink/zink_batch.c
+@@ -1111,7 +1111,7 @@ batch_reference_resource_move_internal(struct zink_batch_state *bs, struct zink_
+    bs->buffer_indices_hashlist[hash] = idx & 0x7fff;
+    bs->last_added_obj = res->obj;
+    if (!(res->base.b.flags & PIPE_RESOURCE_FLAG_SPARSE)) {
+-      bs->resource_size += res->obj->size;
++      bs->resource_size += bo->base.size;
+    } else {
+       /* Sparse backing pages are not directly referenced by the batch as
+        * there can be a lot of them.
+-- 
+GitLab
+

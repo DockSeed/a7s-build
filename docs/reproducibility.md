@@ -24,9 +24,11 @@ per architecture. sha256 of `a7s-trixie-minimal.img.xz`:
 | Builder packages | `container/packages.lock`: one snapshot.debian.org timestamp and the exact `name:arch=version` of every package, both architectures | image build fails unless the installed set equals the lock |
 | Builder package list | `container/packages.d/*.txt` | image build fails while a package is not in the lock |
 | Root filesystem packages | `A7S_SNAPSHOT` (APT sources point at that snapshot) | APT, against the signed `InRelease` |
+| Mesa and xfwm4 build chroots | `A7S_SNAPSHOT`, as the root filesystem (the Mesa build needs a snapshot from 20261112 on, for wayland-scanner from trixie-backports) | APT, against the signed `InRelease` |
+| Mesa patches and packaging diff | `userspace/mesa/patches.sha256` (content and order), `MESA_DEBIAN_DIFF_SHA256` | before the build |
 | Downloaded files | sha256 in the repository, `fetch_verified` | before entering the cache and on every use |
 | Git sources | full commit id, `git_fetch_pinned` | git checks every object; `HEAD` is compared with the pin |
-| Time stamps | `SOURCE_DATE_EPOCH` = commit time of `HEAD` (`A7S_SOURCE_DATE_EPOCH` overrides) | exported to every stage (the kernel takes the commit time of its own recipe); a time in the future is refused, because file times are only clamped downwards |
+| Time stamps | `SOURCE_DATE_EPOCH` = commit time of `HEAD` (`A7S_SOURCE_DATE_EPOCH` overrides) | exported to every stage (the kernel takes the commit time of its own recipe; the xfwm4 and Mesa packages the fixed date of their changelog entry); a time in the future is refused, because file times are only clamped downwards |
 | Build identity | `A7S_BUILD_COMMIT` = `HEAD` id, `-dirty` if modified | stamped into the image |
 
 A mirror (`A7S_DOWNLOAD_MIRROR`) and the cache are only places to look; a
@@ -46,9 +48,14 @@ time zone `UTC`.
   between the cross and the native compiler.
 - **A modified tree** (marked `-dirty`, builds from the changed files).
 
+The images above were checked before the `mesa` stage existed; whether two
+builds of its packages give the same bytes has not been checked yet.
+
 ## Moving a pin
 
 - **Image packages:** change `A7S_SNAPSHOT` in `config/defaults.conf`.
+- **Mesa:** the `MESA_*` pins in `scripts/stages/mesa.sh`; a changed patch
+  needs its new sum in `userspace/mesa/patches.sha256`.
 - **Builder packages and base image:** pinned in `container/packages.lock` and
   the `FROM` line of `container/Containerfile`; the maintainers move them.
   The lock is one `<builder arch> <package>:<arch>=<version>` line per package; the

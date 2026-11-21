@@ -1,0 +1,34 @@
+Description: pvr: raise maxTexelBufferElements to what the descriptor holds
+ A texel buffer view is a linear 2D texture PVR_BUFFER_VIEW_WIDTH (8192)
+ texels wide with one row per 8192 elements (pvr_CreateBufferView()); pco
+ turns the element index into (index % 8192, index / 8192) for both the
+ sampled and the storage path. The row count is bounded by the 2D texture
+ height, so report PVR_BUFFER_VIEW_WIDTH * max_render_size instead of
+ 64 Ki. With 64 Ki, st/mesa on zink rejects its GPU path for PBO uploads
+ larger than that (st_pbo_addresses_setup() against MaxTextureBufferSize)
+ and copies through a CPU mapping of the buffer instead.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/vulkan/pvr_physical_device.c
++++ b/src/imagination/vulkan/pvr_physical_device.c
+@@ -29,6 +29,7 @@
+ #include "pco/pco.h"
+ #include "pco_uscgen_programs.h"
+ 
++#include "pvr_buffer.h"
+ #include "pvr_device.h"
+ #include "pvr_dump_info.h"
+ #include "pvr_entrypoints.h"
+@@ -679,7 +680,7 @@ static bool pvr_physical_device_get_properties(
+       .maxImageDimension3D = pvr_get_texture_extent_max_z(dev_info),
+       .maxImageDimensionCube = max_render_size,
+       .maxImageArrayLayers = rogue_get_render_size_max_z(dev_info),
+-      .maxTexelBufferElements = 64U * 1024U,
++      .maxTexelBufferElements = PVR_BUFFER_VIEW_WIDTH * max_render_size,
+       .maxUniformBufferRange = 128U * 1024U * 1024U,
+       .maxStorageBufferRange = 128U * 1024U * 1024U,
+       .maxPushConstantsSize = PVR_MAX_PUSH_CONSTANTS_SIZE,

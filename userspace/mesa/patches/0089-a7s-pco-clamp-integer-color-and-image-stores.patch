@@ -1,0 +1,178 @@
+Description: pco: clamp integer color outputs and image stores to the format
+ Fragment outputs to integer attachments with channels narrower than 32 bit
+ are bit-packed in pack_to_format() with nir_bitfield_insert, which keeps the
+ low bits. Image stores to such formats write the raw 32-bit value, also for
+ formatless stores (no pck format for integer formats). Values that do not
+ fit therefore wrap. Vulkan leaves out-of-range values undefined for color
+ attachments (interfaces.adoc, Fragment Output Interface), but zink and the
+ GL state tracker rely on them saturating: u_blitter and the st_pbo shaders
+ only clamp at the sign boundary (u_simple_shaders.c, st_pbo.c) and expect
+ the store to clamp to the channel width. GL-CTS packed_pixels shows this as
+ wrapped instead of saturated GetTexImage/ReadPixels results.
+ .
+ Clamp each integer channel to its range before packing, and before formatted
+ and formatless integer image stores. For formatless stores the descriptor
+ pck_info carries an integer flag, the signedness and the bit width minus one
+ of each component. The transfer path already clamps the same way
+ (pvr_usc.c, pack_int_value()). 32-bit integer formats are unchanged.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/common/pvr_iface.h
++++ b/src/imagination/common/pvr_iface.h
+@@ -154,6 +154,12 @@
+ #define PVR_PCK_INFO_SCALE_BIT BITFIELD_BIT(PVR_PCK_INFO_SCALE_OFFSET)
+ #define PVR_PCK_INFO_ROUNDZERO_BIT BITFIELD_BIT(PVR_PCK_INFO_ROUNDZERO_OFFSET)
+ #define PVR_PCK_INFO_UNORM_BIT BITFIELD_BIT(PVR_PCK_INFO_UNORM_OFFSET)
++#define PVR_PCK_INFO_INT_OFFSET 9U
++#define PVR_PCK_INFO_INT_SIGNED_OFFSET 10U
++#define PVR_PCK_INFO_INT_BITS_OFFSET 11U
++#define PVR_PCK_INFO_INT_BITS_LENGTH 5U
++#define PVR_PCK_INFO_INT_BIT BITFIELD_BIT(PVR_PCK_INFO_INT_OFFSET)
++#define PVR_PCK_INFO_INT_SIGNED_BIT BITFIELD_BIT(PVR_PCK_INFO_INT_SIGNED_OFFSET)
+ 
+ /** Fragment shader metadata bit offsets. */
+ #define PVR_FS_META_ALPHA_TO_ONE_OFFSET 0U
+--- a/src/imagination/pco/pco_nir_pvfio.c
++++ b/src/imagination/pco/pco_nir_pvfio.c
+@@ -179,10 +179,22 @@
+          unsigned dword = desc->channel[u].shift / 32;
+          unsigned offset = desc->channel[u].shift % 32;
+          unsigned size = desc->channel[u].size;
++         nir_def *comp = input_comps[u];
++
++         if (size < 32) {
++            if (desc->channel[u].type == UTIL_FORMAT_TYPE_SIGNED) {
++               comp = nir_iclamp(b,
++                                 comp,
++                                 nir_imm_int(b, -(1 << (size - 1))),
++                                 nir_imm_int(b, (1 << (size - 1)) - 1));
++            } else {
++               comp = nir_umin(b, comp, nir_imm_int(b, (1u << size) - 1));
++            }
++         }
+ 
+          packed_comps[dword] = nir_bitfield_insert_imm(b,
+                                                        packed_comps[dword],
+-                                                       input_comps[u],
++                                                       comp,
+                                                        offset,
+                                                        size);
+       }
+--- a/src/imagination/pco/pco_nir_tex.c
++++ b/src/imagination/pco/pco_nir_tex.c
+@@ -1059,6 +1059,35 @@
+          enum pipe_format data_format =
+             nir_type_to_pipe_format(type, desc->nr_channels);
+ 
++         if (util_format_is_pure_integer(format) &&
++             util_format_get_max_channel_size(format) < 32) {
++            bool is_signed = util_format_is_pure_sint(format);
++            nir_def *comps[4];
++
++            for (unsigned c = 0; c < 4; ++c) {
++               unsigned bits =
++                  util_format_get_component_bits(format,
++                                                 UTIL_FORMAT_COLORSPACE_RGB,
++                                                 c);
++               comps[c] = nir_channel(b, write_data, c);
++
++               if (!bits || bits >= 32)
++                  continue;
++
++               if (is_signed) {
++                  comps[c] = nir_iclamp(b,
++                                        comps[c],
++                                        nir_imm_int(b, -(1 << (bits - 1))),
++                                        nir_imm_int(b, (1 << (bits - 1)) - 1));
++               } else {
++                  comps[c] =
++                     nir_umin(b, comps[c], nir_imm_int(b, (1u << bits) - 1));
++               }
++            }
++
++            write_data = nir_vec(b, comps, 4);
++         }
++
+          if (format != data_format) {
+             bool scale = false;
+             bool roundzero = false;
+@@ -1174,10 +1203,44 @@
+          nir_def *write_data_unsplit =
+             nir_bcsel(b, pck_scale, write_data_scale, write_data_noscale);
+ 
++         nir_def *int_clamp = nir_ine_imm(
++            b,
++            nir_ubitfield_extract_imm(b, pck_info, PVR_PCK_INFO_INT_OFFSET, 1),
++            0);
++         nir_def *int_signed = nir_ine_imm(
++            b,
++            nir_ubitfield_extract_imm(b,
++                                      pck_info,
++                                      PVR_PCK_INFO_INT_SIGNED_OFFSET,
++                                      1),
++            0);
++         nir_def *int_comps[4];
++         for (unsigned c = 0; c < 4; ++c) {
++            nir_def *bits_m1 = nir_ubitfield_extract_imm(
++               b,
++               pck_info,
++               PVR_PCK_INFO_INT_BITS_OFFSET + c * PVR_PCK_INFO_INT_BITS_LENGTH,
++               PVR_PCK_INFO_INT_BITS_LENGTH);
++            nir_def *umax =
++               nir_iadd_imm(b, nir_ishl(b, nir_imm_int(b, 2), bits_m1), -1);
++            nir_def *smax =
++               nir_iadd_imm(b, nir_ishl(b, nir_imm_int(b, 1), bits_m1), -1);
++            nir_def *smin = nir_inot(b, smax);
++            nir_def *comp = nir_channel(b, write_data, c);
++
++            int_comps[c] =
++               nir_bcsel(b,
++                         int_signed,
++                         nir_imax(b, nir_imin(b, comp, smax), smin),
++                         nir_umin(b, comp, umax));
++         }
++         nir_def *write_data_int =
++            nir_bcsel(b, int_clamp, nir_vec(b, int_comps, 4), write_data);
++
+          write_data = nir_bcsel(
+             b,
+             pck_skip,
+-            write_data,
++            write_data_int,
+             nir_bcsel(b, pck_split, write_data_split, write_data_unsplit));
+       }
+    }
+--- a/src/imagination/vulkan/pvr_arch_tex_state.c
++++ b/src/imagination/vulkan/pvr_arch_tex_state.c
+@@ -108,6 +108,27 @@
+    if (util_format_is_unorm(format))
+       pck_info |= PVR_PCK_INFO_UNORM_BIT;
+ 
++   if (util_format_is_pure_integer(format) &&
++       util_format_get_max_channel_size(format) < 32) {
++      pck_info |= PVR_PCK_INFO_INT_BIT;
++
++      if (util_format_is_pure_sint(format))
++         pck_info |= PVR_PCK_INFO_INT_SIGNED_BIT;
++
++      for (unsigned c = 0; c < 4; ++c) {
++         unsigned bits =
++            util_format_get_component_bits(format,
++                                           UTIL_FORMAT_COLORSPACE_RGB,
++                                           c);
++         if (!bits)
++            bits = 32;
++
++         pck_info |= (bits - 1)
++                     << (PVR_PCK_INFO_INT_BITS_OFFSET +
++                         c * PVR_PCK_INFO_INT_BITS_LENGTH);
++      }
++   }
++
+    return pck_info;
+ }
+ 

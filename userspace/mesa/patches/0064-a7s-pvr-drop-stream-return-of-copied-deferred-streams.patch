@@ -1,0 +1,51 @@
+Description: pvr: do not inline the stream return of deferred secondaries
+ A secondary command buffer recorded with RENDER_PASS_CONTINUE ends its
+ control stream with VDMCTRL_STREAM_RETURN (pvr_arch_cmd_buffer_end_sub_cmd(),
+ secondary_cont). Without SIMULTANEOUS_USE the primary reaches that stream
+ through a VDMCTRL_STREAM_LINK with with_return set, so the return goes back
+ to the primary. With SIMULTANEOUS_USE the stream is deferred and
+ pvr_arch_csb_copy() copies it into the primary stream itself, including the
+ return. The primary stream is not entered through a link with return, so the
+ return is not matched by a call, and everything the primary emits after the
+ copy (further secondaries, the end of the render) follows it.
+ .
+ Drop the trailing VDMCTRL_STREAM_RETURN when copying a deferred stream, so
+ the copied commands continue in the primary stream like commands recorded in
+ the primary.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/vulkan/pvr_arch_csb.c
++++ b/src/imagination/vulkan/pvr_arch_csb.c
+@@ -254,9 +254,9 @@
+  */
+ VkResult pvr_arch_csb_copy(struct pvr_csb *csb_dst, struct pvr_csb *csb_src)
+ {
+-   const uint32_t size =
+-      util_dynarray_num_elements(&csb_src->deferred_cs_mem, char);
++   uint32_t size = util_dynarray_num_elements(&csb_src->deferred_cs_mem, char);
+    const uint8_t *start = util_dynarray_begin(&csb_src->deferred_cs_mem);
++   uint32_t stream_return;
+    void *destination;
+ 
+    /* Only deferred control stream supported as src. */
+@@ -267,6 +267,16 @@
+ 
+    assert(size % sizeof(uint32_t) == 0);
+ 
++   pvr_csb_pack (&stream_return, VDMCTRL_STREAM_RETURN, ret) {
++   }
++
++   if (size >= sizeof(stream_return) &&
++       !memcmp(start + size - sizeof(stream_return),
++               &stream_return,
++               sizeof(stream_return))) {
++      size -= sizeof(stream_return);
++   }
++
+    pvr_csb_set_relocation_mark(csb_dst);
+    destination = pvr_arch_csb_alloc_dwords(csb_dst, size / sizeof(uint32_t));
+    pvr_csb_clear_relocation_mark(csb_dst);

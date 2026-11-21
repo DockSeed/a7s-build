@@ -71,6 +71,11 @@ the boot files around the kernel it finds installed. In both modes the package
 `a7s-kernel-hook` (`OUT_DIR/kernel-hook/`) is installed; with no systemd running
 it leaves `/boot` alone. `/lib` may be a link to `usr/lib`.
 
+Mesa arrives as packages too: the runtime packages in `OUT_DIR/mesa/` (the
+`mesa` stage), each listed with its sha256 in `OUT_DIR/mesa/MESA-ID`. The
+distro installs them in place of its own Mesa; the `-dev` packages in
+`OUT_DIR/mesa-dev/` are not for the image.
+
 ## Adding a distro
 
 1. `scripts/distro/<name>/distro.sh` with the four names above.

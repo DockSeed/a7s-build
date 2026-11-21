@@ -1,0 +1,586 @@
+Description: pvr, pco: load small uniform buffers into shared registers
+ pco reads only push constants and inline uniform blocks from shared
+ registers; every other uniform buffer load is a memory load with a wait
+ in each instance. zink puts all GL uniforms (constant buffer 0) into a
+ plain uniform buffer, so every GL shader with uniforms pays that.
+ .
+ pco_nir_lower_io() now picks up to PCO_MAX_PROMOTED_UBOS uniform buffers
+ whose loads all have constant descriptors, constant 4-byte aligned
+ offsets and 32-bit results, PCO_MAX_PROMOTED_UBO_DWORDS dwords in total,
+ for vertex and fragment shaders without robust buffer access. Bindings
+ with update-after-bind or update-unused-while-pending are excluded,
+ because the driver reads the descriptor when recording. The loads read
+ the shared registers like an inline uniform block, and the null check of
+ such a descriptor folds to false.
+ .
+ The PDS descriptor program DMAs each range into its shared registers
+ (PVR_BUFFER_TYPE_UBO, which pvr_pds.h already had). At draw time the
+ driver reads the buffer descriptor from the bound set, writes its address
+ and sets the DMA size to the smaller of the promoted range and the bound
+ range, so the DMA never reads past the range. A null descriptor gets a
+ zero-filled upload instead.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/pco/pco_data.h
++++ b/src/imagination/pco/pco_data.h
+@@ -172,6 +172,8 @@ typedef struct _pco_binding_data {
+ 
+    /** Whether the descriptor binding is an inline uniform block. */
+    bool is_inline_ubo;
++
++   bool is_ubo;
+ } pco_binding_data;
+ 
+ /** PCO descriptor set data. */
+@@ -192,6 +194,16 @@ typedef struct _pco_push_const_data {
+    unsigned used;
+ } pco_push_const_data;
+ 
++#define PCO_MAX_PROMOTED_UBOS 4U
++#define PCO_MAX_PROMOTED_UBO_DWORDS 64U
++
++typedef struct _pco_promoted_ubo {
++   unsigned desc_set;
++   unsigned binding;
++   unsigned elem;
++   pco_range range;
++} pco_promoted_ubo;
++
+ /** PCO common data. */
+ typedef struct _pco_common_data {
+    /** System value mappings. */
+@@ -203,6 +215,9 @@ typedef struct _pco_common_data {
+    /** Push constant data. */
+    pco_push_const_data push_consts;
+ 
++   pco_promoted_ubo promoted_ubos[PCO_MAX_PROMOTED_UBOS];
++   unsigned num_promoted_ubos;
++
+    pco_range point_sampler;
+    pco_range ia_sampler;
+ 
+--- a/src/imagination/pco/pco_internal.h
++++ b/src/imagination/pco/pco_internal.h
+@@ -1828,6 +1828,10 @@ bool pco_nir_lower_vs_intrinsics(nir_shader *shader);
+ bool pco_nir_lower_images(nir_shader *shader, pco_data *data, pco_ctx *ctx);
+ bool pco_nir_lower_interpolation(nir_shader *shader, pco_fs_data *fs);
+ bool pco_nir_lower_io(nir_shader *shader, pco_data *data);
++const pco_promoted_ubo *pco_find_promoted_ubo(const pco_common_data *common,
++                                              unsigned desc_set,
++                                              unsigned binding,
++                                              unsigned elem);
+ bool pco_nir_lower_sample_mask_out(nir_shader *shader, bool single_sample);
+ bool pco_nir_lower_shared_io_to_global(nir_shader *shader, unsigned usc_slots);
+ bool pco_nir_lower_subgroups(nir_shader *shader);
+--- a/src/imagination/pco/pco_nir.c
++++ b/src/imagination/pco/pco_nir.c
+@@ -499,7 +499,17 @@ static bool should_vectorize_mem_cb(unsigned align_mul,
+       uint32_t packed_desc = nir_scalar_as_uint(scalar);
+ 
+       pco_unpack_desc(packed_desc, &desc_set, &binding);
+-      return !is_inline_ubo(desc_set, binding, common);
++      if (is_inline_ubo(desc_set, binding, common))
++         return false;
++
++      if (common->num_promoted_ubos) {
++         if (!nir_src_is_const(low->src[0]))
++            return true;
++
++         unsigned elem = nir_src_comp_as_uint(low->src[0], 1);
++         if (pco_find_promoted_ubo(common, desc_set, binding, elem))
++            return false;
++      }
+    }
+ 
+    return true;
+--- a/src/imagination/pco/pco_nir_io.c
++++ b/src/imagination/pco/pco_nir_io.c
+@@ -32,6 +32,188 @@ static inline bool is_inline_ubo(unsigned desc_set,
+    return binding_data->is_inline_ubo;
+ }
+ 
++const pco_promoted_ubo *pco_find_promoted_ubo(const pco_common_data *common,
++                                              unsigned desc_set,
++                                              unsigned binding,
++                                              unsigned elem)
++{
++   for (unsigned u = 0; u < common->num_promoted_ubos; ++u) {
++      const pco_promoted_ubo *ubo = &common->promoted_ubos[u];
++      if (ubo->desc_set == desc_set && ubo->binding == binding &&
++          ubo->elem == elem) {
++         return ubo;
++      }
++   }
++
++   return NULL;
++}
++
++struct ubo_candidate {
++   uint32_t packed_desc;
++   unsigned elem;
++   unsigned dwords;
++   bool bad;
++};
++
++struct ubo_candidates {
++   struct ubo_candidate list[PCO_MAX_PROMOTED_UBOS * 2];
++   unsigned count;
++};
++
++static struct ubo_candidate *get_candidate(struct ubo_candidates *cands,
++                                           uint32_t packed_desc,
++                                           unsigned elem)
++{
++   bool blocked = false;
++   for (unsigned u = 0; u < cands->count; ++u) {
++      struct ubo_candidate *cand = &cands->list[u];
++      if (cand->packed_desc != packed_desc)
++         continue;
++
++      if (cand->elem == elem)
++         return cand;
++
++      if (cand->elem == ~0U)
++         blocked = true;
++   }
++
++   if (cands->count == ARRAY_SIZE(cands->list))
++      return NULL;
++
++   struct ubo_candidate *cand = &cands->list[cands->count++];
++   *cand = (struct ubo_candidate){
++      .packed_desc = packed_desc,
++      .elem = elem,
++      .bad = blocked,
++   };
++
++   if (elem == ~0U) {
++      for (unsigned u = 0; u < cands->count; ++u) {
++         if (cands->list[u].packed_desc == packed_desc)
++            cands->list[u].bad = true;
++      }
++   }
++
++   return cand;
++}
++
++static bool gather_ubo_candidate(nir_builder *b,
++                                 nir_intrinsic_instr *intr,
++                                 void *cb_data)
++{
++   if (intr->intrinsic != nir_intrinsic_load_ubo)
++      return false;
++
++   struct {
++      const pco_common_data *common;
++      struct ubo_candidates *cands;
++   } *state = cb_data;
++
++   nir_scalar scalar = nir_scalar_resolved(intr->src[0].ssa, 0);
++   uint32_t packed_desc = nir_scalar_as_uint(scalar);
++
++   unsigned desc_set;
++   unsigned binding;
++   pco_unpack_desc(packed_desc, &desc_set, &binding);
++
++   const pco_descriptor_set_data *desc_set_data =
++      &state->common->desc_sets[desc_set];
++   if (!desc_set_data->bindings || binding >= desc_set_data->binding_count)
++      return false;
++
++   if (!desc_set_data->bindings[binding].is_ubo)
++      return false;
++
++   unsigned elem = nir_src_is_const(intr->src[0])
++                      ? nir_src_comp_as_uint(intr->src[0], 1)
++                      : ~0U;
++
++   struct ubo_candidate *cand = get_candidate(state->cands, packed_desc, elem);
++   if (!cand || cand->bad)
++      return false;
++
++   nir_src *offset_src = nir_get_io_offset_src(intr);
++   if (elem == ~0U || !nir_src_is_const(*offset_src) ||
++       intr->def.bit_size != 32) {
++      cand->bad = true;
++      return false;
++   }
++
++   unsigned offset = nir_src_as_uint(*offset_src);
++   if (offset % 4) {
++      cand->bad = true;
++      return false;
++   }
++
++   cand->dwords = MAX2(cand->dwords, offset / 4 + intr->def.num_components);
++   return false;
++}
++
++static void promote_ubos(nir_shader *shader, pco_common_data *common)
++{
++   common->num_promoted_ubos = 0;
++
++   if (common->robust_buffer_access || shader->info.internal)
++      return;
++
++   if (shader->info.stage != MESA_SHADER_VERTEX &&
++       shader->info.stage != MESA_SHADER_FRAGMENT) {
++      return;
++   }
++
++   struct ubo_candidates cands = { 0 };
++   struct {
++      const pco_common_data *common;
++      struct ubo_candidates *cands;
++   } state = {
++      .common = common,
++      .cands = &cands,
++   };
++
++   nir_shader_intrinsics_pass(shader,
++                              gather_ubo_candidate,
++                              nir_metadata_all,
++                              &state);
++
++   unsigned total_dwords = 0;
++   for (unsigned u = 0; u < cands.count; ++u) {
++      const struct ubo_candidate *cand = &cands.list[u];
++      if (cand->bad || !cand->dwords)
++         continue;
++
++      if (common->num_promoted_ubos == PCO_MAX_PROMOTED_UBOS)
++         break;
++
++      if (total_dwords + cand->dwords > PCO_MAX_PROMOTED_UBO_DWORDS)
++         continue;
++
++      unsigned desc_set;
++      unsigned binding;
++      pco_unpack_desc(cand->packed_desc, &desc_set, &binding);
++
++      common->promoted_ubos[common->num_promoted_ubos++] = (pco_promoted_ubo){
++         .desc_set = desc_set,
++         .binding = binding,
++         .elem = cand->elem,
++         .range = { .count = cand->dwords },
++      };
++
++      total_dwords += cand->dwords;
++   }
++}
++
++static inline bool is_promoted_ubo(nir_intrinsic_instr *intr,
++                                   unsigned desc_set,
++                                   unsigned binding,
++                                   const pco_common_data *common)
++{
++   if (!nir_src_is_const(intr->src[0]))
++      return false;
++
++   unsigned elem = nir_src_comp_as_uint(intr->src[0], 1);
++   return !!pco_find_promoted_ubo(common, desc_set, binding, elem);
++}
++
+ /**
+  * \brief Lowers an I/O instruction.
+  *
+@@ -46,6 +228,23 @@ lower_io(nir_builder *b, nir_intrinsic_instr *intr, void *cb_data)
+    b->cursor = nir_before_instr(&intr->instr);
+ 
+    switch (intr->intrinsic) {
++   case nir_intrinsic_is_null_descriptor: {
++      const pco_common_data *common = cb_data;
++      if (!common->num_promoted_ubos || !nir_src_is_const(intr->src[0]))
++         return false;
++
++      unsigned desc_set;
++      unsigned binding;
++      pco_unpack_desc(nir_src_comp_as_uint(intr->src[0], 0), &desc_set, &binding);
++
++      unsigned elem = nir_src_comp_as_uint(intr->src[0], 1);
++      if (!pco_find_promoted_ubo(common, desc_set, binding, elem))
++         return false;
++
++      nir_def_replace(&intr->def, nir_imm_false(b));
++      return true;
++   }
++
+    case nir_intrinsic_load_push_constant:
+    case nir_intrinsic_load_shared:
+    case nir_intrinsic_shared_atomic:
+@@ -63,10 +262,38 @@ lower_io(nir_builder *b, nir_intrinsic_instr *intr, void *cb_data)
+ 
+       pco_unpack_desc(packed_desc, &desc_set, &binding);
+ 
+-      if (!is_inline_ubo(desc_set, binding, common))
++      if (is_inline_ubo(desc_set, binding, common))
++         break;
++
++      if (!is_promoted_ubo(intr, desc_set, binding, common))
+          return false;
+ 
+-      break;
++      unsigned num_comps = intr->def.num_components;
++      if (num_comps <= 4)
++         break;
++
++      nir_def *offset = nir_get_io_offset_src(intr)->ssa;
++      nir_def *comps[NIR_MAX_VEC_COMPONENTS];
++      for (unsigned c = 0; c < num_comps; c += 4) {
++         unsigned count = MIN2(4, num_comps - c);
++         nir_def *part_offset =
++            nir_ushr_imm(b, nir_iadd_imm(b, offset, c * 4), 2);
++         nir_def *part = nir_load_ubo(b,
++                                      count,
++                                      32,
++                                      intr->src[0].ssa,
++                                      part_offset,
++                                      .access = nir_intrinsic_access(intr),
++                                      .align_mul = 4,
++                                      .align_offset = 0,
++                                      .range_base = 0,
++                                      .range = ~0);
++         for (unsigned k = 0; k < count; ++k)
++            comps[c + k] = nir_channel(b, part, k);
++      }
++
++      nir_def_replace(&intr->def, nir_vec(b, comps, num_comps));
++      return true;
+    }
+ 
+    default:
+@@ -94,6 +321,9 @@ bool pco_nir_lower_io(nir_shader *shader, pco_data *data)
+    pco_common_data *common = &data->common;
+    bool progress = false;
+ 
++   progress |= nir_opt_constant_folding(shader);
++   promote_ubos(shader, common);
++
+    progress |= nir_shader_intrinsics_pass(shader,
+                                           lower_io,
+                                           nir_metadata_control_flow,
+--- a/src/imagination/pco/pco_trans_nir.c
++++ b/src/imagination/pco/pco_trans_nir.c
+@@ -1306,6 +1306,25 @@ static pco_instr *trans_load_buffer(trans_ctx *tctx,
+                                      });
+    }
+ 
++   if (intr->intrinsic == nir_intrinsic_load_ubo && !is_dynidx) {
++      unsigned desc_set;
++      unsigned binding;
++      pco_unpack_desc(packed_desc, &desc_set, &binding);
++
++      const pco_promoted_ubo *ubo =
++         pco_find_promoted_ubo(common, desc_set, binding, elem);
++      if (ubo) {
++         pco_range range = ubo->range;
++         return trans_load_common_store(tctx,
++                                        intr,
++                                        dest,
++                                        offset_src,
++                                        1,
++                                        false,
++                                        &range);
++      }
++   }
++
+    pco_ref base_addr[2];
+    pco_ref_hwreg_addr_comps(sh_index, PCO_REG_CLASS_SHARED, base_addr);
+ 
+--- a/src/imagination/vulkan/pds/pvr_pds.h
++++ b/src/imagination/vulkan/pds/pvr_pds.h
+@@ -1071,6 +1071,7 @@ struct pvr_pds_vertex_primary_program_input {
+ #define PVR_PDS_CONST_MAP_ENTRY_TYPE_BASE_WORKGROUP (14)
+ #define PVR_PDS_CONST_MAP_ENTRY_TYPE_COND_RENDER (15)
+ #define PVR_PDS_CONST_MAP_ENTRY_TYPE_VERTEX_ATTRIBUTE_STRIDE (16)
++#define PVR_PDS_CONST_MAP_ENTRY_TYPE_UBO_DOUTD_SRC1 (17)
+ 
+ /* We pack all the following structs tightly into a buffer using += sizeof(x)
+  * offsets, this can lead to data that is not native aligned. Supplying the
+--- a/src/imagination/vulkan/pds/pvr_pipeline_pds.c
++++ b/src/imagination/vulkan/pds/pvr_pipeline_pds.c
+@@ -1640,6 +1640,21 @@ void pvr_pds_generate_descriptor_upload_program(
+          }
+          break;
+       }
++      case PVR_BUFFER_TYPE_UBO: {
++         struct pvr_const_map_entry_special_buffer *special_buffer_entry;
++
++         special_buffer_entry =
++            pvr_prepare_next_pds_const_map_entry(&entry_write_state,
++                                                 sizeof(*special_buffer_entry));
++         special_buffer_entry->type =
++            PVR_PDS_CONST_MAP_ENTRY_TYPE_SPECIAL_BUFFER;
++         special_buffer_entry->buffer_type = PVR_BUFFER_TYPE_UBO;
++         special_buffer_entry->size_in_dwords = buffer->size_in_dwords;
++         special_buffer_entry->buffer_index = buffer->buffer_id;
++         special_buffer_entry->data =
++            ((uint32_t)buffer->desc_set << 16) | buffer->binding;
++         break;
++      }
+       case PVR_BUFFER_TYPE_COMPILE_TIME: {
+          struct pvr_const_map_entry_special_buffer *special_buffer_entry;
+ 
+@@ -1666,6 +1681,13 @@ void pvr_pds_generate_descriptor_upload_program(
+                                               buffer->size_in_dwords,
+                                               buffer->destination));
+ 
++      if (code_section && buffer->type == PVR_BUFFER_TYPE_UBO) {
++         assert(entry_write_state.entry->type ==
++                PVR_PDS_CONST_MAP_ENTRY_TYPE_LITERAL32);
++         entry_write_state.entry->type =
++            PVR_PDS_CONST_MAP_ENTRY_TYPE_UBO_DOUTD_SRC1;
++      }
++
+       next_const64++;
+       next_const32++;
+    }
+--- a/src/imagination/vulkan/pvr_arch_cmd_buffer.c
++++ b/src/imagination/vulkan/pvr_arch_cmd_buffer.c
+@@ -5859,6 +5859,7 @@ static VkResult pvr_setup_descriptor_mappings(
+    const uint8_t *entries;
+    uint32_t *dword_buffer;
+    uint64_t *qword_buffer;
++   uint32_t ubo_dma_dwords = 0;
+    VkResult result;
+ 
+    if (!pds_info->data_size_in_dwords)
+@@ -5916,6 +5917,25 @@ static VkResult pvr_setup_descriptor_mappings(
+          break;
+       }
+ 
++      case PVR_PDS_CONST_MAP_ENTRY_TYPE_UBO_DOUTD_SRC1: {
++         const struct pvr_const_map_entry_literal32 *const literal =
++            (struct pvr_const_map_entry_literal32 *)entries;
++         uint32_t value = literal->literal_value &
++                          PVR_ROGUE_PDSINST_DOUT_FIELDS_DOUTD_SRC1_BSIZE_CLRMSK;
++
++         assert(ubo_dma_dwords);
++         value |= ubo_dma_dwords
++                  << PVR_ROGUE_PDSINST_DOUT_FIELDS_DOUTD_SRC1_BSIZE_SHIFT;
++
++         PVR_WRITE(dword_buffer,
++                   value,
++                   literal->const_offset,
++                   pds_info->data_size_in_dwords);
++
++         entries += sizeof(*literal);
++         break;
++      }
++
+       case PVR_PDS_CONST_MAP_ENTRY_TYPE_DESCRIPTOR_SET: {
+          const struct pvr_const_map_entry_descriptor_set *desc_set_entry =
+             (struct pvr_const_map_entry_descriptor_set *)entries;
+@@ -5945,6 +5965,60 @@ static VkResult pvr_setup_descriptor_mappings(
+             (struct pvr_const_map_entry_special_buffer *)entries;
+ 
+          switch (special_buff_entry->buffer_type) {
++         case PVR_BUFFER_TYPE_UBO: {
++            const unsigned desc_set = special_buff_entry->data >> 16;
++            const unsigned binding = special_buff_entry->data & 0xffff;
++            const unsigned elem = special_buff_entry->buffer_index;
++            const struct pvr_descriptor_set *descriptor_set;
++            const struct pvr_descriptor_set_layout_binding *layout_binding;
++            struct pvr_buffer_descriptor buffer_desc;
++            uint64_t ubo_addr;
++
++            assert(desc_set < PVR_MAX_DESCRIPTOR_SETS);
++
++            descriptor_set = desc_state->sets[desc_set];
++            assert(descriptor_set);
++            assert(binding < descriptor_set->layout->binding_count);
++
++            layout_binding = &descriptor_set->layout->bindings[binding];
++            assert(layout_binding->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
++
++            memcpy(&buffer_desc,
++                   (const uint8_t *)descriptor_set->mapping +
++                      layout_binding->offset + elem * layout_binding->stride,
++                   sizeof(buffer_desc));
++
++            ubo_dma_dwords = special_buff_entry->size_in_dwords;
++
++            if (!buffer_desc.addr || !buffer_desc.size) {
++               uint32_t zeros[PCO_MAX_PROMOTED_UBO_DWORDS] = { 0 };
++               struct pvr_suballoc_bo *zero_bo;
++
++               assert(ubo_dma_dwords <= ARRAY_SIZE(zeros));
++
++               result = pvr_arch_cmd_buffer_upload_general(
++                  cmd_buffer,
++                  zeros,
++                  PVR_DW_TO_BYTES(ubo_dma_dwords),
++                  &zero_bo);
++
++               if (result != VK_SUCCESS)
++                  return result;
++
++               ubo_addr = zero_bo->dev_addr.addr;
++            } else {
++               ubo_addr = buffer_desc.addr;
++               ubo_dma_dwords =
++                  MIN2(ubo_dma_dwords, DIV_ROUND_UP(buffer_desc.size, 4));
++            }
++
++            PVR_WRITE(qword_buffer,
++                      ubo_addr,
++                      special_buff_entry->const_offset,
++                      pds_info->data_size_in_dwords);
++            break;
++         }
++
+          case PVR_BUFFER_TYPE_DYNAMIC: {
+             unsigned desc_set = special_buff_entry->data;
+             const struct pvr_descriptor_set *descriptor_set;
+--- a/src/imagination/vulkan/pvr_arch_pipeline.c
++++ b/src/imagination/vulkan/pvr_arch_pipeline.c
+@@ -618,6 +618,18 @@ static VkResult pvr_pds_descriptor_program_create_and_upload(
+       goto err_free_static_consts;
+    }
+ 
++   for (unsigned u = 0; u < data->common.num_promoted_ubos; ++u) {
++      const pco_promoted_ubo *ubo = &data->common.promoted_ubos[u];
++      program.buffers[program.buffer_count++] = (struct pvr_pds_buffer){
++         .type = PVR_BUFFER_TYPE_UBO,
++         .size_in_dwords = ubo->range.count,
++         .destination = ubo->range.start,
++         .buffer_id = ubo->elem,
++         .desc_set = ubo->desc_set,
++         .binding = ubo->binding,
++      };
++   }
++
+    if (data->common.push_consts.range.count > 0) {
+       program.buffers[program.buffer_count++] = (struct pvr_pds_buffer){
+          .type = PVR_BUFFER_TYPE_PUSH_CONSTS,
+@@ -2586,6 +2598,12 @@ static void pvr_init_descriptors(pco_data *data,
+ 
+          binding_data->is_inline_ubo = layout_binding->type ==
+                                        VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK;
++
++         binding_data->is_ubo =
++            layout_binding->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER &&
++            !(layout_binding->flags &
++              (VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
++               VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT));
+       }
+    }
+ }
+@@ -2699,6 +2717,13 @@ static void pvr_setup_descriptors(pco_data *data,
+       }
+    }
+ 
++   for (unsigned u = 0; u < data->common.num_promoted_ubos; ++u) {
++      pco_range *range = &data->common.promoted_ubos[u].range;
++      data->common.shareds = ALIGN_POT(data->common.shareds, 4);
++      range->start = data->common.shareds;
++      data->common.shareds += range->count;
++   }
++
+    if (data->common.push_consts.used > 0) {
+       unsigned count = data->common.push_consts.used;
+ 

@@ -1,0 +1,42 @@
+Description: pvr: keep device tile buffers on vkCmdBeginRendering errors
+ The tile buffers in device->tile_buffer_state are shared by all render
+ states and command buffers of the device and only grow
+ (pvr_device_tile_buffer_ensure_cap()). The error path of
+ vkCmdBeginRendering() after a failed render state setup or sub command start
+ called pvr_device_free_tile_buffer_state(), which frees every tile buffer but
+ leaves buffer_count and the pointers unchanged. Command buffers that were
+ recorded or are pending keep the GPU addresses of the freed buffers, later
+ recordings read the freed pvr_bo structures (pvr_arch_cmd_buffer.c, tile
+ buffer addresses from device->tile_buffer_state),
+ pvr_device_tile_buffer_ensure_cap() does not replace them, and device
+ destruction frees them a second time.
+ .
+ Leave the tile buffers alone on these errors; they are released with the
+ device as before.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/vulkan/pvr_arch_cmd_buffer.c
++++ b/src/imagination/vulkan/pvr_arch_cmd_buffer.c
+@@ -5083,7 +5083,7 @@
+                                              &state->render_pass_info.rstate);
+    if (result != VK_SUCCESS) {
+       vk_command_buffer_set_error(&cmd_buffer->vk, result);
+-      goto err_cleanup_tile_buffers;
++      goto err_destroy_dynamic_render_info;
+    }
+ 
+    result =
+@@ -5114,9 +5114,6 @@
+    pvr_render_state_cache_put(device, state->render_pass_info.rstate);
+    state->render_pass_info.rstate = NULL;
+ 
+-err_cleanup_tile_buffers:
+-   pvr_device_free_tile_buffer_state(device);
+-
+ err_destroy_dynamic_render_info:
+    vk_free(&device->vk.alloc, state->render_pass_info.rstate);
+    state->render_pass_info.rstate = NULL;

@@ -1,0 +1,32 @@
+Description: zink: no pipeline statistics pool without pipelineStatisticsQuery
+ Without VK_EXT_primitives_generated_query, or for a non-zero stream without
+ primitivesGeneratedQueryWithNonZeroStreams, zink emulates
+ PIPE_QUERY_PRIMITIVES_GENERATED with a VK_QUERY_TYPE_PIPELINE_STATISTICS pool
+ (zink_query.c, convert_query_type() and zink_create_query()). It did not
+ check the pipelineStatisticsQuery feature. Vulkan forbids such a pool when
+ the feature is not enabled (VkQueryPoolCreateInfo valid usage), so on a
+ driver without it the pool creation is undefined behaviour; pvr reaches
+ UNREACHABLE in pvr_query_pool_setup().
+ .
+ Fail the query creation in that case, as zink already gates
+ PIPE_QUERY_PIPELINE_STATISTICS_SINGLE on the feature (zink_screen.c,
+ query_pipeline_statistics_single).
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/gallium/drivers/zink/zink_query.c
++++ b/src/gallium/drivers/zink/zink_query.c
+@@ -540,6 +540,10 @@
+        !screen->info.primgen_feats.primitivesGeneratedQueryWithNonZeroStreams)
+       query->vkqtype = VK_QUERY_TYPE_PIPELINE_STATISTICS;
+ 
++   if (query->vkqtype == VK_QUERY_TYPE_PIPELINE_STATISTICS &&
++       !screen->info.feats.features.pipelineStatisticsQuery)
++      goto fail;
++
+    if (query->vkqtype == VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT) {
+       query->needs_rast_discard_workaround = !screen->info.primgen_feats.primitivesGeneratedQueryWithRasterizerDiscard;
+    } else if (query_type == PIPE_QUERY_PRIMITIVES_GENERATED) {

@@ -1,0 +1,71 @@
+Description: pvr: keep deferred DBSC patch locations valid
+ For a secondary command buffer with a deferred control stream,
+ pvr_emit_ppp_state() reserves two dwords for a PPP state update in the
+ host-side stream and stores a pointer to them in a
+ PVR_DEFERRED_CS_COMMAND_TYPE_DBSC command. pvr_execute_deferred_cmd_buffer()
+ writes VDMCTRL_PPP_STATE0/1 through that pointer in vkCmdExecuteCommands().
+ The stream is a util_dynarray (deferred_cs_mem) that is reallocated when it
+ grows, starting at 64 bytes, so the stored pointer refers to freed memory as
+ soon as later commands of the secondary enlarge the stream. The PPP state
+ words in the copied stream then keep their uninitialized contents, and the
+ write goes to freed heap memory.
+ .
+ Store the control stream and the dword offset instead of the pointer and
+ compute the address when the command is executed.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/vulkan/pvr_arch_cmd_buffer.c
++++ b/src/imagination/vulkan/pvr_arch_cmd_buffer.c
+@@ -8256,7 +8256,10 @@
+             .type = PVR_DEFERRED_CS_COMMAND_TYPE_DBSC,
+             .dbsc = {
+                .state = ppp_state->depthbias_scissor_indices,
+-               .vdm_state = vdm_state,
++               .csb = control_stream,
++               .vdm_state_offset =
++                  vdm_state - (uint32_t *)util_dynarray_begin(
++                                 &control_stream->deferred_cs_mem),
+             },
+          };
+       } else {
+@@ -9676,6 +9679,9 @@
+             prim_db_elems + cmd->dbsc.state.depthbias_index;
+          const uint32_t num_dwords =
+             pvr_cmd_length(TA_STATE_HEADER) + pvr_cmd_length(TA_STATE_ISPDBSC);
++         uint32_t *const vdm_state =
++            (uint32_t *)util_dynarray_begin(&cmd->dbsc.csb->deferred_cs_mem) +
++            cmd->dbsc.vdm_state_offset;
+          struct pvr_suballoc_bo *suballoc_bo;
+          uint32_t ppp_state[num_dwords];
+          VkResult result;
+@@ -9696,12 +9702,12 @@
+          if (result != VK_SUCCESS)
+             return result;
+ 
+-         pvr_csb_pack (&cmd->dbsc.vdm_state[0], VDMCTRL_PPP_STATE0, state) {
++         pvr_csb_pack (&vdm_state[0], VDMCTRL_PPP_STATE0, state) {
+             state.word_count = num_dwords;
+             state.addrmsb = suballoc_bo->dev_addr;
+          }
+ 
+-         pvr_csb_pack (&cmd->dbsc.vdm_state[1], VDMCTRL_PPP_STATE1, state) {
++         pvr_csb_pack (&vdm_state[1], VDMCTRL_PPP_STATE1, state) {
+             state.addrlsb = suballoc_bo->dev_addr;
+          }
+ 
+--- a/src/imagination/vulkan/pvr_cmd_buffer.h
++++ b/src/imagination/vulkan/pvr_cmd_buffer.h
+@@ -410,7 +410,8 @@
+       struct {
+          struct pvr_ppp_dbsc state;
+ 
+-         uint32_t *vdm_state;
++         struct pvr_csb *csb;
++         uint32_t vdm_state_offset;
+       } dbsc;
+ 
+       struct {

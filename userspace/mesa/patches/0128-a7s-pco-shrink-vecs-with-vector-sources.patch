@@ -1,0 +1,61 @@
+Description: pco: shrink vecs whose sources are vectors too
+ pco_emit_nir_smp() pads the sampler data to 16 components and passes the
+ real size as RANGE; lower_smp() then uses only RANGE channels. The vec of
+ a 2D sample starts with the coordinate vec2 and continues with 14 undef
+ scalars, so pco_shrink_vecs() skipped it (only_uncollated_elems()), and
+ each such sample wrote 14 zero registers. Shrink any vec instead, as long as
+ the used channels end on a source boundary.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/pco/pco_opt.c
++++ b/src/imagination/pco/pco_opt.c
+@@ -679,16 +679,6 @@ bool pco_dce(pco_shader *shader)
+    return progress;
+ }
+ 
+-static inline bool only_uncollated_elems(pco_instr *vec)
+-{
+-   pco_foreach_instr_src (psrc, vec) {
+-      if (pco_ref_get_chans(*psrc) > 1)
+-         return false;
+-   }
+-
+-   return true;
+-}
+-
+ /**
+  * \brief Shrinks vectors with unused components.
+  *
+@@ -704,10 +694,6 @@ bool pco_shrink_vecs(pco_shader *shader)
+          if (vec->op != PCO_OP_VEC)
+             continue;
+ 
+-         /* Can't shrink if has collated elems. */
+-         if (!only_uncollated_elems(vec))
+-            continue;
+-
+          pco_ref *pdest = &vec->dest[0];
+          unsigned chans_used = 0;
+          unsigned chans = pco_ref_get_chans(*pdest);
+@@ -740,8 +726,16 @@ bool pco_shrink_vecs(pco_shader *shader)
+          if (chans_used == chans)
+             continue;
+ 
++         unsigned num_srcs = 0;
++         unsigned offset = 0;
++         while (num_srcs < vec->num_srcs && offset < chans_used)
++            offset += pco_ref_get_chans(vec->src[num_srcs++]);
++
++         if (offset != chans_used)
++            continue;
++
+          /* Update the vec. */
+-         vec->num_srcs = chans_used;
++         vec->num_srcs = num_srcs;
+          *pdest = pco_ref_chans(*pdest, chans_used);
+ 
+          progress = true;

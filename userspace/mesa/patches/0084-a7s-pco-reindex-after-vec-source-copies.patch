@@ -1,0 +1,31 @@
+Description: pco: reindex instructions after preproc_vecs() copies vec sources
+ preproc_vecs() gives every vec use of an SSA value that feeds more than one
+ vec its own mbyp copy. A new instruction takes func->next_instr++ as its
+ index, so the copy sorts behind every instruction of the function. The pass
+ only reindexed for the >4-channel path (vec merge), not for these copies.
+ pco_ra_func() then computes live ranges from the stale indices: a vec whose
+ coalesced source is such a copy starts after its own last use, interferes
+ with nothing and can share registers with values that are still live.
+ .
+ Seen in dEQP-VK.renderpasses.renderpass{1,2}.*.attachment.8.797: the vec for
+ the R16G16_SFLOAT pack of attachment 7 got the registers of an earlier vec
+ whose component it still had to read, the copy of its first source
+ overwrote that component and the pack wrote the red value into green.
+ .
+ Set needs_reindex for the copy path as well.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/pco/pco_ra.c
++++ b/src/imagination/pco/pco_ra.c
+@@ -194,6 +194,7 @@
+                                     : PCO_EXEC_CND_E1_ZX,
+                      .rpt = pco_ref_get_chans(var));
+             *use->ref = dest;
++            needs_reindex = true;
+          } else {
+             assert(use->instr->op == PCO_OP_VEC && producer->op == PCO_OP_VEC);
+ 

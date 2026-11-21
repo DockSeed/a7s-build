@@ -1,0 +1,71 @@
+Description: st/mesa: only expose ASTC sliced 3D when 3D textures work
+ KHR_texture_compression_astc_sliced_3d was enabled together with
+ KHR_texture_compression_astc_ldr from 2D support of the ASTC formats. When
+ the formats are supported natively in 2D, st does not emulate them:
+ st_astc_format_fallback() decides from 2D sampler support of ASTC 4x4 and
+ 5x5 sRGB (has_astc_2d_ldr, has_astc_5x5_ldr), not per format and not per
+ target. A TEXTURE_3D texture of such a format then needs native 3D support.
+ Without it the extension allowed glCompressedTexImage3D(GL_TEXTURE_3D) with
+ ASTC and the texture could not be created. Before the driver supported
+ ASTC, the same textures were decoded in software and worked.
+ .
+ Disable the sliced 3D extension if an ASTC format with 2D blocks is supported
+ for 2D sampling but not for PIPE_TEXTURE_3D. Fully emulated ASTC keeps it.
+ With the extension off, TEXTURE_3D is rejected for ASTC as the
+ KHR_texture_compression_astc_ldr specification requires.
+ .
+ This needs "zink: check 3D image support in is_format_supported" (patch 0079
+ in this series), otherwise zink reports 3D support from the format features.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/mesa/state_tracker/st_extensions.c
++++ b/src/mesa/state_tracker/st_extensions.c
+@@ -39,6 +39,7 @@
+ #include "pipe/p_defines.h"
+ #include "pipe/p_screen.h"
+ #include "tgsi/tgsi_from_mesa.h"
++#include "util/format/u_format.h"
+ #include "util/u_math.h"
+ #include "util/u_memory.h"
+ 
+@@ -773,6 +774,26 @@
+    return 0;
+ }
+ 
++static bool
++native_astc_2d_formats_support_3d(struct pipe_screen *screen)
++{
++   for (enum pipe_format f = 0; f < PIPE_FORMAT_COUNT; f++) {
++      const struct util_format_description *desc = util_format_description(f);
++
++      if (!desc || desc->layout != UTIL_FORMAT_LAYOUT_ASTC ||
++          desc->block.depth != 1)
++         continue;
++
++      if (screen->is_format_supported(screen, f, PIPE_TEXTURE_2D, 0, 0,
++                                      PIPE_BIND_SAMPLER_VIEW) &&
++          !screen->is_format_supported(screen, f, PIPE_TEXTURE_3D, 0, 0,
++                                       PIPE_BIND_SAMPLER_VIEW))
++         return false;
++   }
++
++   return true;
++}
++
+ /**
+  * Use pipe_screen::get_param() to query pipe_caps. values to determine
+  * which GL extensions are supported.
+@@ -1217,6 +1238,9 @@
+                              texture_mapping_compressed_fallback,
+                              ARRAY_SIZE(texture_mapping_compressed_fallback),
+                              PIPE_TEXTURE_2D, PIPE_BIND_SAMPLER_VIEW);
++   if (extensions->KHR_texture_compression_astc_sliced_3d &&
++       !native_astc_2d_formats_support_3d(screen))
++      extensions->KHR_texture_compression_astc_sliced_3d = GL_FALSE;
+    init_format_extensions(screen, extensions, vertex_mapping,
+                           ARRAY_SIZE(vertex_mapping), PIPE_BUFFER,
+                           PIPE_BIND_VERTEX_BUFFER);

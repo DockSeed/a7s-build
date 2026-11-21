@@ -1,0 +1,74 @@
+From 9aebee16893b908b71312f86aa986726913c6694 Mon Sep 17 00:00:00 2001
+From: Frank Binns <frank.binns@imgtec.com>
+Date: Thu, 5 Nov 2026 11:46:32 +0000
+Subject: [PATCH] pvr: use max render size for a bunch of properties
+
+These property values were reduced by a22ad99bdd2 ("pvr: set device
+features/props/extensions to Vulkan 1.0 minimums (unless implemented)")
+when working to pass conformance, but can now safely be set based on the
+HW capabilities.
+
+Reviewed-by: Ashish Chauhan <ashish.chauhan@imgtec.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/46084>
+Link: https://gitlab.freedesktop.org/mesa/mesa/-/commit/9aebee16893b908b71312f86aa986726913c6694
+[ adapted: context line changed, UNUSED before max_sample_bits was already removed on main by a6fd0595abf; the changed lines are identical ]
+---
+ src/imagination/vulkan/pvr_physical_device.c | 20 ++++++++++----------
+ 1 file changed, 10 insertions(+), 10 deletions(-)
+
+diff --git a/src/imagination/vulkan/pvr_physical_device.c b/src/imagination/vulkan/pvr_physical_device.c
+index 7b0c441229ab..f5c8bbf7fb85 100644
+--- a/src/imagination/vulkan/pvr_physical_device.c
++++ b/src/imagination/vulkan/pvr_physical_device.c
+@@ -621,7 +621,7 @@ static bool pvr_physical_device_get_properties(
+    UNUSED const uint32_t sub_pixel_precision =
+       PVR_HAS_FEATURE(dev_info, simple_internal_parameter_format) ? 4U : 8U;
+ 
+-   UNUSED const uint32_t max_render_size = rogue_get_render_size_max(dev_info);
++   const uint32_t max_render_size = rogue_get_render_size_max(dev_info);
+ 
+    UNUSED const uint32_t max_sample_bits = ((max_multisample << 1) - 1);
+ 
+@@ -672,10 +672,10 @@ static bool pvr_physical_device_get_properties(
+       .deviceType = VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU,
+       /* deviceName and pipelineCacheUUID are filled below .*/
+ 
+-      .maxImageDimension1D = 4096U,
+-      .maxImageDimension2D = 4096U,
++      .maxImageDimension1D = max_render_size,
++      .maxImageDimension2D = max_render_size,
+       .maxImageDimension3D = pvr_get_texture_extent_max_z(dev_info),
+-      .maxImageDimensionCube = 4096U,
++      .maxImageDimensionCube = max_render_size,
+       .maxImageArrayLayers = rogue_get_render_size_max_z(dev_info),
+       .maxTexelBufferElements = 64U * 1024U,
+       .maxUniformBufferRange = 16U * 1024U,
+@@ -759,10 +759,10 @@ static bool pvr_physical_device_get_properties(
+       .maxSamplerAnisotropy = 16.0f, /* Requires samplerAnisotropy */
+       .maxViewports = 1U, /* Requires multiViewport */
+ 
+-      .maxViewportDimensions[0] = 4096U,
+-      .maxViewportDimensions[1] = 4096U,
+-      .viewportBoundsRange[0] = -8192.0f,
+-      .viewportBoundsRange[1] = 8191.0f,
++      .maxViewportDimensions[0] = max_render_size,
++      .maxViewportDimensions[1] = max_render_size,
++      .viewportBoundsRange[0] = -(int32_t)(2U * max_render_size),
++      .viewportBoundsRange[1] = 2U * max_render_size,
+ 
+       .viewportSubPixelBits = 0U,
+       .minMemoryMapAlignment = pdevice->ws->page_size,
+@@ -782,8 +782,8 @@ static bool pvr_physical_device_get_properties(
+       .maxInterpolationOffset = 0.5f,
+       .subPixelInterpolationOffsetBits = 4U,
+ 
+-      .maxFramebufferWidth = 4096U,
+-      .maxFramebufferHeight = 4096U,
++      .maxFramebufferWidth = max_render_size,
++      .maxFramebufferHeight = max_render_size,
+       .maxFramebufferLayers = 256U,
+ 
+       /* Note: update nir_shader_compiler_options.max_samples when changing this. */
+-- 
+GitLab
+

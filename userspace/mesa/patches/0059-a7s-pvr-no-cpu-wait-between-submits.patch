@@ -1,0 +1,162 @@
+Description: pvr: do not wait for the previous submit on the CPU
+ pvr_driver_queue_submit() started with pvr_clear_last_submits_syncs(), which
+ waited on the CPU (vk_sync_wait_many() with UINT64_MAX) until every job of
+ the previous vkQueueSubmit had completed and then dropped all per-queue
+ syncs. The pvr DRM winsys has no threaded submit, so this wait runs in the
+ submitting thread and the next submission only reaches the kernel once the
+ GPU is idle. Under zink this is the flush thread, which then waits in
+ DRM_IOCTL_SYNCOBJ_WAIT once per frame. The wait was added when the queue moved
+ to the common vk_queue code (upstream 80f864cd23b), replacing the earlier
+ tracking of the previous submit's syncs.
+ .
+ Keep last_job_signal_sync[] across submits instead. Jobs of one type run in
+ submission order on their firmware context, so the last signal sync of a
+ type covers all earlier jobs of that type, also those of earlier submits.
+ Pipeline barriers and event waits (pvr_process_event_cmd_barrier()) and
+ the semaphore and fence signals (pvr_process_queue_signals()) already wait
+ on these syncs, so they now also order against work of earlier submits that
+ is still running, instead of relying on the CPU wait. Command buffers start
+ with all barriers armed (barriers_needed set to all stages in
+ vkBeginCommandBuffer), so a barrier at the start of a command buffer
+ that vkCmdPipelineBarrier2 records as a barrier event is resolved against
+ the jobs of the previous submit. Barriers from a stage to the same single
+ stage and from geometry to fragment are not recorded as an event; they rely
+ on the order of the jobs on their firmware context, as within a submit.
+ .
+ The next-job wait syncs (next_job_wait_sync[]) are kept across submits as
+ well. Besides the queue waits they carry the barriers recorded at the end
+ of a command buffer, and the first job of a stage in the next submit has to
+ wait for them; without the CPU wait, dropping them at the start of a submit
+ let such a job overtake the work the barrier ordered it after (seen as a
+ query copy under zink reading an unfinished result). Queue waits are added
+ to an existing next-job wait sync instead of replacing it.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/vulkan/pvr_arch_queue.c
++++ b/src/imagination/vulkan/pvr_arch_queue.c
+@@ -898,54 +898,6 @@
+    return VK_SUCCESS;
+ }
+ 
+-static VkResult pvr_clear_last_submits_syncs(struct pvr_queue *queue)
+-{
+-   struct vk_sync_wait waits[PVR_JOB_TYPE_MAX * 2];
+-   uint32_t wait_count = 0;
+-   VkResult result;
+-
+-   for (uint32_t i = 0; i < PVR_JOB_TYPE_MAX; i++) {
+-      if (queue->next_job_wait_sync[i]) {
+-         waits[wait_count++] = (struct vk_sync_wait){
+-            .sync = queue->next_job_wait_sync[i],
+-            .stage_mask = ~(VkPipelineStageFlags2)0,
+-            .wait_value = 0,
+-         };
+-      }
+-
+-      if (queue->last_job_signal_sync[i]) {
+-         waits[wait_count++] = (struct vk_sync_wait){
+-            .sync = queue->last_job_signal_sync[i],
+-            .stage_mask = ~(VkPipelineStageFlags2)0,
+-            .wait_value = 0,
+-         };
+-      }
+-   }
+-
+-   result = vk_sync_wait_many(&queue->device->vk,
+-                              wait_count,
+-                              waits,
+-                              VK_SYNC_WAIT_COMPLETE,
+-                              UINT64_MAX);
+-
+-   if (result != VK_SUCCESS)
+-      return vk_error(queue, result);
+-
+-   for (uint32_t i = 0; i < PVR_JOB_TYPE_MAX; i++) {
+-      if (queue->next_job_wait_sync[i]) {
+-         vk_sync_destroy(&queue->device->vk, queue->next_job_wait_sync[i]);
+-         queue->next_job_wait_sync[i] = NULL;
+-      }
+-
+-      if (queue->last_job_signal_sync[i]) {
+-         vk_sync_destroy(&queue->device->vk, queue->last_job_signal_sync[i]);
+-         queue->last_job_signal_sync[i] = NULL;
+-      }
+-   }
+-
+-   return VK_SUCCESS;
+-}
+-
+ static VkResult pvr_process_queue_signals(struct pvr_queue *queue,
+                                           struct vk_sync_signal *signals,
+                                           uint32_t signal_count)
+@@ -995,7 +947,7 @@
+    struct pvr_device *device = queue->device;
+    VkResult result;
+ 
+-   STACK_ARRAY(struct vk_sync_wait, stage_waits, wait_count);
++   STACK_ARRAY(struct vk_sync_wait, stage_waits, wait_count + 1);
+    if (!stage_waits)
+       return vk_error(queue, VK_ERROR_OUT_OF_HOST_MEMORY);
+ 
+@@ -1019,16 +971,27 @@
+       if (!stage_wait_count)
+          continue;
+ 
++      struct vk_sync *prev_wait_sync = queue->next_job_wait_sync[i];
++      struct vk_sync *signal_sync;
++
++      if (prev_wait_sync) {
++         stage_waits[stage_wait_count++] = (struct vk_sync_wait){
++            .sync = prev_wait_sync,
++            .stage_mask = ~(VkPipelineStageFlags2)0,
++            .wait_value = 0,
++         };
++      }
++
+       result = vk_sync_create(&device->vk,
+                               &device->pdevice->ws->syncobj_type,
+                               0U,
+                               0UL,
+-                              &queue->next_job_wait_sync[i]);
++                              &signal_sync);
+       if (result != VK_SUCCESS)
+          goto err_free_waits;
+ 
+       next_job_wait_signal_sync = (struct vk_sync_signal){
+-         .sync = queue->next_job_wait_sync[i],
++         .sync = signal_sync,
+          .stage_mask = ~(VkPipelineStageFlags2)0,
+          .signal_value = 0,
+       };
+@@ -1037,8 +1000,15 @@
+                                                 stage_waits,
+                                                 stage_wait_count,
+                                                 &next_job_wait_signal_sync);
+-      if (result != VK_SUCCESS)
++      if (result != VK_SUCCESS) {
++         vk_sync_destroy(&device->vk, signal_sync);
+          goto err_free_waits;
++      }
++
++      if (prev_wait_sync)
++         vk_sync_destroy(&device->vk, prev_wait_sync);
++
++      queue->next_job_wait_sync[i] = signal_sync;
+    }
+ 
+    STACK_ARRAY_FINISH(stage_waits);
+@@ -1058,10 +1028,6 @@
+    struct pvr_device *device = driver_queue->device;
+    VkResult result;
+ 
+-   result = pvr_clear_last_submits_syncs(driver_queue);
+-   if (result != VK_SUCCESS)
+-      return result;
+-
+    if (submit->wait_count) {
+       result = pvr_process_queue_waits(driver_queue,
+                                        submit->waits,

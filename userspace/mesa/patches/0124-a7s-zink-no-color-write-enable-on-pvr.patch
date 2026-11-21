@@ -1,0 +1,26 @@
+Description: zink: do not use VK_EXT_color_write_enable on pvr
+ zink lists VK_DYNAMIC_STATE_COLOR_WRITE_ENABLE_EXT in every graphics
+ pipeline. pvr turns a dynamic color write enable into a shader-side
+ lowering: meta_present.color_write_enable sets uses.fbfetch and every
+ colour store reads the destination pixel back and selects per channel.
+ zink only needs the state to switch all colour writes off while the
+ fragment shader is disabled (rasterizer discard with a primitives
+ generated query); without the extension it binds a null fragment shader
+ instead, the same path as on drivers without EDS1.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/gallium/drivers/zink/zink_screen.c
++++ b/src/gallium/drivers/zink/zink_screen.c
+@@ -3025,6 +3025,8 @@ init_driver_workarounds(struct zink_screen *screen)
+       /* CWE usage needs EDS1 */
+       screen->info.have_EXT_color_write_enable = false;
+    }
++   if (zink_driverid(screen) == VK_DRIVER_ID_IMAGINATION_OPEN_SOURCE_MESA)
++      screen->info.have_EXT_color_write_enable = false;
+    if (zink_driverid(screen) == VK_DRIVER_ID_AMD_PROPRIETARY)
+       /* this completely breaks xfb somehow */
+       screen->info.have_EXT_extended_dynamic_state2 = false;

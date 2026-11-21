@@ -1,0 +1,37 @@
+Description: pvr: accept a NULL pCounterBuffers in transform feedback begin/end
+ vkCmdBeginTransformFeedbackEXT and vkCmdEndTransformFeedbackEXT may be called
+ with counterBufferCount > 0 and pCounterBuffers NULL, which means no counter
+ buffers (vk.xml: pCounterBuffers is noautovalidity; radv, hasvk and hk check
+ the pointer). pvr read pCounterBuffers[j] unconditionally and dereferenced
+ NULL. dEQP-VK.transform_feedback.simple.resume_1_*_null_counter_buffers
+ (NULL in begin) and resume_1_*_null_ptrs_end_xfb (NULL in end) end with a
+ segmentation fault.
+ .
+ Treat a NULL array like VK_NULL_HANDLE entries: the binding gets no counter
+ buffer address, as already done for single VK_NULL_HANDLE entries.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/vulkan/pvr_arch_xfb.c
++++ b/src/imagination/vulkan/pvr_arch_xfb.c
+@@ -869,7 +869,7 @@
+ 
+       unsigned j = i - firstCounterBuffer;
+ 
+-      if (pCounterBuffers[j] != VK_NULL_HANDLE) {
++      if (pCounterBuffers && pCounterBuffers[j] != VK_NULL_HANDLE) {
+          VK_FROM_HANDLE(pvr_buffer, buffer, pCounterBuffers[j]);
+          uint64_t offset = pCounterBufferOffsets ? pCounterBufferOffsets[j] : 0;
+ 
+@@ -917,7 +917,7 @@
+ 
+       unsigned j = i - firstCounterBuffer;
+ 
+-      if (pCounterBuffers[j] != VK_NULL_HANDLE) {
++      if (pCounterBuffers && pCounterBuffers[j] != VK_NULL_HANDLE) {
+          VK_FROM_HANDLE(pvr_buffer, buffer, pCounterBuffers[j]);
+          uint64_t offset = pCounterBufferOffsets ? pCounterBufferOffsets[j] : 0;
+ 

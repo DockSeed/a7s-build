@@ -8,7 +8,7 @@ may not be redistributed. "Unknown" means no licence text came with the file.
 
 | What | Origin | Pin | Licence | Redistribute? |
 |---|---|---|---|---|
-| Kernel recipe `a7s-linux-lts` (Linux 6.18.64 and the patch series; fetches the row below itself) | github.com/DockSeed/a7s-linux-lts | commit `02e8144e2763`, `scripts/stages/kernel.sh` | GPL-2.0 | yes |
+| Kernel recipe `a7s-linux-lts` (Linux 6.18.64 and the patch series; fetches the row below itself) | github.com/DockSeed/a7s-linux-lts | commit `2a76e318f483`, `scripts/stages/kernel.sh` | GPL-2.0 | yes |
 | Linux 6.18.64 | cdn.kernel.org | by `a7s-linux-lts`: sha256 | GPL-2.0 | yes |
 | Kernel packages `linux-image`, `linux-headers`, `a7s-kernel-hook`, `a7s-aic8800-dkms` (unless `A7S_KERNEL=build`) | github.com/DockSeed/a7s-linux-lts, the release of `KERNEL_RELEASE_TAG` | sha256 of each file, `scripts/stages/kernel.sh` | GPL-2.0 | yes |
 | Boot-chain recipe `a733-bootchain` (U-Boot, TF-A and the patches on both; fetches the rows below itself) | github.com/DockSeed/a733-bootchain | commit `bd0f37556b82`, `scripts/stages/bootchain.sh` | GPL / BSD-3-Clause, per file | yes |
@@ -19,5 +19,6 @@ may not be redistributed. "Unknown" means no licence text came with the file.
 | AIC8800D80 firmware (7 files) | same | commit `b6e136a9fe30` in `scripts/stages/wifi.sh`, sha256 per file, `out-of-tree/aic8800/firmware.sha256` | vendor, no grant | no |
 | GPU firmware `rogue_36.56.104.183_v1.fw` | gitlab.freedesktop.org/imagination/linux-firmware | commit `8a58f81883f7`, sha256 | `LICENSE.powervr`: binary redistribution unmodified, with notice and disclaimer; the name of Imagination or its suppliers not used to endorse or promote without written permission; no reverse engineering, decompilation or disassembly; only with products designed and licensed by Imagination | yes, with the licence file |
 | ORC 0.4.41, xfwm4 4.20.0-1 sources | gstreamer.freedesktop.org, deb.debian.org / snapshot.debian.org | sha256 | BSD / GPL-2.0+ | yes |
+| Mesa 26.3.0 source, *Debian*'s mesa 26.2.6-1 packaging (`debian.tar.xz`), wayland-protocols 1.50-1 (build only) | archive.mesa3d.org, deb.debian.org / snapshot.debian.org | sha256, `scripts/stages/mesa.sh` | Mesa: per file, listed in the packages' `debian/copyright`; packaging: GPL; wayland-protocols: its `debian/copyright` | yes |
 
 A new download is added here in the same change that adds the fetch.

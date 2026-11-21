@@ -1,0 +1,111 @@
+From a3a4e2e3bfd6dbddee6b51984b3c951fe21d2e93 Mon Sep 17 00:00:00 2001
+From: Simon Perretta <simon.perretta@imgtec.com>
+Date: Mon, 1 Sep 2025 12:40:46 +0100
+Subject: [PATCH] pvr: fix multilayered clear with rta support, re-enable for
+ bxs-4-64
+
+Remaining issues relate to missing clear handling for depth/stencil attachments
+
+Signed-off-by: Simon Perretta <simon.perretta@imgtec.com>
+Acked-by: Luigi Santivetti <luigi.santivetti@imgtec.com>
+Reviewed-by: Frank Bouwer <frank.bouwer@imgtec.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/40973>
+Link: https://gitlab.freedesktop.org/mesa/mesa/-/commit/a3a4e2e3bfd6dbddee6b51984b3c951fe21d2e93
+---
+ src/imagination/vulkan/pvr_arch_cmd_buffer.c | 15 +++++++++++++++
+ src/imagination/vulkan/pvr_usc.c             | 12 ++++++++++++
+ src/imagination/vulkan/pvr_usc.h             |  1 +
+ 3 files changed, 28 insertions(+)
+
+diff --git a/src/imagination/vulkan/pvr_arch_cmd_buffer.c b/src/imagination/vulkan/pvr_arch_cmd_buffer.c
+index e4bd2227a5cb..a1763cc7acf2 100644
+--- a/src/imagination/vulkan/pvr_arch_cmd_buffer.c
++++ b/src/imagination/vulkan/pvr_arch_cmd_buffer.c
+@@ -569,6 +569,7 @@ static VkResult pvr_sub_cmd_gfx_per_job_fragment_programs_create_and_upload(
+    const uint32_t emit_count,
+    const uint32_t *pbe_cs_words,
+    const unsigned *tile_buffer_ids,
++   unsigned long *layer_size,
+    unsigned pixel_output_width,
+    struct pvr_pds_upload *const pds_upload_out)
+ {
+@@ -595,6 +596,9 @@ static VkResult pvr_sub_cmd_gfx_per_job_fragment_programs_create_and_upload(
+ 
+    bool has_tile_buffers = false;
+    for (unsigned u = 0; u < emit_count; ++u) {
++      props.rta_element_stride[u] =
++         layer_size[u] / ROGUE_PBESTATE_STATE_WORD0_ADDRESS_LOW_ALIGNMENT;
++
+       unsigned tile_buffer_id = tile_buffer_ids[u];
+       if (tile_buffer_id == ~0)
+          continue;
+@@ -1524,6 +1528,8 @@ struct pvr_emit_state {
+ 
+    unsigned tile_buffer_ids[PVR_MAX_COLOR_ATTACHMENTS];
+ 
++   unsigned long layer_size[PVR_MAX_COLOR_ATTACHMENTS];
++
+    uint32_t emit_count;
+ };
+ 
+@@ -1567,6 +1573,14 @@ pvr_setup_emit_state(const struct pvr_device_info *dev_info,
+          if (mrt_resource->type != resource_type)
+             continue;
+ 
++         const struct pvr_image *image = pvr_image_view_get_image(iview);
++         if (PVR_HAS_FEATURE(dev_info, gs_rta_support) &&
++             rstate->layers > 1) {
++            const struct pvr_image_plane *plane = pvr_single_plane_const(image);
++
++            emit_state->layer_size[emit_state->emit_count] = plane->layer_size;
++         }
++
+          if (surface->need_resolve) {
+             const struct pvr_image_view *resolve_src =
+                render_pass_info->attachments[surface->src_attachment_idx];
+@@ -1705,6 +1719,7 @@ static VkResult pvr_sub_cmd_gfx_job_init(const struct pvr_device_info *dev_info,
+             emit_state.emit_count,
+             emit_state.pbe_cs_words[0],
+             emit_state.tile_buffer_ids,
++            emit_state.layer_size,
+             pixel_output_width,
+             &pds_pixel_event_program);
+          if (result != VK_SUCCESS)
+diff --git a/src/imagination/vulkan/pvr_usc.c b/src/imagination/vulkan/pvr_usc.c
+index 7c86d013906d..c56f08c8ed77 100644
+--- a/src/imagination/vulkan/pvr_usc.c
++++ b/src/imagination/vulkan/pvr_usc.c
+@@ -166,6 +166,18 @@ pco_shader *pvr_usc_eot(pco_ctx *ctx,
+          state1 = nir_imm_int(&b, props->state_words[state_off + 1]);
+       }
+ 
++      if (props->rta_element_stride[u]) {
++         nir_def *state =
++            nir_umad64_32(&b,
++                          nir_imm_int(&b, props->rta_element_stride[u]),
++                          nir_load_layer_id(&b),
++                          state0,
++                          state1);
++
++         state0 = nir_channel(&b, state, 0);
++         state1 = nir_channel(&b, state, 1);
++      }
++
+       last_emit = nir_emitpix_pco(&b, state0, state1);
+    }
+ 
+diff --git a/src/imagination/vulkan/pvr_usc.h b/src/imagination/vulkan/pvr_usc.h
+index 67b3ccda3616..ac1df07924da 100644
+--- a/src/imagination/vulkan/pvr_usc.h
++++ b/src/imagination/vulkan/pvr_usc.h
+@@ -24,6 +24,7 @@ struct pvr_load_op;
+ /* EOT shader generation. */
+ struct pvr_eot_props {
+    unsigned emit_count;
++   uint32_t rta_element_stride[PVR_MAX_COLOR_ATTACHMENTS];
+ 
+    bool shared_words;
+    union {
+-- 
+GitLab
+

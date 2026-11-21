@@ -1,0 +1,32 @@
+Description: pvr: report a 128 MiB maxUniformBufferRange
+ maxUniformBufferRange is a literal 16 KiB, the Vulkan 1.0 minimum. Before
+ a22ad99bdd2 ("pvr: set device features/props/extensions to Vulkan 1.0
+ minimums (unless implemented)") it was 128 MiB. Uniform and storage buffers
+ take the same path: both use nir_address_format_vec2_index_32bit_offset
+ (pco_nir.c), both are lowered by trans_load_buffer() (pco_trans_nir.c),
+ which adds a 32-bit offset to the 64-bit address from the buffer
+ descriptor, and the descriptor holds a 32-bit size (struct
+ pvr_buffer_descriptor, pvr_common.h). Only inline uniform blocks are read
+ from shared registers, and they have their own limits.
+ .
+ Report the same range as maxStorageBufferRange. zink clamps every bound
+ uniform buffer to maxUniformBufferRange (zink_context.c) and derives
+ GL_MAX_UNIFORM_BLOCK_SIZE from it; wgpu reports it as
+ max_uniform_buffer_binding_size.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/vulkan/pvr_physical_device.c
++++ b/src/imagination/vulkan/pvr_physical_device.c
+@@ -681,7 +681,7 @@
+       .maxImageDimensionCube = max_render_size,
+       .maxImageArrayLayers = rogue_get_render_size_max_z(dev_info),
+       .maxTexelBufferElements = 64U * 1024U,
+-      .maxUniformBufferRange = 16U * 1024U,
++      .maxUniformBufferRange = 128U * 1024U * 1024U,
+       .maxStorageBufferRange = 128U * 1024U * 1024U,
+       .maxPushConstantsSize = 128U,
+       .maxMemoryAllocationCount = 4096U,

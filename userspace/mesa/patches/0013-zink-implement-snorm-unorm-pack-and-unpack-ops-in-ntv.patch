@@ -1,0 +1,64 @@
+From 77869cdae4173962f91887998a6c7b86e489dc6b Mon Sep 17 00:00:00 2001
+From: Ali Milhim <alimilhim5@gmail.com>
+Date: Sun, 8 Nov 2026 05:01:28 +0200
+Subject: [PATCH] zink: implement snorm/unorm pack and unpack ops in ntv
+
+Map all eight to their GLSL.std.450 instructions.
+
+Cc: mesa-stable
+Closes: https://gitlab.freedesktop.org/mesa/mesa/-/issues/16360
+Reviewed-by: Georg Lehmann <dadschoorse@gmail.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/46062>
+(cherry picked from commit b2f0db7e08a2d5eb299e853b74df9b2d74080931)
+Link: https://gitlab.freedesktop.org/mesa/mesa/-/commit/77869cdae4173962f91887998a6c7b86e489dc6b
+[ adapted: dropped .pick_status.json, not in the 26.3.0 tarball or bookkeeping only ]
+---
+ .pick_status.json                             |  2 +-
+ .../drivers/zink/nir_to_spirv/nir_to_spirv.c  | 22 ++++++++++++++-----
+ 2 files changed, 18 insertions(+), 6 deletions(-)
+
+diff --git a/src/gallium/drivers/zink/nir_to_spirv/nir_to_spirv.c b/src/gallium/drivers/zink/nir_to_spirv/nir_to_spirv.c
+index 2c6a97ab975d..865d6d68180c 100644
+--- a/src/gallium/drivers/zink/nir_to_spirv/nir_to_spirv.c
++++ b/src/gallium/drivers/zink/nir_to_spirv/nir_to_spirv.c
+@@ -2002,6 +2002,13 @@ emit_alu(struct ntv_context *ctx, nir_alu_instr *alu)
+       atype = nir_type_float; \
+       break;
+ 
++#define BUILTIN_UNOPU(nir_op, spirv_op) \
++   case nir_op: \
++      assert(nir_op_infos[alu->op].num_inputs == 1); \
++      result = emit_builtin_unop(ctx, spirv_op, get_def_type(ctx, &alu->def, nir_type_uint), src[0]); \
++      atype = nir_type_uint; \
++      break;
++
+    BUILTIN_UNOP(nir_op_iabs, GLSLstd450SAbs)
+    BUILTIN_UNOP(nir_op_fabs, GLSLstd450FAbs)
+    BUILTIN_UNOP(nir_op_fsqrt, GLSLstd450Sqrt)
+@@ -2021,13 +2028,18 @@ emit_alu(struct ntv_context *ctx, nir_alu_instr *alu)
+    BUILTIN_UNOP(nir_op_find_lsb, GLSLstd450FindILsb)
+    BUILTIN_UNOP(nir_op_ifind_msb, GLSLstd450FindSMsb)
+ 
+-   case nir_op_pack_half_2x16:
+-      assert(nir_op_infos[alu->op].num_inputs == 1);
+-      result = emit_builtin_unop(ctx, GLSLstd450PackHalf2x16, get_def_type(ctx, &alu->def, nir_type_uint), src[0]);
+-      break;
+-
++   BUILTIN_UNOPU(nir_op_pack_half_2x16, GLSLstd450PackHalf2x16)
++   BUILTIN_UNOPU(nir_op_pack_snorm_2x16, GLSLstd450PackSnorm2x16)
++   BUILTIN_UNOPU(nir_op_pack_unorm_2x16, GLSLstd450PackUnorm2x16)
++   BUILTIN_UNOPU(nir_op_pack_snorm_4x8, GLSLstd450PackSnorm4x8)
++   BUILTIN_UNOPU(nir_op_pack_unorm_4x8, GLSLstd450PackUnorm4x8)
++   BUILTIN_UNOPF(nir_op_unpack_snorm_2x16, GLSLstd450UnpackSnorm2x16)
++   BUILTIN_UNOPF(nir_op_unpack_unorm_2x16, GLSLstd450UnpackUnorm2x16)
++   BUILTIN_UNOPF(nir_op_unpack_snorm_4x8, GLSLstd450UnpackSnorm4x8)
++   BUILTIN_UNOPF(nir_op_unpack_unorm_4x8, GLSLstd450UnpackUnorm4x8)
+    BUILTIN_UNOPF(nir_op_unpack_half_2x16, GLSLstd450UnpackHalf2x16)
+ #undef BUILTIN_UNOP
++#undef BUILTIN_UNOPU
+ #undef BUILTIN_UNOPF
+ 
+    case nir_op_frcp:
+-- 
+GitLab
+

@@ -1,0 +1,117 @@
+Description: pvr: lay out twiddled mip levels as power-of-two block grids
+ pvr_image_plane_setup_mip_levels() converts the power-of-two physical extent
+ of level 0 to blocks and halves the block count for every further level.
+ That is only correct while the block dimensions are powers of two. For a
+ block size that is not a power of two the block counts do not match what the
+ TPU reads: the physical extent is the texel extent rounded up to a power of
+ two, and the block count of that extent, rounded up to a power of two again,
+ can be larger than the block count of the image extent rounded up to a power of
+ two (65 texels in blocks of 5: 128 texels, 26 blocks, 32; against 13 blocks,
+ 16). A twiddled level also needs a power-of-two block grid: usclib_twiddle2d()
+ (pco/usclib/tex.cl) rounds both dimensions up to a power of two before
+ interleaving the coordinates.
+ .
+ For twiddled images take the block extent of the image extent, round each
+ dimension up to a power of two and halve it for every level. Other layouts
+ keep the block extent of the physical extent. The trailing levels that are
+ added to the layer size stop at the same condition as before (block extent
+ 1x1x1). For block dimensions 1, 2 and 4, that is all formats the driver
+ supports before ASTC, the result is the same as before for every level,
+ offset, pitch and layer size; checked offline by comparing both
+ computations over extents, block sizes, layouts and level counts.
+ .
+ On the board, the layout from the physical extent made
+ dEQP-VK.texture.compressed.astc_*_npot_mip1* (51x65, level 1) fail for
+ exactly the block heights that are not a power of two, while the level 0 and
+ power-of-two cases passed; the block extent of the image extent explains all
+ block sizes of that run. Offsets of levels above 1 are not covered by these
+ tests.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/vulkan/pvr_image.c
++++ b/src/imagination/vulkan/pvr_image.c
+@@ -138,6 +138,29 @@
+    }
+ }
+ 
++static VkExtent3D
++pvr_image_plane_level_extent(const struct pvr_image *image,
++                             const struct pvr_image_plane *plane,
++                             uint32_t level)
++{
++   VkExtent3D extent;
++
++   if (image->memlayout == PVR_MEMLAYOUT_TWIDDLED) {
++      extent = vk_image_extent_to_elements(&image->vk, image->vk.extent);
++      extent.width = util_next_power_of_two(extent.width);
++      extent.height = util_next_power_of_two(extent.height);
++      extent.depth = util_next_power_of_two(extent.depth);
++   } else {
++      extent = vk_image_extent_to_elements(&image->vk, plane->physical_extent);
++   }
++
++   return (VkExtent3D){
++      .width = u_minify(extent.width, level),
++      .height = u_minify(extent.height, level),
++      .depth = u_minify(extent.depth, level),
++   };
++}
++
+ static void pvr_image_plane_setup_mip_levels(struct pvr_image *image, uint8_t i)
+ {
+    struct pvr_image_plane *plane = &image->planes[i];
+@@ -146,8 +169,7 @@
+    const uint32_t extent_alignment =
+       image->vk.image_type == VK_IMAGE_TYPE_3D ? 4 : 1;
+    const unsigned int cpp = vk_format_get_blocksize(plane_format);
+-   VkExtent3D extent =
+-      vk_image_extent_to_elements(&image->vk, plane->physical_extent);
++   VkExtent3D extent;
+ 
+    assert(image->vk.mip_levels <= ARRAY_SIZE(plane->mip_levels));
+ 
+@@ -156,6 +178,8 @@
+    for (uint32_t i = 0; i < image->vk.mip_levels; i++) {
+       struct pvr_mip_level *mip_level = &plane->mip_levels[i];
+ 
++      extent = pvr_image_plane_level_extent(image, plane, i);
++
+       mip_level->pitch = cpp * align(extent.width, extent_alignment);
+       mip_level->height_pitch = align(extent.height, extent_alignment);
+       mip_level->size = image->vk.samples * mip_level->pitch *
+@@ -164,26 +188,22 @@
+       mip_level->offset = plane->layer_size;
+ 
+       plane->layer_size += mip_level->size;
+-
+-      extent.height = u_minify(extent.height, 1);
+-      extent.width = u_minify(extent.width, 1);
+-      extent.depth = u_minify(extent.depth, 1);
+    }
+ 
+    if (image->vk.mip_levels > 1) {
+       /* The hw calculates layer strides as if a full mip chain up until 1x1x1
+        * were present so we need to account for that in the `layer_size`.
+        */
+-      while (extent.height != 1 || extent.width != 1 || extent.depth != 1) {
++      for (uint32_t level = image->vk.mip_levels;; level++) {
++         extent = pvr_image_plane_level_extent(image, plane, level);
++         if (extent.height == 1 && extent.width == 1 && extent.depth == 1)
++            break;
++
+          const uint32_t height_pitch = align(extent.height, extent_alignment);
+          const uint32_t pitch = cpp * align(extent.width, extent_alignment);
+ 
+          plane->layer_size += image->vk.samples * pitch * height_pitch *
+                               align(extent.depth, extent_alignment);
+-
+-         extent.height = u_minify(extent.height, 1);
+-         extent.width = u_minify(extent.width, 1);
+-         extent.depth = u_minify(extent.depth, 1);
+       }
+    }
+ 

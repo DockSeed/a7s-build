@@ -1,0 +1,36 @@
+Description: nir/opt_vectorize_io: keep dual-source blend outputs apart
+ Both colours of dual-source blending are stored at the same location
+ (FRAG_RESULT_DATA0) and differ only in dual_source_blend_index.
+ compare_is_not_vectorizable() did not look at the index, so after
+ nir_lower_io_to_scalar() the scalar stores of both colours fell into one
+ group, and vectorize_batch() removed the earlier store of each component as
+ overwritten. With the shader order of the CTS (index 0 first) only the
+ index 1 colour was left.
+ .
+ pco runs nir_lower_io_to_scalar(), nir_opt_cse() and nir_opt_vectorize_io()
+ on fragment outputs before nir_lower_blend() (pco_lower_nir()). Once CSE
+ has merged the zero offsets, nir_lower_blend() found only the second colour,
+ took it as src1 in consume_dual_stores(), and the shader stored no colour at
+ all. The index is now compared like the location, so both colours are
+ vectorized separately.
+ .
+ Needed by 0054 (dualSrcBlend); without dual-source blending no shader has
+ an output with index 1, so nothing changes there.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/compiler/nir/nir_opt_vectorize_io.c
++++ b/src/compiler/nir/nir_opt_vectorize_io.c
+@@ -58,6 +58,9 @@
+    if (sem0.location != sem1.location)
+       return sem0.location > sem1.location ? 1 : -1;
+ 
++   if (sem0.dual_source_blend_index != sem1.dual_source_blend_index)
++      return sem0.dual_source_blend_index > sem1.dual_source_blend_index ? 1 : -1;
++
+    /* The mediump flag isn't mergable. */
+    if (sem0.medium_precision != sem1.medium_precision)
+       return sem0.medium_precision > sem1.medium_precision ? 1 : -1;

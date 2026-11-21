@@ -1,0 +1,115 @@
+From e4182b59942b07648cd608cb5ad287c6f7c34be7 Mon Sep 17 00:00:00 2001
+From: Mike Blumenkrantz <michael.blumenkrantz@gmail.com>
+Date: Wed, 21 Oct 2026 13:53:37 -0400
+Subject: [PATCH] zink: collect all the supported robustness features into a
+ bitfield
+
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45499>
+Link: https://gitlab.freedesktop.org/mesa/mesa/-/commit/e4182b59942b07648cd608cb5ad287c6f7c34be7
+[ adapted: context only: struct zink_transfer in 26.3 ends with 'bool invalidated;' (zink_types.h); the added lines are unchanged ]
+---
+diff --git a/src/gallium/drivers/zink/zink_program.c b/src/gallium/drivers/zink/zink_program.c
+index 5f8d93e..16b15e9 100644
+--- a/src/gallium/drivers/zink/zink_program.c
++++ b/src/gallium/drivers/zink/zink_program.c
+@@ -1739,14 +1739,15 @@ create_compute_program(struct zink_context *ctx, nir_shader *nir)
+    comp->scratch_size = nir->scratch_size;
+    comp->nir = nir;
+    comp->num_inlinable_uniforms = nir->info.num_inlinable_uniforms;
+-
++   if (ctx->flags & PIPE_CONTEXT_ROBUST_BUFFER_ACCESS)
++      comp->robust = screen->info.have_EXT_pipeline_robustness;
+    comp->use_local_size = !(nir->info.workgroup_size[0] ||
+                             nir->info.workgroup_size[1] ||
+                             nir->info.workgroup_size[2]);
+    comp->has_variable_shared_mem = nir->info.cs.has_variable_shared_mem;
+    comp->base.can_precompile = !comp->use_local_size &&
+                                (screen->info.have_EXT_non_seamless_cube_map || !zink_shader_has_cubes(nir)) &&
+-                               (screen->info.rb2_feats.robustImageAccess2 || !(ctx->flags & PIPE_CONTEXT_ROBUST_BUFFER_ACCESS));
++                               (screen->robustness & ZINK_ROBUSTNESS_IMAGE2 || !(ctx->flags & PIPE_CONTEXT_ROBUST_BUFFER_ACCESS));
+    _mesa_hash_table_init(&comp->pipelines, comp->base.ralloc_ctx, NULL, comp->use_local_size ?
+                                                        equals_compute_pipeline_state_local_size :
+                                                        equals_compute_pipeline_state);
+diff --git a/src/gallium/drivers/zink/zink_screen.c b/src/gallium/drivers/zink/zink_screen.c
+index d05df40..052d069 100644
+--- a/src/gallium/drivers/zink/zink_screen.c
++++ b/src/gallium/drivers/zink/zink_screen.c
+@@ -861,9 +861,8 @@ zink_init_screen_caps(struct zink_screen *screen)
+       screen->info.feats.features.pipelineStatisticsQuery;
+ 
+    caps->robust_buffer_access_behavior =
+-      screen->info.feats.features.robustBufferAccess &&
+-      (screen->info.rb2_feats.robustImageAccess2 ||
+-       screen->driver_compiler_workarounds.lower_robustImageAccess2);
++      screen->robustness & ZINK_ROBUSTNESS_BUFFER &&
++      screen->robustness & (ZINK_ROBUSTNESS_IMAGE | ZINK_ROBUSTNESS_IMAGE2);
+ 
+    caps->multi_draw_indirect = screen->info.feats.features.multiDrawIndirect;
+ 
+@@ -3159,9 +3158,7 @@ init_driver_workarounds(struct zink_screen *screen)
+ 
+    /* When robust contexts are advertised but robustImageAccess2 is not available */
+    screen->driver_compiler_workarounds.lower_robustImageAccess2 =
+-      !screen->info.rb2_feats.robustImageAccess2 &&
+-      screen->info.feats.features.robustBufferAccess &&
+-      screen->info.rb_image_feats.robustImageAccess;
++      screen->robustness == (ZINK_ROBUSTNESS_BUFFER | ZINK_ROBUSTNESS_IMAGE);
+ 
+    /* once more testing has been done, use the #if 0 block */
+    unsigned illegal = ZINK_DEBUG_RP | ZINK_DEBUG_NORP;
+@@ -3304,6 +3301,13 @@ disable_features(struct zink_screen *screen)
+    screen->info.mesh_feats.primitiveFragmentShadingRateMeshShader = false;
+    /* if this is used anywhere it should just be enabled with driconf */
+    screen->info.view2d_feats.sampler2DViewOf3D = false;
++
++   if (screen->info.feats.features.robustBufferAccess)
++      screen->robustness |= ZINK_ROBUSTNESS_BUFFER;
++   if (screen->info.rb_image_feats.robustImageAccess)
++      screen->robustness |= ZINK_ROBUSTNESS_IMAGE;
++   if (screen->info.rb2_feats.robustImageAccess2)
++      screen->robustness |= ZINK_ROBUSTNESS_IMAGE2;
+ }
+ 
+ static void
+@@ -3352,9 +3356,12 @@ init_optimal_keys(struct zink_screen *screen)
+       if (screen->driver_workarounds.no_linesmooth)
+          fprintf(stderr, "driver does not support smooth lines\n");
+       CHECK_OR_PRINT(maint5_props.polygonModePointSize);
+-      CHECK_OR_PRINT(rb2_feats.robustImageAccess2);
+-      CHECK_OR_PRINT(feats.features.robustBufferAccess);
+-      CHECK_OR_PRINT(rb_image_feats.robustImageAccess);
++      if (!(screen->robustness & ZINK_ROBUSTNESS_IMAGE2))
++         fprintf(stderr, "zink: driver does not support robustImageAccess2\n");
++      if (!(screen->robustness & ZINK_ROBUSTNESS_BUFFER))
++         fprintf(stderr, "zink: driver does not support robustBufferAccess\n");
++      if (!(screen->robustness & ZINK_ROBUSTNESS_IMAGE))
++         fprintf(stderr, "zink: driver does not support robustImageAccess\n");
+       printf("\n");
+       mesa_logw("zink: force-enabling optimal_keys despite missing features. Good luck!");
+    }
+diff --git a/src/gallium/drivers/zink/zink_types.h b/src/gallium/drivers/zink/zink_types.h
+index a6cddae..01178c9 100644
+--- a/src/gallium/drivers/zink/zink_types.h
++++ b/src/gallium/drivers/zink/zink_types.h
+@@ -1418,6 +1418,12 @@ struct zink_transfer {
+    bool invalidated;
+ };
+ 
++enum zink_robustness {
++   ZINK_ROBUSTNESS_NONE = 0,
++   ZINK_ROBUSTNESS_BUFFER = (1 << 0),
++   ZINK_ROBUSTNESS_IMAGE = (1 << 1),
++   ZINK_ROBUSTNESS_IMAGE2 = (1 << 2),
++};
+ 
+ /** screen types */
+ struct zink_modifier_props {
+@@ -1541,6 +1547,8 @@ struct zink_screen {
+    struct util_idalloc_mt buffer_ids;
+    struct util_vertex_state_cache vertex_state_cache;
+ 
++   /* supported features */
++   enum zink_robustness robustness;
+    struct zink_device_info info;
+    struct nir_shader_compiler_options nir_options;
+    struct ntv_info ntv_info;

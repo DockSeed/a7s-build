@@ -1,0 +1,58 @@
+From 2138d9ab67e309d12bc6a8785aa67ce7d2fc9224 Mon Sep 17 00:00:00 2001
+From: Ali Milhim <alimilhim5@gmail.com>
+Date: Thu, 12 Nov 2026 16:05:42 +0200
+Subject: [PATCH] nir/opt_copy_prop_vars: don't create a copies array just to
+ kill nothing
+
+The kill fast path created an empty copies array for every untracked
+variable and removed it again straight away. The arrays stayed allocated
+until the end of the pass, so they piled up with every invalidation.
+
+Cc: mesa-stable
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/46213>
+(cherry picked from commit 8159fedf1b5a810d0a698f88d5b8d30ecbd32099)
+Link: https://gitlab.freedesktop.org/mesa/mesa/-/commit/2138d9ab67e309d12bc6a8785aa67ce7d2fc9224
+[ adapted: dropped .pick_status.json, not in the 26.3.0 tarball or bookkeeping only ]
+---
+ .pick_status.json                         |  2 +-
+ src/compiler/nir/nir_opt_copy_prop_vars.c | 21 ++++++++++++---------
+ 2 files changed, 13 insertions(+), 10 deletions(-)
+
+diff --git a/src/compiler/nir/nir_opt_copy_prop_vars.c b/src/compiler/nir/nir_opt_copy_prop_vars.c
+index f81bcea7a0e1..794bec04b43d 100644
+--- a/src/compiler/nir/nir_opt_copy_prop_vars.c
++++ b/src/compiler/nir/nir_opt_copy_prop_vars.c
+@@ -593,18 +593,21 @@ lookup_entry_and_kill_aliases(struct copy_prop_var_state *state,
+       /*
+        * Fast path for regular variables: different variables can't alias
+        * each other's destinations, so only the same-variable bucket needs
+-       * the full dst+src check.
++       * the full dst+src check.  Don't create a bucket for a variable we
++       * aren't tracking, there is nothing in it to kill.
+        */
+-      struct copies_dynarray *cpda =
+-         copies_array_for_var(state, copies, write_var);
+-      struct util_dynarray *copies_array = &cpda->arr;
++      struct hash_entry *ht_entry =
++         _mesa_hash_table_search(&copies->ht, write_var);
++      if (ht_entry) {
++         struct copies_dynarray *cpda =
++            get_copies_array_from_ht_entry(state, copies, ht_entry);
+ 
+-      lookup_entry_and_kill_aliases_copy_array(state, copies_array, deref,
+-                                               write_mask, remove_entry,
+-                                               &entry, &entry_removed);
++         lookup_entry_and_kill_aliases_copy_array(state, &cpda->arr, deref,
++                                                  write_mask, remove_entry,
++                                                  &entry, &entry_removed);
+ 
+-      if (copies_array->size == 0) {
+-         _mesa_hash_table_remove_key(&copies->ht, deref->_path->path[0]->var);
++         if (cpda->arr.size == 0)
++            _mesa_hash_table_remove(&copies->ht, ht_entry);
+       }
+ 
+       /*
+-- 
+GitLab
+

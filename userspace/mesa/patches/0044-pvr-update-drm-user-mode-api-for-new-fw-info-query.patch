@@ -1,0 +1,62 @@
+From f66e794b7874b17de1baa120cc06ec635fa65285 Mon Sep 17 00:00:00 2001
+From: Nick Hamilton <nick.hamilton@imgtec.com>
+Date: Fri, 2 Oct 2026 10:21:00 +0100
+Subject: [PATCH] pvr: update drm user mode api for new fw info query
+
+Add the new enum and struct for the new fw info query which can
+obtain the fw version.
+
+Kernel update: drm/misc/kernel@de30740d.
+
+Signed-off-by: Nick Hamilton <nick.hamilton@imgtec.com>
+Acked-by: Luigi Santivetti <luigi.santivetti@imgtec.com>
+Reviewed-by: Alessio Belle <alessio.belle@imgtec.com>
+Reviewed-by: Frank Bouwer <frank.bouwer@imgtec.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/40973>
+Link: https://gitlab.freedesktop.org/mesa/mesa/-/commit/f66e794b7874b17de1baa120cc06ec635fa65285
+---
+ include/drm-uapi/pvr_drm.h | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/include/drm-uapi/pvr_drm.h b/include/drm-uapi/pvr_drm.h
+index ccf6c2112468..1179c1e7d92d 100644
+--- a/include/drm-uapi/pvr_drm.h
++++ b/include/drm-uapi/pvr_drm.h
+@@ -434,6 +434,21 @@ struct drm_pvr_dev_query_static_data_areas {
+ 	struct drm_pvr_obj_array static_data_areas;
+ };
+ 
++/**
++ * struct drm_pvr_dev_query_fw_info - Container used to fetch information
++ * about the GPU Firmware like its version.
++ */
++struct drm_pvr_dev_query_fw_info {
++	/** @major_version: Major version of the Firmware. */
++	__u16 major_version;
++
++	/** @minor_version: Minor version of the Firmware. */
++	__u16 minor_version;
++
++	/** @_padding_4: Reserved. This field must be zeroed. */
++	__u32 _padding_4;
++};
++
+ /**
+  * enum drm_pvr_dev_query - For use with &drm_pvr_ioctl_dev_query_args.type to
+  * indicate the type of the receiving container.
+@@ -476,6 +491,12 @@ enum drm_pvr_dev_query {
+ 	 * a pointer to &struct drm_pvr_dev_query_static_data_areas.
+ 	 */
+ 	DRM_PVR_DEV_QUERY_STATIC_DATA_AREAS_GET,
++
++	/**
++	 * @DRM_PVR_DEV_QUERY_FW_INFO_GET: The dev query args contain
++	 * a pointer to &struct drm_pvr_dev_query_fw_info.
++	 */
++	DRM_PVR_DEV_QUERY_FW_INFO_GET,
+ };
+ 
+ /**
+-- 
+GitLab
+

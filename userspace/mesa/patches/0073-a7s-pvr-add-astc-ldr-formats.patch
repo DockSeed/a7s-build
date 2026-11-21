@@ -1,0 +1,157 @@
+Description: pvr: add the ASTC LDR formats
+ BXM-4-64 reports has_astc (common/device_info/bxm-4-64.h), and the texture
+ state of Rogue has the 14 two-dimensional ASTC block sizes as
+ FORMAT_COMPRESSED values 0 to 13 (csbgen/rogue/texstate.xml). These values
+ overlap uncompressed FORMAT values; on cores with tpu_image_state_v2 the
+ texture word sets compression mode TPU for every compressed format
+ (pvr_arch_pack_tex_state(), IMAGE_WORD1 and STRIDE_IMAGE_WORD1
+ tpu_image_state_v2_compression_mode), which selects the compressed format
+ table. Copies already handle any block size through pvr_get_raw_copy_format()
+ and the block conversions in rogue/pvr_blit.c, as for ETC2 RGBA8 and EAC
+ RG11, which also have 128-bit blocks.
+ .
+ Add the 28 UNORM and SRGB ASTC LDR formats to the format table with sampled
+ image support, add the 14 ASTC texture formats to the compressed border
+ colour table and report textureCompressionASTC_LDR. ASTC formats are only
+ supported, and the feature is only reported, on cores with both astc and
+ tpu_image_state_v2; ge7800 and ge8300 have astc without tpu_image_state_v2,
+ where the encoding is not described. Linear tiling is not offered for ASTC:
+ the stride of a strided texture is given in pixels, and nothing in the
+ hardware definitions describes it for blocks that are not a power of two.
+ With optimal tiling the formats get sampled image, linear filtering, blit
+ source and transfer source and destination, as ETC2. Block-compressed 3D
+ images stay unsupported.
+ .
+ On cores with tpu_border_colour_enhanced the border colour of the ASTC
+ formats is stored as U16U16U16U16. On the board, a border colour stored as
+ U8U8U8U8 came back as its bytes read as four UNORM16 channels for every
+ block size (dEQP-VK.pipeline.monolithic.sampler address_modes
+ clamp_to_border, opaque white returned (1, 1, 0, 0)).
+ .
+ This needs "pvr: lay out twiddled mip levels as power-of-two block grids"
+ (patch 0072 in this series) for block sizes that are not a power of two.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/vulkan/pvr_arch_border.c
++++ b/src/imagination/vulkan/pvr_arch_border.c
+@@ -145,6 +145,20 @@
+    struct pvr_tex_format_compressed_description desc;
+    bool present;
+ } pvr_tex_format_compressed_table[PVR_TEX_FORMAT_COUNT] = {
++   FORMAT(ASTC_4X4, ASTC_4x4, U16U16U16U16),
++   FORMAT(ASTC_5X4, ASTC_5x4, U16U16U16U16),
++   FORMAT(ASTC_5X5, ASTC_5x5, U16U16U16U16),
++   FORMAT(ASTC_6X5, ASTC_6x5, U16U16U16U16),
++   FORMAT(ASTC_6X6, ASTC_6x6, U16U16U16U16),
++   FORMAT(ASTC_8X5, ASTC_8x5, U16U16U16U16),
++   FORMAT(ASTC_8X6, ASTC_8x6, U16U16U16U16),
++   FORMAT(ASTC_8X8, ASTC_8x8, U16U16U16U16),
++   FORMAT(ASTC_10X5, ASTC_10x5, U16U16U16U16),
++   FORMAT(ASTC_10X6, ASTC_10x6, U16U16U16U16),
++   FORMAT(ASTC_10X8, ASTC_10x8, U16U16U16U16),
++   FORMAT(ASTC_10X10, ASTC_10x10, U16U16U16U16),
++   FORMAT(ASTC_12X10, ASTC_12x10, U16U16U16U16),
++   FORMAT(ASTC_12X12, ASTC_12x12, U16U16U16U16),
+    /*  68 */ FORMAT(ETC2_RGB, ETC2_RGB8, U8U8U8U8),
+    /*  69 */ FORMAT(ETC2A_RGBA, ETC2_RGBA8, U8U8U8U8),
+    /*  70 */ FORMAT(ETC2_PUNCHTHROUGHA, ETC2_RGB8A1, U8U8U8U8),
+--- a/src/imagination/vulkan/pvr_arch_formats.c
++++ b/src/imagination/vulkan/pvr_arch_formats.c
+@@ -167,6 +167,34 @@
+    FORMAT_COMPRESSED(ETC2_R11_SNORM, EAC_R11_SIGNED),
+    FORMAT_COMPRESSED(ETC2_RG11_UNORM, EAC_RG11_UNSIGNED),
+    FORMAT_COMPRESSED(ETC2_RG11_SNORM, EAC_RG11_SIGNED),
++   FORMAT_COMPRESSED(ASTC_4x4, ASTC_4X4),
++   FORMAT_COMPRESSED(ASTC_4x4_SRGB, ASTC_4X4),
++   FORMAT_COMPRESSED(ASTC_5x4, ASTC_5X4),
++   FORMAT_COMPRESSED(ASTC_5x4_SRGB, ASTC_5X4),
++   FORMAT_COMPRESSED(ASTC_5x5, ASTC_5X5),
++   FORMAT_COMPRESSED(ASTC_5x5_SRGB, ASTC_5X5),
++   FORMAT_COMPRESSED(ASTC_6x5, ASTC_6X5),
++   FORMAT_COMPRESSED(ASTC_6x5_SRGB, ASTC_6X5),
++   FORMAT_COMPRESSED(ASTC_6x6, ASTC_6X6),
++   FORMAT_COMPRESSED(ASTC_6x6_SRGB, ASTC_6X6),
++   FORMAT_COMPRESSED(ASTC_8x5, ASTC_8X5),
++   FORMAT_COMPRESSED(ASTC_8x5_SRGB, ASTC_8X5),
++   FORMAT_COMPRESSED(ASTC_8x6, ASTC_8X6),
++   FORMAT_COMPRESSED(ASTC_8x6_SRGB, ASTC_8X6),
++   FORMAT_COMPRESSED(ASTC_8x8, ASTC_8X8),
++   FORMAT_COMPRESSED(ASTC_8x8_SRGB, ASTC_8X8),
++   FORMAT_COMPRESSED(ASTC_10x5, ASTC_10X5),
++   FORMAT_COMPRESSED(ASTC_10x5_SRGB, ASTC_10X5),
++   FORMAT_COMPRESSED(ASTC_10x6, ASTC_10X6),
++   FORMAT_COMPRESSED(ASTC_10x6_SRGB, ASTC_10X6),
++   FORMAT_COMPRESSED(ASTC_10x8, ASTC_10X8),
++   FORMAT_COMPRESSED(ASTC_10x8_SRGB, ASTC_10X8),
++   FORMAT_COMPRESSED(ASTC_10x10, ASTC_10X10),
++   FORMAT_COMPRESSED(ASTC_10x10_SRGB, ASTC_10X10),
++   FORMAT_COMPRESSED(ASTC_12x10, ASTC_12X10),
++   FORMAT_COMPRESSED(ASTC_12x10_SRGB, ASTC_12X10),
++   FORMAT_COMPRESSED(ASTC_12x12, ASTC_12X12),
++   FORMAT_COMPRESSED(ASTC_12x12_SRGB, ASTC_12X12),
+    FORMAT_YCBCR(G8_B8R8_420_UNORM, YVU420_2PLANE),
+    FORMAT_YCBCR(G8_B8_R8_420_UNORM, YUV420_3PLANE),
+ };
+--- a/src/imagination/vulkan/pvr_formats.c
++++ b/src/imagination/vulkan/pvr_formats.c
+@@ -229,12 +229,24 @@
+ #undef f32_to_snorm16
+ #undef f32_to_f16
+ 
++bool pvr_has_astc_ldr(const struct pvr_device_info *dev_info)
++{
++   return PVR_HAS_FEATURE(dev_info, astc) &&
++          PVR_HAS_FEATURE(dev_info, tpu_image_state_v2);
++}
++
++static inline bool pvr_format_is_astc(enum pipe_format format)
++{
++   return util_format_description(format)->layout == UTIL_FORMAT_LAYOUT_ASTC;
++}
++
+ static inline const struct pvr_format *
+ pvr_get_format(struct pvr_physical_device *pdevice, VkFormat vk_format)
+ {
+    enum pipe_format format = vk_format_to_pipe_format(vk_format);
+    if (format < pdevice->formats.count &&
+-       pdevice->formats.formats[format].bind != 0) {
++       pdevice->formats.formats[format].bind != 0 &&
++       (!pvr_format_is_astc(format) || pvr_has_astc_ldr(&pdevice->dev_info))) {
+       return &pdevice->formats.formats[format];
+    }
+ 
+@@ -266,7 +278,8 @@
+          vk_format_get_component_bits(vk_format, UTIL_FORMAT_COLORSPACE_RGB, 0);
+ 
+       if (vk_tiling == VK_IMAGE_TILING_LINEAR &&
+-          vk_format_is_block_compressed(vk_format)) {
++          vk_format_is_block_compressed(vk_format) &&
++          !pvr_format_is_astc(vk_format_to_pipe_format(vk_format))) {
+          flags |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
+                   VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT |
+                   VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT;
+--- a/src/imagination/vulkan/pvr_formats.h
++++ b/src/imagination/vulkan/pvr_formats.h
+@@ -237,6 +237,7 @@
+ const uint8_t *
+ pvr_get_format_swizzle_for_tpu(const struct util_format_description *desc);
+ const uint8_t *pvr_get_format_swizzle(VkFormat vk_format);
++bool pvr_has_astc_ldr(const struct pvr_device_info *dev_info);
+ uint32_t pvr_rogue_get_pbe_accum_format(VkFormat vk_format);
+ uint32_t pvr_get_pbe_accum_format_size_in_bytes(VkFormat vk_format);
+ void pvr_get_hw_clear_color(VkFormat vk_format,
+--- a/src/imagination/vulkan/pvr_physical_device.c
++++ b/src/imagination/vulkan/pvr_physical_device.c
+@@ -269,7 +269,7 @@
+       .multiViewport = false,
+       .samplerAnisotropy = true,
+       .textureCompressionETC2 = true,
+-      .textureCompressionASTC_LDR = false,
++      .textureCompressionASTC_LDR = pvr_has_astc_ldr(dev_info),
+       .textureCompressionBC = false,
+       .occlusionQueryPrecise = true,
+       .pipelineStatisticsQuery = false,

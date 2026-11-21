@@ -1,0 +1,194 @@
+Description: pvr: reuse control stream buffers
+ Every control stream buffer of a command buffer is a separate 4 KiB buffer
+ object: pvr_csb_buffer_extend() creates, CPU-maps and GPU-maps one with
+ pvr_bo_alloc(), and pvr_csb_finish() and the free of a graphics sub command
+ unmap and destroy it again. With render states cached, buffer objects are
+ still created, mapped and destroyed for every submit under zink, each costing
+ PVR_CREATE_BO, PVR_GET_BO_MMAP_OFFSET, mmap, PVR_VM_MAP and on release
+ PVR_VM_UNMAP, munmap and GEM_CLOSE; every graphics and compute sub command
+ allocates at least one control stream buffer.
+ .
+ Keep released control stream buffers in a per-device pool of up to 256
+ buffers (1 MiB) and take from it in pvr_csb_buffer_extend() before
+ allocating. pvr_csb_finish() and the release of the baked terminate and view
+ index control streams return the buffers to the pool. A reused buffer is
+ cleared, so it has the same contents as a new one. Buffers are released only
+ when the command buffer is reset or freed, which requires that it is not
+ pending, so a pooled buffer is not in use by the GPU. The pool is emptied in
+ device destruction after the render state cache.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/vulkan/pvr_arch_cmd_buffer.c
++++ b/src/imagination/vulkan/pvr_arch_cmd_buffer.c
+@@ -143,8 +143,10 @@
+          util_dynarray_fini(&sub_cmd->gfx.sec_query_indices);
+          util_dynarray_fini(&sub_cmd->gfx.unbound_deferred_clears);
+          pvr_csb_finish(&sub_cmd->gfx.control_stream);
+-         pvr_bo_free(cmd_buffer->device, sub_cmd->gfx.terminate_ctrl_stream);
+-         pvr_bo_free(cmd_buffer->device, sub_cmd->gfx.multiview_ctrl_stream);
++         pvr_csb_bo_release(cmd_buffer->device,
++                            sub_cmd->gfx.terminate_ctrl_stream);
++         pvr_csb_bo_release(cmd_buffer->device,
++                            sub_cmd->gfx.multiview_ctrl_stream);
+          pvr_bo_suballoc_free(sub_cmd->gfx.depth_bias_bo);
+          pvr_bo_suballoc_free(sub_cmd->gfx.scissor_bo);
+          if (sub_cmd->is_dynamic_render && !secondary_cont) {
+--- a/src/imagination/vulkan/pvr_arch_csb.c
++++ b/src/imagination/vulkan/pvr_arch_csb.c
+@@ -121,16 +121,19 @@
+    STATIC_ASSERT(ROGUE_VDMCTRL_GUARD_SIZE_DEFAULT ==
+                  ROGUE_CDMCTRL_GUARD_SIZE_DEFAULT);
+ 
+-   result = pvr_bo_alloc(csb->device,
+-                         csb->device->heaps.general_heap,
+-                         PVR_CMD_BUFFER_CSB_BO_SIZE,
+-                         cache_line_size,
+-                         PVR_BO_ALLOC_FLAG_CPU_MAPPED,
+-                         &pvr_bo);
+-   if (result != VK_SUCCESS) {
+-      vk_error(csb->device, result);
+-      csb->status = result;
+-      return false;
++   pvr_bo = pvr_csb_bo_pool_take(csb->device);
++   if (!pvr_bo) {
++      result = pvr_bo_alloc(csb->device,
++                            csb->device->heaps.general_heap,
++                            PVR_CMD_BUFFER_CSB_BO_SIZE,
++                            cache_line_size,
++                            PVR_BO_ALLOC_FLAG_CPU_MAPPED,
++                            &pvr_bo);
++      if (result != VK_SUCCESS) {
++         vk_error(csb->device, result);
++         csb->status = result;
++         return false;
++      }
+    }
+ 
+    /* if this is not the first BO in csb */
+--- a/src/imagination/vulkan/pvr_arch_device.c
++++ b/src/imagination/vulkan/pvr_arch_device.c
+@@ -940,6 +940,8 @@
+    if (result != VK_SUCCESS)
+       goto err_pvr_device_dummy_rt_finish;
+ 
++   pvr_csb_bo_pool_init(device);
++
+    /* Initialize GPU tracing infrastructure */
+    pvr_device_utrace_init(device);
+ 
+@@ -1039,6 +1041,7 @@
+    pvr_device_utrace_finish(device);
+ 
+    pvr_render_state_cache_finish(device);
++   pvr_csb_bo_pool_finish(device);
+ 
+    pvr_device_dummy_rt_finish(device);
+    pvr_arch_border_color_table_finish(device);
+--- a/src/imagination/vulkan/pvr_csb.c
++++ b/src/imagination/vulkan/pvr_csb.c
+@@ -118,7 +118,7 @@
+    } else {
+       list_for_each_entry_safe (struct pvr_bo, pvr_bo, &csb->pvr_bo_list, link) {
+          list_del(&pvr_bo->link);
+-         pvr_bo_free(csb->device, pvr_bo);
++         pvr_csb_bo_release(csb->device, pvr_bo);
+       }
+    }
+ 
+@@ -126,6 +126,65 @@
+    pvr_csb_init(NULL, PVR_CMD_STREAM_TYPE_INVALID, csb);
+ }
+ 
++#define PVR_CSB_BO_POOL_MAX 256
++
++void pvr_csb_bo_pool_init(struct pvr_device *device)
++{
++   simple_mtx_init(&device->csb_bo_pool_mtx, mtx_plain);
++   list_inithead(&device->csb_bo_pool);
++   device->csb_bo_pool_count = 0;
++}
++
++void pvr_csb_bo_pool_finish(struct pvr_device *device)
++{
++   list_for_each_entry_safe (struct pvr_bo, pvr_bo, &device->csb_bo_pool, link) {
++      list_del(&pvr_bo->link);
++      pvr_bo_free(device, pvr_bo);
++   }
++
++   device->csb_bo_pool_count = 0;
++   simple_mtx_destroy(&device->csb_bo_pool_mtx);
++}
++
++struct pvr_bo *pvr_csb_bo_pool_take(struct pvr_device *device)
++{
++   struct pvr_bo *pvr_bo = NULL;
++
++   simple_mtx_lock(&device->csb_bo_pool_mtx);
++
++   if (!list_is_empty(&device->csb_bo_pool)) {
++      pvr_bo = list_first_entry(&device->csb_bo_pool, struct pvr_bo, link);
++      list_del(&pvr_bo->link);
++      device->csb_bo_pool_count--;
++   }
++
++   simple_mtx_unlock(&device->csb_bo_pool_mtx);
++
++   if (pvr_bo)
++      memset(pvr_bo->bo->map, 0, pvr_bo->bo->size);
++
++   return pvr_bo;
++}
++
++void pvr_csb_bo_release(struct pvr_device *device, struct pvr_bo *pvr_bo)
++{
++   if (!pvr_bo)
++      return;
++
++   simple_mtx_lock(&device->csb_bo_pool_mtx);
++
++   if (device->csb_bo_pool_count < PVR_CSB_BO_POOL_MAX) {
++      list_add(&pvr_bo->link, &device->csb_bo_pool);
++      device->csb_bo_pool_count++;
++      pvr_bo = NULL;
++   }
++
++   simple_mtx_unlock(&device->csb_bo_pool_mtx);
++
++   if (pvr_bo)
++      pvr_bo_free(device, pvr_bo);
++}
++
+ /**
+  * \brief Discard information only required while building and return the BOs.
+  *
+--- a/src/imagination/vulkan/pvr_csb.h
++++ b/src/imagination/vulkan/pvr_csb.h
+@@ -251,6 +251,11 @@
+ void pvr_csb_finish(struct pvr_csb *csb);
+ VkResult pvr_csb_bake(struct pvr_csb *csb, struct list_head *bo_list_out);
+ 
++void pvr_csb_bo_pool_init(struct pvr_device *device);
++void pvr_csb_bo_pool_finish(struct pvr_device *device);
++struct pvr_bo *pvr_csb_bo_pool_take(struct pvr_device *device);
++void pvr_csb_bo_release(struct pvr_device *device, struct pvr_bo *pvr_bo);
++
+ #ifdef PVR_PER_ARCH
+ 
+ void *PVR_PER_ARCH(csb_alloc_dwords)(struct pvr_csb *csb, uint32_t num_dwords);
+--- a/src/imagination/vulkan/pvr_device.h
++++ b/src/imagination/vulkan/pvr_device.h
+@@ -173,6 +173,10 @@
+    struct list_head rstate_cache_idle;
+    uint32_t rstate_cache_idle_count;
+ 
++   simple_mtx_t csb_bo_pool_mtx;
++   struct list_head csb_bo_pool;
++   uint32_t csb_bo_pool_count;
++
+    /* Data Source for GPU tracing */
+    struct pvr_ds_device ds;
+ };

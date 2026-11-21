@@ -1,0 +1,110 @@
+From a7cea6aef00a0d424cea6ac4f039bbb47d65d38f Mon Sep 17 00:00:00 2001
+From: Rhys Perry <pendingchaos02@gmail.com>
+Date: Mon, 9 Nov 2026 11:31:18 +0000
+Subject: [PATCH] nir/uub: fix imul by constant with overflow
+
+This was broken with some non-power-of-two constants, such as a 8-bit
+multiplication with a constant of 129. The old code would have
+limited the result to 129, but 129 * 3 would be 131.
+
+fossil-db (gfx1201):
+Totals from 4820 (2.29% of 210532) affected shaders:
+Instrs: 9481691 -> 9499116 (+0.18%); split: -0.00%, +0.19%
+CodeSize: 49350464 -> 49467840 (+0.24%); split: -0.00%, +0.24%
+SpillSGPRs: 12763 -> 12774 (+0.09%)
+Latency: 212851544 -> 213046883 (+0.09%); split: -0.01%, +0.10%
+InvThroughput: 30496232 -> 30521593 (+0.08%); split: -0.00%, +0.08%
+VClause: 120141 -> 120147 (+0.00%); split: -0.01%, +0.01%
+SClause: 241675 -> 241522 (-0.06%); split: -0.24%, +0.17%
+Copies: 639762 -> 639823 (+0.01%); split: -0.03%, +0.04%
+Branches: 192582 -> 192586 (+0.00%); split: -0.00%, +0.00%
+PreSGPRs: 298007 -> 298021 (+0.00%)
+VALU: 5080113 -> 5080444 (+0.01%); split: -0.00%, +0.01%
+SALU: 1681946 -> 1700947 (+1.13%); split: -0.00%, +1.13%
+SMEM: 370345 -> 370352 (+0.00%)
+VOPD: 27308 -> 27310 (+0.01%); split: +0.01%, -0.00%
+
+Signed-off-by: Rhys Perry <pendingchaos02@gmail.com>
+Backport-to: *
+Gitlab: https://gitlab.freedesktop.org/mesa/mesa/-/work_items/16740
+Reviewed-by: Georg Lehmann <dadschoorse@gmail.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/46098>
+(cherry picked from commit acdc92ace4fecc57778c50f0e8387e7713d260ae)
+Link: https://gitlab.freedesktop.org/mesa/mesa/-/commit/a7cea6aef00a0d424cea6ac4f039bbb47d65d38f
+[ adapted: dropped .pick_status.json, not in the 26.3.0 tarball or bookkeeping only ]
+---
+ .pick_status.json                     |  2 +-
+ src/compiler/nir/nir_range_analysis.c | 44 +++++++++++++++++++++++----
+ 2 files changed, 39 insertions(+), 7 deletions(-)
+
+diff --git a/src/compiler/nir/nir_range_analysis.c b/src/compiler/nir/nir_range_analysis.c
+index c0107111caa9..9f65339d92f9 100644
+--- a/src/compiler/nir/nir_range_analysis.c
++++ b/src/compiler/nir/nir_range_analysis.c
+@@ -1916,6 +1916,38 @@ unsigned_upper_bound_alu_supported(nir_scalar scalar)
+    }
+ }
+ 
++static uint32_t uub_iadd(uint32_t max, uint32_t x, uint32_t y)
++{
++   return MIN2((uint64_t)x + y, max);
++}
++
++static uint32_t uub_shl_const(unsigned bit_size, uint32_t max, uint32_t x, uint32_t C)
++{
++   C &= (bit_size - 1);
++   if (util_last_bit(x) + C > bit_size)
++      return (max << C) & max;
++   return x << C;
++}
++
++static uint32_t uub_imul_const(unsigned bit_size, uint32_t max, uint32_t x, uint32_t C)
++{
++   /* TODO: This is just a conservative approximation. For example:
++    * x=2 and C=129 would have a uub of 130 instead of 129.
++    */
++   uint32_t res = 0;
++
++   while (C) {
++      unsigned b = util_last_bit(C) - 1;
++      C &= ~(1u << b);
++
++      res = uub_iadd(max, res, uub_shl_const(bit_size, max, x, b));
++      /* Because we're scanning the bits in reverse, we know what the low bits are. */
++      res &= ~bitmask(b);
++   }
++
++   return res;
++}
++
+ static void
+ get_alu_uub(struct analysis_state *state, struct scalar_query q, uint32_t *result, const uint32_t *src)
+ {
+@@ -1984,18 +2016,18 @@ get_alu_uub(struct analysis_state *state, struct scalar_query q, uint32_t *resul
+       break;
+    }
+    case nir_op_imul: {
+-      if (src[0] == 0 || (src[0] * src[1]) / src[0] == src[1]) /* check overflow */
+-         *result = src[0] * src[1];
+-      *result = MIN2(*result, max);
+-
+       nir_scalar src0_scalar = nir_scalar_chase_alu_src(q.scalar, 0);
+       nir_scalar src1_scalar = nir_scalar_chase_alu_src(q.scalar, 1);
+       if (nir_scalar_is_const(src0_scalar)) {
+          uint32_t const_val = nir_scalar_as_uint(src0_scalar);
+-         *result = const_val ? MIN2(*result, max / const_val * const_val) : 0;
++         *result = uub_imul_const(q.scalar.def->bit_size, max, src[1], const_val);
+       } else if (nir_scalar_is_const(src1_scalar)) {
+          uint32_t const_val = nir_scalar_as_uint(src1_scalar);
+-         *result = const_val ? MIN2(*result, max / const_val * const_val) : 0;
++         *result = uub_imul_const(q.scalar.def->bit_size, max, src[0], const_val);
++      } else {
++         if (src[0] == 0 || (src[0] * src[1]) / src[0] == src[1]) /* check overflow */
++            *result = src[0] * src[1];
++         *result = MIN2(*result, max);
+       }
+       break;
+    }
+-- 
+GitLab
+

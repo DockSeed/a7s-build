@@ -1,0 +1,93 @@
+Description: pvr: limit z replication to subpasses with a free color output
+ When a depth attachment written in a render is read as an input attachment
+ by a subpass merged into the same render, the hardware setup in
+ pvr_arch_hw_pass.c replicates the depth into color storage
+ (pvr_enable_z_replicate()). The fragment shader of a writing subpass stores
+ the replicated depth to the output location FRAG_RESULT_DATA0 + color_count
+ (pvr_init_fs_outputs(), pvr_setup_fs_outputs() in pvr_arch_pipeline.c), and
+ the load op shader to FRAG_RESULT_DATA0 + z_replicate, where z_replicate
+ counts the color attachments and the on-chip input attachments of the
+ subpass (pvr_copy_z_replicate_details(), pvr_uscgen_loadop() in
+ pvr_usc.c). The tile buffer flags of these locations are kept in the 8 bit
+ masks output_tile_buffers (pco_data.h). An index of 8 or more selects
+ FRAG_RESULT_DUAL_SRC_BLEND, whose stores nir_lower_blend() removes
+ (consume_dual_stores()), loses its tile buffer flag, and from 9 on is past
+ the end of pco_fs_data::outputs[]. With at most 4 color and 4 input
+ attachments this can only happen for 4 + 4; with 8 color attachments every
+ subpass that writes the replicated depth would hit it.
+ .
+ Only replicate the depth if every subpass of the render that writes it has
+ fewer than PVR_MAX_COLOR_ATTACHMENTS color and input attachments together.
+ Otherwise the subpass is not merged and reads the depth from memory, as is
+ already done for a stencil input attachment. A subpass that reads its own
+ depth attachment and has no room for the replica reads it from memory as
+ well. Nothing changes for subpasses with less than 8 color and input
+ attachments.
+ .
+ Only for this downstream stack; not intended for upstream submission.
+Author: DockSeed <dockseed@proton.me>
+Generated-by: LLM
+Forwarded: not-needed
+
+--- a/src/imagination/vulkan/pvr_arch_hw_pass.c
++++ b/src/imagination/vulkan/pvr_arch_hw_pass.c
+@@ -1333,6 +1333,37 @@
+    return false;
+ }
+ 
++static bool pvr_z_replicate_fits(const struct pvr_render_subpass *subpass)
++{
++   return subpass->color_count + subpass->input_count <
++          PVR_MAX_COLOR_ATTACHMENTS;
++}
++
++static bool pvr_can_z_replicate(struct pvr_renderpass_context *ctx,
++                                const struct pvr_render_subpass *subpass,
++                                uint32_t attach_idx)
++{
++   if (subpass->depth_stencil_attachment == attach_idx &&
++       !pvr_z_replicate_fits(subpass)) {
++      return false;
++   }
++
++   if (!ctx->hw_render)
++      return true;
++
++   for (uint32_t i = 0U; i < ctx->hw_render->subpass_count; i++) {
++      const struct pvr_render_subpass *input_subpass =
++         ctx->subpasses[i].input_subpass;
++
++      if (input_subpass->depth_stencil_attachment == attach_idx &&
++          !pvr_z_replicate_fits(input_subpass)) {
++         return false;
++      }
++   }
++
++   return true;
++}
++
+ static bool
+ pvr_depth_zls_conflict(struct pvr_renderpass_context *ctx,
+                        struct pvr_render_int_attachment *int_ds_attach,
+@@ -1829,6 +1860,11 @@
+       return false;
+    }
+ 
++   if (sp_depth->existing_ds_is_input &&
++       !pvr_can_z_replicate(ctx, subpass, sp_depth->existing_ds_attach)) {
++      return false;
++   }
++
+    if (sp_depth->incoming_ds_is_input && int_ds_attach &&
+        int_ds_attach->attachment->aspects & VK_IMAGE_ASPECT_STENCIL_BIT &&
+        ctx->hw_render) {
+@@ -1949,7 +1985,8 @@
+    /* Is the incoming depth attachment used as an input to the incoming subpass?
+     */
+    sp_depth.incoming_ds_is_input =
+-      pvr_is_input(input_subpass, input_subpass->depth_stencil_attachment);
++      pvr_is_input(input_subpass, input_subpass->depth_stencil_attachment) &&
++      pvr_z_replicate_fits(input_subpass);
+ 
+    /* Is the current depth attachment used as an input to the incoming subpass?
+     */

@@ -1,0 +1,46 @@
+From 5e1ea841c743713498733e06985f59f48b6d0d6a Mon Sep 17 00:00:00 2001
+From: Dmitry Baryshkov <dmitry.baryshkov@oss.qualcomm.com>
+Date: Sun, 1 Nov 2026 00:10:38 +0200
+Subject: [PATCH] dri: round up the subsampled plane size on dma-buf import
+
+When a planar YUV dma-buf with an odd width or height is imported, the
+subsampled planes are created with the size shifted down, one chroma
+sample short of what the producer allocated. This results in the
+information loss. This contradics with the other code handling
+dimensions. FOr example, util_format_get_plane_width/height() rounds up.
+In the kernel, drm_format_info_plane_width/height() also rounds
+dimensions up.
+
+Round the plane size up, as util_format_get_plane_width() and DRM do.
+
+Fixes: ecd6fce2611e ("mesa/st: support lowering multi-planar YUV")
+Cc: mesa-stable
+Assisted-by: LLM
+Signed-off-by: Dmitry Baryshkov <dmitry.baryshkov@oss.qualcomm.com>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45727>
+(cherry picked from commit 6b41b56dea2d3d827cbb118ece95e2ba39a73e1a)
+Link: https://gitlab.freedesktop.org/mesa/mesa/-/commit/5e1ea841c743713498733e06985f59f48b6d0d6a
+[ adapted: dropped .pick_status.json, not in the 26.3.0 tarball or bookkeeping only ]
+---
+ .pick_status.json                | 2 +-
+ src/gallium/frontends/dri/dri2.c | 4 ++--
+ 2 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/src/gallium/frontends/dri/dri2.c b/src/gallium/frontends/dri/dri2.c
+index 4846d9c1c7e7..b8b732c2bd8f 100644
+--- a/src/gallium/frontends/dri/dri2.c
++++ b/src/gallium/frontends/dri/dri2.c
+@@ -750,8 +750,8 @@ dri_create_image_from_winsys(struct dri_screen *screen,
+       struct pipe_resource *tex;
+ 
+       templ.next = img->texture;
+-      templ.width0 = width >> map->planes[i].width_shift;
+-      templ.height0 = height >> map->planes[i].height_shift;
++      templ.width0 = DIV_ROUND_UP(width, 1 << map->planes[i].width_shift);
++      templ.height0 = DIV_ROUND_UP(height, 1 << map->planes[i].height_shift);
+       if (use_lowered)
+          templ.format = map->planes[i].dri_format;
+       else
+-- 
+GitLab
+
