@@ -72,6 +72,15 @@ OpenSSH, systemd-timesyncd, kmscon on tty1, Mesa 26.3.0 built by this recipe
 the usual tools (`ip`, `iw`, `ethtool`, `lspci`, `lsusb`, `nvme`, `curl`,
 `nano`, …). The full list with reasons: `scripts/distro/debian/packages.sh`.
 
+The boot chain sits in front of the first partition, so no package owns it. Its
+licence notices are in `/usr/share/doc/a733-boot-chain/`: `copyright` (the
+machine-readable format of *Debian* policy) names U-Boot, TF-A and the DRAM
+initialisation, gives the commits the chain was built from, the copyright lines
+of the TF-A sources that go into BL31 and the licence texts of the ones that
+carry their own (BSD-3-Clause for the rest); `COPYING.u-boot`, `Licenses/` and
+`tf-a-license.rst` are the texts of the built sources. The GPU firmware has its `LICENSE.powervr` in
+`/usr/share/doc/powervr-firmware/`.
+
 AppArmor is the `apparmor` package every *Debian* install has (*Debian*'s kernel
 packages recommend it). `apparmor.service` loads its profiles when the kernel
 has AppArmor and is skipped otherwise.

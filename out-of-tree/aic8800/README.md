@@ -29,9 +29,10 @@ commit, tag or subdirectory.
 
 ## Firmware
 
-The firmware is vendor-supplied binary without a licence statement. We claim no
-right to redistribute it: it is fetched at build time from the pinned upstream
-commit, verified against `firmware.sha256`, and never committed.
+The firmware files are vendor binaries and carry no licence text themselves.
+Radxa's `debian/copyright` for the package lists `src/*`, which holds them, as
+GPL-2. We do not pass the files on: they are fetched at build time from the
+pinned upstream commit, verified against `firmware.sha256`, and never committed.
 
 The driver does not use `request_firmware()`; it opens
 `/lib/firmware/aic8800_fw/USB/aic8800D80/<name>` directly (Radxa's

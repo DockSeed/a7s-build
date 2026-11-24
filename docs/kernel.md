@@ -8,7 +8,7 @@ to one commit (`KERNEL_RECIPE_COMMIT` in `scripts/stages/kernel.sh`):
 | | |
 |---|---|
 | Repository | `https://github.com/DockSeed/a7s-linux-lts` |
-| Pinned commit | `c91768288c13` |
+| Pinned commit | `e800c36edde5` |
 | Result | `Image`, `sun60i-a733-cubie-a7s.dtb`, `config`, `System.map`, `modules/` (with aic8800), `KERNEL-ID` |
 
 Changes to the series are made there only; here the pin moves. What the kernel

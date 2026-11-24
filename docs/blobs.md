@@ -4,19 +4,22 @@
 The repository contains no vendor binary. Everything below is fetched at build
 time from its public origin, checked against a sha256 or commit id committed here,
 and kept in the download cache. Do not publish an image you built: several parts
-may not be redistributed. "Unknown" means no licence text came with the file.
+may not be redistributed. A file "without licence text" carries none itself; where
+the package it comes from covers it in its `debian/copyright`, the table says so
+without judging it. "no" in the last column: we do not pass the file on and
+make no claim that anyone may.
 
 | What | Origin | Pin | Licence | Redistribute? |
 |---|---|---|---|---|
-| Kernel recipe `a7s-linux-lts` (Linux 6.18.65 and the patch series; fetches the row below itself) | github.com/DockSeed/a7s-linux-lts | commit `c91768288c13`, `scripts/stages/kernel.sh` | GPL-2.0 | yes |
+| Kernel recipe `a7s-linux-lts` (Linux 6.18.65 and the patch series; fetches the row below itself) | github.com/DockSeed/a7s-linux-lts | commit `e800c36edde5`, `scripts/stages/kernel.sh` | GPL-2.0 | yes |
 | Linux 6.18.65 | cdn.kernel.org | by `a7s-linux-lts`: sha256 | GPL-2.0 | yes |
 | Kernel packages `linux-image`, `linux-headers`, `a7s-kernel-hook`, `a7s-aic8800-dkms` (unless `A7S_KERNEL=build`) | github.com/DockSeed/a7s-linux-lts, the release of `KERNEL_RELEASE_TAG` | sha256 of each file, `scripts/stages/kernel.sh` | GPL-2.0 | yes |
-| Boot-chain recipe `a733-bootchain` (U-Boot, TF-A and the patches on both; fetches the rows below itself) | github.com/DockSeed/a733-bootchain | commit `bd0f37556b82`, `scripts/stages/bootchain.sh` | GPL / BSD-3-Clause, per file | yes |
-| Boot-chain package `u-boot-dlan17` (build glue, with the DRAM blob `awbin/a733/ddr.bin`) | github.com/radxa-pkg/u-boot-dlan17 | by `a733-bootchain`: commit, `ddr.bin` sha256 | glue GPL; `ddr.bin` closed vendor code, no licence text | `ddr.bin`: no |
+| Boot-chain recipe `a733-bootchain` (U-Boot, TF-A and the patches on both; fetches the rows below itself) | github.com/DockSeed/a733-bootchain | commit `797a561442a4`, `scripts/stages/bootchain.sh` | GPL / BSD-3-Clause, per file; the image carries their notices ([image](image.md#what-is-in-it)) | yes |
+| Boot-chain package `u-boot-dlan17` (build glue, with the DRAM blob `awbin/a733/ddr.bin`) | github.com/radxa-pkg/u-boot-dlan17 | by `a733-bootchain`: commit, `ddr.bin` sha256 | glue: GPL-3+ (its `debian/copyright`); `ddr.bin`: binary without licence text, which that `debian/copyright` lists under `Files: *` (GPL-3+) | `ddr.bin`: no |
 | U-Boot source | github.com/radxa/u-boot | by `a733-bootchain`: commit, by hash only | GPL-2.0+ | yes |
 | TF-A | git.trustedfirmware.org/TF-A/trusted-firmware-a master | by `a733-bootchain`: commit | BSD-3-Clause | yes |
 | AIC8800 driver | github.com/radxa-pkg/aic8800 | commit `b6e136a9fe30`, by `a7s-linux-lts` (`build`, or its release file `a7s-aic8800-dkms`, built by DKMS) | GPL-2.0 | yes |
-| AIC8800D80 firmware (7 files) | same | commit `b6e136a9fe30` in `scripts/stages/wifi.sh`, sha256 per file, `out-of-tree/aic8800/firmware.sha256` | vendor, no grant | no |
+| AIC8800D80 firmware (7 files) | same | commit `b6e136a9fe30` in `scripts/stages/wifi.sh`, sha256 per file, `out-of-tree/aic8800/firmware.sha256` | binaries without licence text; the package's `debian/copyright` lists `src/*` as GPL-2 | no |
 | GPU firmware `rogue_36.56.104.183_v1.fw` | gitlab.freedesktop.org/imagination/linux-firmware | commit `8a58f81883f7`, sha256 | `LICENSE.powervr`: binary redistribution unmodified, with notice and disclaimer; the name of Imagination or its suppliers not used to endorse or promote without written permission; no reverse engineering, decompilation or disassembly; only with products designed and licensed by Imagination | yes, with the licence file |
 | ORC 0.4.41, xfwm4 4.20.0-1 sources | gstreamer.freedesktop.org, deb.debian.org / snapshot.debian.org | sha256 | BSD / GPL-2.0+ | yes |
 | Mesa 26.3.0 source, *Debian*'s mesa 26.2.6-1 packaging (`debian.tar.xz`), wayland-protocols 1.50-1 (build only) | archive.mesa3d.org, deb.debian.org / snapshot.debian.org | sha256, `scripts/stages/mesa.sh` | Mesa: per file, listed in the packages' `debian/copyright`; packaging: GPL; wayland-protocols: its `debian/copyright` | yes |

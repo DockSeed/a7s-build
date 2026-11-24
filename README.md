@@ -305,6 +305,7 @@ GPL-2.0-or-later, Mesa MIT; `userspace/mesa/debian.diff` as *Debian*'s
 packaging of Mesa, see [REUSE.toml](REUSE.toml)). The boot chain and the kernel are not
 part of this repository: [a733-bootchain](https://github.com/DockSeed/a733-bootchain)
 and [a7s-linux-lts](https://github.com/DockSeed/a7s-linux-lts), each pinned to a
-commit, have their own licences. The repository as a whole can be shared under
+commit, have their own licences; an image carries the notices of the boot chain
+in `/usr/share/doc/a733-boot-chain/`. The repository as a whole can be shared under
 GPL-2.0 ([LICENSE](LICENSE)). Full texts in [LICENSES/](LICENSES/),
 assignments in [REUSE.toml](REUSE.toml); `reuse lint` checks them.

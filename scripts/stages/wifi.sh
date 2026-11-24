@@ -9,7 +9,8 @@
 # release file a7s-aic8800-dkms (the driver source for DKMS) when
 # A7S_KERNEL=release. This stage provides what the driver loads at run time:
 # the seven firmware files of the same upstream commit. They are vendor
-# binaries without a licence statement: fetched at build time, verified against
+# binaries that carry no licence text (the package's debian/copyright lists
+# src/* as GPL-2): fetched at build time, verified against
 # out-of-tree/aic8800/firmware.sha256 and never committed.
 #
 # Output: OUT_DIR/aic8800/usr/lib/firmware/aic8800D80/ and, for the release
