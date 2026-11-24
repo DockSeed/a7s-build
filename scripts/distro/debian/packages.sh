@@ -51,7 +51,7 @@ DEBIAN_BASE_PACKAGES=(
   unattended-upgrades kmscon
 )
 
-# The image's kernel is no Debian package: the image stage writes it to /boot
+# With A7S_KERNEL=build the image's kernel is no Debian package: the image stage writes it to /boot
 # and /usr/lib/modules. KERNEL_PACKAGE holds no files; it declares to dpkg the
 # virtual packages that kernel provides, as Debian's linux-image-arm64 does, so
 # apt meets a dependency on one of them with it instead of installing a Debian

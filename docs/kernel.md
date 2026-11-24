@@ -19,7 +19,7 @@ the build) is described there (`docs/kernel.md`).
 
 | `A7S_KERNEL` | The image's kernel | The aic8800 driver |
 |---|---|---|
-| `release` (default) | the *Debian* packages `linux-image` and `linux-headers` of a release of the recipe, downloaded and installed with dpkg | built by DKMS in the image, against the installed headers |
+| `release` (default) | the *Debian* packages `linux-image` and `linux-headers` of a release of the recipe (plus its hook package `a7s-kernel-hook`), downloaded and installed with dpkg | built by DKMS in the image, against the installed headers |
 | `build` | built here from source by the recipe (`./build.sh kernel`), copied into the image | built by the recipe with the kernel, copied into the image |
 
 Stages: `fetch-kernel` (the recipe at the pin; with `release` also the
@@ -101,7 +101,7 @@ What the image gets:
   `out-of-tree/aic8800/firmware.sha256`.
 
 Instead of the key of `KERNEL-ID`, the rootfs stage checks the pinned sha256 of
-both packages before dpkg sees them (and the image stage again), and the rootfs rules check that the packages are installed
+the three packages before dpkg sees them (and the image stage again), and the rootfs rules check that the packages are installed
 and that the DKMS modules have the vermagic of the kernel's own modules.
 
 What this gives: dpkg knows the kernel, its headers and the driver package.

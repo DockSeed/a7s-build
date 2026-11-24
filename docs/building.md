@@ -25,14 +25,14 @@ The result lands in `out/`. `./build.sh --help` lists every stage and switch.
 - Disk: about 30 GB free (work, out, cache, builder image). Measured pieces
   (desktop image): Mesa build 6.8 GB, root filesystem and its image copy
   2.7 GB each, xfwm4 2.6 GB, kernel tree 2.7 GB (`A7S_KERNEL=build` only),
-  builder image 1.4 GB, raw desktop image 3.9 GiB, cache about 1 GB.
+  builder image 1.4 GB, raw desktop image 3.8 GiB, cache about 1 GB.
 - RAM: 8 GB is comfortable; lower `A7S_JOBS` on a small machine.
 - Time: a first full build takes on the order of an hour on 4 cores (kernel
   compile, root filesystem under emulation); root filesystem plus image from a
   warm cache took about 5 minutes (those times are of `A7S_KERNEL=build`). Later
   builds reuse the cache. With the default `A7S_KERNEL=release` the kernel
-  compile (about 30 minutes on 4 cores) is replaced by a download of three
-  packages; the root filesystem takes several minutes longer, because DKMS
+  compile (about 30 minutes on 4 cores) is replaced by a download of four
+  packages (kernel image, headers, hook, aic8800 DKMS); the root filesystem takes several minutes longer, because DKMS
   compiles the WLAN driver under emulation. These times were taken before the
   `mesa` stage existed; the time it adds (Mesa's compiler tools, then Mesa,
   built in a chroot of its own) has not been measured yet.

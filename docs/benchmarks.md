@@ -7,7 +7,7 @@ stands. Other boards, kernels, DRAM clocks and cooling give other numbers.
 
 | | |
 |---|---|
-| Image | desktop image of commit `b9f5896`, built from a fresh clone (`A7S_DESKTOP=1 A7S_BUILD_COMMIT=unknown`), xz sha256 `401fe12d745fe523…` |
+| Image | desktop image of commit `b9f5896` (of the earlier, unpublished lab history, not in this repository), built from a fresh clone (`A7S_DESKTOP=1 A7S_BUILD_COMMIT=unknown`), xz sha256 `401fe12d745fe523…` |
 | Kernel | Linux 6.18.54 |
 | Board | Radxa Cubie A7S, 8 GB, DRAM at 2040 MHz |
 | Cooling | 40 mm fan on 5 V, always on |

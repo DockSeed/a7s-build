@@ -11,7 +11,8 @@ is shipped.
 ## The story
 
 **Before this repository.** The work started in May 2026, months before the
-history shown here. Two earlier tracks came first:
+lab history (the earlier, unpublished history; this repository's public history
+begins on 23 Oct 2026). Two earlier tracks came first:
 
 - **An Armbian track** (mid-June): the vendor's 6.6 kernel overlaid on
   Armbian, with a small set of validated patches. It produced a bootable
@@ -33,7 +34,7 @@ history shown here. Two earlier tracks came first:
 Both tracks depended on vendor code and blobs that cannot be published. So
 in mid-July the work moved to *Debian* on pristine mainline, with the vendor
 tree dropped and the closed parts pushed to the edges, fetched rather than
-shipped. That is the first commit of this history.
+shipped. That is the first commit of the lab history.
 
 **One board, one person.** On 16 July there was a single board, an SD card
 flashed by hand, and a person at the serial console watching the first kernel
@@ -111,7 +112,7 @@ combined, and over four times their CI runs.
 | 20 May | First experiments (earliest repository) |
 | 16 Jun | Armbian track on the vendor 6.6 kernel |
 | 21 Jun | Fedora track, from scratch |
-| 16 Jul | *Debian* on mainline: first commit; mainline 6.18 boots on the board |
+| 16 Jul | *Debian* on mainline: first commit of the lab history; mainline 6.18 boots on the board |
 | 18 Jul | SD card and eMMC work; USB 2 |
 | 21 Jul | USB 3 (10 Gbit/s), Ethernet, Type-C, PMIC, CPU topology |
 | 8-13 Aug | First image composed by our own build boots from SD |
@@ -146,7 +147,7 @@ Measured in the lab repository, up to 3 Oct 2026:
 
 | What | Amount |
 |---|---|
-| Calendar time | 77 days (16 Jul - 3 Oct), commits on 61 of them; 136 days since the first experiments (20 May) |
+| Calendar time | 79 days (16 Jul - 3 Oct), commits on 61 of them; 136 days since the first experiments (20 May) |
 | Commits (main) | 2,970; about 270 more in the earlier tracks |
 | Pull requests | 745, all closed |
 | Issues | 374 (303 closed, 71 open) |

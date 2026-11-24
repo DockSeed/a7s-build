@@ -14,7 +14,7 @@ A new distro is a new directory that keeps this contract.
 
 | Name | Contract |
 |---|---|
-| `DISTRO_NAME`, `DISTRO_RELEASE` | `DISTRO_RELEASE` is used in the image name |
+| `DISTRO_NAME`, `DISTRO_RELEASE` | `DISTRO_RELEASE` is recorded in the build log and the image's `distro=` line; the image file name is `A7S_IMAGE_NAME` (set from `A7S_SUITE`, `config/defaults.conf`) |
 | `distro_rootfs_inputs` | prints everything the root filesystem is made from (own files by content, package source and timestamp, switches, sha256 of every `OUT_DIR` file it installs); the `rootfs` stage reuses a tree only while this is unchanged |
 | `distro_rootfs_build <dir>` | builds the complete root filesystem into `<dir>` |
 | `distro_rootfs_assert <dir>` | fails (`die`) when the tree breaks a rule below; also run on the finished image tree |
@@ -78,7 +78,7 @@ distro installs them in place of its own Mesa; the `-dev` packages in
 
 ## Adding a distro
 
-1. `scripts/distro/<name>/distro.sh` with the four names above.
+1. `scripts/distro/<name>/distro.sh` with the five names above.
 2. `container/packages.d/<name>.txt`; the maintainers then update
    `container/packages.lock` (the image build refuses a package that is not in it).
 3. `A7S_DISTRO=<name> ./build.sh rootfs image`, twice; compare the sha256.

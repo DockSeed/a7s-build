@@ -7,7 +7,9 @@
 # path once the packages are in.
 #
 # The interface this file provides:
-#   DISTRO_NAME, DISTRO_RELEASE   DISTRO_RELEASE goes into the image file name
+#   DISTRO_NAME, DISTRO_RELEASE   recorded in the build log and the image info; the
+#                                 file name is A7S_IMAGE_NAME (DISTRO_RELEASE is only
+#                                 its fallback)
 #   distro_rootfs_inputs          prints what the root filesystem is made from
 #   distro_rootfs_build <dir>     builds the root filesystem into <dir>
 #   distro_rootfs_assert <dir>    fails when the root filesystem breaks a rule

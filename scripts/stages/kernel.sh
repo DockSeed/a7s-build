@@ -14,10 +14,10 @@
 #            Output: OUT_DIR/{Image,<dtb>,config,System.map,modules/,KERNEL-ID}.
 #            The modules include the AIC8800 WLAN/BT driver, which the recipe
 #            builds with the kernel; the wifi stage supplies its firmware.
-#   release  (default) the Debian packages (linux-image, linux-headers) of a release of the
+#   release  (default) the Debian packages (linux-image, linux-headers, a7s-kernel-hook) of a release of the
 #            recipe, downloaded from its public URL against a pinned sha256.
 #            Output: OUT_DIR/kernel-release/{*.deb,RELEASE-ID}. The AIC8800
-#            driver is not in them: the wifi stage packages its source for DKMS.
+#            driver is not in them: the wifi stage fetches a7s-aic8800-dkms.
 #            Both modes fetch the recipe (fetch-kernel): the driver's patches
 #            are in it.
 # Both modes put the package a7s-kernel-hook (the recipe's hooks that give a
@@ -196,7 +196,7 @@ kernel_release_check() {
   log "kernel release ${KERNEL_RELEASE_TAG}: ${KERNEL_RELEASE_IMAGE_DEB}, ${KERNEL_RELEASE_HEADERS_DEB}, ${KERNEL_RELEASE_HOOK_DEB} (version ${v}, sha256 verified)"
 }
 
-# Both packages in kernel_release_dir are the pinned bytes.
+# The three packages in kernel_release_dir are the pinned bytes.
 kernel_release_verify_bytes() {
   local d f; d="$(kernel_release_dir)"
   for f in "${KERNEL_RELEASE_IMAGE_DEB}:${KERNEL_RELEASE_IMAGE_SHA256}" "${KERNEL_RELEASE_HEADERS_DEB}:${KERNEL_RELEASE_HEADERS_SHA256}"; do

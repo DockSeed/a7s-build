@@ -3,7 +3,7 @@
 Two builds of the same commit on the same host architecture give the same
 bytes. Known exceptions are listed below.
 
-Checked on 2026-10-04: the desktop image of the first commit, built from a
+Checked on 2026-10-04: the desktop image of the first commit of the lab history (the earlier, unpublished history, not this repository's first commit), built from a
 fresh clone with the same switches on Fedora 44 and on SteamOS 3.8 (both
 x86_64, rootless podman 5.8 and 5.5), came out the same to the byte.
 
