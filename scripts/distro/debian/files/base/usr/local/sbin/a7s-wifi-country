@@ -1,0 +1,100 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only OR MIT
+#
+# a7s-wifi-country -- show or set the Wi-Fi country of the board.
+#
+# The image sets no country, because it is built for every country. As a client
+# the board takes the country from the access point it joins; without one the
+# kernel's world rules apply, and they allow no access point on 5 GHz.
+#
+# Setting a country does two things: the kernel takes it at once (iw reg set),
+# and /etc/modprobe.d/a7s-wifi-country.conf hands it to cfg80211 on every boot
+# (ieee80211_regdom). The file is written only after the kernel has accepted the
+# country, so a code the regulatory database does not know is refused.
+#
+# Usage: a7s-wifi-country            show the set and the active country
+#        a7s-wifi-country CC         set the country (ISO 3166-1, e.g. DE)
+#        a7s-wifi-country --clear    remove it, back to the world rules (00)
+set -eu
+# iw is in /usr/sbin, which a user's PATH on Debian does not name.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+CONF=/etc/modprobe.d/a7s-wifi-country.conf
+# The kernel applies a new country asynchronously; on a Cubie A7S setting one
+# took about 0.12 s. WAIT_S is a chosen upper bound, not measured.
+WAIT_S=5
+USAGE="usage: a7s-wifi-country [CC | --clear]"
+
+die() { printf 'a7s-wifi-country: %s\n' "$*" >&2; exit 1; }
+
+# The country of the global regulatory domain, as `iw reg get` prints it.
+# Called in $(...): a failure is the caller's to stop on (`|| exit 1`).
+active() {
+	out="$(iw reg get)" || die "iw reg get failed"
+	c="$(printf '%s\n' "${out}" | awk '/^global/ { g = 1; next } g && $1 == "country" { sub(":", "", $2); print $2; exit }')"
+	[ -n "${c}" ] || die "iw reg get names no global country"
+	printf '%s' "${c}"
+}
+
+# The country in CONF; empty if there is no CONF. A CONF without the one line
+# this command writes is an error, not "none".
+configured() {
+	[ -e "${CONF}" ] || return 0
+	c="$(sed -n 's/^options cfg80211 ieee80211_regdom=\([A-Z][A-Z]\)$/\1/p' "${CONF}")"
+	[ -n "${c}" ] || die "${CONF} does not hold the line this command writes; remove it with --clear"
+	printf '%s' "${c}"
+}
+
+show() {
+	set_cc="$(configured)" || exit 1
+	act="$(active)" || exit 1
+	printf 'set:    %s\n' "${set_cc:-none (world rules at boot)}"
+	printf 'active: %s\n' "${act}"
+}
+
+# A code the regulatory database does not know sends the kernel back to the
+# world rules (00); put the set country back, if there is one.
+refused() {
+	prev="$(configured)" || exit 1
+	[ -z "${prev}" ] || iw reg set "${prev}" || true
+	act="$(active)" || exit 1
+	[ "$1" != 00 ] || die "the kernel did not go back to the world rules (active: ${act})"
+	die "the kernel did not take $1 (active now: ${act}); not a country in the regulatory database?"
+}
+
+# Ask the kernel for a country and wait until the global domain shows it.
+apply() {
+	iw reg set "$1" || die "iw reg set $1 failed"
+	i=0
+	while :; do
+		act="$(active)" || exit 1
+		[ "${act}" != "$1" ] || return 0
+		i=$((i + 1))
+		[ "${i}" -le "${WAIT_S}" ] || refused "$1"
+		sleep 1
+	done
+}
+
+[ $# -le 1 ] || die "${USAGE}"
+[ $# = 1 ] || { show; exit 0; }
+case "$1" in -h | --help) printf '%s\n' "${USAGE}"; exit 0 ;; esac
+[ "$(id -u)" = 0 ] || die "needs root (writes ${CONF})"
+
+case "$1" in
+--clear)
+	rm -f "${CONF}"
+	apply 00
+	;;
+*)
+	cc="$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')"
+	case "${cc}" in
+	[A-Z][A-Z]) ;;
+	*) die "a country is two letters (DE, US), not '$1'" ;;
+	esac
+	apply "${cc}"
+	printf '%s\noptions cfg80211 ieee80211_regdom=%s\n' \
+		'# a7s-wifi-country: the Wi-Fi country cfg80211 starts with on every boot.' "${cc}" > "${CONF}"
+	;;
+esac
+show

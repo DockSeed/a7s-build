@@ -110,6 +110,10 @@ reboot (`localectl` does not stick on *Debian*).
 The board has no battery for its clock: after power-on the clock starts at the
 time the image was built, and NTP sets it once the network is up.
 
+As a Wi-Fi client the board takes its country from the access point it joins.
+To run it as an access point on 5 GHz, set the country first with
+`sudo a7s-wifi-country DE`, see [access point](docs/image.md#access-point).
+
 There is no sound card yet: the board has no analogue audio output, and audio
 over DisplayPort is not enabled yet. Bluetooth audio (A2DP) works.
 

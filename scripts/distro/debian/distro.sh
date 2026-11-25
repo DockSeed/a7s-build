@@ -939,7 +939,7 @@ debian_accounts() {  # <root>
 debian_system() {  # <root>
   local r="$1" u
   cp -a --no-preserve=ownership "${DEBIAN_DIR}/files/base/." "${r}/"
-  chmod 0755 "${r}/usr/local/sbin/a7s-growroot" "${r}/usr/local/sbin/a7s-root-identity"
+  chmod 0755 "${r}/usr/local/sbin/a7s-growroot" "${r}/usr/local/sbin/a7s-root-identity" "${r}/usr/local/sbin/a7s-wifi-country"
 
   printf '%s\n' "${A7S_HOSTNAME}" > "${r}/etc/hostname"
   cat > "${r}/etc/hosts" <<EOF
@@ -980,6 +980,8 @@ EOF
   # DNS as on a Debian install: NetworkManager writes /etc/resolv.conf, no
   # systemd-resolved (and so no LLMNR listener).
   [ ! -e "${r}/usr/lib/systemd/systemd-resolved" ] || die "systemd-resolved is in the rootfs -- NetworkManager does DNS, as on Debian"
+  # dnsmasq-base only: NetworkManager starts dnsmasq for a hotspot, nothing else does.
+  [ ! -e "${r}/usr/lib/systemd/system/dnsmasq.service" ] || die "dnsmasq.service is in the rootfs -- a DNS server on every board"
   in_rootfs "${r}" /etc/systemd/system/sysinit.target.wants/systemd-timesyncd.service || die "systemd-timesyncd is not enabled"
   in_rootfs "${r}" /etc/systemd/system/bluetooth.target.wants/bluetooth.service || die "bluetooth.service is not enabled"
   # AppArmor as on a Debian install: the package enables apparmor.service, which
@@ -1027,7 +1029,7 @@ EOF
   [ -x "${r}/usr/bin/busybox" ] || die "no busybox -- a7s-boot-good.service could not clear the boot counter"
   { in_root "${r}" /usr/bin/busybox 2>&1 || true; } | grep -qw devmem || die "busybox has no devmem applet"
   local t
-  for t in usr/sbin/nvme usr/bin/uuidgen usr/sbin/sfdisk usr/bin/partx usr/sbin/dumpe2fs usr/sbin/resize2fs usr/sbin/tune2fs usr/bin/od usr/sbin/fsck.ext4 usr/sbin/modprobe usr/bin/ssh-keygen usr/sbin/sshd; do
+  for t in usr/sbin/nvme usr/bin/uuidgen usr/sbin/sfdisk usr/bin/partx usr/sbin/dumpe2fs usr/sbin/resize2fs usr/sbin/tune2fs usr/bin/od usr/sbin/fsck.ext4 usr/sbin/modprobe usr/bin/ssh-keygen usr/sbin/sshd usr/sbin/iw usr/sbin/dnsmasq; do
     [ -x "${r}/${t}" ] || die "no /${t} in the rootfs"
   done
   [ -f "${r}/usr/lib/aarch64-linux-gnu/security/pam_systemd.so" ] || die "no pam_systemd.so"
@@ -1168,6 +1170,9 @@ distro_rootfs_assert() {  # <dir>
   [ "$(stat -c %Y "${r}/usr/lib/clock-epoch" 2>/dev/null)" = "${SOURCE_DATE_EPOCH}" ] \
     || die "/usr/lib/clock-epoch is missing or its mtime is not SOURCE_DATE_EPOCH"
   [ "$(cat "${r}/etc/hostname")" = "${A7S_HOSTNAME}" ] || die "/etc/hostname is not ${A7S_HOSTNAME}"
+  # No Wi-Fi country: the image is for every country (a7s-wifi-country sets one on the board).
+  ! grep -rqsE '^[[:space:]]*options[[:space:]]+cfg80211[[:space:]].*ieee80211_regdom' "${r}/etc/modprobe.d" "${r}/usr/lib/modprobe.d" \
+    || die "a Wi-Fi country is set in modprobe.d -- the image is for every country"
   # KERNEL_PACKAGE stands in for the kernel; once the image stage has added the
   # modules, every one its Provides rest on must be there.
   assert_installed "${r}" "apt would install a Debian kernel for wireguard" "${KERNEL_PACKAGE}"

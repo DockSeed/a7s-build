@@ -90,6 +90,36 @@ Security updates from *Debian* install themselves once a day
 `Debian-Security`). This covers *Debian*'s packages, not the kernel and not
 Mesa: neither is a *Debian* package.
 
+## Access point
+
+The on-board radio (`wl0`) can also be an access point (NetworkManager's
+hotspot), on 2.4 and 5 GHz.
+
+The image sets no Wi-Fi country, because it is built for every country. As a
+client the board takes the country from the access point it joins. Without
+one, the kernel's world rules apply: they allow an access point on 2.4 GHz,
+but not on 5 GHz (`Failed to start AP functionality`). Set your country first,
+with its two letters (ISO 3166-1):
+
+```sh
+sudo a7s-wifi-country DE    # now and on every boot
+sudo a7s-wifi-country       # show the set and the active country
+sudo a7s-wifi-country --clear   # back to the world rules
+```
+
+It sets the country at once (`iw reg set`) and writes
+`/etc/modprobe.d/a7s-wifi-country.conf` (`options cfg80211
+ieee80211_regdom=DE`) for every boot. A code the kernel's regulatory database
+does not know is refused.
+
+A NetworkManager hotspot on 5 GHz, for example:
+
+```sh
+sudo nmcli dev wifi hotspot ifname wl0 band a channel 36 ssid <name> password <password>
+```
+
+NetworkManager runs it at 20 MHz.
+
 ## Swap
 
 The image has no swap partition. Swap is `/dev/zram0`, compressed in RAM, as
